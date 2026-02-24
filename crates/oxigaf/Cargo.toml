@@ -1,0 +1,71 @@
+[package]
+name = "oxigaf"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pure Rust Gaussian Avatar Reconstruction — unified API"
+readme = "README.md"
+keywords = ["gaussian-splatting", "3d-reconstruction", "avatar", "flame", "ai"]
+categories = ["graphics", "multimedia", "science"]
+
+[dependencies]
+oxigaf-flame = { version = "0.1.0", path = "../oxigaf-flame" }
+oxigaf-diffusion = { version = "0.1.0", path = "../oxigaf-diffusion" }
+oxigaf-render = { version = "0.1.0", path = "../oxigaf-render" }
+oxigaf-trainer = { version = "0.1.0", path = "../oxigaf-trainer" }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# Async runtime for blocking on wgpu operations
+pollster = { workspace = true }
+# Logging for examples
+tracing-subscriber = { workspace = true }
+tracing = { workspace = true }
+# GPU compute backend
+wgpu = { workspace = true }
+# Image output
+image = { workspace = true }
+# Tensor operations for diffusion example
+candle-core = { workspace = true }
+
+[features]
+# Default features (none - minimal configuration)
+default = []
+
+# FLAME optimizations
+# Note: `simd` requires nightly Rust; on stable it is accepted but compiled out.
+simd = ["oxigaf-flame/simd"]
+parallel = ["oxigaf-flame/parallel"]
+
+# Diffusion model features
+flash_attention = ["oxigaf-diffusion/flash_attention"]
+mixed_precision = ["oxigaf-diffusion/mixed_precision"]
+
+# Render features
+gpu_debug = ["oxigaf-render/gpu_debug"]
+
+# Convenience feature bundles
+full_performance = ["simd", "parallel", "flash_attention"]
+all_features = ["simd", "parallel", "flash_attention", "mixed_precision", "gpu_debug"]
+
+# ============================================================================
+# Examples
+# ============================================================================
+
+[[example]]
+name = "basic_flame"
+path = "examples/basic_flame.rs"
+
+[[example]]
+name = "gaussian_render"
+path = "examples/gaussian_render.rs"
+
+[[example]]
+name = "training_loop"
+path = "examples/training_loop.rs"
+
+[[example]]
+name = "diffusion_inference"
+path = "examples/diffusion_inference.rs"

@@ -1,0 +1,114 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/oxigaf-flame",
+    "crates/oxigaf-diffusion",
+    "crates/oxigaf-render",
+    "crates/oxigaf-trainer",
+    "crates/oxigaf",
+    "crates/oxigaf-cli",
+    "crates/oxigaf-bridge",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/cool-japan/oxigaf"
+authors = ["COOLJAPAN OU (Team Kitasan)"]
+
+[workspace.dependencies]
+# Linear Algebra
+nalgebra = "0.34"
+glam = "0.32"
+
+# AI / Deep Learning (Pure Rust)
+# Note: default-features = false to avoid CUDA dependencies on macOS
+candle-core = { version = "0.9", default-features = false }
+candle-nn = { version = "0.9", default-features = false }
+candle-transformers = { version = "0.9", default-features = false }
+safetensors = "0.7"
+
+# GPU Graphics & Compute
+wgpu = "28"
+bytemuck = { version = "1", features = ["derive"] }
+
+# Image & Video
+image = { version = "0.25", features = ["exr"] }
+
+# Async & Utilities
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1.0"
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
+indicatif = "0.18"
+clap = { version = "4", features = ["derive", "env"] }
+clap_complete = "4.5"
+
+# Numerical
+ndarray = "0.17"
+ndarray-npy = "0.10"
+rand = "0.10"
+
+# Parallelism & Async
+rayon = "1.11"
+pollster = "0.4"
+
+# Testing
+approx = "0.5"
+proptest = "1.10"
+assert_cmd = "2"
+predicates = "3"
+criterion = { version = "0.8", features = ["html_reports"] }
+serial_test = "3"
+tempfile = "3"
+
+# CLI UX
+owo-colors = "4"
+oxiarc-archive = "0.2.1"
+dirs = "6"
+crossterm = "0.29"
+
+# HuggingFace Hub Integration
+hf-hub = "0.4"
+
+# Cryptography
+sha2 = "0.10"
+
+# Time & Date
+chrono = "0.4"
+
+# File patterns
+glob = "0.3"
+
+# Half-precision floating point
+half = "2.7"
+
+# Internal crates
+oxigaf-flame = { path = "crates/oxigaf-flame" }
+oxigaf-diffusion = { path = "crates/oxigaf-diffusion" }
+oxigaf-render = { path = "crates/oxigaf-render" }
+oxigaf-trainer = { path = "crates/oxigaf-trainer" }
+oxigaf = { path = "crates/oxigaf" }
+oxigaf-bridge = { path = "crates/oxigaf-bridge" }
+
+# Performance optimization profiles
+[profile.release]
+opt-level = 3              # Maximum optimization
+lto = "thin"               # Link-time optimization (thin is faster to compile than "fat")
+codegen-units = 1          # Better optimization at cost of slower compile time
+strip = true               # Remove debug symbols to reduce binary size
+panic = "abort"            # Smaller binary size and faster panics (no unwinding)
+
+[profile.release-with-debug]
+inherits = "release"
+debug = true               # Include debug info for profiling while keeping release optimizations
+
+[profile.bench]
+inherits = "release"
+debug = true               # Include debug info for Criterion benchmarks

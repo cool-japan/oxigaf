@@ -1,0 +1,73 @@
+[package]
+name = "oxigaf-flame"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "FLAME parametric head model — LBS, normal maps, mesh sampling"
+readme = "README.md"
+keywords = ["flame", "3d-model", "parametric", "head-model", "avatar"]
+categories = ["graphics", "algorithms", "science"]
+
+[features]
+default = []
+# Enable SIMD optimizations (requires nightly Rust with portable_simd)
+simd = []
+# Enable parallel processing with rayon
+parallel = ["dep:rayon"]
+# Enable safetensors support for model I/O
+safetensors = []
+# Enable NPZ file format support for sequences
+npz = ["ndarray-npy/npz"]
+# Enable all stable features (parallel, safetensors, npz)
+# Note: 'simd' requires nightly Rust and must be enabled explicitly
+full = ["parallel", "safetensors", "npz"]
+# Enable everything including nightly-only SIMD (requires nightly Rust)
+full_nightly = ["simd", "parallel", "safetensors", "npz"]
+
+[dependencies]
+nalgebra = { workspace = true }
+ndarray = { workspace = true }
+ndarray-npy = { workspace = true }
+image = { workspace = true }
+thiserror = { workspace = true }
+rand = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+safetensors = { workspace = true }
+bytemuck = { workspace = true }
+chrono = { workspace = true }
+lru = "0.16"
+# Optional parallel processing
+rayon = { workspace = true, optional = true }
+
+[dev-dependencies]
+approx = { workspace = true }
+proptest = { workspace = true }
+criterion = { workspace = true }
+rayon = { workspace = true }
+tempfile = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[[bench]]
+name = "flame_bench"
+harness = false
+
+[[bench]]
+name = "lbs_forward"
+harness = false
+
+[[bench]]
+name = "rodrigues"
+harness = false
+
+[[bench]]
+name = "normal_map"
+harness = false
+
+[[bench]]
+name = "simd_ops"
+harness = false
+required-features = ["simd"]

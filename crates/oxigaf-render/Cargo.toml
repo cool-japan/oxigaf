@@ -1,0 +1,41 @@
+[package]
+name = "oxigaf-render"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Differentiable 3D Gaussian Splatting rasterizer (wgpu)"
+readme = "README.md"
+keywords = ["rendering", "gaussian-splatting", "3d", "gpu", "rasterization"]
+categories = ["rendering", "graphics", "multimedia"]
+
+[dependencies]
+wgpu = { workspace = true }
+bytemuck = { workspace = true }
+glam = { workspace = true }
+nalgebra = { workspace = true }
+rayon = { workspace = true }
+image = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+oxigaf-flame = { version = "0.1.0", path = "../oxigaf-flame" }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+criterion = { workspace = true }
+rand = { workspace = true }
+pollster = { workspace = true }
+
+[features]
+# Default features (none - minimal configuration)
+default = []
+# Enable GPU debug mode with validation layers and debug markers
+# This adds runtime overhead but provides detailed error messages and validation
+gpu_debug = []
+
+[[bench]]
+name = "render_bench"
+harness = false

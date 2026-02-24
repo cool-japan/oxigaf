@@ -1,0 +1,280 @@
+//! OxiGAF Bridge - Bidirectional Weight Conversion
+//!
+//! This crate provides bidirectional weight conversion between:
+//! - PyTorch safetensors format
+//! - OxiGAF native format
+//! - ToRSh model format (feature-gated)
+//!
+//! # Features
+//!
+//! - Layer name mapping between different frameworks
+//! - Precision conversion (FP32, FP16, BF16)
+//! - Round-trip conversion with validation
+//! - Comprehensive error handling
+//!
+//! # PyTorch Example
+//!
+//! ```rust,no_run
+//! use oxigaf_bridge::{WeightConverter, Precision};
+//! use std::path::Path;
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let converter = WeightConverter::new()
+//!     .with_precision(Precision::FP32);
+//!
+//! // PyTorch → OxiGAF
+//! converter.pytorch_to_oxigaf(
+//!     Path::new("model.safetensors"),
+//!     Path::new("model_oxigaf.safetensors")
+//! )?;
+//!
+//! // OxiGAF → PyTorch
+//! converter.oxigaf_to_pytorch(
+//!     Path::new("model_oxigaf.safetensors"),
+//!     Path::new("model_pytorch.safetensors")
+//! )?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # ToRSh Example (requires `torsh` feature)
+//!
+//! ```rust,no_run
+//! # #[cfg(feature = "torsh")]
+//! # {
+//! use oxigaf_bridge::{WeightConverter, Precision};
+//! use std::path::Path;
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let converter = WeightConverter::new()
+//!     .with_precision(Precision::FP16);
+//!
+//! // ToRSh → OxiGAF
+//! converter.torsh_to_oxigaf(
+//!     Path::new("gaf_checkpoint.safetensors"),
+//!     Path::new("oxigaf/unet.safetensors")
+//! )?;
+//!
+//! // OxiGAF → ToRSh
+//! converter.oxigaf_to_torsh(
+//!     Path::new("oxigaf/unet.safetensors"),
+//!     Path::new("gaf_checkpoint_new.safetensors")
+//! )?;
+//! # Ok(())
+//! # }
+//! # }
+//! ```
+//!
+//! # Layer Name Conventions
+//!
+//! - **PyTorch**: `unet.down_blocks.0.resnets.0.conv1.weight`
+//! - **OxiGAF**: `down_blocks_0_resnets_0_conv1_weight`
+//! - **ToRSh**: `down_blocks/0/resnets/0/conv1/weight`
+
+pub mod error;
+pub mod gaf_layer_mapper;
+pub mod layer_mapping;
+pub mod oxigaf_to_pytorch;
+pub mod precision;
+pub mod pytorch_to_oxigaf;
+
+#[cfg(feature = "torsh")]
+pub mod oxigaf_to_torsh;
+#[cfg(feature = "torsh")]
+pub mod torsh_to_oxigaf;
+#[cfg(feature = "torsh")]
+pub mod validation;
+
+// Re-exports
+pub use error::{BridgeError, Result};
+pub use gaf_layer_mapper::GafLayerMapper;
+pub use layer_mapping::{LayerMapping, NamingConvention};
+pub use precision::{Precision, PrecisionConfig};
+
+#[cfg(feature = "torsh")]
+pub use validation::{
+    create_synthetic_gaf_checkpoint, validate_converted_checkpoint, ValidationReport,
+};
+
+use std::path::Path;
+
+/// Main weight converter interface
+pub struct WeightConverter {
+    layer_mapping: LayerMapping,
+    precision_config: PrecisionConfig,
+}
+
+impl WeightConverter {
+    /// Create a new weight converter with default settings
+    pub fn new() -> Self {
+        Self {
+            layer_mapping: LayerMapping::new(),
+            precision_config: PrecisionConfig::default(),
+        }
+    }
+
+    /// Set the precision for conversion
+    pub fn with_precision(mut self, precision: Precision) -> Self {
+        self.precision_config.set_default_precision(precision);
+        self
+    }
+
+    /// Set a custom precision config
+    pub fn with_precision_config(mut self, config: PrecisionConfig) -> Self {
+        self.precision_config = config;
+        self
+    }
+
+    /// Set a custom layer mapping
+    pub fn with_layer_mapping(mut self, mapping: LayerMapping) -> Self {
+        self.layer_mapping = mapping;
+        self
+    }
+
+    /// Convert PyTorch weights to OxiGAF format
+    ///
+    /// # Arguments
+    ///
+    /// * `pytorch_path` - Path to PyTorch safetensors file
+    /// * `oxigaf_path` - Output path for OxiGAF format
+    ///
+    /// # Errors
+    ///
+    /// Returns error if file I/O fails or conversion fails
+    pub fn pytorch_to_oxigaf(&self, pytorch_path: &Path, oxigaf_path: &Path) -> Result<()> {
+        pytorch_to_oxigaf::convert(
+            pytorch_path,
+            oxigaf_path,
+            &self.layer_mapping,
+            &self.precision_config,
+        )
+    }
+
+    /// Convert OxiGAF weights to PyTorch format
+    ///
+    /// # Arguments
+    ///
+    /// * `oxigaf_path` - Path to OxiGAF safetensors file
+    /// * `pytorch_path` - Output path for PyTorch format
+    ///
+    /// # Errors
+    ///
+    /// Returns error if file I/O fails or conversion fails
+    pub fn oxigaf_to_pytorch(&self, oxigaf_path: &Path, pytorch_path: &Path) -> Result<()> {
+        oxigaf_to_pytorch::convert(
+            oxigaf_path,
+            pytorch_path,
+            &self.layer_mapping,
+            &self.precision_config,
+        )
+    }
+
+    /// Convert ToRSh weights to OxiGAF format
+    ///
+    /// # Arguments
+    ///
+    /// * `torsh_path` - Path to ToRSh safetensors file
+    /// * `oxigaf_path` - Output path for OxiGAF format
+    ///
+    /// # Errors
+    ///
+    /// Returns error if conversion fails or file I/O fails
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use oxigaf_bridge::{WeightConverter, Precision};
+    /// # use std::path::Path;
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # #[cfg(feature = "torsh")]
+    /// # {
+    /// let converter = WeightConverter::new()
+    ///     .with_precision(Precision::FP16);
+    ///
+    /// converter.torsh_to_oxigaf(
+    ///     Path::new("gaf_checkpoint.safetensors"),
+    ///     Path::new("oxigaf/unet.safetensors")
+    /// )?;
+    /// # }
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[cfg(feature = "torsh")]
+    pub fn torsh_to_oxigaf(&self, torsh_path: &Path, oxigaf_path: &Path) -> Result<()> {
+        torsh_to_oxigaf::convert(
+            torsh_path,
+            oxigaf_path,
+            &self.layer_mapping,
+            &self.precision_config,
+        )
+    }
+
+    /// Convert OxiGAF weights to ToRSh format
+    ///
+    /// # Arguments
+    ///
+    /// * `oxigaf_path` - Path to OxiGAF safetensors file
+    /// * `torsh_path` - Output path for ToRSh format
+    ///
+    /// # Errors
+    ///
+    /// Returns error if conversion fails or file I/O fails
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use oxigaf_bridge::{WeightConverter, Precision};
+    /// # use std::path::Path;
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # #[cfg(feature = "torsh")]
+    /// # {
+    /// let converter = WeightConverter::new()
+    ///     .with_precision(Precision::FP32);
+    ///
+    /// converter.oxigaf_to_torsh(
+    ///     Path::new("oxigaf/unet.safetensors"),
+    ///     Path::new("gaf_checkpoint.safetensors")
+    /// )?;
+    /// # }
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[cfg(feature = "torsh")]
+    pub fn oxigaf_to_torsh(&self, oxigaf_path: &Path, torsh_path: &Path) -> Result<()> {
+        oxigaf_to_torsh::convert(
+            oxigaf_path,
+            torsh_path,
+            &self.layer_mapping,
+            &self.precision_config,
+        )
+    }
+}
+
+impl Default for WeightConverter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_converter_creation() {
+        let converter = WeightConverter::new();
+        assert_eq!(
+            converter.precision_config.default_precision(),
+            Precision::FP32
+        );
+    }
+
+    #[test]
+    fn test_converter_with_precision() {
+        let converter = WeightConverter::new().with_precision(Precision::FP16);
+        assert_eq!(
+            converter.precision_config.default_precision(),
+            Precision::FP16
+        );
+    }
+}

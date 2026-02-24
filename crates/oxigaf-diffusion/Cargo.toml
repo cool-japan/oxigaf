@@ -1,0 +1,51 @@
+[package]
+name = "oxigaf-diffusion"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Multi-view diffusion model inference for GAF"
+readme = "README.md"
+keywords = ["diffusion", "multi-view", "ai", "deep-learning", "generative"]
+categories = ["science", "multimedia", "algorithms"]
+
+[dependencies]
+candle-core = { workspace = true }
+candle-nn = { workspace = true }
+candle-transformers = { workspace = true }
+safetensors = { workspace = true }
+image = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+oxigaf-flame = { version = "0.1.0", path = "../oxigaf-flame" }
+
+[dev-dependencies]
+proptest = { workspace = true }
+approx = { workspace = true }
+candle-core = { workspace = true }
+candle-nn = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "diffusion_bench"
+harness = false
+
+[[bench]]
+name = "flash_attention_bench"
+harness = false
+
+[features]
+# Default to CPU-only for compatibility on all platforms
+default = ["flash_attention"]
+# Flash attention for memory-efficient O(N) attention
+flash_attention = []
+# Mixed-precision inference (FP16/BF16 for reduced memory usage)
+# Note: Implementation is planned - currently a placeholder
+mixed_precision = []
+# NOTE: Platform-specific GPU/BLAS backends (accelerate, metal, cuda) have been
+# removed from this crate. To enable them, configure candle-core directly:
+#   candle-core = { version = "0.9", features = ["accelerate"] }  # macOS BLAS
+#   candle-core = { version = "0.9", features = ["metal"] }       # macOS GPU
+#   candle-core = { version = "0.9", features = ["cuda"] }        # NVIDIA GPU

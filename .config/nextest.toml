@@ -1,0 +1,19 @@
+# Nextest configuration for oxigaf
+# Serializes GPU-intensive tests to avoid GPU resource contention
+
+[test-groups.gpu]
+max-threads = 1
+
+# GPU gradient tests must run serially to avoid GPU non-determinism under load
+[[profile.default.overrides]]
+filter = "binary_id(~gpu_gradient_verify) | binary_id(~cpu_gpu_compare) | binary_id(~gradient_tests)"
+test-group = "gpu"
+
+# GPU tests can be slow, allow generous timeouts
+[[profile.default.overrides]]
+filter = "binary_id(~gpu_gradient_verify)"
+slow-timeout = { period = "30s", terminate-after = 2 }
+
+[[profile.default.overrides]]
+filter = "binary_id(~cpu_gpu_compare)"
+slow-timeout = { period = "15s", terminate-after = 2 }

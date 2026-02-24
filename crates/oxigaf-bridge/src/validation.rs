@@ -1,0 +1,651 @@
+//! Checkpoint validation utilities for verifying converted weights
+//!
+//! This module provides validation for converted GAF checkpoints to ensure they are
+//! compatible with oxigaf-diffusion pipeline.
+
+use crate::{BridgeError, Result};
+use std::path::Path;
+
+/// Validation report for a converted checkpoint
+#[derive(Debug, Clone)]
+pub struct ValidationReport {
+    /// File exists and is readable
+    pub file_exists: bool,
+    /// Safetensors format is valid
+    pub safetensors_valid: bool,
+    /// Missing required layers
+    pub missing_layers: Vec<String>,
+    /// Layer names with invalid format (contains '/')
+    pub invalid_names: Vec<String>,
+    /// Tensors with invalid shapes
+    pub invalid_shapes: Vec<(String, Vec<usize>)>,
+    /// Layers containing NaN or Inf values
+    pub has_nan_inf: Vec<String>,
+    /// Non-critical warnings
+    pub warnings: Vec<String>,
+}
+
+impl ValidationReport {
+    /// Create a new empty validation report
+    pub fn new() -> Self {
+        Self {
+            file_exists: false,
+            safetensors_valid: false,
+            missing_layers: Vec::new(),
+            invalid_names: Vec::new(),
+            invalid_shapes: Vec::new(),
+            has_nan_inf: Vec::new(),
+            warnings: Vec::new(),
+        }
+    }
+
+    /// Check if validation passed (no errors)
+    pub fn is_valid(&self) -> bool {
+        self.file_exists
+            && self.safetensors_valid
+            && self.missing_layers.is_empty()
+            && self.invalid_names.is_empty()
+            && self.invalid_shapes.is_empty()
+            && self.has_nan_inf.is_empty()
+    }
+
+    /// Get summary of validation results
+    pub fn summary(&self) -> String {
+        if self.is_valid() {
+            format!(
+                "✓ Validation passed ({})",
+                if self.warnings.is_empty() {
+                    "no warnings".to_string()
+                } else {
+                    format!("{} warnings", self.warnings.len())
+                }
+            )
+        } else {
+            let mut errors = Vec::new();
+            if !self.file_exists {
+                errors.push("file not found".to_string());
+            }
+            if !self.safetensors_valid {
+                errors.push("invalid safetensors".to_string());
+            }
+            if !self.missing_layers.is_empty() {
+                errors.push(format!("{} missing layers", self.missing_layers.len()));
+            }
+            if !self.invalid_names.is_empty() {
+                errors.push(format!("{} invalid names", self.invalid_names.len()));
+            }
+            if !self.invalid_shapes.is_empty() {
+                errors.push(format!("{} invalid shapes", self.invalid_shapes.len()));
+            }
+            if !self.has_nan_inf.is_empty() {
+                errors.push(format!("{} NaN/Inf tensors", self.has_nan_inf.len()));
+            }
+            format!("✗ Validation failed: {}", errors.join(", "))
+        }
+    }
+}
+
+impl Default for ValidationReport {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Validate a converted checkpoint for oxigaf-diffusion compatibility
+///
+/// # Arguments
+///
+/// * `path` - Path to the converted checkpoint file
+///
+/// # Returns
+///
+/// A detailed validation report
+///
+/// # Errors
+///
+/// Returns error if file cannot be read or parsed
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// # use oxigaf_bridge::validation::validate_converted_checkpoint;
+/// # use std::path::Path;
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let report = validate_converted_checkpoint(Path::new("unet.safetensors"))?;
+/// if report.is_valid() {
+///     println!("✓ Checkpoint is valid");
+/// } else {
+///     println!("✗ Validation failed: {}", report.summary());
+/// }
+/// # Ok(())
+/// # }
+/// ```
+pub fn validate_converted_checkpoint(path: &Path) -> Result<ValidationReport> {
+    use safetensors::SafeTensors;
+
+    let mut report = ValidationReport::new();
+
+    // 1. Check file exists
+    if !path.exists() {
+        return Ok(report); // file_exists remains false
+    }
+    report.file_exists = true;
+
+    // 2. Try to load as safetensors
+    let data = std::fs::read(path)?;
+    let safetensors = match SafeTensors::deserialize(&data) {
+        Ok(st) => {
+            report.safetensors_valid = true;
+            st
+        }
+        Err(e) => {
+            tracing::error!("Failed to parse safetensors: {}", e);
+            return Ok(report);
+        }
+    };
+
+    // 3. Check for required layers (minimal set for testing)
+    let required_layers = get_required_unet_layers();
+    for layer_name in &required_layers {
+        if safetensors.tensor(layer_name).is_err() {
+            report.missing_layers.push(layer_name.clone());
+        }
+    }
+
+    // 4. Validate layer names (should use dots, not slashes)
+    for name in safetensors.names() {
+        if name.contains('/') {
+            report
+                .invalid_names
+                .push(format!("{} (contains '/')", name));
+        }
+    }
+
+    // 5. Validate tensor shapes
+    for name in safetensors.names() {
+        if let Ok(tensor) = safetensors.tensor(name) {
+            if !is_valid_shape(tensor.shape()) {
+                report
+                    .invalid_shapes
+                    .push((name.to_string(), tensor.shape().to_vec()));
+            }
+        }
+    }
+
+    // 6. Check for NaN/Inf values
+    for name in safetensors.names() {
+        if let Ok(tensor) = safetensors.tensor(name) {
+            let dtype = tensor.dtype();
+            match dtype {
+                safetensors::tensor::Dtype::F32 => {
+                    let data: &[f32] = bytemuck::cast_slice(tensor.data());
+                    if data.iter().any(|x| x.is_nan() || x.is_infinite()) {
+                        report.has_nan_inf.push(name.to_string());
+                    }
+                }
+                safetensors::tensor::Dtype::F16 => {
+                    // Cast to u16 and convert to f16 for checking
+                    let data_u16: &[u16] = bytemuck::cast_slice(tensor.data());
+                    for &bits in data_u16 {
+                        let f = half::f16::from_bits(bits);
+                        if f.is_nan() || f.is_infinite() {
+                            report.has_nan_inf.push(name.to_string());
+                            break;
+                        }
+                    }
+                }
+                safetensors::tensor::Dtype::BF16 => {
+                    // Cast to u16 and convert to bf16 for checking
+                    let data_u16: &[u16] = bytemuck::cast_slice(tensor.data());
+                    for &bits in data_u16 {
+                        let f = half::bf16::from_bits(bits);
+                        if f.is_nan() || f.is_infinite() {
+                            report.has_nan_inf.push(name.to_string());
+                            break;
+                        }
+                    }
+                }
+                _ => {
+                    // Other dtypes - skip NaN check
+                    report.warnings.push(format!(
+                        "Skipping NaN check for {} (dtype: {:?})",
+                        name, dtype
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(report)
+}
+
+/// Get list of required U-Net layers (minimal set for validation)
+fn get_required_unet_layers() -> Vec<String> {
+    vec![
+        // Input conv
+        "conv_in.weight".to_string(),
+        // Time embedding
+        "time_embedding.linear_1.weight".to_string(),
+        "time_embedding.linear_2.weight".to_string(),
+        // At least one down block layer
+        "down_blocks.0.resnets.0.norm1.weight".to_string(),
+        // At least one up block layer
+        "up_blocks.0.resnets.0.norm1.weight".to_string(),
+        // Mid block
+        "mid_block.resnets.0.norm1.weight".to_string(),
+        // Output conv
+        "conv_out.weight".to_string(),
+    ]
+}
+
+/// Check if a tensor shape is valid
+///
+/// Valid shapes:
+/// - Non-empty
+/// - All dimensions > 0
+/// - Total size < 10GB (safety check)
+fn is_valid_shape(shape: &[usize]) -> bool {
+    if shape.is_empty() {
+        return false;
+    }
+
+    // Check all dimensions are positive
+    if shape.contains(&0) {
+        return false;
+    }
+
+    // Check total size is reasonable (< 10GB for safety)
+    let total_elements: usize = shape.iter().product();
+    const MAX_ELEMENTS: usize = 10 * 1024 * 1024 * 1024 / 4; // 10GB / 4 bytes per f32
+    if total_elements > MAX_ELEMENTS {
+        return false;
+    }
+
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_validation_report_is_valid() {
+        let mut report = ValidationReport::new();
+        assert!(!report.is_valid());
+
+        report.file_exists = true;
+        report.safetensors_valid = true;
+        assert!(report.is_valid());
+
+        report.invalid_names.push("bad/name".to_string());
+        assert!(!report.is_valid());
+    }
+
+    #[test]
+    fn test_validation_report_summary() {
+        let mut report = ValidationReport::new();
+        report.file_exists = true;
+        report.safetensors_valid = true;
+
+        let summary = report.summary();
+        assert!(summary.contains("✓ Validation passed"));
+
+        report.invalid_names.push("bad/name".to_string());
+        let summary = report.summary();
+        assert!(summary.contains("✗ Validation failed"));
+        assert!(summary.contains("1 invalid names"));
+    }
+
+    #[test]
+    fn test_validate_nonexistent_file() {
+        let temp_dir = std::env::temp_dir();
+        let path = temp_dir.join("nonexistent_validation_test.safetensors");
+
+        let report = validate_converted_checkpoint(&path)
+            .expect("validation should not error for nonexistent file");
+        assert!(!report.file_exists);
+        assert!(!report.is_valid());
+    }
+
+    #[test]
+    fn test_is_valid_shape() {
+        assert!(is_valid_shape(&[3, 224, 224]));
+        assert!(is_valid_shape(&[1]));
+        assert!(is_valid_shape(&[320, 320, 3, 3]));
+
+        assert!(!is_valid_shape(&[])); // Empty
+        assert!(!is_valid_shape(&[0, 10])); // Zero dimension
+        assert!(!is_valid_shape(&[1000000, 1000000])); // Too large
+    }
+
+    #[test]
+    fn test_get_required_unet_layers() {
+        let layers = get_required_unet_layers();
+        assert!(!layers.is_empty());
+        assert!(layers.contains(&"conv_in.weight".to_string()));
+        assert!(layers.contains(&"conv_out.weight".to_string()));
+
+        // All required layers should use dots, not slashes
+        for layer in &layers {
+            assert!(!layer.contains('/'), "Layer {} contains slash", layer);
+        }
+    }
+}
+
+/// Create a synthetic GAF checkpoint for testing (exposed for integration tests)
+#[cfg(feature = "torsh")]
+pub fn create_synthetic_gaf_checkpoint(output: &Path) -> Result<()> {
+    use torsh_nn::serialization::{ModelMetadata, ModelState, SerializableTensor};
+
+    let mut state = ModelState::new("GAF".to_string());
+    state.metadata = ModelMetadata {
+        architecture: "GAF".to_string(),
+        version: "0.1.0".to_string(),
+        created_at: "2026-02-11T00:00:00Z".to_string(),
+        framework_version: "torsh-0.1.0".to_string(),
+        tags: vec!["test".to_string(), "synthetic".to_string()],
+    };
+
+    // Helper to create a tensor
+    let mut rng_state = 12345u64; // Simple LCG for deterministic random
+    let mut next_random = || -> f32 {
+        rng_state = rng_state.wrapping_mul(1103515245).wrapping_add(12345);
+        ((rng_state / 65536) % 32768) as f32 / 32768.0 * 0.02 - 0.01
+    };
+
+    let mut create_tensor = |shape: Vec<usize>| -> SerializableTensor {
+        let size: usize = shape.iter().product();
+        let data: Vec<f32> = (0..size).map(|_| next_random()).collect();
+        SerializableTensor {
+            shape,
+            dtype: "f32".to_string(),
+            data,
+            requires_grad: false,
+        }
+    };
+
+    // Input conv
+    state.parameters.insert(
+        "conv_in/weight".to_string(),
+        create_tensor(vec![320, 8, 3, 3]),
+    );
+
+    // Time embedding
+    state.parameters.insert(
+        "time_embedding/linear_1/weight".to_string(),
+        create_tensor(vec![1280, 320]),
+    );
+    state.parameters.insert(
+        "time_embedding/linear_2/weight".to_string(),
+        create_tensor(vec![1280, 1280]),
+    );
+
+    // Camera embedding
+    state.parameters.insert(
+        "camera_embedding/linear_1/weight".to_string(),
+        create_tensor(vec![1280, 16]),
+    );
+
+    // Down blocks (minimal - just first block, first resnet)
+    state.parameters.insert(
+        "down_blocks/0/resnets/0/norm1/weight".to_string(),
+        create_tensor(vec![320]),
+    );
+    state.parameters.insert(
+        "down_blocks/0/resnets/0/conv1/weight".to_string(),
+        create_tensor(vec![320, 320, 3, 3]),
+    );
+    state.parameters.insert(
+        "down_blocks/0/resnets/0/time_emb_proj/weight".to_string(),
+        create_tensor(vec![320, 1280]),
+    );
+    state.parameters.insert(
+        "down_blocks/0/resnets/0/norm2/weight".to_string(),
+        create_tensor(vec![320]),
+    );
+    state.parameters.insert(
+        "down_blocks/0/resnets/0/conv2/weight".to_string(),
+        create_tensor(vec![320, 320, 3, 3]),
+    );
+
+    // Mid block
+    state.parameters.insert(
+        "mid_block/resnets/0/norm1/weight".to_string(),
+        create_tensor(vec![1280]),
+    );
+    state.parameters.insert(
+        "mid_block/resnets/0/conv1/weight".to_string(),
+        create_tensor(vec![1280, 1280, 3, 3]),
+    );
+
+    // Up blocks (minimal - just first block, first resnet)
+    state.parameters.insert(
+        "up_blocks/0/resnets/0/norm1/weight".to_string(),
+        create_tensor(vec![320]),
+    );
+    state.parameters.insert(
+        "up_blocks/0/resnets/0/conv1/weight".to_string(),
+        create_tensor(vec![320, 640, 3, 3]),
+    );
+
+    // Output conv
+    state.parameters.insert(
+        "conv_out/weight".to_string(),
+        create_tensor(vec![4, 320, 3, 3]),
+    );
+    state
+        .parameters
+        .insert("conv_norm_out/weight".to_string(), create_tensor(vec![320]));
+
+    // Save to file
+    state.save_to_safetensors(output).map_err(|e| {
+        BridgeError::Conversion(format!("Failed to save synthetic checkpoint: {}", e))
+    })?;
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod torsh_tests {
+    use super::*;
+    use torsh_nn::serialization::{ModelMetadata, ModelState, SerializableTensor};
+
+    /// Create a synthetic GAF checkpoint for testing (test-only wrapper)
+    ///
+    /// This generates a minimal but valid checkpoint with:
+    /// - GAF metadata
+    /// - Minimal U-Net layers (down, mid, up blocks)
+    /// - Small random weights
+    ///
+    /// Used for testing when real checkpoints are unavailable.
+    pub fn create_synthetic_gaf_checkpoint(output: &Path) -> Result<()> {
+        let mut state = ModelState::new("GAF".to_string());
+        state.metadata = ModelMetadata {
+            architecture: "GAF".to_string(),
+            version: "0.1.0".to_string(),
+            created_at: "2026-02-11T00:00:00Z".to_string(),
+            framework_version: "torsh-0.1.0".to_string(),
+            tags: vec!["test".to_string(), "synthetic".to_string()],
+        };
+
+        // Helper to create a tensor
+        let mut rng_state = 12345u64; // Simple LCG for deterministic random
+        let mut next_random = || -> f32 {
+            rng_state = rng_state.wrapping_mul(1103515245).wrapping_add(12345);
+            ((rng_state / 65536) % 32768) as f32 / 32768.0 * 0.02 - 0.01
+        };
+
+        let mut create_tensor = |shape: Vec<usize>| -> SerializableTensor {
+            let size: usize = shape.iter().product();
+            let data: Vec<f32> = (0..size).map(|_| next_random()).collect();
+            SerializableTensor {
+                shape,
+                dtype: "f32".to_string(),
+                data,
+                requires_grad: false,
+            }
+        };
+
+        // Input conv
+        state.parameters.insert(
+            "conv_in/weight".to_string(),
+            create_tensor(vec![320, 8, 3, 3]),
+        );
+
+        // Time embedding
+        state.parameters.insert(
+            "time_embedding/linear_1/weight".to_string(),
+            create_tensor(vec![1280, 320]),
+        );
+        state.parameters.insert(
+            "time_embedding/linear_2/weight".to_string(),
+            create_tensor(vec![1280, 1280]),
+        );
+
+        // Camera embedding
+        state.parameters.insert(
+            "camera_embedding/linear_1/weight".to_string(),
+            create_tensor(vec![1280, 16]),
+        );
+
+        // Down blocks (minimal - just first block, first resnet)
+        state.parameters.insert(
+            "down_blocks/0/resnets/0/norm1/weight".to_string(),
+            create_tensor(vec![320]),
+        );
+        state.parameters.insert(
+            "down_blocks/0/resnets/0/conv1/weight".to_string(),
+            create_tensor(vec![320, 320, 3, 3]),
+        );
+        state.parameters.insert(
+            "down_blocks/0/resnets/0/time_emb_proj/weight".to_string(),
+            create_tensor(vec![320, 1280]),
+        );
+        state.parameters.insert(
+            "down_blocks/0/resnets/0/norm2/weight".to_string(),
+            create_tensor(vec![320]),
+        );
+        state.parameters.insert(
+            "down_blocks/0/resnets/0/conv2/weight".to_string(),
+            create_tensor(vec![320, 320, 3, 3]),
+        );
+
+        // Mid block
+        state.parameters.insert(
+            "mid_block/resnets/0/norm1/weight".to_string(),
+            create_tensor(vec![1280]),
+        );
+        state.parameters.insert(
+            "mid_block/resnets/0/conv1/weight".to_string(),
+            create_tensor(vec![1280, 1280, 3, 3]),
+        );
+
+        // Up blocks (minimal - just first block, first resnet)
+        state.parameters.insert(
+            "up_blocks/0/resnets/0/norm1/weight".to_string(),
+            create_tensor(vec![320]),
+        );
+        state.parameters.insert(
+            "up_blocks/0/resnets/0/conv1/weight".to_string(),
+            create_tensor(vec![320, 640, 3, 3]),
+        );
+
+        // Output conv
+        state.parameters.insert(
+            "conv_out/weight".to_string(),
+            create_tensor(vec![4, 320, 3, 3]),
+        );
+        state
+            .parameters
+            .insert("conv_norm_out/weight".to_string(), create_tensor(vec![320]));
+
+        // Save to file
+        state.save_to_safetensors(output).map_err(|e| {
+            BridgeError::Conversion(format!("Failed to save synthetic checkpoint: {}", e))
+        })?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_synthetic_checkpoint_generation() {
+        let temp_dir = std::env::temp_dir();
+        let path = temp_dir.join("test_synthetic_gaf.safetensors");
+
+        // Generate
+        create_synthetic_gaf_checkpoint(&path)
+            .expect("synthetic checkpoint creation should succeed");
+        assert!(path.exists());
+
+        // Load and verify
+        let data = std::fs::read(&path).expect("should read file");
+        let safetensors =
+            safetensors::SafeTensors::deserialize(&data).expect("should parse safetensors");
+
+        assert!(!safetensors.names().is_empty());
+        assert!(safetensors.tensor("conv_in/weight").is_ok());
+
+        // Cleanup
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_validate_synthetic_checkpoint_before_conversion() {
+        let temp_dir = std::env::temp_dir();
+        let path = temp_dir.join("test_validate_synthetic.safetensors");
+
+        // Generate synthetic checkpoint
+        create_synthetic_gaf_checkpoint(&path).expect("should create");
+
+        // Validate - should have slashes (ToRSh format)
+        let report = validate_converted_checkpoint(&path).expect("should validate");
+
+        assert!(report.file_exists);
+        assert!(report.safetensors_valid);
+
+        // Should have invalid names (slashes) since this is pre-conversion
+        assert!(!report.invalid_names.is_empty());
+
+        // Cleanup
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_validate_after_conversion() {
+        use crate::WeightConverter;
+
+        let temp_dir = std::env::temp_dir();
+        let torsh_path = temp_dir.join("test_torsh_validate_after.safetensors");
+        let oxigaf_path = temp_dir.join("test_oxigaf_validate_after.safetensors");
+
+        // Generate and convert
+        create_synthetic_gaf_checkpoint(&torsh_path).expect("should create");
+
+        let converter = WeightConverter::new();
+        converter
+            .torsh_to_oxigaf(&torsh_path, &oxigaf_path)
+            .expect("should convert");
+
+        // Validate converted checkpoint
+        let report = validate_converted_checkpoint(&oxigaf_path).expect("should validate");
+
+        assert!(report.file_exists);
+        assert!(report.safetensors_valid);
+
+        // After conversion, names should be valid (dots not slashes)
+        if !report.invalid_names.is_empty() {
+            eprintln!("Invalid names found: {:?}", report.invalid_names);
+        }
+        assert!(
+            report.invalid_names.is_empty(),
+            "Should have no invalid names after conversion"
+        );
+
+        // Should have no NaN/Inf
+        assert!(report.has_nan_inf.is_empty());
+
+        // Cleanup
+        let _ = std::fs::remove_file(&torsh_path);
+        let _ = std::fs::remove_file(&oxigaf_path);
+    }
+}

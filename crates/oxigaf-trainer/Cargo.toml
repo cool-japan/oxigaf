@@ -1,0 +1,48 @@
+[package]
+name = "oxigaf-trainer"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "GAF optimization pipeline — iterative denoising distillation"
+readme = "README.md"
+keywords = ["training", "optimization", "3d", "gaussian-splatting", "ai"]
+categories = ["science", "algorithms", "graphics"]
+
+[dependencies]
+nalgebra = { workspace = true }
+ndarray = { workspace = true }
+image = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+wgpu = { workspace = true }
+bytemuck = { workspace = true }
+
+# Pure Rust deep learning for LPIPS
+candle-core = { workspace = true }
+candle-nn = { workspace = true }
+safetensors = { workspace = true }
+
+oxigaf-flame = { version = "0.1.0", path = "../oxigaf-flame" }
+oxigaf-diffusion = { version = "0.1.0", path = "../oxigaf-diffusion" }
+oxigaf-render = { version = "0.1.0", path = "../oxigaf-render" }
+
+[features]
+default = []
+torsh_integration = []
+
+[dev-dependencies]
+approx = { workspace = true }
+proptest = { workspace = true }
+criterion = { workspace = true }
+pollster = { workspace = true }
+clap = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[[bench]]
+name = "trainer_bench"
+harness = false
