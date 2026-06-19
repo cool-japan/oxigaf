@@ -104,6 +104,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sequence = FlameSequence::from_memory(frames, Some(fps));
 
     // Save to file
+    #[allow(unused_mut)]
+    let mut sequence = sequence;
+
     match format.as_str() {
         "json" => {
             println!("Saving to JSON: {}", output_path.display());
@@ -113,7 +116,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             #[cfg(feature = "npz")]
             {
                 println!("Saving to NPZ: {}", output_path.display());
-                save_sequence_npz(&sequence, &output_path)?;
+                save_sequence_npz(&mut sequence, &output_path)?;
             }
             #[cfg(not(feature = "npz"))]
             {
@@ -157,20 +160,80 @@ fn save_sequence_json(
 
 #[cfg(feature = "npz")]
 fn save_sequence_npz(
-    _sequence: &FlameSequence,
-    _path: &PathBuf,
+    sequence: &mut FlameSequence,
+    path: &PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // NPZ export would require collecting all frames and writing as arrays
-    // This is left as an exercise for the reader
-    eprintln!("Note: NPZ export from FlameSequence not yet implemented");
-    eprintln!("      You can manually collect frames and write using ndarray-npy");
-    Err("NPZ export not implemented".into())
+    use ndarray::Array2;
+    use ndarray_npy::NpzWriter;
+    use std::fs::File;
+
+    let n_frames = sequence.num_frames();
+    if n_frames == 0 {
+        return Err("Cannot export an empty sequence to NPZ".into());
+    }
+
+    // Determine array widths from the first frame.
+    let first = sequence
+        .get_frame(0)
+        .map_err(|e| format!("Failed to read frame 0: {}", e))?;
+    let n_shape = first.shape.len();
+    let n_expr = first.expression.len();
+    let n_pose = first.pose.len();
+
+    // Allocate row-major f32 arrays: shape (n_frames, n_coeffs).
+    let mut shape_data: Array2<f32> = Array2::zeros((n_frames, n_shape));
+    let mut expr_data: Array2<f32> = Array2::zeros((n_frames, n_expr));
+    let mut pose_data: Array2<f32> = Array2::zeros((n_frames, n_pose));
+    let mut trans_data: Array2<f32> = Array2::zeros((n_frames, 3));
+
+    // Populate arrays from the sequence, one frame at a time.
+    for i in 0..n_frames {
+        let frame = sequence
+            .get_frame(i)
+            .map_err(|e| format!("Failed to read frame {}: {}", i, e))?;
+
+        for (j, &v) in frame.shape.iter().enumerate() {
+            shape_data[[i, j]] = v;
+        }
+        for (j, &v) in frame.expression.iter().enumerate() {
+            expr_data[[i, j]] = v;
+        }
+        for (j, &v) in frame.pose.iter().enumerate() {
+            pose_data[[i, j]] = v;
+        }
+        trans_data[[i, 0]] = frame.translation[0];
+        trans_data[[i, 1]] = frame.translation[1];
+        trans_data[[i, 2]] = frame.translation[2];
+    }
+
+    // Write all arrays into a single .npz archive.
+    let file = File::create(path)
+        .map_err(|e| format!("Failed to create NPZ file {}: {}", path.display(), e))?;
+    let mut writer = NpzWriter::new(file);
+    writer
+        .add_array("shape", &shape_data)
+        .map_err(|e| format!("Failed to write 'shape' array: {}", e))?;
+    writer
+        .add_array("expression", &expr_data)
+        .map_err(|e| format!("Failed to write 'expression' array: {}", e))?;
+    writer
+        .add_array("pose", &pose_data)
+        .map_err(|e| format!("Failed to write 'pose' array: {}", e))?;
+    writer
+        .add_array("translation", &trans_data)
+        .map_err(|e| format!("Failed to write 'translation' array: {}", e))?;
+    writer
+        .finish()
+        .map_err(|e| format!("Failed to finalise NPZ archive: {}", e))?;
+
+    println!("Saved {} frames as NPZ to {}", n_frames, path.display());
+    Ok(())
 }
 
 #[cfg(not(feature = "npz"))]
 #[allow(dead_code)]
 fn save_sequence_npz(
-    _sequence: &FlameSequence,
+    _sequence: &mut FlameSequence,
     _path: &PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
     unreachable!()

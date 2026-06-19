@@ -1,4 +1,32 @@
 // Tile assignment: write (tile_id, depth) sort keys for each Gaussian-tile pair.
+//
+// Purpose
+// ───────
+// For each visible Gaussian, determines which tiles it overlaps (based on its
+// screen-space bounding box derived from mean2d and radius) and writes a
+// sort key of (tile_id << 32 | depth_bits) into the sort_keys buffer.  The
+// matching sort_values entry holds the Gaussian index.  After this pass,
+// a radix sort orders entries by tile then by depth for the rasterizer.
+//
+// Bindings
+// ────────
+// group:binding  type              description
+//    0:0         uniform           Camera/viewport/render uniforms
+//    0:1         storage (ro)      means2d      — projected 2D centres
+//    0:2         storage (ro)      depths       — view-space depths
+//    0:3         storage (ro)      radii        — screen-space radii (pixels)
+//    0:4         storage (ro)      tile_offsets — prefix-summed per-Gaussian tile counts
+//    0:5         storage (rw)      sort_keys    — output (tile,depth) keys
+//    0:6         storage (rw)      sort_values  — output Gaussian indices
+//
+// Dispatch dimensions
+// ───────────────────
+// 1D: ceil(num_gaussians / 256) workgroups × 256 threads.
+//
+// Math
+// ────
+// Bounding box: [mean2d − radius, mean2d + radius] converted to tile coordinates.
+// For each covered tile: key = (tile_y * tile_grid_x + tile_x, reinterpret_f32(depth)).
 
 struct Uniforms {
     view: mat4x4<f32>,

@@ -5,6 +5,84 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] - 2026-06-19
+
+### Added
+
+#### oxigaf-flame — Expanded FLAME head model capabilities
+- Avatar rigging and pose system: `AvatarRig`, `GazeController`, `HeadTracker`, `HeadGeometry`, `PoseEstimation`, `PosePrior`
+- Expression system: `Expressions`, `ExpressionAnimation`, `ExpressionClustering`, `ExpressionTransfer`, FACS AU coefficients, emotion recognition, phoneme-driven animation
+- Mesh processing suite: mesh operations, repair, smoothing, subdivision (Loop/Catmull-Clark), morphing, and analysis
+- Geometry tools: geodesic distance computation, spectral analysis, multiresolution mesh representation, statistical shape model, symmetry detection
+- UV and texture pipeline: UV parameterisation, texture baking, face atlas generation, albedo map, SH lighting model
+- Motion and deformation: timeline, warp field, shape retargeting, dynamic landmark tracking
+- Model fitting and alignment: blend shape solver, rigid alignment, canonical-space conversion
+- Utility: GPU buffer management, vertex masks, visibility culling, contact detection, depth estimation, face normalisation, parameter sampler
+
+#### oxigaf-render — Comprehensive post-processing and rendering pipeline
+- Post-processing: ambient occlusion (SSAO), bloom, denoising, depth-of-field, motion blur, film grain, image sharpening, chromatic aberration, vignetting, lens distortion, temporal anti-aliasing, exposure control, HDR tone mapping, tone curve, color grading, colorspace conversion, color calibration
+- Volumetric rendering module: ray types, camera model, volume grid, and ray-march result traits
+- Scene composition: image compositor, scene compositor, render graph, silhouette extraction, background synthesis
+- Stereo rendering: side-by-side / top-bottom stereo output
+- Spatial acceleration: BVH, LOD generator, Gaussian culling, normal estimation, depth map
+- GPU tooling: workgroup size utilities, debug readback, GPU profiler, render metrics, device init helpers
+- Camera: camera path interpolation, panoramic (equirectangular) projection, multi-view rendering
+- Additional: MIP splatting, interactive Gaussian picking, mesh compression, model pruning, Gaussian deformation, density estimation, tile statistics, edge detection, subsurface scattering, antialiasing module
+
+#### oxigaf-diffusion — Extended diffusion model features
+- Sampler suite: DDPM sampler, adaptive sampling, classifier-free guidance, guidance rescaling, consistency model, flow matching
+- Image editing module: SDEdit-style in-context image editing
+- Conditioning: identity conditioning, avatar conditioning, classifier guidance, ControlNet adapter, LoRA adapter
+- Attention enhancements: attention masking, attention visualisation, fused attention, KV cache
+- Latent space: latent blending, latent interpolation, latent space analysis, latent walk, denoising trajectory
+- Debugging and evaluation: debug hooks, denoising visualisation, distillation loss, batch generation, CLIP scoring
+- Other: cross-frame consistency, dynamic views, image preprocessing, image variations, DDIM inversion
+
+#### oxigaf-trainer — Expanded training infrastructure
+- Loss functions: adaptive loss, adaptive loss weighting, contrastive loss, multi-resolution loss, loss reweighting, loss landscape visualisation
+- Training regimes: curriculum learning, progressive training, few-shot adaptation, meta-learning (MAML), continual learning
+- Gradient tools: gradient accumulation, gradient clipping, gradient flow analysis, gradient surgery
+- Online learning: online learning, online hard example mining (OHEM)
+- Model analysis: activation maps, anomaly detection, convergence analysis, diagnostics, layer freezing, model pruning
+- Optimisation utilities: EMA, spectral normalisation, stochastic weight averaging, mixed precision, custom optimiser, learning-rate scheduler
+- Data pipeline: augmentation, data augmentation, camera sampling, synthetic data generation, validation split, noise injection
+- Session management: session recorder, profiler integration, training callbacks, checkpoint manager, checkpoint interpolation
+- Transfer learning: knowledge distillation, domain adaptation, feature bank, contrastive learning
+- Training configuration: `TrainingConfig`, pose conditioning, view scheduler, view importance sampling, view synthesis evaluation
+- Other: data parallel training, temperature scaling, uncertainty estimation, hyperparameter search, regularisation
+
+#### oxigaf-cli — Dramatically expanded toolset
+- Export: PLY export module, glTF export, mesh export, point cloud export, video export, animation sequence export (JSON)
+- Analysis and inspection: scene analyser, model inspector, diff tool, model comparison, quality checker, evaluation suite
+- Scene operations: scene merging, scene optimiser, scene streaming, Gaussian filter, Gaussian deduplicator, Gaussian compressor (k-means)
+- Training tools: training monitor, resume analyser, parameter sweep, batch processor
+- Visualisation: arcball camera controller, preview, LOD generator, parallel renderer, camera path editor, live dashboard
+- Reporting: experiment report, HTML report generator, profiling report, telemetry
+- Configuration: `config` subcommand, config presets, workspace manager
+- Memory and performance: memory estimator, benchmark suite
+- Cloud and data: cloud (point cloud) registration, colour calibration, dataset tools, geometry tools, format converter
+
+#### oxigaf — Unified pipeline module
+- New `pipeline` module for end-to-end orchestration of training, rendering, and export stages
+- New examples: `checkpoint_lifecycle`, `custom_loss`, `end_to_end_pipeline`
+
+### Changed
+
+- **nalgebra** updated 0.34 → 0.35
+- **glam** updated 0.32 → 0.33
+- **candle-core / candle-nn / candle-transformers** updated 0.9 → 0.10
+- **safetensors** updated 0.7 → 0.8
+- **wgpu** updated 28 → 29
+- **toml** updated 1.0 → 1.1
+- **clap_complete** updated 4.5 → 4.6
+- **rayon** updated 1.11 → 1.12
+- **proptest** updated 1.10 → 1.11
+- **oxiarc-archive** updated 0.2.1 → 0.3.3
+- **hf-hub** updated 0.4 → 0.5
+- **sha2** updated 0.10 → 0.11
+- **torsh-core / torsh-tensor / torsh-nn** (oxigaf-bridge) updated 0.1.0 → 0.1.2
+- Added `kiddo 5` spatial data structure crate to workspace dependencies
+
 ## [0.1.0] - 2026-02-24
 
 ### Added
@@ -155,4 +233,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Async: tokio 1 (full features)
 - Testing: approx 0.5, proptest 1, criterion 0.8
 
+[0.1.1]: https://github.com/cool-japan/oxigaf/releases/tag/v0.1.1
 [0.1.0]: https://github.com/cool-japan/oxigaf/releases/tag/v0.1.0

@@ -122,17 +122,17 @@ impl Rasterizer {
         #[cfg(feature = "gpu_debug")]
         let instance = {
             tracing::info!("GPU debug mode enabled - validation layers active");
-            wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            wgpu::Instance::new(wgpu::InstanceDescriptor {
                 backends: wgpu::Backends::all(),
                 flags: wgpu::InstanceFlags::VALIDATION | wgpu::InstanceFlags::DEBUG,
-                ..Default::default()
+                ..wgpu::InstanceDescriptor::new_without_display_handle()
             })
         };
 
         #[cfg(not(feature = "gpu_debug"))]
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
-            ..Default::default()
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
 
         let adapter = instance
@@ -755,6 +755,19 @@ impl Rasterizer {
         let grad_opacities = self.read_buffer_f32(&grads.grad_opacities, n as usize)?;
         let sh_total = model.sh_coeffs.len();
         let grad_sh_coeffs = self.read_buffer_f32(&grads.grad_sh_coeffs, sh_total.max(1))?;
+
+        // Validate gradients for NaN/Inf under gpu_debug feature.
+        #[cfg(feature = "gpu_debug")]
+        {
+            use crate::debug_readback::{validate_buffer_count, validate_no_nan_inf};
+            validate_no_nan_inf(&grad_positions, "grad_positions")?;
+            validate_no_nan_inf(&grad_rotations, "grad_rotations")?;
+            validate_no_nan_inf(&grad_scales, "grad_scales")?;
+            validate_no_nan_inf(&grad_opacities, "grad_opacities")?;
+            validate_no_nan_inf(&grad_sh_coeffs, "grad_sh_coeffs")?;
+            validate_buffer_count(grad_opacities.len(), n as usize, "grad_opacities")?;
+            validate_buffer_count(grad_sh_coeffs.len(), sh_total.max(1), "grad_sh_coeffs")?;
+        }
 
         // Convert from padded [f32; 4] GPU layout to dense [f32; 3] CPU layout
         // for positions and scales.

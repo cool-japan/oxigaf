@@ -230,6 +230,7 @@ fn gpu_forward_loss(
 // ---------------------------------------------------------------------------
 
 #[test]
+#[ignore = "requires GPU hardware"]
 fn test_gpu_self_consistent_opacity() {
     pollster::block_on(async {
         let resolution = (64, 64);
@@ -335,6 +336,7 @@ fn test_gpu_self_consistent_opacity() {
 }
 
 #[test]
+#[ignore = "requires GPU hardware"]
 fn test_gpu_self_consistent_position() {
     pollster::block_on(async {
         let resolution = (64, 64);
@@ -446,6 +448,7 @@ fn test_gpu_self_consistent_position() {
 }
 
 #[test]
+#[ignore = "requires GPU hardware"]
 fn test_gpu_self_consistent_scale() {
     pollster::block_on(async {
         let resolution = (64, 64);
@@ -554,6 +557,7 @@ fn test_gpu_self_consistent_scale() {
 }
 
 #[test]
+#[ignore = "requires GPU hardware"]
 fn test_gpu_self_consistent_rotation() {
     pollster::block_on(async {
         let resolution = (64, 64);
@@ -665,6 +669,7 @@ fn test_gpu_self_consistent_rotation() {
 }
 
 #[test]
+#[ignore = "requires GPU hardware"]
 fn test_gpu_self_consistent_sh0() {
     pollster::block_on(async {
         let resolution = (64, 64);
@@ -786,6 +791,7 @@ fn test_gpu_self_consistent_sh0() {
 }
 
 #[test]
+#[ignore = "requires GPU hardware"]
 fn test_gpu_self_consistent_sh1() {
     pollster::block_on(async {
         let resolution = (64, 64);
@@ -903,6 +909,7 @@ fn test_gpu_self_consistent_sh1() {
 }
 
 #[test]
+#[ignore = "requires GPU hardware"]
 fn test_gpu_self_consistent_sh2() {
     let max_retries = 3;
     let mut last_error = String::new();
@@ -1049,6 +1056,7 @@ fn test_gpu_self_consistent_sh2() {
 }
 
 #[test]
+#[ignore = "requires GPU hardware"]
 fn test_gpu_self_consistent_sh3() {
     pollster::block_on(async {
         let resolution = (64, 64);
@@ -1170,6 +1178,7 @@ fn test_gpu_self_consistent_sh3() {
 /// This is more efficient than running individual tests because it only
 /// initializes the GPU rasterizer once and shares the base forward pass.
 #[test]
+#[ignore = "requires GPU hardware"]
 fn test_gpu_self_consistent_all_params() {
     pollster::block_on(async {
         let resolution = (64, 64);

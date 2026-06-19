@@ -1,4 +1,14 @@
-// Preprocess compute shader - SH Degree 1 Optimized Variant
+// Preprocess compute shader — SH Degree 1 Optimized Variant
+//
+// Purpose
+// ───────
+// Specialised preprocess shader for sh_degree=1 (DC + linear spherical
+// harmonic terms).  Degree-2 and degree-3 SH evaluation branches are
+// eliminated at shader-compile time for improved GPU occupancy and
+// reduced register pressure.
+//
+// Bindings / Dispatch / Math: identical to preprocess.wgsl.
+// See preprocess.wgsl for authoritative documentation.
 //
 // This shader variant is specialized for sh_degree=1 (DC + linear terms).
 // All branching has been eliminated for maximum performance.

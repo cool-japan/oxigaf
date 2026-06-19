@@ -15,9 +15,9 @@ name = "oxigaf"
 path = "src/main.rs"
 
 [dependencies]
-oxigaf = { version = "0.1.0", path = "../oxigaf" }
-oxigaf-flame = { version = "0.1.0", path = "../oxigaf-flame" }
-oxigaf-trainer = { version = "0.1.0", path = "../oxigaf-trainer" }
+oxigaf = { version = "0.1.1", path = "../oxigaf" }
+oxigaf-flame = { version = "0.1.1", path = "../oxigaf-flame" }
+oxigaf-trainer = { version = "0.1.1", path = "../oxigaf-trainer" }
 clap = { workspace = true }
 clap_complete = { workspace = true }
 anyhow = { workspace = true }
@@ -44,6 +44,7 @@ dirs = { workspace = true }
 crossterm = { workspace = true }
 hf-hub = { workspace = true }
 sha2 = { workspace = true }
+rayon = { workspace = true }
 
 [dev-dependencies]
 assert_cmd = { workspace = true }

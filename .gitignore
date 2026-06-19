@@ -31,3 +31,8 @@ __pycache__/
 # CLAUDE
 **/CLAUDE.md
 **/.claude/
+
+# Rustc ICE dumps
+rustc-ice-*.txt
+
+target

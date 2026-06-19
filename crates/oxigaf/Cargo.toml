@@ -11,11 +11,13 @@ keywords = ["gaussian-splatting", "3d-reconstruction", "avatar", "flame", "ai"]
 categories = ["graphics", "multimedia", "science"]
 
 [dependencies]
-oxigaf-flame = { version = "0.1.0", path = "../oxigaf-flame" }
-oxigaf-diffusion = { version = "0.1.0", path = "../oxigaf-diffusion" }
-oxigaf-render = { version = "0.1.0", path = "../oxigaf-render" }
-oxigaf-trainer = { version = "0.1.0", path = "../oxigaf-trainer" }
+oxigaf-flame = { version = "0.1.1", path = "../oxigaf-flame" }
+oxigaf-diffusion = { version = "0.1.1", path = "../oxigaf-diffusion" }
+oxigaf-render = { version = "0.1.1", path = "../oxigaf-render" }
+oxigaf-trainer = { version = "0.1.1", path = "../oxigaf-trainer" }
 thiserror = { workspace = true }
+wgpu = { workspace = true }
+pollster = { workspace = true }
 
 [dev-dependencies]
 # Async runtime for blocking on wgpu operations
@@ -69,3 +71,15 @@ path = "examples/training_loop.rs"
 [[example]]
 name = "diffusion_inference"
 path = "examples/diffusion_inference.rs"
+
+[[example]]
+name = "end_to_end_pipeline"
+path = "examples/end_to_end_pipeline.rs"
+
+[[example]]
+name = "custom_loss"
+path = "examples/custom_loss.rs"
+
+[[example]]
+name = "checkpoint_lifecycle"
+path = "examples/checkpoint_lifecycle.rs"

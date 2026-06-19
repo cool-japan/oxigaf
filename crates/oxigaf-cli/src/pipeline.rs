@@ -463,9 +463,9 @@ pub fn run_reconstruction(
 /// `wgpu::Instance::request_adapter` / `Adapter::request_device` only block on
 /// the GPU driver, not on tokio I/O.
 fn request_gpu_device() -> Result<(wgpu::Device, wgpu::Queue)> {
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::all(),
-        ..Default::default()
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
     });
 
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {

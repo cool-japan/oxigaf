@@ -1,5 +1,27 @@
-// GPU radix sort (4-bit per pass, 16 passes for 64-bit keys).
-// Simplified single-workgroup counting sort per pass.
+// GPU radix sort (4-bit per pass).
+//
+// Purpose
+// ───────
+// Single-workgroup counting sort for a 4-bit digit.  Executes 16 passes
+// (one per 4-bit digit group of a 64-bit key) to produce a fully sorted
+// key-value array.  Used as fallback or small-array path; large-array sort
+// is handled by radix_histogram + prefix_sum + radix_scatter.
+//
+// Bindings
+// ────────
+// See binding declarations below. Typically:
+//   input keys, input values, output keys, output values, element count, bit_shift.
+//
+// Dispatch dimensions
+// ───────────────────
+// Single workgroup of 256 threads; handles up to 256 elements per pass.
+//
+// Math
+// ────
+// Standard 1-pass stable counting sort on 4 bits:
+//   1. Count occurrences of each 4-bit digit.
+//   2. Prefix-sum the counts.
+//   3. Scatter each element to its sorted output position.
 
 struct SortParams {
     count: u32,

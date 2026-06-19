@@ -1,5 +1,25 @@
 // Radix sort histogram pass: compute per-workgroup digit counts.
-// Output layout: histogram[digit * num_workgroups + workgroup_id]
+//
+// Purpose
+// ───────
+// First pass of GPU radix sort.  For a given bit-shift (selecting 4 bits),
+// each workgroup histograms its slice of keys into 16 digit buckets and writes
+// the counts to histogram[], which is later prefix-summed and used by the
+// scatter pass to place elements at their correct sorted positions.
+//
+// Bindings
+// ────────
+// See struct/binding declarations below.  Typically:
+//   input keys, histogram output, bit-shift uniform.
+//
+// Dispatch dimensions
+// ───────────────────
+// 1D: ceil(num_elements / workgroup_size) workgroups.
+//
+// Math
+// ────
+// digit = (key >> bit_shift) & 0xF.
+// histogram[digit * num_workgroups + wid] += 1  for each key in slice.
 
 struct SortParams {
     count: u32,

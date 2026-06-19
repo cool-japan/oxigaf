@@ -347,6 +347,7 @@ mod tests {
 
     /// GRADIENT VERIFICATION TEST: Compare analytical vs numerical scale gradients.
     #[test]
+    #[ignore = "requires GPU hardware"]
     fn test_scale_analytical_vs_numerical() {
         let scene_config = TestSceneConfig {
             num_gaussians: 5,
@@ -396,6 +397,7 @@ mod tests {
 
     /// Test scale gradients with extreme anisotropic configurations.
     #[test]
+    #[ignore = "requires GPU hardware"]
     fn test_scale_gradients_extreme_anisotropic() {
         let test_cases = [
             [1.0, -2.0, -2.0], // Very elongated in X

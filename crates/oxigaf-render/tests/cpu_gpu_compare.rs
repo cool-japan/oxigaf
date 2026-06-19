@@ -342,6 +342,7 @@ fn compute_mse_loss(color_data: &[f32]) -> f64 {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[ignore = "requires GPU hardware"]
 fn test_cpu_gpu_compare_default_scene() {
     let resolution = (128, 128);
     let sh_degree = 0u32;
@@ -422,6 +423,7 @@ fn test_cpu_gpu_compare_default_scene() {
 }
 
 #[test]
+#[ignore = "requires GPU hardware"]
 fn test_cpu_gpu_compare_64x64() {
     let resolution = (64, 64);
     let sh_degree = 0u32;
@@ -475,6 +477,7 @@ fn test_cpu_gpu_compare_64x64() {
 }
 
 #[test]
+#[ignore = "requires GPU hardware"]
 fn test_cpu_gpu_compare_single_gaussian() {
     // Simplest possible case: one Gaussian, SH degree 0.
     // If even this disagrees, there is a fundamental projection / blending mismatch.
@@ -569,6 +572,7 @@ fn test_cpu_gpu_compare_single_gaussian() {
 }
 
 #[test]
+#[ignore = "requires GPU hardware"]
 fn test_cpu_gpu_compare_intermediate_diagnostics() {
     // Detailed diagnostic: print per-Gaussian projected attributes for a single Gaussian
     // so we can compare projection / SH / blending step by step.

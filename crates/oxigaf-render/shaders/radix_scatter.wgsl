@@ -1,6 +1,25 @@
 // Radix sort scatter pass: place elements at their sorted positions.
-// Uses the inclusive prefix-summed histogram to compute global destinations.
-// histogram_prefix[digit * num_wg + wg_id] = inclusive prefix sum of counts.
+//
+// Purpose
+// ───────
+// Second pass of GPU radix sort.  Using the prefix-summed histogram from
+// the histogram pass, each thread writes its key and value to the globally
+// correct output position, producing a stably sorted output array for the
+// selected 4-bit digit.
+//
+// Bindings
+// ────────
+// See struct/binding declarations below.  Typically:
+//   input keys+values, prefix-summed histogram, output keys+values, bit-shift.
+//
+// Dispatch dimensions
+// ───────────────────
+// 1D: ceil(num_elements / workgroup_size) workgroups.
+//
+// Math
+// ────
+// pos = histogram_prefix[digit * num_wg + wid] + local_rank.
+// out_key[pos] = in_key[i];  out_val[pos] = in_val[i].
 // The starting position for (digit, wg_id) = prefix[d*nwg + wg] - count[d*nwg + wg].
 
 struct SortParams {

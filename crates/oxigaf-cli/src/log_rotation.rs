@@ -243,6 +243,7 @@ pub fn cleanup_old_logs(log_dir: &Path, prefix: &str, max_files: usize) -> Resul
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 

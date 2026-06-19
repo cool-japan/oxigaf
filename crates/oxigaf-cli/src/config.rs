@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use oxigaf::render::RasterConfig;
 use oxigaf::trainer::{
     DensityConfig, InitConfig, LossConfig, OptimizerConfig, TensorBoardConfig, TrainingConfig,
+    TrainingPrecision,
 };
 
 // ---------------------------------------------------------------------------
@@ -350,6 +351,8 @@ impl ProjectConfig {
                 sh_degree: t.init.sh_degree,
             },
             tensorboard: TensorBoardConfig::default(),
+            precision: TrainingPrecision::Float32,
+            enable_profiling: false,
         }
     }
 

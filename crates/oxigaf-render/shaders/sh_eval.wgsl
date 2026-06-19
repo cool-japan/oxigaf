@@ -1,6 +1,28 @@
-// Spherical harmonics evaluation (degree 0-3) with SIMD optimizations.
+// Spherical harmonics evaluation (degree 0-3).
 //
-// Performance optimizations:
+// Purpose
+// ───────
+// Standalone SH evaluation helper included (or used as reference) by the
+// preprocess shaders.  Evaluates real spherical harmonics basis functions up
+// to degree 3 for a given view direction and contracts them with per-Gaussian
+// SH coefficient arrays to produce view-dependent RGB colors.
+//
+// Bindings
+// ────────
+// (Library file — no direct bindings; functions are inlined by callers.)
+//
+// Dispatch dimensions
+// ───────────────────
+// N/A — this file contains only function definitions, not an entry point.
+//
+// Math
+// ────
+// Real SH basis Y_l^m evaluated at unit direction (x,y,z):
+//   Y_0^0  = 0.2821            (DC, degree 0)
+//   Y_1^{-1}, Y_1^0, Y_1^1   (linear, degree 1)
+//   Y_2^{-2..2}               (quadratic, degree 2)
+//   Y_3^{-3..3}               (cubic, degree 3)
+// color = max(sum_lm c_lm · Y_lm(dir) + 0.5, 0) — clamped to [0, ∞).
 // - SIMD-friendly vec4 layout for vectorized operations
 // - Precomputed basis function coefficients
 // - Specialized fast paths for each degree

@@ -126,7 +126,7 @@ fn cli_version_shows_version() {
         .assert()
         .success()
         .stdout(predicate::str::contains("oxigaf"))
-        .stdout(predicate::str::contains("0.1.0"));
+        .stdout(predicate::str::contains("0.1.1"));
 }
 
 // ---------------------------------------------------------------------------

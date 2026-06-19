@@ -127,6 +127,19 @@ pub struct DiffusionConfig {
     ///
     /// Default: None (256×256 output).
     pub upsampler_mode: Option<UpsamplerMode>,
+    /// Whether to process VAE encode/decode sequentially (one chunk at a time)
+    /// to reduce peak GPU memory. When false, all views are batched together.
+    ///
+    /// Default: false.
+    pub sequential_vae: bool,
+    /// Number of views per chunk when `sequential_vae` is true.
+    ///
+    /// Default: 1.
+    pub vae_chunk_size: usize,
+    /// Weight offloading strategy for low-VRAM inference.
+    ///
+    /// Default: `OffloadStrategy::AllInMemory`.
+    pub offload_strategy: crate::weight_offload::OffloadStrategy,
 }
 
 impl Default for DiffusionConfig {
@@ -161,6 +174,9 @@ impl Default for DiffusionConfig {
             use_flash_attention: false,
             flash_attention_block_size: 64,
             upsampler_mode: None,
+            sequential_vae: false,
+            vae_chunk_size: 1,
+            offload_strategy: crate::weight_offload::OffloadStrategy::AllInMemory,
         }
     }
 }

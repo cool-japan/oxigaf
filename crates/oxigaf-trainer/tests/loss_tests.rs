@@ -641,6 +641,7 @@ fn make_test_mesh() -> Mesh {
         vertices,
         normals,
         faces,
+        uv_coords: Vec::new(),
     }
 }
 
@@ -666,6 +667,7 @@ fn make_varied_normal_mesh() -> Mesh {
         vertices,
         normals,
         faces,
+        uv_coords: Vec::new(),
     }
 }
 

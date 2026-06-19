@@ -19,35 +19,44 @@ fn create_mock_flame_model(n_vertices: usize) -> oxigaf_flame::FlameModel {
     let n_shape = 100;
     let n_expr = 50;
 
-    oxigaf_flame::FlameModel {
-        v_template: Array2::from_shape_fn((n_vertices, 3), |(i, j)| (i + j) as f32 * 0.001),
-        faces: vec![[0, 1, 2]; n_vertices / 3],
-        shapedirs: Array3::from_shape_fn((n_vertices, 3, n_shape), |(i, j, k)| {
-            ((i + j + k) as f32 * 0.0001).sin()
-        }),
-        expressiondirs: Array3::from_shape_fn((n_vertices, 3, n_expr), |(i, j, k)| {
-            ((i + j + k) as f32 * 0.0001).cos()
-        }),
-        posedirs: Array3::from_shape_fn((n_vertices, 3, (n_joints - 1) * 9), |(i, j, k)| {
-            ((i + j + k) as f32 * 0.00001).sin()
-        }),
-        j_regressor: Array2::from_shape_fn((n_joints, n_vertices), |(i, j)| {
-            if j % n_joints == i {
-                1.0 / (n_vertices / n_joints) as f32
-            } else {
-                0.0
-            }
-        }),
-        parents: vec![-1, 0, 1, 2, 3],
-        lbs_weights: Array2::from_shape_fn((n_vertices, n_joints), |(i, j)| {
-            if i % n_joints == j {
-                0.8
-            } else {
-                0.05
-            }
-        }),
+    let v_template = Array2::from_shape_fn((n_vertices, 3), |(i, j)| (i + j) as f32 * 0.001);
+    let faces = vec![[0u32, 1, 2]; n_vertices / 3];
+    let shapedirs = Array3::from_shape_fn((n_vertices, 3, n_shape), |(i, j, k)| {
+        ((i + j + k) as f32 * 0.0001).sin()
+    });
+    let expressiondirs = Array3::from_shape_fn((n_vertices, 3, n_expr), |(i, j, k)| {
+        ((i + j + k) as f32 * 0.0001).cos()
+    });
+    let posedirs = Array3::from_shape_fn((n_vertices, 3, (n_joints - 1) * 9), |(i, j, k)| {
+        ((i + j + k) as f32 * 0.00001).sin()
+    });
+    let j_regressor = Array2::from_shape_fn((n_joints, n_vertices), |(i, j)| {
+        if j % n_joints == i {
+            1.0 / (n_vertices / n_joints) as f32
+        } else {
+            0.0
+        }
+    });
+    let parents = vec![-1i32, 0, 1, 2, 3];
+    let lbs_weights = Array2::from_shape_fn((n_vertices, n_joints), |(i, j)| {
+        if i % n_joints == j {
+            0.8
+        } else {
+            0.05
+        }
+    });
+
+    oxigaf_flame::FlameModel::from_arrays(
+        v_template,
+        faces,
+        shapedirs,
+        expressiondirs,
+        posedirs,
+        j_regressor,
+        parents,
+        lbs_weights,
         n_joints,
-    }
+    )
 }
 
 /// Create a batch of random parameters for benchmarking.

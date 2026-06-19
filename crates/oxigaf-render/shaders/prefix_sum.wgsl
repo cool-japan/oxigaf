@@ -1,6 +1,31 @@
 // Inclusive prefix sum (Blelloch-style work-efficient scan).
-// Operates on input → output.
-// Also writes per-workgroup totals to block_sums for hierarchical scan.
+//
+// Purpose
+// ───────
+// Computes an inclusive prefix sum (scan) over a u32 array in two phases:
+//   Phase 1 — each workgroup scans its 512-element chunk and writes its total
+//             to block_sums[].
+//   Phase 2 — block offsets are propagated back via prefix_sum_add.wgsl.
+//
+// Bindings
+// ────────
+// group:binding  type              description
+//    0:0         storage (ro)      input       — source u32 array
+//    0:1         storage (rw)      output      — scanned u32 array
+//    0:2         uniform (vec4u)   params      — params.x = element count
+//    0:3         storage (rw)      block_sums  — per-workgroup totals
+//
+// Dispatch dimensions
+// ───────────────────
+// 1D: ceil(count / 512) workgroups × 256 threads each.
+// Each workgroup processes 512 elements (2 per thread).
+//
+// Math
+// ────
+// Blelloch two-phase scan in shared memory (512-element tile):
+//   Up-sweep:   reduce pairs into a binary tree of partial sums.
+//   Down-sweep: propagate partial sums back through the tree.
+// Result: output[i] = sum(input[0..=i]).
 
 @group(0) @binding(0) var<storage, read> input: array<u32>;
 @group(0) @binding(1) var<storage, read_write> output: array<u32>;

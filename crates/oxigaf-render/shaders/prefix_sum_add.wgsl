@@ -1,6 +1,26 @@
-// Add scanned block offsets back to each element.
-// This is the third phase of hierarchical prefix sum.
-// For each element in workgroup wid.x, add the scanned block_sums[wid.x].
+// Add scanned block offsets back to each element (hierarchical prefix-sum phase 3).
+//
+// Purpose
+// ───────
+// After prefix_sum.wgsl scans each block independently and writes totals to
+// block_sums[], and block_sums[] itself is scanned, this shader adds the
+// appropriate block offset to every element so the full array is consistent.
+//
+// Bindings
+// ────────
+// group:binding  type              description
+//    0:0         storage (rw)      data          — partially-scanned array (in-place)
+//    0:1         storage (ro)      block_offsets — scanned block_sums from phase 2
+//    0:2         uniform (vec4u)   params        — params.x = element count
+//
+// Dispatch dimensions
+// ───────────────────
+// 1D: same grid as prefix_sum phase 1. Each workgroup adds block_offsets[wid.x]
+// to its 512-element slice.
+//
+// Math
+// ────
+// data[i] += block_offsets[wid.x]   for all i in [wid.x*512, (wid.x+1)*512).
 
 @group(0) @binding(0) var<storage, read_write> data: array<u32>;
 @group(0) @binding(1) var<storage, read> block_offsets: array<u32>;

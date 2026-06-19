@@ -8,7 +8,7 @@ This crate implements the [FLAME (Faces Learned with an Articulated Model and Ex
 
 FLAME is a statistical 3D head model that represents shape, expression, and pose variations using a Linear Blend Skinning (LBS) framework. It's widely used in computer vision and graphics for facial animation, avatar creation, and 3D reconstruction.
 
-**v0.1.0 — what's included:**
+**v0.1.1 — what's included:**
 - Linear Blend Skinning (LBS) forward pass with SIMD/parallel acceleration
 - CPU software rasterizer for normal map generation
 - Mesh surface sampling for Gaussian initialization
@@ -109,7 +109,7 @@ fn main() -> Result<(), oxigaf_flame::FlameError> {
 }
 ```
 
-### Safetensors I/O (v0.1.0)
+### Safetensors I/O (v0.1.1)
 
 ```rust
 use oxigaf_flame::{load_flame_model_safetensors, save_flame_model_safetensors};
@@ -126,7 +126,7 @@ fn main() -> Result<(), oxigaf_flame::FlameError> {
 }
 ```
 
-### Video Sequence Processing (v0.1.0)
+### Video Sequence Processing (v0.1.1)
 
 ```rust
 use oxigaf_flame::FlameSequence;

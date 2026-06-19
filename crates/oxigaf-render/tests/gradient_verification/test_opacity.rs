@@ -317,6 +317,7 @@ mod tests {
 
     /// GRADIENT VERIFICATION TEST: Compare analytical vs numerical opacity gradients.
     #[test]
+    #[ignore = "requires GPU hardware"]
     fn test_opacity_analytical_vs_numerical() {
         let scene_config = TestSceneConfig {
             num_gaussians: 5,
@@ -366,6 +367,7 @@ mod tests {
 
     /// Test opacity gradients across the full sigmoid range.
     #[test]
+    #[ignore = "requires GPU hardware"]
     fn test_opacity_gradients_sigmoid_range() {
         // Test a range of opacity values (sigmoid input), excluding extreme values
         // where the sigmoid derivative is near-zero and single-entry median is unreliable

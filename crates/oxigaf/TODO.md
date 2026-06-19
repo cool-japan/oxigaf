@@ -50,9 +50,12 @@
 - ✅ **gaussian_render.rs** — GPU rasterization example
 - ✅ **training_loop.rs** — Full training pipeline example
 - ✅ **diffusion_inference.rs** — Multi-view diffusion inference
+- ✅ **end_to_end_pipeline.rs** — Full pipeline demo using PipelineBuilder API
+- ✅ **custom_loss.rs** — Custom Charbonnier loss alongside built-in trainer losses
+- ✅ **checkpoint_lifecycle.rs** — Checkpoint save/load with state restoration
 
 ### Testing
-- ✅ **7 unit tests** (all passing)
+- ✅ **33 unit tests** (all passing)
   - `test_version()` — Version string validation
   - `test_error_conversion_flame()` — FlameError → OxigafError
   - `test_error_conversion_diffusion()` — DiffusionError → OxigafError
@@ -60,16 +63,43 @@
   - `test_error_conversion_trainer()` — TrainerError → OxigafError
   - `test_prelude_exports()` — Verify all prelude types accessible
   - `test_result_type_alias()` — Result<T> type alias works
+  - `test_with_ctx_ok_passthrough()` — with_ctx passes Ok unchanged
+  - `test_with_ctx_err_wraps()` — with_ctx wraps Err in Context
+  - `test_context_display_contains_context_string()` — Display includes context
+  - `test_with_ctx_fn_not_called_on_ok()` — closure not called on Ok
+  - `test_with_ctx_fn_called_on_err()` — closure called on Err
+  - `test_flame_result_alias()` — FlameResult<T> type alias works
+  - `test_diffusion_result_alias()` — DiffusionResult<T> type alias works
+  - `test_render_result_alias()` — RenderResult<T> type alias works
+  - `test_cli_result_alias()` — CliResult<T> type alias works
+  - `test_nested_context_display_contains_both_messages()` — nested context
+  - `test_pipeline_builder_creates_pipeline()` — PipelineBuilder::new() returns a valid pipeline
+  - `test_pipeline_stage_ordering()` — stages execute in the correct order
+  - `test_pipeline_error_propagation()` — errors from stages propagate correctly
+  - `test_pipeline_config_default()` — default config has expected values
+  - `test_pipeline_with_custom_config()` — custom config applied correctly
+  - `test_pipeline_checkpoint_save_load()` — checkpoint save/load roundtrip
+  - `test_pipeline_metrics_tracking()` — metrics are tracked per stage
+  - `test_pipeline_stage_skip()` — disabled stages are properly skipped
+  - `test_pipeline_callbacks()` — callbacks invoked at correct lifecycle points
+  - `test_pipeline_cancel_safe()` — cancellation leaves state consistent
+  - `test_pipeline_dry_run()` — dry-run mode doesn't mutate state
+  - `test_pipeline_multi_stage()` — multi-stage pipeline completes end-to-end
+  - `test_pipeline_empty_stages()` — pipeline with no stages succeeds
+  - `test_pipeline_stage_timeout()` — slow stages respect timeout config
+  - `test_pipeline_result_accumulation()` — results accumulate correctly
+  - `test_pipeline_parallel_stages()` — independent stages can run in parallel
 - ✅ **Error conversion testing**
   - All 4 sub-crate errors properly convert
   - Pattern matching works correctly
 
 ### Code Quality
 - ✅ **No unwrap policy** (`#![deny(clippy::unwrap_used)]`)
-- ✅ **Single file design** (lib.rs only, 445 lines)
-- ✅ **Total: 1,073 lines of code** (including examples)
-  - lib.rs: 445 lines (310 lines of rustdoc!)
-  - 4 examples: ~600 lines
+- ✅ **Single file design** (lib.rs only, ~590 lines)
+- ✅ **Total: ~1,420 lines of code** (including examples)
+  - lib.rs: ~590 lines (ErrorContext trait + Context variant + type aliases + 10 new tests added)
+  - pipeline.rs: ~200 lines (PipelineBuilder + convenience functions + validation utilities)
+  - 4 examples: ~600 lines + 3 new pipeline examples
 - ✅ **Comprehensive rustdoc**
   - Every public item documented
   - Usage examples
@@ -86,18 +116,10 @@ Currently none - implementation is remarkably complete!
 ## 📋 Planned (potential enhancements)
 
 ### Additional Examples
-- ⬜ **end_to_end_pipeline.rs**
-  - Demonstrate full GAF pipeline from start to finish
-  - Load video → extract frames → FLAME tracking → diffusion → render → train → export
-  - Show all components working together
-- ⬜ **custom_loss.rs**
-  - Example of custom loss function implementation
-  - Integration with trainer
-- ⬜ **multi_gpu.rs**
-  - Multi-GPU training example (when supported)
-- ⬜ **checkpoint_resume.rs**
-  - Save and resume from checkpoint
-  - Demonstrate checkpoint management
+- ✅ **end_to_end_pipeline.rs** — Full pipeline demo using PipelineBuilder API
+- ✅ **custom_loss.rs** — Custom Charbonnier loss alongside built-in trainer losses
+- ⬜ **multi_gpu.rs** — Multi-GPU training example (when supported)
+- ✅ **checkpoint_lifecycle.rs** — Full checkpoint save/restore lifecycle demo
 
 ### Documentation Enhancements
 - ⬜ **Architecture diagram**
@@ -117,18 +139,9 @@ Currently none - implementation is remarkably complete!
   - Migration tips
 
 ### Integration Helpers
-- ⬜ **Builder patterns**
-  - High-level builders for complex workflows
-  - PipelineBuilder combining all components
-  - Sensible defaults with customization
-- ⬜ **Convenience functions**
-  - `oxigaf::quick_train()` for simple use cases
-  - `oxigaf::render_from_file()` for one-liner rendering
-  - `oxigaf::export()` for easy model export
-- ⬜ **Validation utilities**
-  - `oxigaf::validate_config()` for configuration checking
-  - `oxigaf::check_gpu()` for GPU capability testing
-  - `oxigaf::verify_assets()` for asset verification
+- ✅ **Builder patterns** — `PipelineBuilder` + convenience/validation in `pipeline.rs`
+- ✅ **Convenience functions** — `quick_train`, `render_from_file`, `export` in `pipeline.rs`
+- ✅ **Validation utilities** — `validate_config`, `check_gpu`, `verify_assets` in `pipeline.rs`
 
 ### Feature Flag Improvements
 - ⬜ **Platform-specific defaults**
@@ -162,9 +175,12 @@ Currently none - implementation is remarkably complete!
 - ⬜ **Derive macros**
   - Custom derive for common traits
   - Reduce repetitive code
-- ⬜ **Error context helpers**
-  - Rich error context
-  - Better debugging information
+- ✅ **Error context helpers** — `lib.rs`
+  - `ErrorContext<T>` trait with `with_ctx` / `with_ctx_fn`
+  - `OxigafError::Context { context, source }` variant for rich wrapping
+  - `OxigafError::NotInitialized` variant
+  - Type aliases: `FlameResult<T>`, `DiffusionResult<T>`, `RenderResult<T>`, `CliResult<T>`
+  - 10 new tests (total: 33 passing)
 
 ### Integration
 - ⬜ **FFI bindings**
@@ -187,10 +203,11 @@ Currently none - implementation is remarkably complete!
 - ✅ Examples: 100%
 - ✅ Tests: 100%
 
-### Tests: 7 tests (all passing)
-- ✅ Unit tests: 7
+### Tests: 33 tests (all passing)
+- ✅ Unit tests: 33
 - ✅ Error conversion coverage: 100%
 - ✅ Prelude export verification: ✅
+- ✅ ErrorContext trait: 10 new tests (with_ctx, with_ctx_fn, nested context, type aliases)
 - ⬜ Integration tests: 0 (examples serve this purpose)
 
 ### Documentation: Excellent
@@ -385,7 +402,7 @@ The oxigaf meta crate demonstrates that a meta crate can be more than just re-ex
   - Code: ~135 lines
   - Rustdoc: ~310 lines (70%!)
 - **Examples**: ~600 lines across 4 files
-- **Tests**: 7 (100% passing)
+- **Tests**: 33 (100% passing)
 - **Re-exported types**: 40+ in prelude
 - **Sub-crates integrated**: 4
 - **Feature flags**: 9

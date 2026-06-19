@@ -11,9 +11,11 @@ use candle_nn as nn;
 use crate::clip::{build_clip_encoder, ClipImageEncoder};
 use crate::config::DiffusionConfig;
 use crate::scheduler::{DdimScheduler, PredictionType};
+use crate::sequential_vae::{decode_sequential, EncodedViews, SequentialVaeConfig};
 use crate::unet::MultiViewUNet;
 use crate::upsampler::LatentUpsampler;
 use crate::vae::Vae;
+use crate::weight_offload::OffloadSchedule;
 use crate::DiffusionError;
 
 /// Output of the multi-view diffusion pipeline.
@@ -144,6 +146,21 @@ impl MultiViewDiffusionPipeline {
             )));
         }
 
+        // Log the offload schedule for the configured strategy.
+        // In production, phase transitions would trigger actual component
+        // load/unload operations; here we log the schedule for observability.
+        let offload_schedule = OffloadSchedule::for_strategy(self.config.offload_strategy);
+        tracing::debug!("Offload schedule:\n{}", offload_schedule.format_schedule());
+        for (idx, phase) in offload_schedule.phases.iter().enumerate() {
+            tracing::trace!(
+                "Phase {}/{}: {} — peak {:.0} MB",
+                idx + 1,
+                offload_schedule.total_phases(),
+                phase.name,
+                phase.peak_memory_mb()
+            );
+        }
+
         // 1. Encode reference image with CLIP for IP-Adapter conditioning
         let ip_tokens = self
             .clip_encoder
@@ -222,11 +239,14 @@ impl MultiViewDiffusionPipeline {
                 .map_err(|e| DiffusionError::Inference(format!("Upsampler: {e}")))?;
         }
 
-        // 8. Decode latents with VAE
-        let decoded = self
-            .vae
-            .decode(&latents)
-            .map_err(|e| DiffusionError::Inference(format!("VAE decode: {e}")))?;
+        // 8. Decode latents with VAE (batch or sequential based on config)
+        let decoded = if self.config.sequential_vae {
+            self.sequential_vae_decode(&latents)?
+        } else {
+            self.vae
+                .decode(&latents)
+                .map_err(|e| DiffusionError::Inference(format!("VAE decode: {e}")))?
+        };
 
         // 9. Post-process: clamp to [0, 1]
         let images = ((decoded + 1.0)
@@ -257,5 +277,63 @@ impl MultiViewDiffusionPipeline {
             width: size,
             height: size,
         })
+    }
+
+    /// Decode latents sequentially (one chunk at a time) to reduce peak memory.
+    ///
+    /// Converts the `(num_views, lc, lh, lw)` latents tensor to per-view
+    /// `Vec<f32>` slices, runs `decode_sequential`, and reconstructs a
+    /// `(num_views, 3, H, W)` tensor from the decoded images.
+    fn sequential_vae_decode(&self, latents: &Tensor) -> Result<Tensor, DiffusionError> {
+        let (num_views, lc, lh, lw) = latents
+            .dims4()
+            .map_err(|e| DiffusionError::Inference(format!("latents dims4: {e}")))?;
+
+        let vae_cfg = SequentialVaeConfig {
+            chunk_size: self.config.vae_chunk_size.max(1),
+            latent_channels: lc,
+            image_height: lh * 8,
+            image_width: lw * 8,
+            latent_scale: self.config.vae_scale_factor as f32,
+        };
+
+        // Extract per-view latent vectors from the tensor.
+        let mut latent_vecs: Vec<Vec<f32>> = Vec::with_capacity(num_views);
+        for i in 0..num_views {
+            let view = latents
+                .narrow(0, i, 1)
+                .and_then(|t| t.squeeze(0))
+                .and_then(|t| t.flatten_all())
+                .map_err(|e| DiffusionError::Inference(format!("latent view {i}: {e}")))?;
+            let data = view
+                .to_vec1::<f32>()
+                .map_err(|e| DiffusionError::Inference(format!("latent to_vec1 {i}: {e}")))?;
+            latent_vecs.push(data);
+        }
+
+        let encoded = EncodedViews {
+            latents: latent_vecs,
+            num_views,
+            latent_height: lh,
+            latent_width: lw,
+            latent_channels: lc,
+        };
+
+        let decoded = decode_sequential(&encoded, &vae_cfg)?;
+
+        // Reconstruct tensor from the decoded image data.
+        let out_c = decoded.channels;
+        let out_h = decoded.height;
+        let out_w = decoded.width;
+        let mut view_tensors: Vec<Tensor> = Vec::with_capacity(num_views);
+        for image_data in &decoded.images {
+            let t = Tensor::from_vec(image_data.clone(), (out_c, out_h, out_w), &self.device)
+                .and_then(|t| t.unsqueeze(0))
+                .map_err(|e| DiffusionError::Inference(format!("sequential decode tensor: {e}")))?;
+            view_tensors.push(t);
+        }
+
+        Tensor::cat(&view_tensors, 0)
+            .map_err(|e| DiffusionError::Inference(format!("sequential decode cat: {e}")))
     }
 }

@@ -298,6 +298,7 @@ mod tests {
 
     /// GRADIENT VERIFICATION TEST: Compare analytical vs numerical position gradients.
     #[test]
+    #[ignore = "requires GPU hardware"]
     fn test_position_analytical_vs_numerical() {
         let scene_config = TestSceneConfig {
             num_gaussians: 5,
@@ -347,6 +348,7 @@ mod tests {
 
     /// Test position gradients with 10 Gaussians.
     #[test]
+    #[ignore = "requires GPU hardware"]
     fn test_position_gradients_10_gaussians() {
         let scene_config = TestSceneConfig {
             num_gaussians: 10,
@@ -432,6 +434,7 @@ mod tests {
 
     /// Test position gradients at different resolutions.
     #[test]
+    #[ignore = "requires GPU hardware"]
     fn test_position_gradients_different_resolutions() {
         let resolutions = vec![(64, 64), (128, 128), (256, 256)];
 

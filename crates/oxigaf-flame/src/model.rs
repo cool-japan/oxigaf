@@ -23,7 +23,10 @@
 //! # Ok::<(), oxigaf_flame::FlameError>(())
 //! ```
 
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::path::Path;
+use std::sync::Mutex;
 
 use nalgebra as na;
 use ndarray::{s, Array2, Array3};
@@ -95,6 +98,7 @@ impl BatchedFlameOutput {
             vertices: self.vertices[index].clone(),
             normals: self.normals[index].clone(),
             faces: self.faces.clone(),
+            uv_coords: Vec::new(),
         })
     }
 
@@ -109,6 +113,7 @@ impl BatchedFlameOutput {
                 vertices: verts,
                 normals: norms,
                 faces: faces.clone(),
+                uv_coords: Vec::new(),
             })
             .collect()
     }
@@ -220,6 +225,10 @@ impl BatchBufferPool {
 ///
 /// Immutable after construction — call [`forward`](Self::forward) with
 /// different [`FlameParams`] to produce posed meshes.
+///
+/// Joint positions depend only on shape parameters (not expression or pose),
+/// so they are memoized per unique shape parameter vector. See
+/// [`joint_positions_cached`](Self::joint_positions_cached).
 pub struct FlameModel {
     /// Template (rest-pose) vertex positions `[N, 3]`.
     pub v_template: Array2<f32>,
@@ -239,6 +248,15 @@ pub struct FlameModel {
     pub lbs_weights: Array2<f32>,
     /// Number of joints (5 for FLAME).
     pub n_joints: usize,
+    /// Memoization cache: FNV hash of shape params → joint positions.
+    ///
+    /// Joint positions depend only on shape parameters (they are derived from
+    /// `v_template + shape_blend_shapes`). The cache avoids recomputing joints
+    /// when the same shape is used across many frames (e.g., video sequences).
+    ///
+    /// The `Mutex` makes `FlameModel: Send + Sync` while allowing interior
+    /// mutability for cache updates. Holds at most 64 entries; cleared when full.
+    pub(crate) joint_cache: Mutex<HashMap<u64, Vec<[f32; 3]>>>,
 }
 
 impl FlameModel {
@@ -253,6 +271,52 @@ impl FlameModel {
     /// - Array shapes do not match expected dimensions
     pub fn load(dir: impl AsRef<Path>) -> Result<Self, FlameError> {
         crate::io::load_flame_model(dir.as_ref())
+    }
+
+    /// Construct a `FlameModel` directly from its constituent arrays.
+    ///
+    /// This constructor is primarily intended for testing and for loaders that
+    /// do not go through the standard `.npy` file path. In typical production
+    /// use, prefer [`FlameModel::load`].
+    ///
+    /// The joint-positions cache is initialised empty.
+    ///
+    /// # Arguments
+    ///
+    /// * `v_template`     — Template vertex positions `[N, 3]`
+    /// * `faces`          — Triangle face indices
+    /// * `shapedirs`      — Shape blend-shape directions `[N, 3, n_shape]`
+    /// * `expressiondirs` — Expression blend-shape directions `[N, 3, n_expr]`
+    /// * `posedirs`       — Pose blend-shape directions `[N, 3, (n_joints-1)×9]`
+    /// * `j_regressor`    — Joint regressor `[n_joints, N]`
+    /// * `parents`        — Parent joint indices (−1 for root)
+    /// * `lbs_weights`    — LBS skinning weights `[N, n_joints]`
+    /// * `n_joints`       — Number of joints (5 for standard FLAME)
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_arrays(
+        v_template: Array2<f32>,
+        faces: Vec<[u32; 3]>,
+        shapedirs: Array3<f32>,
+        expressiondirs: Array3<f32>,
+        posedirs: Array3<f32>,
+        j_regressor: Array2<f32>,
+        parents: Vec<i32>,
+        lbs_weights: Array2<f32>,
+        n_joints: usize,
+    ) -> Self {
+        Self {
+            v_template,
+            faces,
+            shapedirs,
+            expressiondirs,
+            posedirs,
+            j_regressor,
+            parents,
+            lbs_weights,
+            n_joints,
+            joint_cache: Mutex::new(HashMap::new()),
+        }
     }
 
     /// Number of template vertices (5023 for standard FLAME).
@@ -967,6 +1031,123 @@ impl FlameModel {
         let mut v = v_shaped.clone();
         apply_blend_shapes_simd(&mut v, &self.posedirs, &pose_feature);
         v
+    }
+
+    // -----------------------------------------------------------------------
+    // Memoized joint positions
+    // -----------------------------------------------------------------------
+
+    /// Compute joint positions from shape parameters only (no expression).
+    ///
+    /// In FLAME, joint locations are regressed from the shaped rest-pose mesh,
+    /// which depends only on shape blend shapes (identity parameters), not
+    /// expression or pose. This makes them stable across an animation sequence
+    /// where the same person performs many expressions.
+    ///
+    /// `joint_positions_cached` should be preferred over calling this directly;
+    /// it returns a cached result when the same shape vector has been seen before.
+    ///
+    /// # Returns
+    ///
+    /// `Vec<[f32; 3]>` with `n_joints` entries, each being `[x, y, z]`.
+    fn compute_joint_positions(&self, shape: &[f32]) -> Vec<[f32; 3]> {
+        // Apply only shape blend shapes (not expression) to v_template
+        let mut v_shape_only = self.v_template.clone();
+        apply_blend_shapes(&mut v_shape_only, &self.shapedirs, shape);
+
+        // Regress joint positions: [n_joints, 3] = j_regressor [n_joints, N] · v [N, 3]
+        let joints = self.j_regressor.dot(&v_shape_only);
+
+        // Convert to Vec<[f32; 3]>
+        (0..self.n_joints)
+            .map(|j| [joints[[j, 0]], joints[[j, 1]], joints[[j, 2]]])
+            .collect()
+    }
+
+    /// Compute FNV-1a hash of shape parameters (as raw f32 bits).
+    ///
+    /// Using raw bit representation means that bitwise-identical f32 values
+    /// produce the same hash (no floating-point ambiguity). This is safe
+    /// because we want exact cache hits — same bits means same computation.
+    fn compute_shape_hash(shape: &[f32]) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for &v in shape {
+            v.to_bits().hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
+    /// Return joint positions for the given shape parameters, using the cache.
+    ///
+    /// Joint positions depend only on shape (identity) parameters, not on
+    /// expression or pose. This cache avoids redundant matrix multiplications
+    /// when processing video sequences where shape is constant per-person.
+    ///
+    /// ### Cache eviction
+    ///
+    /// The cache holds at most 64 distinct shape vectors. When full, the entire
+    /// cache is cleared before inserting the new entry. This simple strategy
+    /// works well in practice because FLAME shape parameters are effectively
+    /// constant across a video (one identity per sequence).
+    ///
+    /// ### Poisoned `Mutex`
+    ///
+    /// Uses `unwrap_or_else(|e| e.into_inner())` so that a panicking thread
+    /// does not permanently prevent future cache access; the last consistent
+    /// cache state is recovered instead.
+    pub fn joint_positions_cached(&self, shape: &[f32]) -> Vec<[f32; 3]> {
+        let key = Self::compute_shape_hash(shape);
+
+        // Fast path: cache hit
+        {
+            let cache = self
+                .joint_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(cached) = cache.get(&key) {
+                return cached.clone();
+            }
+        }
+
+        // Slow path: compute and insert
+        let joints = self.compute_joint_positions(shape);
+
+        {
+            let mut cache = self
+                .joint_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+            // Limit cache size: clear all entries when capacity reached
+            if cache.len() >= 64 {
+                cache.clear();
+            }
+            cache.insert(key, joints.clone());
+        }
+
+        joints
+    }
+
+    /// Return the current number of entries in the joint-positions cache.
+    ///
+    /// Useful for testing and diagnostics.
+    #[must_use]
+    pub fn joint_cache_len(&self) -> usize {
+        self.joint_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
+    /// Clear the joint-positions cache.
+    ///
+    /// Call this if shape parameters change in a way that would benefit from
+    /// a fresh cache (e.g., switching to a completely different identity set).
+    pub fn clear_joint_cache(&self) {
+        self.joint_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
     }
 }
 

@@ -62,9 +62,9 @@ fn make_test_model() -> GaussianModel {
 
 /// Setup wgpu device and queue for testing.
 async fn setup_gpu_async() -> (wgpu::Device, wgpu::Queue) {
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::all(),
-        ..Default::default()
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
     });
 
     let adapter = instance

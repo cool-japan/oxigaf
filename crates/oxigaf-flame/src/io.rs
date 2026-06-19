@@ -82,6 +82,7 @@ pub fn load_flame_model(dir: &Path) -> Result<FlameModel, FlameError> {
         parents,
         lbs_weights,
         n_joints,
+        joint_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
     })
 }
 

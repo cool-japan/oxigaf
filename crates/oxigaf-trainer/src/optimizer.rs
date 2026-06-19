@@ -92,6 +92,50 @@ impl Gradients {
     pub fn num_gaussians(&self) -> usize {
         self.position.len() / 3
     }
+
+    /// Accumulate (`+=`) each element from `other` element-wise.
+    ///
+    /// Fields are zipped so mismatched lengths silently skip extra elements
+    /// of the longer slice — callers should ensure both buffers are sized
+    /// identically.
+    pub fn accumulate_from(&mut self, other: &Gradients) {
+        add_elementwise(&mut self.position, &other.position);
+        add_elementwise(&mut self.rotation, &other.rotation);
+        add_elementwise(&mut self.scale, &other.scale);
+        add_elementwise(&mut self.opacity, &other.opacity);
+        add_elementwise(&mut self.sh, &other.sh);
+        add_elementwise(&mut self.offset, &other.offset);
+    }
+
+    /// Scale every element by `factor` (in-place).
+    pub fn scale(&mut self, factor: f32) {
+        for x in self.position.iter_mut() {
+            *x *= factor;
+        }
+        for x in self.rotation.iter_mut() {
+            *x *= factor;
+        }
+        for x in self.scale.iter_mut() {
+            *x *= factor;
+        }
+        for x in self.opacity.iter_mut() {
+            *x *= factor;
+        }
+        for x in self.sh.iter_mut() {
+            *x *= factor;
+        }
+        for x in self.offset.iter_mut() {
+            *x *= factor;
+        }
+    }
+}
+
+/// Add `src` into `dst` element-wise (zip stops at the shorter slice).
+#[inline]
+fn add_elementwise(dst: &mut [f32], src: &[f32]) {
+    for (d, &s) in dst.iter_mut().zip(src.iter()) {
+        *d += s;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -136,6 +180,10 @@ pub struct GaussianOptimizer {
     pub offset: AdamState,
     /// Number of SH coefficients per Gaussian.
     sh_channels: usize,
+    /// Running sum of gradients across micro-batches for gradient accumulation.
+    accumulated_gradients: Option<Gradients>,
+    /// Number of micro-batches accumulated so far since the last optimizer step.
+    accumulation_step: u32,
 }
 
 impl GaussianOptimizer {
@@ -152,6 +200,8 @@ impl GaussianOptimizer {
             sh: AdamState::new(n * sh_channels),
             offset: AdamState::new(n * 3),
             sh_channels,
+            accumulated_gradients: None,
+            accumulation_step: 0,
         }
     }
 
@@ -324,6 +374,140 @@ impl GaussianOptimizer {
         }
     }
 
+    // ----- gradient clipping ------------------------------------------------
+
+    /// Clip gradients by global L2 norm across all parameter groups.
+    ///
+    /// Computes the global L2 norm of all gradient tensors (position, rotation,
+    /// scale, opacity, sh, offset). If the norm exceeds `max_norm`, all gradients
+    /// are scaled uniformly by `max_norm / norm`.
+    ///
+    /// Returns the norm **before** any clipping was applied.
+    pub fn clip_grad_norm(&self, gradients: &mut Gradients, max_norm: f32) -> f32 {
+        // Accumulate squared sum over every gradient slice.
+        let sum_sq = [
+            &gradients.position,
+            &gradients.rotation,
+            &gradients.scale,
+            &gradients.opacity,
+            &gradients.sh,
+            &gradients.offset,
+        ]
+        .iter()
+        .flat_map(|g| g.iter())
+        .fold(0.0_f32, |acc, &x| acc + x * x);
+
+        let norm = sum_sq.sqrt();
+
+        if norm > max_norm && norm > 0.0 {
+            let scale = max_norm / norm;
+            for g in [
+                &mut gradients.position,
+                &mut gradients.rotation,
+                &mut gradients.scale,
+                &mut gradients.opacity,
+                &mut gradients.sh,
+                &mut gradients.offset,
+            ] {
+                for x in g.iter_mut() {
+                    *x *= scale;
+                }
+            }
+        }
+
+        norm
+    }
+
+    /// Clip each gradient value per-parameter group to `[-max_value, max_value]`.
+    ///
+    /// Every element of every gradient tensor is clamped independently.
+    pub fn clip_grad_value(&self, gradients: &mut Gradients, max_value: f32) {
+        for g in [
+            &mut gradients.position,
+            &mut gradients.rotation,
+            &mut gradients.scale,
+            &mut gradients.opacity,
+            &mut gradients.sh,
+            &mut gradients.offset,
+        ] {
+            for x in g.iter_mut() {
+                *x = x.clamp(-max_value, max_value);
+            }
+        }
+    }
+
+    // ----- gradient accumulation --------------------------------------------
+
+    /// Accumulate gradients from one micro-batch.
+    ///
+    /// Call this method once per micro-batch.  After `accumulation_steps`
+    /// calls, invoke [`Self::step_accumulated`] to apply the averaged update
+    /// and reset the accumulation buffer.
+    ///
+    /// If the accumulation buffer has not been initialised yet (or was just
+    /// reset after a step), it is created as all-zeros matching `gradients`'
+    /// shape on the first call.
+    pub fn accumulate_gradients(&mut self, gradients: &Gradients) {
+        match self.accumulated_gradients {
+            None => {
+                // Initialise buffer as zeros with the same shape as `gradients`.
+                let n = gradients.num_gaussians();
+                let sh_len = gradients.sh.len();
+                let sh_channels = sh_len.checked_div(n).unwrap_or(0);
+                let mut buf = Gradients::zeros(n, sh_channels);
+                buf.accumulate_from(gradients);
+                self.accumulated_gradients = Some(buf);
+            }
+            Some(ref mut buf) => {
+                buf.accumulate_from(gradients);
+            }
+        }
+        self.accumulation_step += 1;
+    }
+
+    /// Apply an Adam update using the mean of all accumulated micro-batch
+    /// gradients, then reset the accumulation state.
+    ///
+    /// # Parameters
+    /// * `model` — model whose parameters will be updated.
+    /// * `accumulation_steps` — total number of micro-batches to wait for
+    ///   before applying the update.
+    /// * `iteration` — global training iteration (used for LR scheduling).
+    ///
+    /// # Returns
+    /// * `Some(n)` — the update was applied; `n` is the number of
+    ///   micro-batches that were averaged together.
+    /// * `None` — not enough micro-batches have been accumulated yet; the
+    ///   caller should continue calling `accumulate_gradients`.
+    pub fn step_accumulated(
+        &mut self,
+        model: &mut GaussianModel,
+        accumulation_steps: u32,
+        iteration: u32,
+    ) -> Option<u32> {
+        if self.accumulation_step < accumulation_steps {
+            return None;
+        }
+
+        let n_steps = self.accumulation_step;
+
+        // Take ownership of the accumulated buffer to release the borrow on
+        // `self.accumulated_gradients` before calling `self.step()`.
+        let mut averaged = self.accumulated_gradients.take()?;
+
+        // Average in-place.
+        if n_steps > 1 {
+            averaged.scale(1.0 / n_steps as f32);
+        }
+
+        // Reset counter before calling step (step may panic; we still reset).
+        self.accumulation_step = 0;
+
+        self.step(model, &averaged, iteration);
+
+        Some(n_steps)
+    }
+
     // ----- density-control bookkeeping --------------------------------------
 
     /// Adjust internal buffers after density control has modified the model.
@@ -337,6 +521,16 @@ impl GaussianOptimizer {
         compact_and_extend(&mut self.opacity, keep_mask, num_added, 1);
         compact_and_extend(&mut self.sh, keep_mask, num_added, self.sh_channels);
         compact_and_extend(&mut self.offset, keep_mask, num_added, 3);
+
+        // Also compact the accumulation buffer if one is in-flight.
+        if let Some(ref mut buf) = self.accumulated_gradients {
+            compact_and_extend_vec(&mut buf.position, keep_mask, num_added, 3);
+            compact_and_extend_vec(&mut buf.rotation, keep_mask, num_added, 4);
+            compact_and_extend_vec(&mut buf.scale, keep_mask, num_added, 3);
+            compact_and_extend_vec(&mut buf.opacity, keep_mask, num_added, 1);
+            compact_and_extend_vec(&mut buf.sh, keep_mask, num_added, self.sh_channels);
+            compact_and_extend_vec(&mut buf.offset, keep_mask, num_added, 3);
+        }
     }
 
     // ----- checkpoint helpers -----------------------------------------------
@@ -426,6 +620,27 @@ fn adam_scalar(
     *param -= lr * m_hat / (v_hat.sqrt() + epsilon);
 }
 
+/// Compact a flat gradient `Vec<f32>` to keep only the entries where
+/// `keep[i]` is true, then append zeros for `num_added` new Gaussians.
+fn compact_and_extend_vec(buf: &mut Vec<f32>, keep: &[bool], num_added: usize, elem_size: usize) {
+    let kept_count = keep.iter().filter(|&&k| k).count();
+    let mut new_buf = Vec::with_capacity((kept_count + num_added) * elem_size);
+
+    for (i, &k) in keep.iter().enumerate() {
+        if k {
+            let start = i * elem_size;
+            let end = start + elem_size;
+            if end <= buf.len() {
+                new_buf.extend_from_slice(&buf[start..end]);
+            } else {
+                new_buf.extend(std::iter::repeat_n(0.0_f32, elem_size));
+            }
+        }
+    }
+    new_buf.resize(new_buf.len() + num_added * elem_size, 0.0);
+    *buf = new_buf;
+}
+
 /// Compact an [`AdamState`] to keep only the entries where `keep[i]` is true,
 /// then extend with zeros for `num_added` new Gaussians.
 fn compact_and_extend(state: &mut AdamState, keep: &[bool], num_added: usize, elem_size: usize) {
@@ -485,6 +700,130 @@ mod tests {
     }
 
     #[test]
+    fn clip_grad_norm_reduces_norm_correctly() {
+        // Build a tiny GaussianModel and optimizer purely to call the method.
+        // We only need the GaussianOptimizer value for the receiver; the method
+        // only reads `self.config` and `self.sh_channels` (not used in clipping).
+        let config = crate::config::OptimizerConfig::default();
+
+        // We can't trivially create a GaussianModel here without a large set-up,
+        // so test the core logic through the Gradients struct directly, calling
+        // the method via a synthetic optimizer with sh_channels = 0.
+        let dummy_model = make_tiny_model(2, 0);
+        let opt = GaussianOptimizer::new(&config, &dummy_model);
+
+        // Gradient buffer: N=2, sh_channels=0.
+        // position: 2×3 = 6 elements, set to 1.0 each.
+        // All others zero to keep the math simple.
+        let mut grads = Gradients {
+            position: vec![1.0_f32; 6],
+            rotation: vec![0.0_f32; 8],
+            scale: vec![0.0_f32; 6],
+            opacity: vec![0.0_f32; 2],
+            sh: vec![],
+            offset: vec![0.0_f32; 6],
+        };
+
+        // Global L2 norm = sqrt(6 * 1²) = sqrt(6) ≈ 2.449
+        let expected_norm = (6.0_f32).sqrt();
+        let max_norm = 1.0_f32;
+        let returned_norm = opt.clip_grad_norm(&mut grads, max_norm);
+
+        // Returned norm must equal norm *before* clipping.
+        assert!(
+            (returned_norm - expected_norm).abs() < 1e-5,
+            "returned norm {returned_norm} != expected {expected_norm}"
+        );
+
+        // After clipping, every position element should be scaled by 1.0 / sqrt(6).
+        let expected_val = 1.0 / expected_norm;
+        for &v in &grads.position {
+            assert!(
+                (v - expected_val).abs() < 1e-5,
+                "position element {v} != expected {expected_val}"
+            );
+        }
+    }
+
+    #[test]
+    fn clip_grad_norm_no_op_when_within_bound() {
+        let config = crate::config::OptimizerConfig::default();
+        let dummy_model = make_tiny_model(1, 0);
+        let opt = GaussianOptimizer::new(&config, &dummy_model);
+
+        let mut grads = Gradients {
+            position: vec![0.1_f32; 3],
+            rotation: vec![0.0_f32; 4],
+            scale: vec![0.0_f32; 3],
+            opacity: vec![0.0_f32; 1],
+            sh: vec![],
+            offset: vec![0.0_f32; 3],
+        };
+        // norm = sqrt(3 * 0.01) = sqrt(0.03) ≈ 0.173, well within max_norm=1.0
+        let norm = opt.clip_grad_norm(&mut grads, 1.0);
+        assert!(norm < 1.0, "norm should be under max_norm");
+        // Values must be unchanged.
+        for &v in &grads.position {
+            assert!((v - 0.1).abs() < 1e-7, "should be unchanged, got {v}");
+        }
+    }
+
+    #[test]
+    fn clip_grad_value_clamps_all_elements() {
+        let config = crate::config::OptimizerConfig::default();
+        let dummy_model = make_tiny_model(2, 0);
+        let opt = GaussianOptimizer::new(&config, &dummy_model);
+
+        let mut grads = Gradients {
+            position: vec![5.0, -7.0, 2.0, -3.0, 0.5, -0.5],
+            rotation: vec![10.0; 8],
+            scale: vec![-10.0; 6],
+            opacity: vec![0.0_f32; 2],
+            sh: vec![],
+            offset: vec![1.5, -2.5, 3.0, -4.0, 0.0, 0.0],
+        };
+        opt.clip_grad_value(&mut grads, 2.0);
+
+        // Every value must be in [-2.0, 2.0].
+        for (field_name, field) in [
+            ("position", &grads.position),
+            ("rotation", &grads.rotation),
+            ("scale", &grads.scale),
+            ("opacity", &grads.opacity),
+            ("offset", &grads.offset),
+        ] {
+            for &v in field.iter() {
+                assert!(
+                    (-2.0..=2.0).contains(&v),
+                    "{field_name} value {v} out of [-2.0, 2.0]"
+                );
+            }
+        }
+    }
+
+    /// Build a minimal GaussianModel with `n` Gaussians and the given `sh_degree`.
+    fn make_tiny_model(n: usize, sh_degree: u32) -> oxigaf_render::gaussian::GaussianModel {
+        use oxigaf_render::gaussian::{GaussianAttributes, GaussianModel};
+        let attr = GaussianAttributes {
+            position: [0.0; 3],
+            _pad0: 0.0,
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            scale: [1.0; 3],
+            opacity: 0.5,
+        };
+        let sh_channels = ((sh_degree + 1) * (sh_degree + 1) * 3) as usize;
+        GaussianModel {
+            gaussians: vec![attr; n],
+            sh_coeffs: vec![0.0; n * sh_channels],
+            sh_degree,
+            face_indices: vec![0; n],
+            barycentric: vec![[1.0, 0.0, 0.0]; n],
+            local_offsets: vec![[0.0; 3]; n],
+            is_rigid: vec![false; n],
+        }
+    }
+
+    #[test]
     fn compact_and_extend_works() {
         let mut state = AdamState {
             m: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
@@ -497,5 +836,191 @@ mod tests {
         assert_eq!(state.m, vec![1.0, 2.0, 5.0, 6.0, 0.0, 0.0]);
         assert_eq!(state.v, vec![10.0, 20.0, 50.0, 60.0, 0.0, 0.0]);
         assert_eq!(state.t, 5); // unchanged
+    }
+
+    // -----------------------------------------------------------------------
+    // Gradient accumulation tests
+    // -----------------------------------------------------------------------
+
+    /// Build a tiny Gradients buffer for `n` Gaussians with SH degree 0.
+    ///
+    /// SH degree 0 → `(0+1)² × 3 = 3` channels per Gaussian.
+    fn make_tiny_gradients(n: usize, fill: f32) -> Gradients {
+        // sh_degree=0 → sh_channels = (0+1)*(0+1)*3 = 3
+        let sh_channels = 3_usize;
+        Gradients {
+            position: vec![fill; n * 3],
+            rotation: vec![fill; n * 4],
+            scale: vec![fill; n * 3],
+            opacity: vec![fill; n],
+            sh: vec![fill; n * sh_channels],
+            offset: vec![fill; n * 3],
+        }
+    }
+
+    #[test]
+    fn accumulate_once_and_step_applies_update() {
+        let config = crate::config::OptimizerConfig::default();
+        let mut model = make_tiny_model(2, 0);
+        let mut opt = GaussianOptimizer::new(&config, &model);
+
+        // Record original position values.
+        let before: Vec<f32> = model.gaussians.iter().map(|g| g.position[0]).collect();
+
+        let grads = make_tiny_gradients(2, 0.1);
+        opt.accumulate_gradients(&grads);
+
+        // With accumulation_steps = 1, step_accumulated should fire immediately.
+        let result = opt.step_accumulated(&mut model, 1, 0);
+        assert_eq!(result, Some(1), "expected step to fire");
+
+        // Position should have changed (Adam update with non-zero gradient).
+        let after: Vec<f32> = model.gaussians.iter().map(|g| g.position[0]).collect();
+        assert!(
+            before
+                .iter()
+                .zip(after.iter())
+                .any(|(b, a)| (b - a).abs() > 1e-8),
+            "model parameters should have changed after step"
+        );
+    }
+
+    #[test]
+    fn step_accumulated_returns_none_when_not_enough_microbatches() {
+        let config = crate::config::OptimizerConfig::default();
+        let mut model = make_tiny_model(2, 0);
+        let mut opt = GaussianOptimizer::new(&config, &model);
+
+        let grads = make_tiny_gradients(2, 0.1);
+        opt.accumulate_gradients(&grads);
+
+        // Require 4 micro-batches; only 1 accumulated — should return None.
+        let result = opt.step_accumulated(&mut model, 4, 0);
+        assert_eq!(
+            result, None,
+            "should not fire with only 1 of 4 micro-batches"
+        );
+        assert_eq!(opt.accumulation_step, 1);
+    }
+
+    #[test]
+    fn accumulate_and_step_resets_state() {
+        let config = crate::config::OptimizerConfig::default();
+        let mut model = make_tiny_model(2, 0);
+        let mut opt = GaussianOptimizer::new(&config, &model);
+
+        let grads = make_tiny_gradients(2, 0.5);
+        opt.accumulate_gradients(&grads);
+        opt.step_accumulated(&mut model, 1, 0);
+
+        // After step, accumulation_step must be reset.
+        assert_eq!(
+            opt.accumulation_step, 0,
+            "step counter should reset after step"
+        );
+        assert!(
+            opt.accumulated_gradients.is_none(),
+            "gradient buffer should be cleared after step"
+        );
+    }
+
+    #[test]
+    fn gradient_averaging_correctness() {
+        // Accumulate 4 identical micro-batch gradients of 1.0.
+        // The averaged gradient should equal 1.0 (not 4.0).
+        // We verify this indirectly by checking that the model update is the
+        // same as a direct step with a single batch of 1.0 gradients.
+        let config = crate::config::OptimizerConfig::default();
+
+        let mut model_direct = make_tiny_model(1, 0);
+        let mut opt_direct = GaussianOptimizer::new(&config, &model_direct);
+        let single_grad = make_tiny_gradients(1, 1.0);
+        opt_direct.step(&mut model_direct, &single_grad, 0);
+
+        let mut model_accum = make_tiny_model(1, 0);
+        let mut opt_accum = GaussianOptimizer::new(&config, &model_accum);
+        let micro = make_tiny_gradients(1, 1.0);
+        for _ in 0..4 {
+            opt_accum.accumulate_gradients(&micro);
+        }
+        opt_accum.step_accumulated(&mut model_accum, 4, 0);
+
+        // Both should result in the same parameter values.
+        for i in 0..model_direct.gaussians.len() {
+            for j in 0..3 {
+                let d = model_direct.gaussians[i].position[j];
+                let a = model_accum.gaussians[i].position[j];
+                assert!(
+                    (d - a).abs() < 1e-6,
+                    "position[{i}][{j}]: direct={d}, accum={a}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn multiple_accumulate_steps_before_fire() {
+        let config = crate::config::OptimizerConfig::default();
+        let mut model = make_tiny_model(2, 0);
+        let mut opt = GaussianOptimizer::new(&config, &model);
+
+        let grads = make_tiny_gradients(2, 0.2);
+        // Accumulate 3 times; require 4.
+        for _ in 0..3 {
+            opt.accumulate_gradients(&grads);
+        }
+        assert_eq!(
+            opt.step_accumulated(&mut model, 4, 0),
+            None,
+            "should not fire after 3 of 4"
+        );
+        assert_eq!(opt.accumulation_step, 3);
+
+        // Fourth micro-batch — should now fire.
+        opt.accumulate_gradients(&grads);
+        let result = opt.step_accumulated(&mut model, 4, 0);
+        assert_eq!(result, Some(4), "should fire after 4 micro-batches");
+    }
+
+    #[test]
+    fn accumulate_from_adds_elementwise() {
+        let mut base = make_tiny_gradients(2, 1.0);
+        let extra = make_tiny_gradients(2, 3.0);
+        base.accumulate_from(&extra);
+
+        // All elements should now be 4.0.
+        for &v in base
+            .position
+            .iter()
+            .chain(base.rotation.iter())
+            .chain(base.scale.iter())
+            .chain(base.opacity.iter())
+            .chain(base.offset.iter())
+        {
+            assert!(
+                (v - 4.0).abs() < 1e-6,
+                "expected 4.0 after accumulate, got {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn gradient_scale_method() {
+        let mut grads = make_tiny_gradients(2, 4.0);
+        grads.scale(0.25);
+
+        for &v in grads
+            .position
+            .iter()
+            .chain(grads.rotation.iter())
+            .chain(grads.scale.iter())
+            .chain(grads.opacity.iter())
+            .chain(grads.offset.iter())
+        {
+            assert!(
+                (v - 1.0).abs() < 1e-6,
+                "expected 1.0 after scale by 0.25, got {v}"
+            );
+        }
     }
 }

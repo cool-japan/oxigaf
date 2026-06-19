@@ -55,6 +55,7 @@ mod tests {
 
     /// GRADIENT VERIFICATION TEST: SH degree 0 (DC term only).
     #[test]
+    #[ignore = "requires GPU hardware"]
     fn test_sh_gradients_degree0() {
         let scene_config = TestSceneConfig {
             num_gaussians: 3,
@@ -105,6 +106,7 @@ mod tests {
 
     /// GRADIENT VERIFICATION TEST: SH degree 1 (DC + linear).
     #[test]
+    #[ignore = "requires GPU hardware"]
     fn test_sh_gradients_degree1() {
         let scene_config = TestSceneConfig {
             num_gaussians: 3,
@@ -155,6 +157,7 @@ mod tests {
 
     /// GRADIENT VERIFICATION TEST: SH degree 2 (DC + linear + quadratic).
     #[test]
+    #[ignore = "requires GPU hardware"]
     fn test_sh_gradients_degree2() {
         let scene_config = TestSceneConfig {
             num_gaussians: 3,
@@ -205,6 +208,7 @@ mod tests {
 
     /// GRADIENT VERIFICATION TEST: SH degree 3 (DC + linear + quadratic + cubic).
     #[test]
+    #[ignore = "requires GPU hardware"]
     fn test_sh_gradients_degree3() {
         let scene_config = TestSceneConfig {
             num_gaussians: 3,

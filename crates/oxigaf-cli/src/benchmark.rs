@@ -462,18 +462,68 @@ fn get_cpu_info() -> String {
     }
 }
 
-/// Get total memory in MB.
+/// Parse `MemTotal` kB from a `/proc/meminfo`-formatted string and return MB.
+///
+/// Returns 0 if no valid `MemTotal` line is found.
+#[cfg(target_os = "linux")]
+fn parse_mem_from_str(s: &str) -> u64 {
+    for line in s.lines() {
+        if line.starts_with("MemTotal:") {
+            let kb: u64 = line
+                .split_whitespace()
+                .nth(1)
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            if kb > 0 {
+                return kb / 1024;
+            }
+        }
+    }
+    0
+}
+
+/// Get total physical memory in MB.
+///
+/// On Linux reads `MemTotal` from `/proc/meminfo`.  On macOS queries
+/// `sysctl hw.memsize`.  Falls back to 4 096 MB on all other platforms or
+/// when the OS query fails.
 fn get_memory_mb() -> u64 {
-    // Placeholder - would need system-specific implementation
-    8192
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(content) = std::fs::read_to_string("/proc/meminfo") {
+            let mb = parse_mem_from_str(&content);
+            if mb > 0 {
+                return mb;
+            }
+        }
+        4096
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("sysctl")
+            .args(["-n", "hw.memsize"])
+            .output();
+        if let Ok(out) = output {
+            if let Ok(s) = std::str::from_utf8(&out.stdout) {
+                if let Ok(bytes) = s.trim().parse::<u64>() {
+                    return bytes / (1024 * 1024);
+                }
+            }
+        }
+        4096
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        4096
+    }
 }
 
 /// Get GPU info via wgpu.
 fn get_gpu_info() -> Option<String> {
     // Try to get GPU info via wgpu (non-blocking check)
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::all(),
-        ..Default::default()
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
     });
 
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -685,6 +735,39 @@ mod tests {
         assert!((result.mean_us - 100.0).abs() < 1.0);
         assert_eq!(result.min_us, 90);
         assert_eq!(result.max_us, 110);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_parse_mem_correct_line() {
+        let s = "MemTotal:       16384000 kB\nMemFree: 4000 kB\n";
+        assert_eq!(parse_mem_from_str(s), 16000);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_parse_mem_empty_string_returns_zero() {
+        assert_eq!(parse_mem_from_str(""), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_parse_mem_malformed_line_returns_zero() {
+        let s = "MemTotal:       not_a_number kB\n";
+        assert_eq!(parse_mem_from_str(s), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_parse_mem_missing_memtotal_returns_zero() {
+        let s = "MemFree:  4000 kB\nBuffers:  512 kB\n";
+        assert_eq!(parse_mem_from_str(s), 0);
+    }
+
+    #[test]
+    fn test_get_memory_mb_returns_nonzero() {
+        let mb = get_memory_mb();
+        assert!(mb > 0, "get_memory_mb() returned 0");
     }
 
     #[test]

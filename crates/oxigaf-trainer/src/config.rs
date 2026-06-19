@@ -5,6 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::mixed_precision::TrainingPrecision;
 use crate::tensorboard::TensorBoardConfig;
 use crate::TrainerError;
 
@@ -49,6 +50,12 @@ pub struct TrainingConfig {
     pub init: InitConfig,
     /// TensorBoard logging configuration.
     pub tensorboard: TensorBoardConfig,
+
+    /// Floating-point precision mode for training (default: Float32).
+    pub precision: TrainingPrecision,
+
+    /// Enable per-phase profiling of the training loop (default: false).
+    pub enable_profiling: bool,
 }
 
 impl Default for TrainingConfig {
@@ -70,6 +77,8 @@ impl Default for TrainingConfig {
             density: DensityConfig::default(),
             init: InitConfig::default(),
             tensorboard: TensorBoardConfig::default(),
+            precision: TrainingPrecision::Float32,
+            enable_profiling: false,
         }
     }
 }

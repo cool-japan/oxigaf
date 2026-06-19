@@ -1,4 +1,14 @@
-// Preprocess compute shader - SH Degree 0 Optimized Variant
+// Preprocess compute shader — SH Degree 0 Optimized Variant
+//
+// Purpose
+// ───────
+// Specialised preprocess shader for sh_degree=0 (DC color term only).
+// Eliminates all direction computation and degree-1/2/3 SH evaluation,
+// reducing the per-Gaussian shader to the minimal ops needed for a static
+// Gaussian color (approximately 3 multiplies instead of ~100).
+//
+// Bindings / Dispatch / Math: identical to preprocess.wgsl.
+// See preprocess.wgsl for the authoritative documentation.
 //
 // This shader variant is specialized for sh_degree=0 (DC term only).
 // All branching has been eliminated for maximum performance.

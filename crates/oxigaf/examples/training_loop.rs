@@ -206,9 +206,9 @@ async fn run_training() -> oxigaf::Result<()> {
     println!("Initializing trainer...");
 
     // Request GPU device
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::all(),
-        ..Default::default()
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
     });
 
     let adapter = instance

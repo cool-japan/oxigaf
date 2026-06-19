@@ -9,6 +9,28 @@ use candle_nn as nn;
 use candle_nn::Module;
 
 // ---------------------------------------------------------------------------
+// Constants and pure helpers
+// ---------------------------------------------------------------------------
+
+/// SD 2.1 latent scaling factor (applied to the encoded mean before storing).
+pub const SCALING_FACTOR: f32 = 0.18215;
+
+/// Number of latent channels used by SD 2.1 (and most SD variants).
+pub const LATENT_CHANNELS: usize = 4;
+
+/// Spatial compression factor: the VAE down-samples each spatial dimension
+/// by this factor during encoding (3 strided convolutions → 2^3 = 8).
+pub const SPATIAL_COMPRESSION: usize = 8;
+
+/// Convert an image side-length to the corresponding latent side-length.
+///
+/// This is a pure, allocation-free helper used in tests and memory estimation.
+#[inline]
+pub fn encode_latent_size(image_size: usize) -> usize {
+    image_size / SPATIAL_COMPRESSION
+}
+
+// ---------------------------------------------------------------------------
 // Building blocks
 // ---------------------------------------------------------------------------
 
@@ -475,5 +497,88 @@ impl Vae {
         let z = (latents * (1.0 / self.scaling_factor))?;
         let z = self.post_quant_conv.forward(&z)?;
         self.decoder.forward(&z)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // 1. SCALING_FACTOR is the SD 2.1 standard value and is < 1.0
+    #[test]
+    fn scaling_factor_is_valid() {
+        assert!((SCALING_FACTOR - 0.18215_f32).abs() < 1e-5);
+        assert!(SCALING_FACTOR.abs() < 1.0);
+    }
+
+    // 2. LATENT_CHANNELS for SD 2.1 = 4
+    #[test]
+    fn latent_channels_is_four() {
+        assert_eq!(LATENT_CHANNELS, 4);
+    }
+
+    // 3. Spatial compression factor 8: 512×512 image → 64×64 latents
+    #[test]
+    fn spatial_compression_512() {
+        let latent = 512 / SPATIAL_COMPRESSION;
+        assert_eq!(latent, 64);
+    }
+
+    // 4a. encode_latent_size(512) == 64
+    #[test]
+    fn encode_latent_size_512() {
+        assert_eq!(encode_latent_size(512), 64);
+    }
+
+    // 4b. encode_latent_size(256) == 32
+    #[test]
+    fn encode_latent_size_256() {
+        assert_eq!(encode_latent_size(256), 32);
+    }
+
+    // 4c. encode_latent_size(128) == 16
+    #[test]
+    fn encode_latent_size_128() {
+        assert_eq!(encode_latent_size(128), 16);
+    }
+
+    // 5. scaling_factor * latent ∈ [−3,3] stays within [−0.55, 0.55] approximately
+    #[test]
+    fn scaled_latent_range() {
+        let latent_min = -3.0_f32;
+        let latent_max = 3.0_f32;
+        let scaled_min = SCALING_FACTOR * latent_min;
+        let scaled_max = SCALING_FACTOR * latent_max;
+        assert!(
+            scaled_min > -0.60,
+            "scaled min should be > -0.60, got {scaled_min}"
+        );
+        assert!(
+            scaled_max < 0.60,
+            "scaled max should be < 0.60, got {scaled_max}"
+        );
+    }
+
+    // 6. Decode scale ≈ 5.48 (1 / 0.18215 ≈ 5.4901)
+    #[test]
+    fn decode_scale_approx() {
+        let decode_scale = 1.0_f32 / SCALING_FACTOR;
+        assert!(
+            (decode_scale - 5.48_f32).abs() < 0.02,
+            "expected ~5.48, got {decode_scale}"
+        );
+    }
+
+    // Additional: encode_latent_size is monotonic
+    #[test]
+    fn encode_latent_size_monotonic() {
+        assert!(encode_latent_size(512) > encode_latent_size(256));
+        assert!(encode_latent_size(256) > encode_latent_size(128));
+    }
+
+    // Additional: SPATIAL_COMPRESSION constant is 8
+    #[test]
+    fn spatial_compression_constant_is_eight() {
+        assert_eq!(SPATIAL_COMPRESSION, 8);
     }
 }

@@ -124,6 +124,38 @@ pub enum Command {
         command: CacheCommands,
     },
 
+    /// Inspect a model or data file and display its metadata.
+    ///
+    /// Supported file types:
+    /// - `.ply` — PLY header parse: Gaussian count, SH degree, properties, file size, bounding box, opacity/scale stats
+    /// - `.safetensors` — tensor names/shapes/dtypes, metadata dict, file size
+    /// - `.json` — training config or checkpoint metadata, key fields
+    Info(InfoArgs),
+
+    /// Compare two model files and report structural and statistical differences.
+    ///
+    /// Supported file types: `.ply`, `.safetensors`
+    ///
+    /// # Example
+    ///
+    /// ```bash
+    /// oxigaf compare model_a.ply model_b.ply
+    /// oxigaf compare model_a.ply model_b.ply --format json
+    /// oxigaf compare model_a.ply model_b.ply --threshold 0.85
+    /// ```
+    Compare(CompareArgs),
+
+    /// Manage training configuration files.
+    ///
+    /// Subcommands:
+    /// - `init [--output <path>]` — write default config TOML to stdout or a file
+    /// - `validate <path>` — parse the config file and report errors or "OK"
+    /// - `show <path>` — parse and pretty-print the config
+    ConfigCmd {
+        #[command(subcommand)]
+        command: ConfigCmdSubcommand,
+    },
+
     /// Generate shell completion scripts.
     ///
     /// # Installation
@@ -367,6 +399,14 @@ pub struct RenderArgs {
     /// Quality preset affecting render fidelity.
     #[arg(long, default_value = "medium")]
     pub quality: RenderQuality,
+
+    /// Number of parallel threads for rendering. 0 = auto (all cores).
+    ///
+    /// When set to 0 (default), rayon's global thread pool is used which
+    /// selects the number of threads automatically based on available CPU cores.
+    /// Set to 1 for sequential (single-threaded) rendering.
+    #[arg(long, default_value = "0")]
+    pub parallel: usize,
 }
 
 #[derive(Debug, Clone, ValueEnum, Default)]
@@ -468,6 +508,37 @@ pub struct ExportArgs {
     /// Overwrite existing output file without prompting.
     #[arg(long)]
     pub force: bool,
+
+    /// Color mode for point cloud export (only for `--format pointcloud`).
+    ///
+    /// Controls how each point's RGB color is derived:
+    /// - `sh-dc`: View-independent color from SH DC coefficient (default)
+    /// - `white`: All points rendered as white (255, 255, 255)
+    /// - `opacity`: Grayscale proportional to sigmoid(opacity)
+    /// - `scale`: Rainbow-ish hue from average log-scale magnitude
+    #[arg(long, value_enum, default_value = "sh-dc")]
+    pub point_color_mode: PointColorMode,
+
+    /// Voxel grid resolution along the longest axis for mesh export (default 128, max 256).
+    ///
+    /// Only used when `--format mesh`. Higher values produce finer geometry but
+    /// increase memory and compute time proportionally to the cube of this value.
+    #[arg(long, default_value = "128")]
+    pub mesh_resolution: u32,
+
+    /// Density isosurface threshold for mesh export (default 0.5).
+    ///
+    /// Only used when `--format mesh`. Lower values capture thinner shells of
+    /// Gaussian density; higher values extract only dense core regions.
+    #[arg(long, default_value = "0.5")]
+    pub mesh_iso: f32,
+
+    /// Fractional bounding-box padding for mesh export (default 0.1).
+    ///
+    /// Only used when `--format mesh`. Adds padding around the Gaussian extent
+    /// so the isosurface is never clipped at the grid boundary.
+    #[arg(long, default_value = "0.1")]
+    pub mesh_padding: f32,
 }
 
 #[derive(Debug, Clone, ValueEnum, Default)]
@@ -481,6 +552,24 @@ pub enum ExportFormat {
     Gltf,
     /// JSON checkpoint format.
     Json,
+    /// Colored PLY point cloud (xyzirgb) from SH DC coefficients.
+    PointCloud,
+    /// Surface Nets triangle mesh exported as binary little-endian PLY.
+    Mesh,
+}
+
+/// Color mode for point cloud export.
+#[derive(Debug, Clone, Copy, ValueEnum, Default)]
+pub enum PointColorMode {
+    /// Use SH DC coefficient for view-independent color (default).
+    #[default]
+    ShDc,
+    /// Use white (255, 255, 255) for all points.
+    White,
+    /// Grayscale proportional to sigmoid(opacity).
+    Opacity,
+    /// Rainbow color by average scale magnitude.
+    Scale,
 }
 
 #[derive(Debug, Clone, ValueEnum, Default)]
@@ -730,6 +819,76 @@ pub enum CacheCommands {
 
     /// Print cache directory path.
     Path,
+}
+
+// ---------------------------------------------------------------------------
+// Info Command
+// ---------------------------------------------------------------------------
+
+/// Arguments for `oxigaf info <path>`.
+#[derive(Debug, clap::Args)]
+pub struct InfoArgs {
+    /// File to inspect (.ply, .safetensors, or .json).
+    pub path: PathBuf,
+}
+
+// ---------------------------------------------------------------------------
+// Compare Command
+// ---------------------------------------------------------------------------
+
+/// Arguments for `oxigaf compare <model1> <model2>`.
+#[derive(Debug, clap::Args)]
+pub struct CompareArgs {
+    /// First model file to compare (.ply or .safetensors).
+    pub model1: PathBuf,
+
+    /// Second model file to compare (.ply or .safetensors).
+    pub model2: PathBuf,
+
+    /// Output format: "text" (default) or "json".
+    #[arg(long, default_value = "text")]
+    pub format: String,
+
+    /// Similarity threshold for recommendation (0.0–1.0).
+    ///
+    /// Models above this threshold are considered similar. Below it, they are
+    /// flagged as significantly different.
+    #[arg(long, default_value = "0.8")]
+    pub threshold: f64,
+}
+
+// ---------------------------------------------------------------------------
+// ConfigCmd Subcommands
+// ---------------------------------------------------------------------------
+
+/// Subcommands for `oxigaf config-cmd`.
+#[derive(Debug, Subcommand)]
+pub enum ConfigCmdSubcommand {
+    /// Write a default OxiGAF configuration TOML to stdout or to a file.
+    Init {
+        /// Write to this file instead of stdout.
+        #[arg(long, short)]
+        output: Option<PathBuf>,
+
+        /// Generate config via hardware-detection wizard (non-interactive).
+        ///
+        /// Detects available CPU cores and suggests optimal settings.
+        /// Prints the reasoning for each configuration choice.
+        #[arg(long)]
+        interactive: bool,
+    },
+
+    /// Parse a configuration file and report any errors, or print "OK".
+    Validate {
+        /// Path to the configuration TOML file.
+        path: PathBuf,
+    },
+
+    /// Parse a configuration file and pretty-print all fields.
+    Show {
+        /// Path to the configuration TOML file.
+        path: PathBuf,
+    },
 }
 
 // ---------------------------------------------------------------------------

@@ -17,7 +17,7 @@ This crate implements the multi-view diffusion pipeline for Gaussian Avatar Fram
 
 The pipeline takes a single input image and generates multiple novel views of the subject at **512×512 resolution**, which are then used to initialize and optimize 3D Gaussians.
 
-**v0.1.0 — what's included:**
+**v0.1.1 — what's included:**
 - Full 512×512 multi-view generation pipeline (Latent Upsampler + IP-Adapter + CFG)
 - 66 tests (all passing)
 - Benchmarks: standard vs Flash Attention, sequence lengths, DDIM scheduler
@@ -276,7 +276,7 @@ Decodes latent representations to RGB images:
 - RGB output: 3 channels
 - Upsampling factor: 8× (e.g., 64×64 latent → 512×512 RGB)
 
-### Latent Upsampler (v0.1.0)
+### Latent Upsampler (v0.1.1)
 
 Upscales latent representations from 32×32 to 64×64 for 512×512 output:
 
@@ -284,7 +284,7 @@ Upscales latent representations from 32×32 to 64×64 for 512×512 output:
 - 10-step DDIM denoising in latent space
 - Fallback: `BilinearVae` mode for CPU inference
 
-### IP-Adapter (v0.1.0)
+### IP-Adapter (v0.1.1)
 
 Adds pixel-level identity conditioning:
 
@@ -292,7 +292,7 @@ Adds pixel-level identity conditioning:
 - Context = VAE-encoded reference image
 - Ensures face identity consistency across all generated views
 
-### Classifier-Free Guidance (v0.1.0)
+### Classifier-Free Guidance (v0.1.1)
 
 Improves generation quality via dual forward pass:
 

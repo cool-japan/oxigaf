@@ -123,6 +123,7 @@ pub fn load_flame_model_safetensors(path: &Path) -> Result<FlameModel, FlameErro
         parents,
         lbs_weights,
         n_joints,
+        joint_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
     })
 }
 
@@ -579,6 +580,7 @@ mod tests {
             parents: vec![-1, 0, 1, 2, 3],
             lbs_weights: Array2::zeros((n_verts, n_joints)),
             n_joints,
+            joint_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 

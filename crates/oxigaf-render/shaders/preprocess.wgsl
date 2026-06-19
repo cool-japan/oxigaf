@@ -1,5 +1,45 @@
 // Preprocess compute shader: project 3D Gaussians to 2D, compute cov2D, evaluate SH colors.
 //
+// Purpose
+// ───────
+// One thread per Gaussian.  Projects world-space positions through the camera
+// view+projection matrices, computes the 2D covariance (cov2D) from 3D
+// covariance via the projection Jacobian, inverts cov2D to obtain the conic,
+// evaluates spherical harmonics to get view-dependent color, culls off-screen
+// or degenerate Gaussians, and writes radii + tile counts for the subsequent
+// sorting and rasterization passes.
+//
+// Bindings
+// ────────
+// group:binding  type              description
+//    0:0         uniform           Camera/viewport/render uniforms
+//    0:1         storage (ro)      positions   — world-space Gaussian centres
+//    0:2         storage (ro)      rotations   — quaternions
+//    0:3         storage (ro)      scales      — log-space scales
+//    0:4         storage (ro)      opacities   — logit-space opacities
+//    0:5         storage (rw)      means2d     — projected 2D centres (output)
+//    0:6         storage (rw)      cov2d       — upper-triangle cov2D (output)
+//    0:7         storage (rw)      conics      — inverse-cov2D (output)
+//    0:8         storage (rw)      depths      — view-space depths (output)
+//    0:9         storage (rw)      radii       — screen-space radii (output)
+//   0:10         storage (rw)      tile_counts — tiles per Gaussian (output)
+//   0:11         storage (ro)      sh_coeffs   — SH coefficient array
+//   0:12         storage (rw)      colors      — evaluated RGB colors (output)
+//   0:13         storage (rw)      normals     — surface normals (optional)
+//
+// Dispatch dimensions
+// ───────────────────
+// 1D: ceil(num_gaussians / 256) workgroups × 256 threads.
+//
+// Math
+// ────
+// Projection:  p_ndc = proj(view · pos_w);
+//              mean2d = viewport(p_ndc)
+// Covariance:  M = R · S;  cov3D = M · Mᵀ
+//              cov2D = T · cov3D · Tᵀ   where T = J · W (Jacobian · view rot)
+// Conic:       inverse(cov2D)  (2×2 symmetric using Cramer's rule)
+// SH color:    Σ_{lm} c_{lm} · Y_lm(dir);  dir = normalize(pos_w - cam_pos)
+//
 // Performance optimizations:
 // - SH degree 0 fast path: Skip direction computation, use 3 multiplies only
 // - SIMD-friendly vec4 operations for SH evaluation

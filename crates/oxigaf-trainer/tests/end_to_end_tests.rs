@@ -115,9 +115,9 @@ fn make_test_gaussian_model() -> GaussianModel {
 /// Note: Uses expect() for test setup - this is acceptable in test code
 /// as GPU availability is a precondition for running GPU tests.
 async fn setup_gpu_async() -> (wgpu::Device, wgpu::Queue) {
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::all(),
-        ..Default::default()
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
     });
 
     let adapter = instance

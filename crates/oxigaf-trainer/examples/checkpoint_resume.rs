@@ -414,9 +414,9 @@ async fn resume_training(
 
 /// Setup GPU device and queue.
 async fn setup_gpu() -> Result<(wgpu::Device, wgpu::Queue), TrainerError> {
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::all(),
-        ..Default::default()
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
     });
 
     let adapter = instance

@@ -19,7 +19,7 @@ image = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
-oxigaf-flame = { version = "0.1.0", path = "../oxigaf-flame" }
+oxigaf-flame = { version = "0.1.1", path = "../oxigaf-flame" }
 
 [dev-dependencies]
 proptest = { workspace = true }
@@ -44,6 +44,8 @@ flash_attention = []
 # Mixed-precision inference (FP16/BF16 for reduced memory usage)
 # Note: Implementation is planned - currently a placeholder
 mixed_precision = []
+# Enable NaN/Inf debug hooks (DebugConfig::default() sets enabled=true when active)
+gpu_debug = []
 # NOTE: Platform-specific GPU/BLAS backends (accelerate, metal, cuda) have been
 # removed from this crate. To enable them, configure candle-core directly:
 #   candle-core = { version = "0.9", features = ["accelerate"] }  # macOS BLAS

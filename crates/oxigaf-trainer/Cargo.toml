@@ -27,9 +27,9 @@ candle-core = { workspace = true }
 candle-nn = { workspace = true }
 safetensors = { workspace = true }
 
-oxigaf-flame = { version = "0.1.0", path = "../oxigaf-flame" }
-oxigaf-diffusion = { version = "0.1.0", path = "../oxigaf-diffusion" }
-oxigaf-render = { version = "0.1.0", path = "../oxigaf-render" }
+oxigaf-flame = { version = "0.1.1", path = "../oxigaf-flame" }
+oxigaf-diffusion = { version = "0.1.1", path = "../oxigaf-diffusion" }
+oxigaf-render = { version = "0.1.1", path = "../oxigaf-render" }
 
 [features]
 default = []

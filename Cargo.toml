@@ -11,7 +11,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/cool-japan/oxigaf"
@@ -19,18 +19,18 @@ authors = ["COOLJAPAN OU (Team Kitasan)"]
 
 [workspace.dependencies]
 # Linear Algebra
-nalgebra = "0.34"
-glam = "0.32"
+nalgebra = "0.35"
+glam = "0.33"
 
 # AI / Deep Learning (Pure Rust)
 # Note: default-features = false to avoid CUDA dependencies on macOS
-candle-core = { version = "0.9", default-features = false }
-candle-nn = { version = "0.9", default-features = false }
-candle-transformers = { version = "0.9", default-features = false }
-safetensors = "0.7"
+candle-core = { version = "0.10", default-features = false }
+candle-nn = { version = "0.10", default-features = false }
+candle-transformers = { version = "0.10", default-features = false }
+safetensors = "0.8"
 
 # GPU Graphics & Compute
-wgpu = "28"
+wgpu = "29"
 bytemuck = { version = "1", features = ["derive"] }
 
 # Image & Video
@@ -40,7 +40,7 @@ image = { version = "0.25", features = ["exr"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "1.0"
+toml = "1.1"
 anyhow = "1"
 thiserror = "2"
 tracing = "0.1"
@@ -48,7 +48,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-appender = "0.2"
 indicatif = "0.18"
 clap = { version = "4", features = ["derive", "env"] }
-clap_complete = "4.5"
+clap_complete = "4.6"
 
 # Numerical
 ndarray = "0.17"
@@ -56,12 +56,12 @@ ndarray-npy = "0.10"
 rand = "0.10"
 
 # Parallelism & Async
-rayon = "1.11"
+rayon = "1.12"
 pollster = "0.4"
 
 # Testing
 approx = "0.5"
-proptest = "1.10"
+proptest = "1.11"
 assert_cmd = "2"
 predicates = "3"
 criterion = { version = "0.8", features = ["html_reports"] }
@@ -70,21 +70,24 @@ tempfile = "3"
 
 # CLI UX
 owo-colors = "4"
-oxiarc-archive = "0.2.1"
+oxiarc-archive = "0.3.3"
 dirs = "6"
 crossterm = "0.29"
 
 # HuggingFace Hub Integration
-hf-hub = "0.4"
+hf-hub = "0.5"
 
 # Cryptography
-sha2 = "0.10"
+sha2 = "0.11"
 
 # Time & Date
 chrono = "0.4"
 
 # File patterns
 glob = "0.3"
+
+# Spatial data structures
+kiddo = "5"
 
 # Half-precision floating point
 half = "2.7"

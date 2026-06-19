@@ -42,7 +42,9 @@ use crate::density::DensityController;
 use crate::diffusion_target::{DiffusionTargetConfig, DiffusionTargetGenerator, SdsLoss};
 use crate::loss::{LossComputer, LossOutput};
 use crate::metrics::{self, MetricTracker};
+use crate::mixed_precision::{LossScaler, MixedPrecisionTrainer, TrainingPrecision};
 use crate::optimizer::{GaussianOptimizer, Gradients};
+use crate::profiler_integration::{TrainingPhase, TrainingProfiler};
 use crate::tensorboard::{LearningRates, TrainingMetricsLogger};
 use crate::TrainerError;
 
@@ -105,6 +107,12 @@ pub struct Trainer {
     // ---- TensorBoard logging ----
     /// TensorBoard metrics logger.
     pub tensorboard_logger: TrainingMetricsLogger,
+
+    // ---- Mixed precision / profiling ----
+    /// Mixed-precision trainer (loss scaler + precision mode).
+    pub mp_trainer: MixedPrecisionTrainer,
+    /// Per-phase training profiler.
+    pub profiler: TrainingProfiler,
 }
 
 impl Trainer {
@@ -166,12 +174,18 @@ impl Trainer {
         // Initialize TensorBoard logger
         let tensorboard_logger = TrainingMetricsLogger::new(config.tensorboard.clone())?;
 
+        // Initialize mixed-precision trainer and profiler
+        let mp_trainer = MixedPrecisionTrainer::new(config.precision);
+        let profiler = TrainingProfiler::new(config.enable_profiling);
+
         tracing::info!(
-            "Trainer created: {} Gaussians, {} total iterations, warmup={} iters, tensorboard={}",
+            "Trainer created: {} Gaussians, {} total iterations, warmup={} iters, tensorboard={}, precision={}, profiling={}",
             model.len(),
             config.total_iterations,
             diffusion_config.warmup_iterations,
             tensorboard_logger.is_enabled(),
+            mp_trainer.precision.label(),
+            profiler.is_enabled(),
         );
 
         Ok(Self {
@@ -189,6 +203,8 @@ impl Trainer {
             sds_loss,
             diffusion_config,
             tensorboard_logger,
+            mp_trainer,
+            profiler,
         })
     }
 
@@ -275,11 +291,17 @@ impl Trainer {
         // Initialize TensorBoard logger
         let tensorboard_logger = TrainingMetricsLogger::new(config.tensorboard.clone())?;
 
+        // Initialize mixed-precision trainer and profiler
+        let mp_trainer = MixedPrecisionTrainer::new(config.precision);
+        let profiler = TrainingProfiler::new(config.enable_profiling);
+
         tracing::info!(
-            "Trainer restored from checkpoint at iteration {iteration}, {} Gaussians, warmup={}, tensorboard={}",
+            "Trainer restored from checkpoint at iteration {iteration}, {} Gaussians, warmup={}, tensorboard={}, precision={}, profiling={}",
             model.len(),
             diffusion_config.warmup_iterations,
             tensorboard_logger.is_enabled(),
+            mp_trainer.precision.label(),
+            profiler.is_enabled(),
         );
 
         Ok(Self {
@@ -297,6 +319,8 @@ impl Trainer {
             sds_loss,
             diffusion_config,
             tensorboard_logger,
+            mp_trainer,
+            profiler,
         })
     }
 
@@ -369,14 +393,23 @@ impl Trainer {
         // 2. Sample random cameras.
         let cameras = self.sample_cameras();
 
-        // 3. Render current model from each camera.
+        // 3. Render current model from each camera  [Forward pass].
+        let t_fwd = std::time::Instant::now();
         let rendered = self.render_views(&cameras);
+        self.profiler
+            .record(TrainingPhase::Forward, t_fwd.elapsed().as_micros() as u64);
 
-        // 4. Generate diffusion targets (or fallback to rendered).
+        // 4. Generate diffusion targets (or fallback to rendered)  [DiffusionTarget].
+        let t_diff = std::time::Instant::now();
         let (targets, used_diffusion) =
             self.generate_diffusion_targets(&cameras, &rendered, iter)?;
+        self.profiler.record(
+            TrainingPhase::DiffusionTarget,
+            t_diff.elapsed().as_micros() as u64,
+        );
 
-        // 5. Compute photometric loss.
+        // 5. Compute photometric loss  [LossComputation].
+        let t_loss = std::time::Instant::now();
         let loss_output = self.loss_computer.compute(
             &rendered,
             &targets,
@@ -384,6 +417,10 @@ impl Trainer {
             self.raster_config.image_height as usize,
             &self.model,
             None, // Mesh not tracked by trainer; normal consistency loss will be 0.0
+        );
+        self.profiler.record(
+            TrainingPhase::LossComputation,
+            t_loss.elapsed().as_micros() as u64,
         );
 
         // 6. Compute SDS loss (only if using diffusion targets).
@@ -396,20 +433,79 @@ impl Trainer {
         // Combined total loss for gradient computation
         let _combined_total = loss_output.total + sds_loss_value;
 
-        // 7. Backward pass — GPU rasterizer backward.
+        // 7. Backward pass — GPU rasterizer backward  [Backward].
         // The gradients incorporate both photometric and SDS contributions
         // since targets already encode the diffusion guidance.
+        let t_bwd = std::time::Instant::now();
         let mut gradients = self.compute_gradients(&rendered, &targets);
+        self.profiler
+            .record(TrainingPhase::Backward, t_bwd.elapsed().as_micros() as u64);
 
-        // 8. Apply SDS gradient scaling if using diffusion.
+        // 8. Mixed-precision loss scaling: scale gradients before SDS/clip step.
+        // For Float16, this simulates the effect of having scaled the loss before
+        // the backward pass, enabling dynamic overflow detection.
+        if matches!(self.config.precision, TrainingPrecision::Float16) {
+            self.mp_trainer
+                .scaler
+                .scale_gradients(&mut gradients.position);
+            self.mp_trainer
+                .scaler
+                .scale_gradients(&mut gradients.rotation);
+            self.mp_trainer.scaler.scale_gradients(&mut gradients.scale);
+            self.mp_trainer
+                .scaler
+                .scale_gradients(&mut gradients.opacity);
+            self.mp_trainer.scaler.scale_gradients(&mut gradients.sh);
+            self.mp_trainer
+                .scaler
+                .scale_gradients(&mut gradients.offset);
+        }
+
+        // 9. Apply SDS gradient scaling if using diffusion (acts as gradient clip).
         if used_diffusion && sds_weight > 0.0 {
             self.apply_sds_gradient_scaling(&mut gradients, sds_weight, current_timestep);
         }
 
-        // 9. Optimiser step.
-        self.optimizer.step(&mut self.model, &gradients, iter);
+        // 10. Unscale gradients and check for overflow (Float16 only).
+        // Skips optimizer step on overflow and updates the loss scale adaptively.
+        let should_optimizer_step = if matches!(self.config.precision, TrainingPrecision::Float16) {
+            self.mp_trainer
+                .scaler
+                .unscale_gradients(&mut gradients.position);
+            self.mp_trainer
+                .scaler
+                .unscale_gradients(&mut gradients.rotation);
+            self.mp_trainer
+                .scaler
+                .unscale_gradients(&mut gradients.scale);
+            self.mp_trainer
+                .scaler
+                .unscale_gradients(&mut gradients.opacity);
+            self.mp_trainer.scaler.unscale_gradients(&mut gradients.sh);
+            self.mp_trainer
+                .scaler
+                .unscale_gradients(&mut gradients.offset);
+            let overflow = LossScaler::has_overflow(&gradients.position)
+                || LossScaler::has_overflow(&gradients.rotation)
+                || LossScaler::has_overflow(&gradients.scale)
+                || LossScaler::has_overflow(&gradients.opacity)
+                || LossScaler::has_overflow(&gradients.sh)
+                || LossScaler::has_overflow(&gradients.offset);
+            self.mp_trainer.scaler.update(overflow);
+            !overflow
+        } else {
+            true
+        };
 
-        // 10. Density control.
+        // 11. Optimiser step (skipped on FP16 gradient overflow)  [Optimize].
+        if should_optimizer_step {
+            let t_opt = std::time::Instant::now();
+            self.optimizer.step(&mut self.model, &gradients, iter);
+            self.profiler
+                .record(TrainingPhase::Optimize, t_opt.elapsed().as_micros() as u64);
+        }
+
+        // 12. Density control.
         self.density_controller.accumulate_gradients(&gradients);
 
         if self.should_densify(iter) {
@@ -420,7 +516,7 @@ impl Trainer {
                 .handle_densify(&result.keep_mask, result.num_added);
         }
 
-        // 11. Opacity reset.
+        // 13. Opacity reset.
         if iter > 0
             && self.config.opacity_reset_interval > 0
             && iter.is_multiple_of(self.config.opacity_reset_interval)
@@ -428,7 +524,7 @@ impl Trainer {
             DensityController::reset_opacity(&mut self.model, self.config.init.initial_opacity);
         }
 
-        // 12. Record metrics.
+        // 14. Record metrics.
         let psnr_val = if !rendered.is_empty() && !targets.is_empty() {
             metrics::psnr(&rendered[0], &targets[0])
         } else {
@@ -447,7 +543,7 @@ impl Trainer {
         self.metric_tracker
             .record(iter, psnr_val, ssim_val, loss_output.total + sds_loss_value);
 
-        // 13. TensorBoard logging.
+        // 15. TensorBoard logging.
         self.log_to_tensorboard(
             iter,
             &loss_output,
@@ -513,6 +609,14 @@ impl Trainer {
             &self.metric_tracker,
         );
         checkpoint::save_checkpoint(path, &data)
+    }
+
+    /// Return a formatted profiling report for all training phases.
+    ///
+    /// Shows per-phase timing statistics (count, total, mean, min, max, EMA).
+    /// Returns `"(profiler disabled)"` when profiling is not enabled.
+    pub fn profiler_report(&self) -> String {
+        self.profiler.format_report()
     }
 
     // -----------------------------------------------------------------------

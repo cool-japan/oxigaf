@@ -285,3 +285,119 @@ pub fn build_clip_encoder(
     let clip_config = ClipVisionConfig::default();
     ClipImageEncoder::new(vs, &clip_config, Some(config.cross_attention_dim))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // 1. Default config has valid image_size / patch_size (no panics, integer ratio)
+    #[test]
+    fn default_config_valid_ratio() {
+        let cfg = ClipVisionConfig::default();
+        assert!(cfg.image_size > 0);
+        assert!(cfg.patch_size > 0);
+        assert_eq!(
+            cfg.image_size % cfg.patch_size,
+            0,
+            "image_size must be divisible by patch_size"
+        );
+    }
+
+    // 2. num_patches for 224×224 with patch_size=14 → 256
+    #[test]
+    fn num_patches_224_14() {
+        let cfg = ClipVisionConfig {
+            image_size: 224,
+            patch_size: 14,
+            ..ClipVisionConfig::default()
+        };
+        assert_eq!(cfg.num_patches(), 256);
+    }
+
+    // 3. num_patches for 336×336 with patch_size=14 → 576
+    #[test]
+    fn num_patches_336_14() {
+        let cfg = ClipVisionConfig {
+            image_size: 336,
+            patch_size: 14,
+            ..ClipVisionConfig::default()
+        };
+        assert_eq!(cfg.num_patches(), 576);
+    }
+
+    // 4. embed_dim % num_heads == 0 for the default config
+    #[test]
+    fn default_embed_dim_divisible_by_num_heads() {
+        let cfg = ClipVisionConfig::default();
+        assert_eq!(
+            cfg.embed_dim % cfg.num_heads,
+            0,
+            "embed_dim must be divisible by num_heads"
+        );
+    }
+
+    // 5. Constructing via struct-update syntax does not panic
+    #[test]
+    fn struct_update_no_panic() {
+        let cfg = ClipVisionConfig {
+            image_size: 224,
+            patch_size: 14,
+            ..ClipVisionConfig::default()
+        };
+        // Simply confirming the values are as expected
+        assert_eq!(cfg.image_size, 224);
+        assert_eq!(cfg.patch_size, 14);
+    }
+
+    // 6. Sequence length = num_patches + 1 (CLS token) for the default config
+    #[test]
+    fn seq_len_default() {
+        let cfg = ClipVisionConfig::default();
+        // Default is 224/14 = 16, 16^2 = 256 patches, +1 CLS = 257
+        let seq_len = cfg.num_patches() + 1;
+        assert_eq!(seq_len, 257);
+    }
+
+    // 7. ViT-B/32: 224×224 with patch_size=32 → 49 patches
+    #[test]
+    fn num_patches_vit_b32() {
+        let cfg = ClipVisionConfig {
+            image_size: 224,
+            patch_size: 32,
+            embed_dim: 768,
+            num_heads: 12,
+            num_layers: 12,
+            intermediate_size: 3072,
+        };
+        // (224/32)^2 = 7^2 = 49
+        assert_eq!(cfg.num_patches(), 49);
+    }
+
+    // 8. Large image 504×504 with patch_size=14 → 36^2 = 1296
+    #[test]
+    fn num_patches_large_504() {
+        let cfg = ClipVisionConfig {
+            image_size: 504,
+            patch_size: 14,
+            ..ClipVisionConfig::default()
+        };
+        // 504/14 = 36, 36^2 = 1296
+        assert_eq!(cfg.num_patches(), 1296);
+    }
+
+    // Additional: head_dim is integer for default config
+    #[test]
+    fn head_dim_is_integer_default() {
+        let cfg = ClipVisionConfig::default();
+        let head_dim = cfg.embed_dim / cfg.num_heads;
+        // ViT-H/14: 1280/16 = 80
+        assert_eq!(head_dim, 80);
+    }
+
+    // Additional: default num_patches is 256
+    #[test]
+    fn default_num_patches_is_256() {
+        let cfg = ClipVisionConfig::default();
+        assert_eq!(cfg.num_patches(), 256);
+    }
+}

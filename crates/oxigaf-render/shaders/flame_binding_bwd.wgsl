@@ -1,6 +1,23 @@
 //! FLAME Binding Backward Pass
 //!
-//! Computes gradients w.r.t. local offsets given gradients w.r.t. Gaussian positions.
+//! Purpose
+//! ───────
+//! Computes gradients w.r.t. local Gaussian offsets and blend weights given
+//! gradients w.r.t. world-space Gaussian positions (from preprocess_bwd).
+//!
+//! Bindings
+//! ────────
+//! See struct declarations below. Inputs: world-space position gradients,
+//! blend weights, FLAME vertex transforms. Outputs: local offset gradients.
+//!
+//! Dispatch dimensions
+//! ───────────────────
+//! 1D: ceil(num_gaussians / 256) workgroups × 256 threads.
+//!
+//! Math
+//! ────
+//! Reverse of the forward FLAME binding: chain ∂L/∂pos_world through the
+//! blended rotation matrix to obtain ∂L/∂pos_local.
 //!
 //! Problem:
 //!   Gaussians are positioned via local offsets from FLAME mesh vertices:

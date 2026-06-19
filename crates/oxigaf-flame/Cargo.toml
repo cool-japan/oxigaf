@@ -39,7 +39,8 @@ serde_json = { workspace = true }
 safetensors = { workspace = true }
 bytemuck = { workspace = true }
 chrono = { workspace = true }
-lru = "0.16"
+lru = "0.18"
+kiddo = { workspace = true }
 # Optional parallel processing
 rayon = { workspace = true, optional = true }
 

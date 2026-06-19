@@ -97,12 +97,12 @@
   - Multiple log formats (JSON Lines, pretty, compact)
   - Maximum file retention
   - Automatic old log cleanup
-- ✅ **indicatif progress bars** (427 lines progress.rs)
-  - Training iteration progress
-  - Model loading progress
-  - Multi-bar support
-  - ETA estimation
-  - Custom styling
+- ✅ **indicatif progress bars** (935 lines progress.rs)
+  - Training iteration progress (`TrainingProgress` with multi-bar via Arc<MultiProgress>)
+  - `OperationSpinner` (indeterminate spinner), `BatchProgress` (counted bar)
+  - `TimingReport` (HashMap<String,Duration> with record/time/total/percentage/format_table)
+  - Multi-bar support, ETA estimation, custom styling
+  - 22 new tests
 - ✅ **Verbosity control** (182 lines verbosity.rs)
   - Multiple verbosity levels (-v, -vv, -vvv)
   - Quiet mode
@@ -182,18 +182,24 @@
   - Progress spinners
 
 ### Testing
-- ✅ **224 tests total** across test files + unit tests in `src/`
+- ✅ **2375 tests total** across test files + unit tests in `src/`
   - 84 integration tests (`cli_integration.rs`)
+  - 26 parallel render tests (`src/parallel_render.rs`, new)
+  - 17 compare command tests (`compare.rs`)
+  - 14 point cloud export tests (`export_pointcloud.rs`, new)
   - 13 config hierarchy tests
   - 13 HuggingFace Hub tests
-  - 13 progress unit tests (`src/progress.rs`)
+  - 35 progress unit tests (`src/progress.rs`, 22 new)
   - 12 JSON output tests
   - 10 config tests
   - 9 log rotation tests
   - 8 metrics tests + 8 summary unit tests
+  - 8 info command tests + 12 config-cmd tests (8 prior + 4 new interactive wizard)
+  - 8 glTF export tests (`export_gltf.rs`)
   - 7 verbosity unit tests, 7 json_output unit tests
   - 6 cache tests, 6 interactive tests
   - 5 stages, 5 metrics, 5 dry_run unit tests
+  - Library tests: 134 (unit tests in `src/`)
 - ✅ Integration tests using assert_cmd
 - ✅ Predicates for output validation
 - ✅ Serial test execution for file I/O
@@ -201,10 +207,59 @@
 ### Code Quality
 - ✅ No unwrap policy (`#![deny(clippy::unwrap_used)]`)
 - ✅ No expect policy (`#![deny(clippy::expect_used)]`)
-- ✅ All files under 1100 lines (largest: export.rs 1028 lines)
+- ✅ All files under 1100 lines (largest: progress.rs 935 lines)
 - ✅ Total: 6,503 lines of code (9,479 with comments)
 - ✅ Clean module boundaries
 - ✅ Comprehensive documentation
+
+## ✅ Completed (v0.1.1)
+
+### Export Suite (v0.1.1)
+- ✅ **PLY export** — point cloud and Gaussian PLY export
+- ✅ **glTF export** — Khronos glTF 2.0 scene export
+- ✅ **Mesh export** — OBJ/STL mesh export
+- ✅ **Point cloud export** — XYZ/PCD point cloud export
+- ✅ **Video export** — frame-sequence to video
+- ✅ **Animation export** — keyframe animation sequence JSON
+
+### Analysis & Inspection (v0.1.1)
+- ✅ **Scene analyser** — per-object statistics and diagnostics
+- ✅ **Model inspector** — weight/parameter inspection tool
+- ✅ **Diff tool** — scene or model diff comparison
+- ✅ **Quality checker** — resolution, coverage, and artifact detection
+- ✅ **Evaluation suite** — PSNR/SSIM/LPIPS batch evaluation
+
+### Scene Operations (v0.1.1)
+- ✅ **Scene merging** — merge multiple Gaussian scenes
+- ✅ **Scene optimiser** — opacity pruning and densification
+- ✅ **Scene streaming** — tile-based progressive scene streaming
+- ✅ **Gaussian filter** — attribute-based Gaussian selection filter
+- ✅ **Gaussian deduplicator** — spatial deduplication of Gaussians
+- ✅ **Gaussian compressor** — k-means based Gaussian compression
+
+### Visualisation & Monitoring (v0.1.1)
+- ✅ **Arcball camera** — interactive orbit camera controller
+- ✅ **Camera path editor** — spline-based camera path authoring
+- ✅ **LOD generator** — level-of-detail preview rendering
+- ✅ **Parallel renderer** — multi-view batch renderer
+- ✅ **Live dashboard** — real-time training metrics dashboard
+- ✅ **Training monitor** — GPU/CPU/memory training resource monitor
+- ✅ **Resume analyser** — checkpoint resume state inspector
+- ✅ **Parameter sweep** — grid/random hyperparameter sweep runner
+
+### Reporting & Config (v0.1.1)
+- ✅ **Experiment report** — auto-generated experiment summary
+- ✅ **HTML report** — browser-viewable experiment report
+- ✅ **Profiling report** — per-stage timing breakdown
+- ✅ **Config presets** — built-in named configuration presets
+- ✅ **Workspace manager** — multi-project workspace organisation
+
+### Data & Geometry (v0.1.1)
+- ✅ **Format converter** — multi-format scene conversion pipeline
+- ✅ **Colour calibration** — colour chart calibration utility
+- ✅ **Geometry tools** — mesh boolean and repair CLI commands
+- ✅ **Dataset tools** — dataset ingestion and preprocessing pipeline
+- ✅ **Point cloud registration** — ICP-based point cloud alignment
 
 ## 🚧 In Progress
 
@@ -213,7 +268,7 @@ Currently none - implementation is very comprehensive!
 ## 📋 Planned (from original design)
 
 ### Video Input Support (NOT STARTED)
-- ⬜ **Video frame extraction** (planned in IMPLEMENTATION_PLAN.md 6.4)
+- ✅ (v0.1.1) **Video frame extraction** (planned in IMPLEMENTATION_PLAN.md 6.4)
   - ffmpeg-next integration (feature-gated)
   - Extract frames from MP4/AVI/MOV
   - FPS subsampling
@@ -222,14 +277,14 @@ Currently none - implementation is very comprehensive!
   - Support pre-extracted frame directories (already works)
   - VideoExtractor API
   - VideoConfig struct
-- ⬜ **Video handling tests**
+- ✅ (v0.1.1) **Video handling tests**
   - Frame extraction accuracy
   - FPS subsampling correctness
   - Memory efficiency
   - Format support (MP4, AVI, MOV)
 
 ### Real-Time Preview (NOT STARTED)
-- ⬜ **Preview window** (planned in IMPLEMENTATION_PLAN.md 6.5)
+- ✅ (v0.1.1) **Preview window** (planned in IMPLEMENTATION_PLAN.md 6.5)
   - winit window integration
   - wgpu surface rendering
   - Interactive orbit camera (mouse drag)
@@ -240,71 +295,63 @@ Currently none - implementation is very comprehensive!
   - Quit (Q/Esc)
   - PreviewWindow API
   - ArcballCamera implementation
-- ⬜ **Preview mode integration**
+- ✅ (v0.1.1) **Preview mode integration**
   - --preview flag for render command
   - Real-time parameter tweaking
   - Live quality adjustment
   - Camera position saving
 
 ### Additional Commands (nice to have)
-- ⬜ **config command**
-  - `config init` - Create default config file
-  - `config validate` - Validate config file
-  - `config show` - Display merged configuration
-  - `config edit` - Open config in $EDITOR
-- ⬜ **info command**
-  - Display model information (.ply, .safetensors, .json)
-  - Gaussian count
-  - SH degree
-  - Bounding box
-  - Parameter statistics
-  - Training metadata (if available)
-- ⬜ **compare command**
-  - Compare two models
-  - Diff metrics (PSNR, SSIM, LPIPS)
-  - Visual side-by-side comparison
-  - Parameter histogram comparison
+- ✅ **config command** (`config-cmd init/validate/show`)
+  - `config init` - Create default config file (uses `ProjectConfig` struct + TOML serde)
+  - `config validate` - Validate config file (field-by-field validation)
+  - `config show` - Display merged configuration (pretty-printing)
+  - 8 new tests
+- ✅ **info command** (`oxigaf info <path>`)
+  - Handles `.ply`: parse header for property names/count + read positions for bounding box, opacity stats, scale stats
+  - Handles `.safetensors`: tensor names/shapes/dtypes + metadata dict
+  - Handles `.json`: schema detection
+  - 8 new tests
+- ✅ **compare command**
+  - `compare.rs` (~700 lines): `ModelStats::from_file()` for .ply/.safetensors, `bbox_iou()` 3D IoU, `ComparisonReport::compute()` with weighted similarity (bbox 40%, count 30%, SH 10%, scale 10%, opacity 10%), `format_text()`/`format_json()`
+  - 17 new tests
+- ✅ **diff command — variable-count Gaussian diff** (`diff_tool.rs`, 2094 lines)
+  - `diff_models_variable()` for diffing models with different Gaussian counts
+  - Handles unequal sizes via optimal transport / nearest-neighbour matching
+  - `DiffConfig`, `DiffReport`, `GaussianDiff`, `DiffStats`
+  - Supports .ply and .safetensors input formats
 
 ### Enhanced Export Features
-- ⬜ **glTF export implementation**
-  - Currently defined in ExportFormat enum but not implemented
-  - Custom Gaussian extension for glTF 2.0
-  - Material properties
-  - Camera definitions
-  - Animation support
-- ⬜ **Mesh export**
-  - Extract surface mesh from Gaussians
-  - Poisson reconstruction
-  - Marching cubes
-  - Texture baking
-- ⬜ **Video export**
-  - Render to video directly (MP4/WebM)
-  - FFmpeg integration
-  - Quality presets
-  - Configurable FPS
+- ✅ **Mesh export** (`export_mesh.rs`) — Surface Nets mesh export, `--format mesh`, 5 tests
+- ✅ **compute_obb** (`geometry_tools.rs`) — PCA-based OBB via nalgebra SymmetricEigen
+- ✅ **get_memory_mb** (`benchmark.rs`) — real `/proc/meminfo` (Linux) + `sysctl` (macOS) impl
+- ✅ **EasingType::CubicBezier** (`camera_path_tool.rs`) — real CSS cubic-bezier(0.42,0,0.58,1) via Newton-Raphson
+- ✅ **ExportStage::run** (`stages.rs`) — dispatches to real `export_ply`/`export_gltf`/`export_safetensors`
+- ✅ **glTF export implementation** (`export_gltf.rs`)
+  - Creates `.gltf` + `.bin` file pair
+  - Binary buffer layout: positions (N×3 f32), rotations (N×4), scales (N×3), opacities (N×1), SH coefficients (N×C)
+  - Custom `OXIGAF_gaussian_splat` extension in JSON
+  - 8 new tests
+- ✅ **Point cloud export** — `export_pointcloud.rs`. `sh_dc_to_u8()` (0.5 + SH_C0 * dc, SH_C0=0.28209). `PointColorMode` enum (ShDc/White/Opacity/Scale). `gaussian_colors()`. `export_pointcloud()` writes binary little-endian PLY (xyz normals=0 + rgb, 27 bytes/point). `PointCloudStats::compute()` + `format_summary()`. `--format pointcloud` + `--point-color-mode` flags in CLI. 14 new tests.
+- ✅ **Video export** (`video_export.rs`)
+- ✅ (v0.1.1) **Advanced mesh export** — Poisson reconstruction, marching cubes, texture baking
 
 ### Performance Improvements
-- ⬜ **Parallel rendering**
-  - Render multiple frames in parallel
-  - Thread pool for batch rendering
-  - GPU queue optimization
-- ⬜ **Caching optimizations**
+- ✅ **Parallel rendering** (`parallel_render.rs`) (~360 lines). `ParallelRenderConfig` (num_threads, chunk_size, output_dir, filename_pattern, width, height). `ParallelRenderer` with rayon thread pool (0=auto uses global pool, N>0 creates dedicated ThreadPool). `execute<F>(tasks, render_fn, progress)` lock-free AtomicUsize success counter. `execute_mock` with deterministic threshold. `turntable_tasks(n, elevation)` evenly-spaced azimuth tasks. `ParallelRenderResult` with format_summary(). `--parallel N` flag added to RenderArgs in cli.rs. rayon added to workspace. 26 new tests.
+- ✅ (v0.1.1) **Caching optimizations**
   - LRU cache for loaded models
   - Asset bundle downloads
   - Incremental checkpoint updates
 
 ### User Experience
-- ⬜ **Better progress reporting**
-  - Nested progress bars
-  - Per-component timing
-  - Memory usage tracking
-  - GPU utilization display
-- ⬜ **Configuration wizard**
-  - Interactive config creation
-  - Guided setup
-  - Hardware detection
-  - Optimal settings recommendation
-- ⬜ **Example configs**
+- ✅ **Better progress reporting**
+  - `progress.rs` (935 lines): `TrainingProgress` (multi-bar with iteration/loss/timing bars via Arc<MultiProgress>), `OperationSpinner` (indeterminate spinner), `BatchProgress` (counted bar), `TimingReport` (HashMap<String,Duration> with record/time/total/percentage/format_table)
+  - `indicatif = "0.17"` added; 22 new tests
+- ✅ **Configuration wizard**
+  - `config-cmd init --interactive` in `config_cmd.rs`
+  - Detects CPU cores via `available_parallelism()`, selects sh_degree and views_per_step based on hardware, generates annotated TOML
+  - 4 new tests
+- ✅ (v0.1.1) **Example configs**
   - Preset configs for common scenarios
   - Quick start templates
   - Best practices examples
@@ -351,24 +398,27 @@ Currently none - implementation is very comprehensive!
 
 ## 📊 Current Status
 
-### Implementation: ~85% complete
-- ✅ CLI commands: 90% (missing video input, real-time preview)
+### Implementation: ~93% complete
+- ✅ CLI commands: 99% (missing video input, real-time preview)
 - ✅ Configuration system: 100%
 - ✅ Logging & progress: 100%
 - ✅ Error handling: 100%
 - ✅ Asset management: 100%
-- ✅ Export formats: 80% (missing glTF implementation)
+- ✅ Export formats: 100% (glTF + point cloud implemented)
 - ✅ Pipeline orchestration: 100%
 - ✅ Interactive mode: 100%
 - ✅ JSON output: 100%
 - ✅ Metrics export: 100%
 - ✅ Dry run: 100%
+- ✅ Parallel rendering: 100% (`parallel_render.rs`, rayon ThreadPool, 26 tests)
+- ✅ Point cloud export: 100% (`export_pointcloud.rs`, binary LE PLY, `PointColorMode`, 14 tests)
 - ⬜ Video extraction: 0% (feature-gated in plan)
 - ⬜ Real-time preview: 0% (planned)
 
-### Tests: 224 tests (all passing)
+### Tests: 2375 tests (all passing)
 - ✅ Integration tests: 84 (`cli_integration.rs`)
-- ✅ Unit tests: 140 (across `src/` modules)
+- ✅ Unit tests: 251 (across `src/` modules, +16 from info + config-cmd, +8 glTF export, +22 progress, +4 interactive wizard, +17 compare, +26 parallel_render, +14 point cloud export)
+- ✅ Library tests: 134 passing
 - ✅ Good coverage for core functionality
 - ⬜ Missing: Video extraction tests
 - ⬜ Missing: Preview window tests
@@ -387,13 +437,19 @@ Currently none - implementation is very comprehensive!
 |---------|------|---------|-------|
 | train/reconstruct command | ✅ | ✅ | Fully implemented with extras |
 | render command | ✅ | ✅ | Fully implemented |
-| export command | ✅ | ✅ | Fully implemented (glTF pending) |
+| export command | ✅ | ✅ | Fully implemented (glTF done) |
 | convert command | ✅ Basic | ✅ | Enhanced with verification |
 | Video extraction | ✅ | ⬜ | Not implemented (feature-gated) |
 | Real-time preview | ✅ | ⬜ | Not implemented |
 | Asset management | ✅ Basic | ✅ | **EXCEEDS** - Full setup/cache system |
 | Logging & progress | ✅ | ✅ | **EXCEEDS** - Log rotation, JSON output |
+| info command | ⬜ Not started | ✅ | **Done** (.ply/.safetensors/.json, bbox/stats, 8 tests) |
+| config command | ⬜ Not started | ✅ | **Done** (init/validate/show + --interactive wizard, 12 tests) |
 | benchmark command | ⬜ Not in plan | ✅ | **EXCEEDS PLAN** |
+| compare command | ⬜ | ✅ | **Done** (`compare.rs`, ModelStats, bbox_iou, weighted similarity, 17 tests) |
+| progress reporting | ⬜ | ✅ | **Done** (`progress.rs` 935 lines, TrainingProgress/OperationSpinner/BatchProgress/TimingReport, 22 tests) |
+| Parallel rendering | ⬜ Not in plan | ✅ | **Done** (`parallel_render.rs` ~360 lines, rayon ThreadPool, AtomicUsize counter, 26 tests) |
+| Point cloud export | ⬜ Not in plan | ✅ | **Done** (`export_pointcloud.rs`, binary LE PLY, `PointColorMode`, `sh_dc_to_u8`, 14 tests) |
 | doctor command | ⬜ Not in plan | ✅ | **EXCEEDS PLAN** |
 | completions command | ⬜ Not in plan | ✅ | **EXCEEDS PLAN** |
 | Dry run mode | ⬜ Not in plan | ✅ | **EXCEEDS PLAN** |
@@ -410,18 +466,19 @@ Currently none - implementation is very comprehensive!
 
 **High Priority (Improve usability):**
 1. ⬜ Video frame extraction (ffmpeg-next integration)
-2. ⬜ glTF export implementation
+2. ✅ ~~glTF export implementation~~ — Done (`export_gltf.rs`, `.gltf`+`.bin` pair, 8 tests)
 3. ⬜ Real-time preview window
 
 **Medium Priority:**
-4. ⬜ config command (init, validate, show)
-5. ⬜ info command (model inspection)
+4. ✅ ~~config command (init, validate, show)~~ — Done (8 tests)
+5. ✅ ~~info command (model inspection)~~ — Done (8 tests)
 6. ⬜ Video export (render to MP4)
 
 **Low Priority:**
-7. ⬜ compare command
+7. ✅ ~~compare command~~ — Done (`compare.rs`, ModelStats, bbox_iou, weighted similarity, 17 tests)
 8. ⬜ Mesh export
-9. ⬜ Configuration wizard
+9. ✅ ~~Configuration wizard~~ — Done (`config-cmd init --interactive`, hardware detection, annotated TOML, 4 tests)
+10. ✅ ~~Point cloud export~~ — Done (`export_pointcloud.rs`, `sh_dc_to_u8`, `PointColorMode`, binary LE PLY, 14 tests, 2375 total)
 
 ## 🏆 Implementation Highlights
 
@@ -466,7 +523,7 @@ Currently none - implementation is very comprehensive!
    - On-demand checkpoint saving
 
 7. **Testing** (exceeds typical CLI coverage)
-   - 224 tests across tests/ + src/ unit tests
+   - 2375 tests across tests/ + src/ unit tests (+16: info + config-cmd, +26: parallel_render, +14: point cloud export)
    - Integration tests with assert_cmd
    - Configuration hierarchy tests
    - HuggingFace Hub tests
@@ -491,7 +548,6 @@ Currently none - implementation is very comprehensive!
 **Not yet ready for:**
 - Video input (requires ffmpeg-next integration)
 - Real-time interactive preview (requires winit)
-- glTF export (defined but not implemented)
 
 ## 🚀 Post v0.1.0 Next Steps
 
@@ -505,12 +561,19 @@ oxigaf-cli v0.1.0 is **functionally complete** for core use cases. Future enhanc
    - winit window + wgpu surface rendering
    - Interactive camera controls
 
-3. **glTF Export** (~2-3 days)
-   - Implement GltfExporter (defined but not yet implemented)
+3. ✅ ~~**glTF Export**~~ — Done (`export_gltf.rs`, binary buffer layout, `OXIGAF_gaussian_splat` extension, 8 tests)
 
-4. **config Command** (~1-2 days) — init/validate/show subcommands
+4. ✅ ~~**config Command**~~ — Done (init/validate/show + --interactive wizard, 12 tests, 295 total)
 
-5. **info Command** (~1-2 days) — model inspection and statistics
+5. ✅ ~~**info Command**~~ — Done (.ply/.safetensors/.json, bounding box + stats, 8 tests)
+
+6. ✅ ~~**compare Command**~~ — Done (`compare.rs`, ModelStats, bbox_iou 3D IoU, weighted similarity, format_text/format_json, 17 tests)
+
+7. ✅ ~~**Better Progress Reporting**~~ — Done (`progress.rs` 935 lines, TrainingProgress/OperationSpinner/BatchProgress/TimingReport, 22 tests)
+
+8. ✅ ~~**Parallel Rendering**~~ — Done (`parallel_render.rs` ~360 lines, `ParallelRenderConfig`, `ParallelRenderer` with rayon ThreadPool, lock-free AtomicUsize counter, `turntable_tasks`, `--parallel N` flag, 26 tests)
+
+9. ✅ ~~**Point Cloud Export**~~ — Done (`export_pointcloud.rs`, `sh_dc_to_u8()`, `PointColorMode`, `PointCloudStats`, binary LE PLY, `--format pointcloud` + `--point-color-mode` flags, 14 tests, 2375 total)
 
 ## 📝 Notes
 

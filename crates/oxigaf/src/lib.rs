@@ -200,6 +200,8 @@
 
 use thiserror::Error;
 
+mod pipeline;
+
 /// FLAME parametric head model.
 ///
 /// Provides FLAME model loading, forward pass (LBS), mesh utilities,
@@ -261,6 +263,97 @@ pub enum OxigafError {
     /// Error from the training pipeline.
     #[error("Trainer error: {0}")]
     Trainer(#[from] trainer::TrainerError),
+
+    /// Invalid configuration value or combination.
+    #[error("invalid configuration: {0}")]
+    InvalidConfig(String),
+
+    /// A required path does not exist.
+    #[error("path not found: {0}")]
+    PathNotFound(String),
+
+    /// GPU / wgpu adapter error.
+    #[error("GPU error: {0}")]
+    GpuError(String),
+
+    /// I/O error.
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+
+    /// The pipeline or component has not been initialized.
+    #[error("not initialized")]
+    NotInitialized,
+
+    /// Error with an added contextual message wrapping another error.
+    ///
+    /// Created by [`ErrorContext::with_ctx`] / [`ErrorContext::with_ctx_fn`].
+    #[error("{context}: {source}")]
+    Context {
+        /// Human-readable description of what was being attempted.
+        context: String,
+        /// The underlying error that occurred.
+        #[source]
+        source: Box<OxigafError>,
+    },
+}
+
+pub use pipeline::{
+    check_gpu, detect_best_backend, export, quick_train, render_from_file, validate_config,
+    verify_assets, ExportFormat, GpuInfo, PipelineBuilder, PipelineConfig,
+};
+
+// ============================================================================
+// Error Extension Trait
+// ============================================================================
+
+/// Extension trait for adding contextual messages to `Result` values.
+///
+/// Wraps an inner [`OxigafError`] with a human-readable context string,
+/// which is included in the [`Display`](std::fmt::Display) output of the
+/// resulting error.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use oxigaf::prelude::*;
+///
+/// fn load() -> oxigaf::Result<()> {
+///     std::fs::read("missing.bin")
+///         .map_err(|e| OxigafError::Io(e))
+///         .with_ctx("loading FLAME model weights")?;
+///     Ok(())
+/// }
+/// ```
+pub trait ErrorContext<T> {
+    /// Wrap an `Err` value with a static context string.
+    ///
+    /// Returns `Ok(value)` unchanged on success; on error wraps the inner
+    /// [`OxigafError`] with `OxigafError::Context { context, source }`.
+    fn with_ctx(self, ctx: impl Into<String>) -> std::result::Result<T, OxigafError>;
+
+    /// Wrap an `Err` value using a lazily-evaluated closure.
+    ///
+    /// The closure `f` is **only called on error**, avoiding any allocation
+    /// cost on the success path.
+    fn with_ctx_fn<F: FnOnce() -> String>(self, f: F) -> std::result::Result<T, OxigafError>;
+}
+
+impl<T> ErrorContext<T> for std::result::Result<T, OxigafError> {
+    #[inline]
+    fn with_ctx(self, ctx: impl Into<String>) -> std::result::Result<T, OxigafError> {
+        self.map_err(|e| OxigafError::Context {
+            context: ctx.into(),
+            source: Box::new(e),
+        })
+    }
+
+    #[inline]
+    fn with_ctx_fn<F: FnOnce() -> String>(self, f: F) -> std::result::Result<T, OxigafError> {
+        self.map_err(|e| OxigafError::Context {
+            context: f(),
+            source: Box::new(e),
+        })
+    }
 }
 
 /// A specialized `Result` type for OxiGAF operations.
@@ -280,6 +373,18 @@ pub enum OxigafError {
 /// }
 /// ```
 pub type Result<T> = std::result::Result<T, OxigafError>;
+
+/// Convenience `Result` alias for FLAME-related operations.
+pub type FlameResult<T> = std::result::Result<T, OxigafError>;
+
+/// Convenience `Result` alias for diffusion-pipeline operations.
+pub type DiffusionResult<T> = std::result::Result<T, OxigafError>;
+
+/// Convenience `Result` alias for rasterizer/rendering operations.
+pub type RenderResult<T> = std::result::Result<T, OxigafError>;
+
+/// Convenience `Result` alias for CLI operations.
+pub type CliResult<T> = std::result::Result<T, OxigafError>;
 
 /// Returns the crate version string.
 ///
@@ -377,7 +482,10 @@ pub mod prelude {
     };
 
     // ---- Unified types ----
-    pub use super::{OxigafError, Result};
+    pub use super::{
+        check_gpu, detect_best_backend, export, quick_train, render_from_file, validate_config,
+        verify_assets, ExportFormat, GpuInfo, OxigafError, PipelineBuilder, PipelineConfig, Result,
+    };
 }
 
 #[cfg(test)]
@@ -441,5 +549,95 @@ mod tests {
             Ok(42)
         }
         assert_eq!(example_fn().ok(), Some(42));
+    }
+
+    // --- ErrorContext tests ---
+
+    #[test]
+    fn test_with_ctx_ok_passthrough() {
+        let r: std::result::Result<i32, OxigafError> = Ok(42);
+        let result = r.with_ctx("context should not appear");
+        assert_eq!(result.ok(), Some(42));
+    }
+
+    #[test]
+    fn test_with_ctx_err_wraps() {
+        let r: std::result::Result<i32, OxigafError> = Err(OxigafError::NotInitialized);
+        let result = r.with_ctx("loading model");
+        assert!(matches!(result, Err(OxigafError::Context { .. })));
+    }
+
+    #[test]
+    fn test_context_display_contains_context_string() {
+        let r: std::result::Result<i32, OxigafError> = Err(OxigafError::NotInitialized);
+        let result = r.with_ctx("rasterizer setup");
+        assert!(result.is_err());
+        if let Err(err) = result {
+            let display = format!("{err}");
+            assert!(
+                display.contains("rasterizer setup"),
+                "display was: {display}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_with_ctx_fn_not_called_on_ok() {
+        let r: std::result::Result<i32, OxigafError> = Ok(99);
+        let mut called = false;
+        let result = r.with_ctx_fn(|| {
+            called = true;
+            "should not be called".to_string()
+        });
+        assert!(!called, "closure must not be called on Ok");
+        assert_eq!(result.ok(), Some(99));
+    }
+
+    #[test]
+    fn test_with_ctx_fn_called_on_err() {
+        let r: std::result::Result<i32, OxigafError> = Err(OxigafError::NotInitialized);
+        let mut called = false;
+        let _ = r.with_ctx_fn(|| {
+            called = true;
+            "lazy context".to_string()
+        });
+        assert!(called, "closure must be called on Err");
+    }
+
+    #[test]
+    fn test_flame_result_alias() {
+        let _r: FlameResult<i32> = Ok(1);
+        let _r2: FlameResult<i32> = Err(OxigafError::NotInitialized);
+    }
+
+    #[test]
+    fn test_diffusion_result_alias() {
+        let _r: DiffusionResult<i32> = Ok(1);
+    }
+
+    #[test]
+    fn test_render_result_alias() {
+        let _r: RenderResult<i32> = Ok(1);
+    }
+
+    #[test]
+    fn test_cli_result_alias() {
+        let _r: CliResult<i32> = Ok(1);
+    }
+
+    #[test]
+    fn test_nested_context_display_contains_both_messages() {
+        let inner: std::result::Result<i32, OxigafError> = Err(OxigafError::NotInitialized);
+        let once_wrapped = inner.with_ctx("inner context");
+        assert!(once_wrapped.is_err());
+        if let Err(inner_err) = once_wrapped {
+            let twice_wrapped = Err::<i32, OxigafError>(inner_err).with_ctx("outer context");
+            assert!(twice_wrapped.is_err());
+            if let Err(outer_err) = twice_wrapped {
+                let display = format!("{outer_err}");
+                assert!(display.contains("outer context"), "display was: {display}");
+                assert!(display.contains("inner context"), "display was: {display}");
+            }
+        }
     }
 }

@@ -137,9 +137,9 @@ pub fn check_gpu() -> Result<()> {
     output::info("Would verify GPU availability");
 
     // In dry-run mode, we perform a lightweight check
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::all(),
-        ..Default::default()
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
     });
 
     let adapter_result =

@@ -19,11 +19,17 @@ mod assets;
 mod benchmark;
 mod cache;
 mod cli;
+mod compare;
 mod config;
+mod config_cmd;
 mod convert;
 mod dry_run;
 mod error;
 mod export;
+mod export_gltf;
+mod export_mesh;
+mod export_pointcloud;
+mod info;
 mod interactive;
 mod json_output;
 mod log_rotation;
@@ -48,6 +54,38 @@ use indicatif::{ProgressBar, ProgressStyle};
 use cli::{CacheCommands, Cli, Command, ExportFormat, ImageFormat, RenderMode};
 use error::{CliError, EXIT_SUCCESS};
 use verbosity::Verbosity;
+
+// ---------------------------------------------------------------------------
+// Memory tracking
+// ---------------------------------------------------------------------------
+
+/// Return the current process peak RSS in megabytes, if the platform exposes it
+/// via a supported interface without requiring external crates.
+///
+/// On Linux this parses `/proc/self/status` (field `VmPeak`).
+/// On macOS and all other platforms this returns `None`.
+fn peak_rss_mb() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        for line in status.lines() {
+            // VmHWM is the high-water mark of resident set size (physical memory peak).
+            // VmPeak would be virtual address space — much larger and less meaningful.
+            if let Some(rest) = line.strip_prefix("VmHWM:") {
+                // Format: "VmHWM:  1234 kB"
+                let trimmed = rest.trim();
+                let kb_str = trimmed.split_whitespace().next()?;
+                let kb: u64 = kb_str.parse().ok()?;
+                return Some(kb / 1024);
+            }
+        }
+        None
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Logging initialization
@@ -132,6 +170,9 @@ async fn main() -> ExitCode {
         Command::Doctor(args) => cmd_doctor(args, verbosity, json_mode),
         Command::Setup(args) => cmd_setup(args, verbosity, json_mode),
         Command::Cache { command } => cmd_cache(command, verbosity, json_mode),
+        Command::Info(args) => info::run_info(args),
+        Command::Compare(args) => compare::run_compare(args),
+        Command::ConfigCmd { command } => config_cmd::run_config_cmd(command),
         Command::Completions { shell } => cmd_completions(shell),
     };
 
@@ -337,7 +378,7 @@ fn cmd_train(
             checkpoint_path: Some(checkpoint_path.display().to_string()),
             ply_path: Some(ply_path.display().to_string()),
             preview_dir: preview_dir.map(|p| p.display().to_string()),
-            peak_memory_mb: None, // TODO: Track memory usage
+            peak_memory_mb: peak_rss_mb(),
         };
 
         training_summary.print();
@@ -631,16 +672,29 @@ fn cmd_export(
             "safetensors"
         }
         ExportFormat::Gltf => {
-            export::export_gltf(&model, &args.output, args.include_metadata)?;
-            if args.include_metadata {
-                "glTF 2.0 (with metadata)"
-            } else {
-                "glTF 2.0"
-            }
+            // Use the new .gltf + .bin file-pair exporter (OXIGAF_gaussian_splat extension).
+            export_gltf::export_gltf(&model, &args.output).map_err(anyhow::Error::from)?;
+            "glTF 2.0"
         }
         ExportFormat::Json => {
             export::export_json_checkpoint(&model, &args.output)?;
             "JSON checkpoint"
+        }
+        ExportFormat::PointCloud => {
+            export_pointcloud::export_pointcloud(&model, &args.output, args.point_color_mode)
+                .map_err(anyhow::Error::from)?;
+            "point cloud PLY"
+        }
+        ExportFormat::Mesh => {
+            let mesh_cfg = export_mesh::MeshExportConfig {
+                resolution: args.mesh_resolution,
+                iso: args.mesh_iso,
+                padding: args.mesh_padding,
+                opacity_cutoff: 0.01,
+            };
+            export_mesh::export_mesh(&model, &args.output, &mesh_cfg)
+                .map_err(anyhow::Error::from)?;
+            "surface mesh PLY"
         }
     };
 
@@ -861,9 +915,9 @@ fn cmd_doctor(args: cli::DoctorArgs, verbosity: Verbosity, json_mode: bool) -> R
 
 /// Check GPU availability via wgpu.
 fn check_gpu() -> Result<String> {
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::all(),
-        ..Default::default()
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
     });
 
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {

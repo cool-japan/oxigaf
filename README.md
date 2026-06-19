@@ -4,30 +4,42 @@
 
 Implements the methods from [GAF: Gaussian Avatar Reconstruction from Monocular Videos via Multi-View Diffusion](https://arxiv.org/abs/2412.10209) entirely in the Rust ecosystem.
 
-## What's in v0.1.0
+## What's in v0.1.1
 
-### 512×512 Multi-View Generation
+### 512×512 Multi-View Generation (v0.1.0)
 - **Latent Upsampler**: 32×32 → 64×64 latent upsampling for 512×512 output resolution
 - **IP-Adapter**: Identity-preserving image conditioning for consistent face/object generation
 - **Classifier-Free Guidance**: Quality improvement with configurable guidance scale (1.0-20.0)
 - **Multi-view UNet**: Cross-view attention for geometric consistency across views
 - **Camera Conditioning**: Explicit camera pose embeddings for view-aware generation
 
-### Gradient Verification & Training
-- **Comprehensive Test Suite**: 35 gradient verification tests with <1e-3 relative error
-- **CPU Reference Rasterizer**: Pure Rust baseline for gradient validation
-- **FLAME Binding Backward Pass**: Train Gaussians bound to mesh vertices with TBN projection
-- **Verified Correctness**: Numerical and analytical gradients match across all parameters
+### Extended Head Model (v0.1.1)
+- **Avatar Rigging & Expressions**: `AvatarRig`, `GazeController`, expression animation with FACS AU coefficients, phoneme-driven animation, emotion recognition
+- **Mesh Processing Suite**: Mesh repair, smoothing, Loop/Catmull-Clark subdivision, morphing, geodesic distance, spectral analysis
+- **UV & Texture Pipeline**: UV parameterisation, texture baking, face atlas generation, albedo maps, SH lighting
+- **Motion & Deformation**: Timeline, warp field, shape retargeting, dynamic landmark tracking
 
-### Modern I/O & Integration
-- **Safetensors Support**: Modern weight format for FLAME models (replacing NPY)
-- **FlameSequence**: Video frame processing with LRU caching and interpolation
-- **Weight Conversion**: Bidirectional PyTorch ↔ OxiGAF conversion (oxigaf-bridge crate)
-- **Pipeline Orchestration**: Modular stages with progress tracking and checkpointing
+### Comprehensive Rendering Pipeline (v0.1.1)
+- **Post-Processing**: SSAO, bloom, depth-of-field, motion blur, HDR tone mapping, film grain, chromatic aberration, TAA
+- **Scene Composition**: Render graph, image compositor, silhouette extraction, background synthesis
+- **Volumetric Rendering**: Ray types, camera model, volume grid, ray-march result traits
+- **Stereo Output**: Side-by-side and top-bottom stereo rendering
+
+### Extended Training & Diffusion (v0.1.1)
+- **Sampler Suite**: DDPM, adaptive sampling, consistency model, flow matching, guidance rescaling
+- **LoRA & ControlNet Adapters**: Parameter-efficient fine-tuning and conditioning adapters
+- **Curriculum Learning**: Progressive training, few-shot adaptation, meta-learning (MAML), continual learning
+- **Gradient Tools**: Gradient surgery, OHEM, anomaly detection, activation maps
+
+### Expanded CLI Toolset (v0.1.1)
+- **Export Suite**: PLY, glTF, mesh, point cloud, video, and animation sequence export
+- **Analysis Tools**: Scene analyser, model inspector, diff tool, model comparison, quality checker
+- **Scene Operations**: Scene merging, optimiser, streaming, Gaussian filter and deduplication
+- **Visualisation**: Arcball camera controller, LOD generator, camera path editor, live dashboard
 
 ### Quality & Performance
 - **100% Pure Rust**: Zero C/Fortran dependencies (COOLJAPAN compliant)
-- **796 Tests Passing**: 100% test coverage with comprehensive validation
+- **12537 Tests Passing**: Comprehensive validation across all crates
 - **Production Ready**: Zero unwrap(), all files <2000 lines, feature-gated dependencies
 
 ## Workspace Structure
@@ -112,7 +124,7 @@ cargo build --release --features "simd,parallel,flash_attention"
 
 OxiGAF supports both legacy NPY and modern Safetensors formats for FLAME models.
 
-### Option 1: Safetensors (Recommended, v0.1.0)
+### Option 1: Safetensors (Recommended, v0.1.1)
 
 Safetensors format is supported for runtime loading/saving. PyTorch conversion script coming soon.
 
@@ -129,7 +141,7 @@ Safetensors format is supported for runtime loading/saving. PyTorch conversion s
 
 ## Usage Examples
 
-### Multi-View Diffusion Pipeline (v0.1.0)
+### Multi-View Diffusion Pipeline (v0.1.1)
 
 ```rust
 use oxigaf_diffusion::{MultiViewDiffusionPipeline, DiffusionConfig};
@@ -156,7 +168,7 @@ let pipeline = MultiViewDiffusionPipeline::load(
 let output = pipeline.generate(&input_image, &camera_poses)?;
 ```
 
-### Video Sequence Processing (v0.1.0)
+### Video Sequence Processing (v0.1.1)
 
 ```rust
 use oxigaf_flame::{FlameSequence, FlameParams};
@@ -172,7 +184,7 @@ let frame_42 = sequence.get_frame(42)?;
 let interpolated = sequence.interpolate(42.5)?;
 ```
 
-### Safetensors I/O (v0.1.0)
+### Safetensors I/O (v0.1.1)
 
 ```rust
 use oxigaf_flame::{load_flame_model_safetensors, save_flame_model_safetensors};
@@ -185,7 +197,7 @@ let model = load_flame_model_safetensors(Path::new("flame_model.safetensors"))?;
 save_flame_model_safetensors(&model, Path::new("output.safetensors"))?;
 ```
 
-### PyTorch Weight Conversion (v0.1.0)
+### PyTorch Weight Conversion (v0.1.1)
 
 ```rust
 use oxigaf_bridge::LayerMapping;
@@ -214,6 +226,21 @@ For new contributors:
 1. Start with [docs/design/IMPLEMENTATION_PLAN.md](docs/design/IMPLEMENTATION_PLAN.md) for the big picture
 2. Check module-specific plans in [docs/design/](docs/design/)
 3. Review current status in the corresponding `crates/*/TODO.md` file
+
+## Sponsorship
+
+OxiGAF is developed and maintained by **COOLJAPAN OU (Team Kitasan)**.
+
+If you find OxiGAF useful, please consider sponsoring the project to support continued development of the Pure Rust ecosystem.
+
+[![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-red?logo=github)](https://github.com/sponsors/cool-japan)
+
+**[https://github.com/sponsors/cool-japan](https://github.com/sponsors/cool-japan)**
+
+Your sponsorship helps us:
+- Maintain and improve the COOLJAPAN ecosystem
+- Keep the entire ecosystem (OxiBLAS, OxiFFT, SciRS2, etc.) 100% Pure Rust
+- Provide long-term support and security updates
 
 ## License
 

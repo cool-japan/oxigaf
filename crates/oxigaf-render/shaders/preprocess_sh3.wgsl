@@ -1,6 +1,14 @@
-// Preprocess compute shader - SH Degree 3 Optimized Variant
+// Preprocess compute shader — SH Degree 3 Optimized Variant
 //
-// This shader variant is specialized for sh_degree=3 (full SH evaluation).
+// Purpose
+// ───────
+// Specialised preprocess shader for sh_degree=3 (full real SH evaluation
+// through degree 3, 16 basis functions per color channel).  All runtime
+// degree-selection branches eliminated; this is the highest-quality and
+// most computationally intensive shader variant.
+//
+// Bindings / Dispatch / Math: identical to preprocess.wgsl.
+// See preprocess.wgsl for authoritative documentation.
 // All branching has been eliminated for maximum performance.
 //
 // Uses all 16 SH basis functions: 1 DC + 3 linear + 5 quadratic + 7 cubic

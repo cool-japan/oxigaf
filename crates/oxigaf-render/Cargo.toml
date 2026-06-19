@@ -21,13 +21,16 @@ serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
-oxigaf-flame = { version = "0.1.0", path = "../oxigaf-flame" }
+safetensors = { workspace = true }
+
+oxigaf-flame = { version = "0.1.1", path = "../oxigaf-flame" }
 
 [dev-dependencies]
 serde_json = { workspace = true }
 criterion = { workspace = true }
 rand = { workspace = true }
 pollster = { workspace = true }
+tokio = { workspace = true }
 
 [features]
 # Default features (none - minimal configuration)

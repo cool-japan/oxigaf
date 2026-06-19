@@ -420,7 +420,7 @@ fn test_config_validation() {
     assert!(config.validate().is_ok());
 
     // Enabled with valid log_dir should be valid
-    let config = TensorBoardConfig::new(&std::env::temp_dir().join("oxigaf_tb_test"));
+    let config = TensorBoardConfig::new(std::env::temp_dir().join("oxigaf_tb_test"));
     assert!(config.validate().is_ok());
 
     // Enabled with empty log_dir should fail

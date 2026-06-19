@@ -317,6 +317,7 @@ mod tests {
 
     /// GRADIENT VERIFICATION TEST: Compare analytical vs numerical rotation gradients.
     #[test]
+    #[ignore = "requires GPU hardware"]
     fn test_rotation_analytical_vs_numerical() {
         let scene_config = TestSceneConfig {
             num_gaussians: 5,
@@ -366,6 +367,7 @@ mod tests {
 
     /// Test rotation gradients with varying quaternion configurations.
     #[test]
+    #[ignore = "requires GPU hardware"]
     fn test_rotation_gradients_various_angles() {
         use nalgebra as na;
 

@@ -230,9 +230,15 @@ pub fn verify_cache(cache_dir: &Path) -> Result<()> {
 /// Compute SHA-256 checksum of a file
 fn compute_sha256(path: &Path) -> Result<String> {
     use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
 
     let data = std::fs::read(path)
         .with_context(|| format!("Failed to read file for checksum: {}", path.display()))?;
     let hash = Sha256::digest(&data);
-    Ok(format!("{:x}", hash))
+    let mut checksum = String::with_capacity(hash.len() * 2);
+    for byte in hash {
+        // Writing a byte to a `String` is infallible, so the result is discarded.
+        let _ = write!(checksum, "{byte:02x}");
+    }
+    Ok(checksum)
 }

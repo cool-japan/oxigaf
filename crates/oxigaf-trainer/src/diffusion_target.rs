@@ -29,8 +29,19 @@ use crate::TrainerError;
 pub struct DiffusionTargetConfig {
     /// Number of inference steps for diffusion denoising.
     pub num_inference_steps: usize,
-    /// Classifier-free guidance scale.
+    /// Classifier-free guidance scale (legacy field; kept for compatibility).
+    ///
+    /// When `guidance_scale_start` and `guidance_scale_end` are used, this
+    /// field represents the initial/static value.  Prefer the annealing
+    /// fields for new code.
     pub guidance_scale: f32,
+    /// Guidance scale at the **start** of training (before annealing).
+    pub guidance_scale_start: f32,
+    /// Guidance scale at the **end** of annealing (held constant afterwards).
+    pub guidance_scale_end: f32,
+    /// Number of training steps over which guidance scale linearly decays
+    /// from `guidance_scale_start` to `guidance_scale_end`.
+    pub guidance_anneal_steps: u32,
     /// Weight for view consistency loss.
     pub view_consistency_weight: f32,
     /// Number of warmup iterations without diffusion.
@@ -52,6 +63,9 @@ impl Default for DiffusionTargetConfig {
         Self {
             num_inference_steps: 50,
             guidance_scale: 3.0,
+            guidance_scale_start: 7.5,
+            guidance_scale_end: 3.0,
+            guidance_anneal_steps: 10_000,
             view_consistency_weight: 0.1,
             warmup_iterations: 1000,
             timestep_start: 1000,
@@ -77,6 +91,20 @@ impl DiffusionTargetConfig {
             return Err(TrainerError::ParameterOutOfRange {
                 param: "guidance_scale".into(),
                 value: format!("{}", self.guidance_scale),
+                expected: "> 0 and finite".into(),
+            });
+        }
+        if !self.guidance_scale_start.is_finite() || self.guidance_scale_start <= 0.0 {
+            return Err(TrainerError::ParameterOutOfRange {
+                param: "guidance_scale_start".into(),
+                value: format!("{}", self.guidance_scale_start),
+                expected: "> 0 and finite".into(),
+            });
+        }
+        if !self.guidance_scale_end.is_finite() || self.guidance_scale_end <= 0.0 {
+            return Err(TrainerError::ParameterOutOfRange {
+                param: "guidance_scale_end".into(),
+                value: format!("{}", self.guidance_scale_end),
                 expected: "> 0 and finite".into(),
             });
         }
@@ -186,6 +214,31 @@ impl DiffusionTargetGenerator {
         let factor = (adjusted / ramp_steps).min(1.0);
 
         self.target_config.sds_weight * factor
+    }
+
+    /// Compute the linearly-annealed guidance scale at a given training step.
+    ///
+    /// The scale decays linearly from `guidance_scale_start` to
+    /// `guidance_scale_end` over `guidance_anneal_steps` steps.  After that
+    /// point it remains clamped at `guidance_scale_end`.
+    ///
+    /// # Example
+    /// ```text
+    /// // At step 0, returns guidance_scale_start (e.g. 7.5).
+    /// // At step guidance_anneal_steps, returns guidance_scale_end (e.g. 3.0).
+    /// // Beyond that, stays at guidance_scale_end.
+    /// ```
+    pub fn annealed_guidance_scale(&self, step: u32) -> f32 {
+        let anneal_steps = self.target_config.guidance_anneal_steps;
+        // Clamp progress to [0, 1].
+        let t = if anneal_steps == 0 {
+            1.0_f32
+        } else {
+            (step as f32 / anneal_steps as f32).min(1.0)
+        };
+        let start = self.target_config.guidance_scale_start;
+        let end = self.target_config.guidance_scale_end;
+        start + t * (end - start)
     }
 
     /// Generate multi-view pseudo ground-truth targets.
@@ -969,5 +1022,98 @@ mod tests {
         let tc = TemporalConsistency::default();
         let l = tc.compute(&[], &[], None);
         assert_eq!(l, 0.0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Guidance scale annealing tests
+    // -----------------------------------------------------------------------
+
+    fn make_annealing_generator(start: f32, end: f32, steps: u32) -> DiffusionTargetGenerator {
+        DiffusionTargetGenerator::new(DiffusionTargetConfig {
+            guidance_scale_start: start,
+            guidance_scale_end: end,
+            guidance_anneal_steps: steps,
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn guidance_annealing_at_step_zero_returns_start() {
+        let gen = make_annealing_generator(7.5, 3.0, 10_000);
+        let scale = gen.annealed_guidance_scale(0);
+        assert!(
+            (scale - 7.5).abs() < 1e-5,
+            "at step 0 expected 7.5, got {scale}"
+        );
+    }
+
+    #[test]
+    fn guidance_annealing_at_full_steps_returns_end() {
+        let gen = make_annealing_generator(7.5, 3.0, 10_000);
+        let scale = gen.annealed_guidance_scale(10_000);
+        assert!(
+            (scale - 3.0).abs() < 1e-5,
+            "at full steps expected 3.0, got {scale}"
+        );
+    }
+
+    #[test]
+    fn guidance_annealing_midpoint_is_midway() {
+        let gen = make_annealing_generator(7.5, 3.0, 10_000);
+        let scale = gen.annealed_guidance_scale(5_000);
+        let expected = (7.5 + 3.0) / 2.0; // 5.25
+        assert!(
+            (scale - expected).abs() < 1e-4,
+            "at midpoint expected {expected}, got {scale}"
+        );
+    }
+
+    #[test]
+    fn guidance_annealing_clamps_beyond_steps() {
+        let gen = make_annealing_generator(7.5, 3.0, 10_000);
+        // Well past the anneal period.
+        let scale = gen.annealed_guidance_scale(50_000);
+        assert!(
+            (scale - 3.0).abs() < 1e-5,
+            "beyond anneal steps expected 3.0, got {scale}"
+        );
+    }
+
+    #[test]
+    fn guidance_annealing_exact_one_step_boundary() {
+        // With anneal_steps = 1, step 1 should return end exactly.
+        let gen = make_annealing_generator(10.0, 2.0, 1);
+        let scale = gen.annealed_guidance_scale(1);
+        assert!(
+            (scale - 2.0).abs() < 1e-5,
+            "at boundary (steps=1) expected 2.0, got {scale}"
+        );
+    }
+
+    #[test]
+    fn guidance_annealing_quarter_point() {
+        let gen = make_annealing_generator(8.0, 0.0, 1_000);
+        // At 25 %, scale should be 8.0 - 0.25 * 8.0 = 6.0.
+        let scale = gen.annealed_guidance_scale(250);
+        assert!(
+            (scale - 6.0).abs() < 1e-4,
+            "at 25 %% expected 6.0, got {scale}"
+        );
+    }
+
+    #[test]
+    fn guidance_annealing_zero_anneal_steps_clamps_to_end() {
+        // When guidance_anneal_steps == 0 every step should return `end`.
+        let gen = make_annealing_generator(7.5, 3.0, 0);
+        let at_zero = gen.annealed_guidance_scale(0);
+        let at_hundred = gen.annealed_guidance_scale(100);
+        assert!(
+            (at_zero - 3.0).abs() < 1e-5,
+            "zero steps: step 0 expected 3.0, got {at_zero}"
+        );
+        assert!(
+            (at_hundred - 3.0).abs() < 1e-5,
+            "zero steps: step 100 expected 3.0, got {at_hundred}"
+        );
     }
 }

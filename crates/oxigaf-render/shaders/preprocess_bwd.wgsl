@@ -118,6 +118,29 @@ fn preprocess_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Chain through view matrix to get world-space gradient
     var dL_dpos = transpose(W) * dL_dp_view;
 
+    // =========================================================================
+    // --- COV2D BACKWARD ---
+    //
+    // This section chains gradients from 2D screen-space quantities back to
+    // 3D world-space covariances via the projection Jacobian.
+    //
+    // Mathematical overview
+    // ─────────────────────
+    // Forward pass (preprocess.wgsl) computes:
+    //   cov2D  = T · cov3D · Tᵀ          where T = J · W  (projection Jacobian)
+    //   conic  = inverse(cov2D)           (used directly in rasterize_fwd)
+    //
+    // Backward pass (this block) propagates:
+    //   ∂L/∂conic  →  ∂L/∂cov2D  via matrix-inverse derivative:
+    //                              ∂L/∂S = −S⁻¹ · G · S⁻¹  (S=cov2D, G=∂L/∂S⁻¹)
+    //   ∂L/∂cov2D  →  ∂L/∂cov3D  via:  ∂L/∂cov3D = Tᵀ · ∂L/∂cov2D_mat · T
+    //   ∂L/∂cov3D  →  ∂L/∂R, ∂L/∂s  via: cov3D = M·Mᵀ, M = R·S (diag scale)
+    //
+    // An additional position gradient arises because J depends on the view-
+    // space position p_view: the depth tz = −p_view.z appears in the Jacobian
+    // denominators, so ∂L/∂p_view has a contribution through ∂L/∂cov2D.
+    // =========================================================================
+
     // ---- 2. grad_cov2d from grad_conics ----
     // Forward: conic = inverse(cov2d_matrix)
     // Backward: dL/dS = -S^{-1} * dL/dS^{-1} * S^{-1}  (S symmetric, S^{-1} = conic)

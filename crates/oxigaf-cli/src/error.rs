@@ -141,6 +141,22 @@ pub enum CliError {
         source: std::io::Error,
     },
 
+    /// glTF export failed.
+    #[error("glTF export failed: {0}")]
+    GltfExport(String),
+
+    /// Point cloud export failed.
+    #[error("Point cloud export failed: {0}")]
+    PointCloudExport(String),
+
+    /// Video export failed.
+    #[error("Video export failed: {0}")]
+    VideoExport(String),
+
+    /// Mesh export failed.
+    #[error("Mesh export failed: {0}")]
+    MeshExport(String),
+
     /// Any other error wrapped via anyhow.
     #[error(transparent)]
     Other(#[from] anyhow::Error),
@@ -167,7 +183,11 @@ impl CliError {
 
             Self::ExportFormatUnsupported { .. }
             | Self::FlameModelInvalid { .. }
-            | Self::ModelLoadError { .. } => EXIT_EXPORT_ERROR,
+            | Self::ModelLoadError { .. }
+            | Self::GltfExport(_)
+            | Self::PointCloudExport(_)
+            | Self::VideoExport(_)
+            | Self::MeshExport(_) => EXIT_EXPORT_ERROR,
 
             Self::Other(_) => EXIT_GENERAL_ERROR,
         }
@@ -206,7 +226,7 @@ impl CliError {
                  the asset manually and place it in ~/.cache/oxigaf/",
             ),
             Self::ExportFormatUnsupported { .. } => {
-                Some("Use one of the supported formats: ply, safetensors, json.")
+                Some("Use one of the supported formats: ply, safetensors, gltf, json, pointcloud.")
             }
             Self::CheckpointCorrupted { .. } => Some(
                 "The checkpoint may be from an incompatible version. \
@@ -223,6 +243,13 @@ impl CliError {
             Self::ModelLoadError { .. } => Some(
                 "Ensure the file is a valid .ply or .json checkpoint. \
                  Check file permissions and integrity.",
+            ),
+            Self::GltfExport(_)
+            | Self::PointCloudExport(_)
+            | Self::VideoExport(_)
+            | Self::MeshExport(_) => Some(
+                "Check output path permissions and available disk space. \
+                 Ensure the output directory exists.",
             ),
             Self::TrainingFailed { .. } => Some(
                 "Check for NaN losses or memory issues. Try reducing \

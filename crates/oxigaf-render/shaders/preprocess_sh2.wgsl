@@ -1,6 +1,13 @@
-// Preprocess compute shader - SH Degree 2 Optimized Variant
+// Preprocess compute shader — SH Degree 2 Optimized Variant
 //
-// This shader variant is specialized for sh_degree=2 (DC + linear + quadratic).
+// Purpose
+// ───────
+// Specialised preprocess shader for sh_degree=2 (DC + linear + quadratic
+// spherical harmonic terms).  Degree-3 evaluation branch eliminated at
+// compile time.
+//
+// Bindings / Dispatch / Math: identical to preprocess.wgsl.
+// See preprocess.wgsl for authoritative documentation.
 // All branching has been eliminated for maximum performance.
 //
 // Uses 9 SH basis functions: 1 DC + 3 linear + 5 quadratic
