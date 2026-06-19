@@ -62,7 +62,7 @@ Add to `Cargo.toml`:
 
 ```toml
 [dependencies]
-oxigaf-bridge = { version = "0.1.1", features = ["torsh"] }
+oxigaf-bridge = { version = "0.1.2", features = ["torsh"] }
 ```
 
 #### Basic ToRSh Conversion

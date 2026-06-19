@@ -17,7 +17,7 @@ This crate implements the multi-view diffusion pipeline for Gaussian Avatar Fram
 
 The pipeline takes a single input image and generates multiple novel views of the subject at **512×512 resolution**, which are then used to initialize and optimize 3D Gaussians.
 
-**v0.1.1 — what's included:**
+**v0.1.2 — what's included:**
 - Full 512×512 multi-view generation pipeline (Latent Upsampler + IP-Adapter + CFG)
 - 66 tests (all passing)
 - Benchmarks: standard vs Flash Attention, sequence lengths, DDIM scheduler

@@ -8,7 +8,7 @@ This crate implements the [FLAME (Faces Learned with an Articulated Model and Ex
 
 FLAME is a statistical 3D head model that represents shape, expression, and pose variations using a Linear Blend Skinning (LBS) framework. It's widely used in computer vision and graphics for facial animation, avatar creation, and 3D reconstruction.
 
-**v0.1.1 — what's included:**
+**v0.1.2 — what's included:**
 - Linear Blend Skinning (LBS) forward pass with SIMD/parallel acceleration
 - CPU software rasterizer for normal map generation
 - Mesh surface sampling for Gaussian initialization

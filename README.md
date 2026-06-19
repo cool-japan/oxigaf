@@ -4,7 +4,7 @@
 
 Implements the methods from [GAF: Gaussian Avatar Reconstruction from Monocular Videos via Multi-View Diffusion](https://arxiv.org/abs/2412.10209) entirely in the Rust ecosystem.
 
-## What's in v0.1.1
+## What's in v0.1.2
 
 ### 512×512 Multi-View Generation (v0.1.0)
 - **Latent Upsampler**: 32×32 → 64×64 latent upsampling for 512×512 output resolution
