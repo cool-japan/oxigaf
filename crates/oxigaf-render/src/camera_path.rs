@@ -473,12 +473,13 @@ pub fn keyframe_to_render_camera(kf: &CameraKeyframe, width: usize, height: usiz
     };
 
     // Build view matrix (right-handed, camera looks toward -Z)
-    let view = glam::Mat4::look_at_rh(eye, center, up);
+    let view = glam::camera::rh::view::look_at_mat4(eye, center, up);
     let view_matrix = view.to_cols_array();
 
     // Build perspective projection (right-handed, depth [0, 1] for wgpu)
     let aspect = width as f32 / height.max(1) as f32;
-    let proj = glam::Mat4::perspective_rh(kf.fov_y, aspect, DEFAULT_NEAR, DEFAULT_FAR);
+    let proj =
+        glam::camera::rh::proj::directx::perspective(kf.fov_y, aspect, DEFAULT_NEAR, DEFAULT_FAR);
     let proj_matrix = proj.to_cols_array();
 
     // Focal lengths in pixels

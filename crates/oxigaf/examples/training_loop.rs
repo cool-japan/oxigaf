@@ -216,6 +216,7 @@ async fn run_training() -> oxigaf::Result<()> {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: None,
             force_fallback_adapter: false,
+            apply_limit_buckets: false,
         })
         .await
         .map_err(|e| {

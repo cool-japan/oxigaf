@@ -455,7 +455,9 @@ impl DeformPipeline {
             .map_err(|e| RenderError::Rasterize(format!("Deform readback channel error: {e}")))?
             .map_err(|e| RenderError::Rasterize(format!("Deform buffer map failed: {e}")))?;
 
-        let mapped = slice.get_mapped_range();
+        let mapped = slice
+            .get_mapped_range()
+            .map_err(|e| RenderError::Rasterize(format!("Deform mapped range failed: {e}")))?;
         let floats: &[f32] = bytemuck::cast_slice(&mapped);
         let result: Vec<[f32; 4]> = floats
             .chunks_exact(4)
@@ -1021,6 +1023,7 @@ mod tests {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: None,
             force_fallback_adapter: false,
+            apply_limit_buckets: false,
         }));
         let adapter = match adapter {
             Ok(a) => a,

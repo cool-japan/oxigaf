@@ -140,6 +140,7 @@ impl Rasterizer {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 compatible_surface: None,
                 force_fallback_adapter: false,
+                apply_limit_buckets: false,
             })
             .await
             .map_err(|e| RenderError::GpuInit(format!("No suitable GPU adapter: {e}")))?;
@@ -911,7 +912,9 @@ impl Rasterizer {
             .map_err(|e| RenderError::Rasterize(format!("Channel recv failed: {e}")))?
             .map_err(|e| RenderError::Rasterize(format!("Buffer map failed: {e}")))?;
 
-        let data = slice.get_mapped_range();
+        let data = slice
+            .get_mapped_range()
+            .map_err(|e| RenderError::Rasterize(format!("Mapped range failed: {e}")))?;
         let all_floats: &[f32] = bytemuck::cast_slice(&data);
         // Only return the requested count, not the entire buffer
         let floats = all_floats[..count.min(all_floats.len())].to_vec();

@@ -147,6 +147,7 @@ pub fn check_gpu() -> Result<()> {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: None,
             force_fallback_adapter: false,
+            apply_limit_buckets: false,
         }));
 
     match adapter_result {

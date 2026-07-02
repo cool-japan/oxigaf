@@ -24,13 +24,13 @@ glam = "0.33"
 
 # AI / Deep Learning (Pure Rust)
 # Note: default-features = false to avoid CUDA dependencies on macOS
-candle-core = { version = "0.10", default-features = false }
-candle-nn = { version = "0.10", default-features = false }
-candle-transformers = { version = "0.10", default-features = false }
+candle-core = { version = "0.11", default-features = false }
+candle-nn = { version = "0.11", default-features = false }
+candle-transformers = { version = "0.11", default-features = false }
 safetensors = "0.8"
 
 # GPU Graphics & Compute
-wgpu = "29"
+wgpu = "30"
 bytemuck = { version = "1", features = ["derive"] }
 
 # Image & Video

@@ -376,7 +376,7 @@ pub(crate) fn build_turntable_cameras(
     let far = 1000.0_f32;
 
     // glam projection (right-hand, depth 0→1, clip-space y-down, matching WGSL)
-    let proj_mat = glam::Mat4::perspective_rh(fov_y_rad, aspect, near, far);
+    let proj_mat = glam::camera::rh::proj::directx::perspective(fov_y_rad, aspect, near, far);
     let proj_matrix: [f32; 16] = proj_mat.to_cols_array();
 
     let mut cameras = Vec::with_capacity(n_views);
@@ -402,7 +402,7 @@ pub(crate) fn build_turntable_cameras(
             glam::Vec3::Y
         };
 
-        let view_mat = glam::Mat4::look_at_rh(eye, tgt, up);
+        let view_mat = glam::camera::rh::view::look_at_mat4(eye, tgt, up);
         let view_matrix: [f32; 16] = view_mat.to_cols_array();
 
         cameras.push(RenderCamera {

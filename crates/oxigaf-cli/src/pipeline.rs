@@ -472,6 +472,7 @@ fn request_gpu_device() -> Result<(wgpu::Device, wgpu::Queue)> {
         power_preference: wgpu::PowerPreference::HighPerformance,
         compatible_surface: None,
         force_fallback_adapter: false,
+        apply_limit_buckets: false,
     }))
     .map_err(|e| anyhow::anyhow!("No suitable GPU adapter found: {e}"))?;
 
