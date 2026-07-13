@@ -70,7 +70,7 @@ tempfile = "3"
 
 # CLI UX
 owo-colors = "4"
-oxiarc-archive = "0.3.5"
+oxiarc-archive = "0.3.6"
 dirs = "6"
 crossterm = "0.29"
 
