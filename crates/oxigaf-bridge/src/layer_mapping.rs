@@ -10,15 +10,53 @@ use std::collections::HashMap;
 pub enum NamingConvention {
     /// PyTorch: `unet.down_blocks.0.resnets.0.conv1.weight`
     PyTorch,
-    /// OxiGAF: `down_blocks_0_resnets_0_conv1_weight`
+    /// OxiGAF: `down__blocks_0_resnets_0_conv1_weight` (existing underscores
+    /// in the source name are doubled before dots are converted to single
+    /// underscores, so the two are distinguishable on the way back)
     OxiGAF,
     /// ToRSh: `down_blocks/0/resnets/0/conv1/weight`
     ToRSh,
 }
 
+/// Prefixes recognized and stripped by [`LayerMapping::pytorch_to_oxigaf`].
+const KNOWN_PYTORCH_PREFIXES: &[&str] = &["unet", "model", "module"];
+
+/// safetensors `__metadata__` key under which `pytorch_to_oxigaf::convert`
+/// records, as a JSON object, which recognized PyTorch prefix (if any) was
+/// stripped from each converted tensor -- keyed by the resulting OxiGAF
+/// name. `oxigaf_to_pytorch::convert` reads this back so it can restore each
+/// tensor's exact original prefix instead of assuming a single prefix (e.g.
+/// `"unet"`) for the whole checkpoint.
+pub(crate) const PREFIX_METADATA_KEY: &str = "oxigaf_bridge:prefixes";
+
+/// Detects a recognized prefix component of `pytorch_name`, returning the
+/// prefix and the remainder of the name after the separating dot.
+///
+/// This performs the same recognition [`LayerMapping::pytorch_to_oxigaf`]
+/// uses internally to decide what to strip. Callers that need to know
+/// *which* prefix (if any) was stripped -- e.g. to persist it so a later
+/// reverse conversion can restore the exact original name -- can call this
+/// directly instead of re-deriving it from ad hoc string manipulation.
+pub fn detect_prefix(pytorch_name: &str) -> Option<(&'static str, &str)> {
+    for &prefix in KNOWN_PYTORCH_PREFIXES {
+        if let Some(rest) = pytorch_name.strip_prefix(prefix) {
+            if let Some(remainder) = rest.strip_prefix('.') {
+                return Some((prefix, remainder));
+            }
+        }
+    }
+    None
+}
+
 /// Layer name mapping handler
 pub struct LayerMapping {
     custom_mappings: HashMap<String, String>,
+    /// Reverse of `custom_mappings` (`to` -> `from`), kept in sync by
+    /// [`LayerMapping::add_custom_mapping`] so [`LayerMapping::oxigaf_to_pytorch`]
+    /// can look up a match in O(1) instead of scanning `custom_mappings`. If
+    /// multiple `from` names are registered with the same `to` value, the
+    /// most recently added mapping wins the reverse lookup.
+    custom_mappings_reverse: HashMap<String, String>,
 }
 
 impl LayerMapping {
@@ -26,28 +64,48 @@ impl LayerMapping {
     pub fn new() -> Self {
         Self {
             custom_mappings: HashMap::new(),
+            custom_mappings_reverse: HashMap::new(),
         }
     }
 
     /// Add a custom mapping from one name to another
     pub fn add_custom_mapping(&mut self, from: String, to: String) {
+        self.custom_mappings_reverse
+            .insert(to.clone(), from.clone());
         self.custom_mappings.insert(from, to);
+    }
+
+    /// Look up a custom mapping by its exact `from` key, if one was
+    /// registered via [`LayerMapping::add_custom_mapping`]. Bypasses
+    /// prefix-stripping and underscore/dot escaping entirely -- the
+    /// registered `to` value is returned verbatim.
+    ///
+    /// This exists for conversion directions (e.g. ToRSh, whose OxiGAF-side
+    /// names use dots as a hierarchical path separator, not the escaped
+    /// underscore convention `pytorch_to_oxigaf`/`oxigaf_to_pytorch` use) to
+    /// still honor caller-supplied overrides without routing every name
+    /// through the PyTorch-specific escaping scheme.
+    pub fn lookup_custom(&self, from: &str) -> Option<&str> {
+        self.custom_mappings.get(from).map(String::as_str)
     }
 
     /// Convert PyTorch name to OxiGAF name
     ///
-    /// Example: `unet.down_blocks.0.resnets.0.conv1.weight` → `down_blocks_0_resnets_0_conv1_weight`
+    /// Example: `unet.down_blocks.0.resnets.0.conv1.weight` → `down__blocks_0_resnets_0_conv1_weight`
+    ///
+    /// Existing underscores in the source name are doubled *before* dots are
+    /// replaced with single underscores, so `down_blocks` (one underscore)
+    /// and the dot-to-underscore conversion don't collide: only a single
+    /// underscore in the OxiGAF name ever originated from a dot.
     pub fn pytorch_to_oxigaf(&self, pytorch_name: &str) -> Result<String> {
         // Check custom mappings first
         if let Some(mapped) = self.custom_mappings.get(pytorch_name) {
             return Ok(mapped.clone());
         }
 
-        // Remove common prefixes like "unet.", "model.", etc.
-        let name = pytorch_name
-            .strip_prefix("unet.")
-            .or_else(|| pytorch_name.strip_prefix("model."))
-            .or_else(|| pytorch_name.strip_prefix("module."))
+        // Remove a common prefix like "unet.", "model.", "module.", if present.
+        let name = detect_prefix(pytorch_name)
+            .map(|(_, remainder)| remainder)
             .unwrap_or(pytorch_name);
 
         // Escape existing underscores (double them) so we can distinguish them from converted dots
@@ -61,14 +119,20 @@ impl LayerMapping {
     /// Convert OxiGAF name to PyTorch name
     ///
     /// Example: `down__blocks_0_resnets_0_conv1_weight` → `unet.down_blocks.0.resnets.0.conv1.weight`
+    ///
+    /// Note: the underscore-escaping `pytorch_to_oxigaf` applies is not
+    /// injective -- `a._b` and `a_.b` both encode to `a___b` -- so a PyTorch
+    /// name with a leading-underscore path component (e.g. `torch.compile`'s
+    /// `_orig_mod.` wrapper) is not guaranteed to round-trip exactly.
     pub fn oxigaf_to_pytorch(&self, oxigaf_name: &str, prefix: Option<&str>) -> Result<String> {
-        // Reverse lookup in custom mappings
-        if let Some((pytorch_name, _)) = self
-            .custom_mappings
-            .iter()
-            .find(|(_, v)| v.as_str() == oxigaf_name)
-        {
-            return Ok(pytorch_name.clone());
+        // Reverse lookup in custom mappings (O(1) via the maintained reverse map).
+        // The prefix is applied here too, same as the non-custom path below, so
+        // custom and mechanical mappings produce a consistent output namespace.
+        if let Some(pytorch_name) = self.custom_mappings_reverse.get(oxigaf_name) {
+            return Ok(match prefix {
+                Some(prefix) => format!("{}.{}", prefix, pytorch_name),
+                None => pytorch_name.clone(),
+            });
         }
 
         // Replace single underscores with dots (these were from PyTorch dots)
@@ -248,6 +312,70 @@ mod tests {
             .pytorch_to_oxigaf("custom.input")
             .expect("test: layer mapping should succeed");
         assert_eq!(result, "custom_special_input");
+    }
+
+    #[test]
+    fn test_custom_mapping_reverse_lookup_applies_prefix() {
+        // Regression test: the reverse (OxiGAF -> PyTorch) lookup for a
+        // custom mapping used to bypass the `prefix` argument entirely,
+        // producing an inconsistent output namespace versus every
+        // mechanically-mapped name (which does get the prefix). It must now
+        // apply the prefix the same way the non-custom path does.
+        let mut mapping = LayerMapping::new();
+        mapping.add_custom_mapping(
+            "custom.input".to_string(),
+            "custom_special_input".to_string(),
+        );
+
+        let with_prefix = mapping
+            .oxigaf_to_pytorch("custom_special_input", Some("unet"))
+            .expect("test: layer mapping should succeed");
+        assert_eq!(with_prefix, "unet.custom.input");
+
+        let without_prefix = mapping
+            .oxigaf_to_pytorch("custom_special_input", None)
+            .expect("test: layer mapping should succeed");
+        assert_eq!(without_prefix, "custom.input");
+    }
+
+    #[test]
+    fn test_lookup_custom() {
+        let mut mapping = LayerMapping::new();
+        assert_eq!(
+            mapping.lookup_custom("down_blocks.0.resnets.0.weight"),
+            None
+        );
+
+        mapping.add_custom_mapping(
+            "down_blocks.0.resnets.0.weight".to_string(),
+            "special_name".to_string(),
+        );
+        assert_eq!(
+            mapping.lookup_custom("down_blocks.0.resnets.0.weight"),
+            Some("special_name")
+        );
+        // Exact-match only: no prefix stripping or escaping is applied.
+        assert_eq!(
+            mapping.lookup_custom("unet.down_blocks.0.resnets.0.weight"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_detect_prefix() {
+        assert_eq!(
+            detect_prefix("unet.down_blocks.0.conv.weight"),
+            Some(("unet", "down_blocks.0.conv.weight"))
+        );
+        assert_eq!(
+            detect_prefix("model.layer.weight"),
+            Some(("model", "layer.weight"))
+        );
+        assert_eq!(detect_prefix("module.foo"), Some(("module", "foo")));
+        assert_eq!(detect_prefix("no_prefix.here"), None);
+        // A name that merely starts with the same letters as a known prefix,
+        // but without the separating dot, must not match.
+        assert_eq!(detect_prefix("unethical.weight"), None);
     }
 
     #[test]

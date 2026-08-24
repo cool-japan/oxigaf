@@ -12,12 +12,31 @@
 //! 4. Uses online softmax with running max/sum for numerical stability
 //! 5. Accumulates weighted values with proper rescaling
 //!
+//! # Dispatch policy
+//!
+//! The tiled loop is expressed with individual `candle` tensor operations, each
+//! of which materialises its own intermediate: it therefore only pays off when
+//! the fully materialised `(batch, heads, seq_q, seq_k)` score matrix would not
+//! comfortably fit in memory. [`FlashAttention`] consequently runs the plain
+//! (single score matrix) kernel whenever
+//!
+//! * the whole sequence fits in one block, or
+//! * the score matrix stays within the configured budget
+//!   ([`DEFAULT_SCORE_MATRIX_BUDGET`], overridable with
+//!   [`FlashAttention::with_score_matrix_budget`]).
+//!
+//! Both paths implement the same mathematics, causal masking included. They are
+//! not bit-identical: besides the different accumulation order, the tiled path
+//! normalises by `l + softmax_eps`, a systematic relative bias of about
+//! `softmax_eps` (1e-6 by default).
+//!
 //! # References
 //!
 //! - Dao et al., "FlashAttention: Fast and Memory-Efficient Exact Attention
 //!   with IO-Awareness", NeurIPS 2022
 
-use candle_core::{DType, Result, Tensor, D};
+use candle_core::{DType, Device, Result, Tensor, D};
+use std::collections::HashMap;
 
 /// Configuration for Flash Attention computation.
 #[derive(Debug, Clone, Copy)]
@@ -58,6 +77,12 @@ impl FlashAttentionConfig {
     }
 }
 
+/// Default budget (64 MiB) for the fully materialised attention score matrix.
+///
+/// Below this size the plain kernel is both faster and no less memory-friendly
+/// than the tiled loop, so [`FlashAttention::forward`] uses it.
+pub const DEFAULT_SCORE_MATRIX_BUDGET: usize = 64 * 1024 * 1024;
+
 /// Flash Attention: Memory-efficient scaled dot-product attention.
 ///
 /// This struct provides the flash attention computation without maintaining
@@ -67,6 +92,8 @@ impl FlashAttentionConfig {
 pub struct FlashAttention {
     config: FlashAttentionConfig,
     scale: f64,
+    /// Largest score matrix (in bytes) that may be materialised in one piece.
+    score_matrix_budget: usize,
 }
 
 impl FlashAttention {
@@ -77,13 +104,57 @@ impl FlashAttention {
     /// * `dim_head` - Dimension of each attention head (for scaling)
     /// * `config` - Flash Attention configuration
     pub fn new(dim_head: usize, config: FlashAttentionConfig) -> Self {
-        let scale = 1.0 / (dim_head as f64).sqrt();
-        Self { config, scale }
+        // `dim_head == 0` would make the scale non-finite; fall back to 1.0.
+        let scale = if dim_head == 0 {
+            1.0
+        } else {
+            1.0 / (dim_head as f64).sqrt()
+        };
+        Self {
+            config,
+            scale,
+            score_matrix_budget: DEFAULT_SCORE_MATRIX_BUDGET,
+        }
     }
 
     /// Create with default configuration.
     pub fn with_dim_head(dim_head: usize) -> Self {
         Self::new(dim_head, FlashAttentionConfig::default())
+    }
+
+    /// Override the score-matrix memory budget (see [`DEFAULT_SCORE_MATRIX_BUDGET`]).
+    ///
+    /// Sequences whose `(batch, heads, seq_q, seq_k)` f32 score matrix exceeds
+    /// `bytes` are processed with the tiled kernel; everything else uses the
+    /// plain one. Passing `0` therefore forces the tiled path (useful for
+    /// testing and for very tight memory budgets).
+    pub fn with_score_matrix_budget(mut self, bytes: usize) -> Self {
+        self.score_matrix_budget = bytes;
+        self
+    }
+
+    /// Current score-matrix memory budget in bytes.
+    pub fn score_matrix_budget(&self) -> usize {
+        self.score_matrix_budget
+    }
+
+    /// Configuration this module was built with.
+    pub fn config(&self) -> &FlashAttentionConfig {
+        &self.config
+    }
+
+    /// Whether the plain (non-tiled) kernel is used for the given shapes.
+    fn use_standard_path(&self, batch: usize, heads: usize, seq_q: usize, seq_k: usize) -> bool {
+        let block_size = self.config.block_size.max(1);
+        if seq_q <= block_size && seq_k <= block_size {
+            return true;
+        }
+        let elems = batch
+            .saturating_mul(heads)
+            .saturating_mul(seq_q)
+            .saturating_mul(seq_k);
+        let bytes = elems.saturating_mul(std::mem::size_of::<f32>());
+        bytes <= self.score_matrix_budget
     }
 
     /// Compute flash attention.
@@ -101,9 +172,9 @@ impl FlashAttention {
         let (batch, heads, seq_q, dim_head) = q.dims4()?;
         let (_, _, seq_k, _) = k.dims4()?;
 
-        // For small sequences, use standard attention (simpler and often faster)
-        let use_standard = seq_q <= self.config.block_size && seq_k <= self.config.block_size;
-        if use_standard {
+        // Materialising the score matrix is cheaper than the tiled loop as long
+        // as it fits in the configured budget (see the module-level docs).
+        if self.use_standard_path(batch, heads, seq_q, seq_k) {
             return self.standard_attention(q, k, v);
         }
 
@@ -114,13 +185,16 @@ impl FlashAttention {
         let v = v.to_dtype(DType::F32)?;
 
         // Block-wise computation
-        let block_size = self.config.block_size;
+        let block_size = self.config.block_size.max(1);
         let num_q_blocks = seq_q.div_ceil(block_size);
         let num_k_blocks = seq_k.div_ceil(block_size);
 
-        // Initialize output accumulator and softmax statistics
-        let device = q.device();
-        let neg_inf = f32::NEG_INFINITY;
+        let device = q.device().clone();
+
+        // Causal masks depend only on (q_start - k_start, q_len, k_len), and the
+        // block grid produces a handful of distinct combinations at most, so the
+        // host-side build plus device upload is done once per distinct mask.
+        let mut mask_cache: HashMap<(i64, usize, usize), Tensor> = HashMap::new();
 
         // Process each query block
         let mut output_blocks: Vec<Tensor> = Vec::with_capacity(num_q_blocks);
@@ -133,13 +207,12 @@ impl FlashAttention {
             // Extract query block: (batch, heads, q_len, dim_head)
             let q_block = q.narrow(2, q_start, q_len)?;
 
-            // Initialize accumulators for this query block
+            // Online softmax accumulators for this query block, created from the
+            // first contributing key block:
             // m: running max, shape (batch, heads, q_len)
             // l: running sum, shape (batch, heads, q_len)
             // o: running output, shape (batch, heads, q_len, dim_head)
-            let mut m = Tensor::full(neg_inf, (batch, heads, q_len), device)?;
-            let mut l = Tensor::zeros((batch, heads, q_len), DType::F32, device)?;
-            let mut o = Tensor::zeros((batch, heads, q_len, dim_head), DType::F32, device)?;
+            let mut acc: Option<(Tensor, Tensor, Tensor)> = None;
 
             // Iterate over key/value blocks
             for k_block_idx in 0..num_k_blocks {
@@ -160,26 +233,43 @@ impl FlashAttention {
                 let k_t = k_block.transpose(D::Minus2, D::Minus1)?;
                 let scores = (q_block.matmul(&k_t)? * self.scale)?;
 
-                // Apply causal mask if needed
-                let scores = if self.config.causal {
-                    self.apply_causal_mask(&scores, q_start, k_start)?
+                // Apply the causal mask only to the block that straddles the
+                // diagonal; blocks entirely in the past are fully visible.
+                let needs_mask = self.config.causal && k_start + k_len > q_start;
+                let scores = if needs_mask {
+                    let key = (q_start as i64 - k_start as i64, q_len, k_len);
+                    let mask = match mask_cache.get(&key) {
+                        Some(cached) => cached.clone(),
+                        None => {
+                            let built =
+                                Self::causal_mask_tensor(q_start, k_start, q_len, k_len, &device)?;
+                            mask_cache.insert(key, built.clone());
+                            built
+                        }
+                    };
+                    scores.broadcast_add(&mask)?
                 } else {
                     scores
                 };
 
                 // Online softmax update
-                let (m_new, l_new, o_new) =
-                    self.online_softmax_update(&m, &l, &o, &scores, &v_block)?;
-
-                m = m_new;
-                l = l_new;
-                o = o_new;
+                acc = Some(match acc {
+                    Some((m, l, o)) => self.online_softmax_update(&m, &l, &o, &scores, &v_block)?,
+                    None => Self::init_softmax_state(&scores, &v_block)?,
+                });
             }
 
             // Finalize output for this block: o = o / l
-            let l_expanded = l.unsqueeze(D::Minus1)?;
-            let l_safe = (l_expanded + self.config.softmax_eps)?;
-            let block_output = o.broadcast_div(&l_safe)?;
+            let block_output = match acc {
+                Some((_m, l, o)) => {
+                    let l_expanded = l.unsqueeze(D::Minus1)?;
+                    let l_safe = (l_expanded + self.config.softmax_eps)?;
+                    o.broadcast_div(&l_safe)?
+                }
+                // No key block contributed (only reachable for degenerate
+                // shapes); an all-zero row is the softmax-free limit of o / l.
+                None => Tensor::zeros((batch, heads, q_len, dim_head), DType::F32, &device)?,
+            };
 
             output_blocks.push(block_output);
         }
@@ -190,6 +280,9 @@ impl FlashAttention {
     }
 
     /// Standard attention for small sequences (fallback path).
+    ///
+    /// Honours [`FlashAttentionConfig::causal`] exactly like the tiled path:
+    /// the two kernels must never disagree on semantics.
     fn standard_attention(&self, q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
         let in_dtype = q.dtype();
         let q = q.to_dtype(DType::F32)?;
@@ -198,9 +291,27 @@ impl FlashAttention {
 
         let k_t = k.transpose(D::Minus2, D::Minus1)?.contiguous()?;
         let attn = (q.matmul(&k_t)? * self.scale)?;
+        let attn = if self.config.causal {
+            self.apply_causal_mask(&attn, 0, 0)?
+        } else {
+            attn
+        };
         let attn = candle_nn::ops::softmax_last_dim(&attn)?;
         let out = attn.matmul(&v)?;
         out.to_dtype(in_dtype)
+    }
+
+    /// Seed the online-softmax accumulators from the first contributing block.
+    ///
+    /// Equivalent to [`Self::online_softmax_update`] against `m = -inf`,
+    /// `l = 0`, `o = 0`, but without the three tensors that identity would
+    /// allocate (and without the `-inf - -inf` NaN hazard).
+    fn init_softmax_state(scores: &Tensor, v_block: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
+        let m = scores.max(D::Minus1)?;
+        let p = scores.broadcast_sub(&m.unsqueeze(D::Minus1)?)?.exp()?;
+        let l = p.sum(D::Minus1)?;
+        let o = p.matmul(v_block)?;
+        Ok((m, l, o))
     }
 
     /// Online softmax update step.
@@ -230,15 +341,10 @@ impl FlashAttention {
         // Compute new global max
         let m_new = m.maximum(&m_block)?;
 
-        // Rescale old statistics
-        // exp(m - m_new) for old values
-        let m_diff_old = m.broadcast_sub(&m_new)?;
-        let rescale_old = m_diff_old.exp()?;
-
-        // exp(m_block - m_new) for new block (computed but kept for debugging/clarity)
-        // The actual rescaling is done implicitly when computing p_block below
-        let m_diff_new = m_block.broadcast_sub(&m_new)?;
-        let _rescale_new = m_diff_new.exp()?;
+        // Rescale old statistics: exp(m - m_new) for the values accumulated so
+        // far. The new block needs no separate factor - its rescaling is folded
+        // into p_block = exp(scores - m_new) below.
+        let rescale_old = m.sub(&m_new)?.exp()?;
 
         // Compute softmax for current block (unnormalized)
         // p_block = exp(scores - m_new)
@@ -260,30 +366,37 @@ impl FlashAttention {
         Ok((m_new, l_new, o_new))
     }
 
+    /// Build the additive causal mask for one `(q_start, k_start)` block.
+    ///
+    /// The result has shape `(1, 1, q_len, k_len)` and holds `-inf` wherever the
+    /// key position exceeds the query position, `0` elsewhere. It is broadcast
+    /// over batch and heads by the caller.
+    fn causal_mask_tensor(
+        q_start: usize,
+        k_start: usize,
+        q_len: usize,
+        k_len: usize,
+        device: &Device,
+    ) -> Result<Tensor> {
+        let mut mask_data = vec![0.0f32; q_len * k_len];
+        for i in 0..q_len {
+            let q_pos = q_start + i;
+            // Number of leading keys of this block that are visible to row `i`.
+            let visible = (q_pos + 1).saturating_sub(k_start).min(k_len);
+            let row = i * k_len;
+            mask_data[row + visible..row + k_len].fill(f32::NEG_INFINITY);
+        }
+
+        Tensor::from_vec(mask_data, (1, 1, q_len, k_len), device)
+    }
+
     /// Apply causal mask to attention scores.
     ///
     /// Sets scores to -inf where key position > query position.
     fn apply_causal_mask(&self, scores: &Tensor, q_start: usize, k_start: usize) -> Result<Tensor> {
-        let (batch, heads, q_len, k_len) = scores.dims4()?;
-        let device = scores.device();
-
-        // Create causal mask: mask[i,j] = true if k_start + j > q_start + i
-        let mut mask_data = vec![0.0f32; q_len * k_len];
-        let neg_inf = f32::NEG_INFINITY;
-
-        for i in 0..q_len {
-            let q_pos = q_start + i;
-            for j in 0..k_len {
-                let k_pos = k_start + j;
-                if k_pos > q_pos {
-                    mask_data[i * k_len + j] = neg_inf;
-                }
-            }
-        }
-
-        let mask = Tensor::from_vec(mask_data, (1, 1, q_len, k_len), device)?;
-        let mask = mask.broadcast_as((batch, heads, q_len, k_len))?;
-        scores.add(&mask)
+        let (_batch, _heads, q_len, k_len) = scores.dims4()?;
+        let mask = Self::causal_mask_tensor(q_start, k_start, q_len, k_len, scores.device())?;
+        scores.broadcast_add(&mask)
     }
 }
 
@@ -358,6 +471,43 @@ mod tests {
         attn.matmul(&v)
     }
 
+    /// Reference causal attention: full score matrix with an explicit mask.
+    fn causal_reference(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64) -> Result<Tensor> {
+        let (_, _, seq_q, _) = q.dims4()?;
+        let (_, _, seq_k, _) = k.dims4()?;
+
+        let q = q.to_dtype(DType::F32)?;
+        let k = k.to_dtype(DType::F32)?;
+        let v = v.to_dtype(DType::F32)?;
+
+        let k_t = k.transpose(D::Minus2, D::Minus1)?.contiguous()?;
+        let attn = (q.matmul(&k_t)? * scale)?;
+
+        let mut mask_data = vec![0.0f32; seq_q * seq_k];
+        for i in 0..seq_q {
+            for (j, cell) in mask_data[i * seq_k..(i + 1) * seq_k].iter_mut().enumerate() {
+                if j > i {
+                    *cell = f32::NEG_INFINITY;
+                }
+            }
+        }
+        let mask = Tensor::from_vec(mask_data, (1, 1, seq_q, seq_k), q.device())?;
+
+        let attn = attn.broadcast_add(&mask)?;
+        let attn = candle_nn::ops::softmax_last_dim(&attn)?;
+        attn.matmul(&v)
+    }
+
+    fn max_abs_diff(a: &Tensor, b: &Tensor) -> Result<f32> {
+        let a: Vec<f32> = a.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+        let b: Vec<f32> = b.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+        assert_eq!(a.len(), b.len());
+        Ok(a.iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0_f32, f32::max))
+    }
+
     #[test]
     fn test_flash_attention_small_sequence() -> Result<()> {
         let device = Device::Cpu;
@@ -396,7 +546,8 @@ mod tests {
 
         let (q, k, v) = create_test_tensors(batch, heads, seq_len, seq_len, dim_head, &device)?;
 
-        let flash = FlashAttention::with_dim_head(dim_head);
+        // Budget 0 forces the tiled kernel for this small shape.
+        let flash = FlashAttention::with_dim_head(dim_head).with_score_matrix_budget(0);
         let flash_out = flash.forward(&q, &k, &v)?;
 
         let scale = 1.0 / (dim_head as f64).sqrt();
@@ -425,7 +576,8 @@ mod tests {
 
         let (q, k, v) = create_test_tensors(batch, heads, seq_q, seq_k, dim_head, &device)?;
 
-        let flash = FlashAttention::with_dim_head(dim_head);
+        // Budget 0 forces the tiled kernel, ragged trailing blocks included.
+        let flash = FlashAttention::with_dim_head(dim_head).with_score_matrix_budget(0);
         let flash_out = flash.forward(&q, &k, &v)?;
 
         let scale = 1.0 / (dim_head as f64).sqrt();
@@ -454,7 +606,7 @@ mod tests {
 
         let (q, k, v) = create_test_tensors(batch, heads, seq_q, seq_k, dim_head, &device)?;
 
-        let flash = FlashAttention::with_dim_head(dim_head);
+        let flash = FlashAttention::with_dim_head(dim_head).with_score_matrix_budget(0);
         let out = flash.forward(&q, &k, &v)?;
 
         assert_eq!(out.dims(), &[batch, heads, seq_q, dim_head]);
@@ -496,10 +648,10 @@ mod tests {
 
         let (q, k, v) = create_test_tensors(batch, heads, seq_len, seq_len, dim_head, &device)?;
 
-        // Test with different block sizes
+        // Test with different block sizes (tiled path forced for all of them)
         for block_size in [32, 64, 128] {
             let config = FlashAttentionConfig::with_block_size(block_size);
-            let flash = FlashAttention::new(dim_head, config);
+            let flash = FlashAttention::new(dim_head, config).with_score_matrix_budget(0);
             let flash_out = flash.forward(&q, &k, &v)?;
 
             let scale = 1.0 / (dim_head as f64).sqrt();
@@ -512,6 +664,124 @@ mod tests {
                 assert_relative_eq!(f, s, epsilon = 1e-3);
             }
         }
+
+        Ok(())
+    }
+
+    /// Regression: the standard (non-tiled) kernel used to ignore
+    /// `config.causal`, silently leaking future keys for short sequences.
+    #[test]
+    fn test_causal_standard_path_applies_mask() -> Result<()> {
+        let device = Device::Cpu;
+        let batch = 1;
+        let heads = 2;
+        let seq_len = 16; // <= default block_size (64) => standard path
+        let dim_head = 8;
+
+        let (q, k, v) = create_test_tensors(batch, heads, seq_len, seq_len, dim_head, &device)?;
+
+        let config = FlashAttentionConfig::default().with_causal(true);
+        let causal_out = FlashAttention::new(dim_head, config).forward(&q, &k, &v)?;
+
+        let scale = 1.0 / (dim_head as f64).sqrt();
+        let reference = causal_reference(&q, &k, &v, scale)?;
+        assert!(max_abs_diff(&causal_out, &reference)? < 1e-5);
+
+        // ... and it must not coincide with unmasked attention.
+        let non_causal = FlashAttention::with_dim_head(dim_head).forward(&q, &k, &v)?;
+        let leak = max_abs_diff(&causal_out, &non_causal)?;
+        assert!(
+            leak > 1e-3,
+            "causal config produced non-causal attention (max diff {leak})"
+        );
+
+        // The first query may only attend to the first key, i.e. output == v[0].
+        let out_row: Vec<f32> = causal_out
+            .narrow(2, 0, 1)?
+            .flatten_all()?
+            .to_dtype(DType::F32)?
+            .to_vec1()?;
+        let v_row: Vec<f32> = v.narrow(2, 0, 1)?.flatten_all()?.to_vec1()?;
+        for (o, expected) in out_row.iter().zip(v_row.iter()) {
+            assert_relative_eq!(o, expected, epsilon = 1e-5);
+        }
+
+        Ok(())
+    }
+
+    /// The tiled kernel must agree with the masked reference, including the
+    /// ragged trailing blocks and the cached diagonal masks.
+    #[test]
+    fn test_causal_tiled_path_matches_reference() -> Result<()> {
+        let device = Device::Cpu;
+        let batch = 1;
+        let heads = 2;
+        let seq_q = 40;
+        let seq_k = 56;
+        let dim_head = 8;
+
+        let (q, k, v) = create_test_tensors(batch, heads, seq_q, seq_k, dim_head, &device)?;
+
+        let config = FlashAttentionConfig::with_block_size(16).with_causal(true);
+        let tiled = FlashAttention::new(dim_head, config).with_score_matrix_budget(0);
+        let tiled_out = tiled.forward(&q, &k, &v)?;
+
+        let scale = 1.0 / (dim_head as f64).sqrt();
+        let reference = causal_reference(&q, &k, &v, scale)?;
+
+        assert_eq!(tiled_out.dims(), &[batch, heads, seq_q, dim_head]);
+        assert!(max_abs_diff(&tiled_out, &reference)? < 1e-4);
+
+        Ok(())
+    }
+
+    /// Both dispatch branches implement the same mathematics.
+    #[test]
+    fn test_score_matrix_budget_dispatch_agrees() -> Result<()> {
+        let device = Device::Cpu;
+        let batch = 1;
+        let heads = 2;
+        let seq_len = 96;
+        let dim_head = 16;
+
+        let (q, k, v) = create_test_tensors(batch, heads, seq_len, seq_len, dim_head, &device)?;
+
+        let config = FlashAttentionConfig::with_block_size(32);
+        let standard = FlashAttention::new(dim_head, config);
+        let tiled = FlashAttention::new(dim_head, config).with_score_matrix_budget(0);
+
+        // A 96x96 score matrix is far below the default budget.
+        assert_eq!(standard.score_matrix_budget(), DEFAULT_SCORE_MATRIX_BUDGET);
+        assert_eq!(tiled.score_matrix_budget(), 0);
+        assert!(standard.use_standard_path(batch, heads, seq_len, seq_len));
+        assert!(!tiled.use_standard_path(batch, heads, seq_len, seq_len));
+        assert_eq!(standard.config().block_size, 32);
+
+        let standard_out = standard.forward(&q, &k, &v)?;
+        let tiled_out = tiled.forward(&q, &k, &v)?;
+        assert!(max_abs_diff(&standard_out, &tiled_out)? < 1e-4);
+
+        Ok(())
+    }
+
+    /// A degenerate `block_size` of 0 must not panic (it is clamped to 1).
+    #[test]
+    fn test_zero_block_size_is_clamped() -> Result<()> {
+        let device = Device::Cpu;
+        let (q, k, v) = create_test_tensors(1, 1, 4, 4, 4, &device)?;
+
+        let config = FlashAttentionConfig {
+            block_size: 0,
+            causal: false,
+            softmax_eps: 1e-6,
+        };
+        let flash = FlashAttention::new(4, config).with_score_matrix_budget(0);
+        let out = flash.forward(&q, &k, &v)?;
+        assert_eq!(out.dims(), &[1, 1, 4, 4]);
+
+        let scale = 1.0 / 4.0_f64.sqrt();
+        let reference = standard_attention(&q, &k, &v, scale)?;
+        assert!(max_abs_diff(&out, &reference)? < 1e-5);
 
         Ok(())
     }

@@ -3,7 +3,7 @@
 //! Wires together FLAME model loading, Gaussian initialisation, trainer
 //! creation, the training loop (with progress reporting), and final export.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use nalgebra as na;
@@ -25,13 +25,18 @@ use crate::verbosity::Verbosity;
 // ---------------------------------------------------------------------------
 
 /// All inputs needed to run the reconstruction pipeline.
-#[allow(dead_code)]
+///
+/// Deliberately carries no `#[allow(dead_code)]`: every field is read by
+/// [`run_reconstruction`], and the blanket suppression is what previously hid
+/// `input_path` and `device_index` being silently ignored.
 pub struct PipelineConfig {
     /// Path to the converted FLAME model directory.
     pub flame_model_path: PathBuf,
     /// Optional pre-computed per-frame FLAME tracking parameters (JSON).
     pub flame_params_path: Option<PathBuf>,
-    /// Input video file or frame directory.
+    /// Frame directory (or single image) holding the subject's footage.
+    ///
+    /// Video containers are rejected — see [`collect_input_frames`].
     pub input_path: PathBuf,
     /// Output directory for checkpoints, exports, and logs.
     pub output_dir: PathBuf,
@@ -79,6 +84,115 @@ fn default_distance() -> f32 {
 }
 
 // ---------------------------------------------------------------------------
+// Input footage discovery
+// ---------------------------------------------------------------------------
+
+/// Still-image extensions accepted inside a frame directory (lower-cased).
+const FRAME_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "bmp", "tif", "tiff", "webp", "exr"];
+
+/// Video container extensions recognised but not decodable in pure Rust.
+const VIDEO_EXTENSIONS: &[&str] = &["mp4", "mov", "avi", "mkv", "webm", "m4v", "mpg", "mpeg"];
+
+/// The footage referenced by `--input`, resolved to a concrete list of frames.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InputFrames {
+    /// Frame image paths, sorted by file name so the sequence is deterministic.
+    pub paths: Vec<PathBuf>,
+    /// Pixel dimensions of the first frame (`width`, `height`).
+    pub width: u32,
+    pub height: u32,
+}
+
+fn has_extension(path: &Path, allowed: &[&str]) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .is_some_and(|e| allowed.contains(&e.as_str()))
+}
+
+/// Enumerate the frame images referenced by `--input`.
+///
+/// `input_path` may be either a single image, or a directory containing a
+/// frame sequence.  Video containers are detected and rejected with an
+/// actionable message: OxiGAF is pure Rust (COOLJAPAN policy) and therefore
+/// ships no video demuxer/decoder, so callers must extract frames first.
+///
+/// # Errors
+///
+/// Returns an error when the path does not exist, names a video container,
+/// names an unsupported file type, or is a directory with no decodable frames.
+pub fn collect_input_frames(input_path: &Path) -> Result<Vec<PathBuf>> {
+    if !input_path.exists() {
+        anyhow::bail!("Input path does not exist: {}", input_path.display());
+    }
+
+    if input_path.is_file() {
+        if has_extension(input_path, VIDEO_EXTENSIONS) {
+            anyhow::bail!(
+                "Video input is not supported: {}\n\
+                 OxiGAF is pure Rust and bundles no video decoder. Extract the frames first \
+                 (e.g. `ffmpeg -i {} frames/%05d.png`) and pass the frame directory to --input.",
+                input_path.display(),
+                input_path.display(),
+            );
+        }
+        if !has_extension(input_path, FRAME_EXTENSIONS) {
+            anyhow::bail!(
+                "Unsupported input file type: {} (expected one of: {})",
+                input_path.display(),
+                FRAME_EXTENSIONS.join(", "),
+            );
+        }
+        return Ok(vec![input_path.to_path_buf()]);
+    }
+
+    let read_dir = std::fs::read_dir(input_path)
+        .with_context(|| format!("Failed to read input directory: {}", input_path.display()))?;
+
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for entry in read_dir {
+        let entry =
+            entry.with_context(|| format!("Failed to read entry in {}", input_path.display()))?;
+        let path = entry.path();
+        if path.is_file() && has_extension(&path, FRAME_EXTENSIONS) {
+            paths.push(path);
+        }
+    }
+
+    if paths.is_empty() {
+        anyhow::bail!(
+            "No decodable frames found in {} (looked for: {})",
+            input_path.display(),
+            FRAME_EXTENSIONS.join(", "),
+        );
+    }
+
+    // Sort by file name so `frame_00001.png`, `frame_00002.png`, … stay ordered
+    // independently of the order the filesystem hands entries back in.
+    paths.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+    Ok(paths)
+}
+
+/// Resolve `--input` into a validated frame sequence.
+///
+/// Beyond enumerating the files this actually opens the first frame's header,
+/// so a directory full of unreadable or truncated images fails here rather
+/// than silently producing a model trained on nothing.
+fn load_input_frames(input_path: &Path) -> Result<InputFrames> {
+    let paths = collect_input_frames(input_path)?;
+    let first = paths
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("Input frame list is empty: {}", input_path.display()))?;
+    let (width, height) = image::image_dimensions(first)
+        .with_context(|| format!("Failed to read image header: {}", first.display()))?;
+    Ok(InputFrames {
+        paths,
+        width,
+        height,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Training result metadata
 // ---------------------------------------------------------------------------
 
@@ -104,6 +218,32 @@ pub fn run_reconstruction(
     interactive_controller: Option<&crate::interactive::InteractiveController>,
 ) -> Result<TrainingResult> {
     let start = std::time::Instant::now();
+
+    // 0. Resolve and validate the user's footage.  This fails fast on a missing
+    //    path, a video container (no pure-Rust decoder), or an empty/unreadable
+    //    frame directory instead of quietly training on nothing.
+    let frames = load_input_frames(&config.input_path)
+        .with_context(|| format!("Invalid --input {}", config.input_path.display()))?;
+    tracing::info!(
+        "Input footage: {} frame(s) at {}×{} from {}",
+        frames.paths.len(),
+        frames.width,
+        frames.height,
+        config.input_path.display(),
+    );
+    // The trainer currently supervises itself from rendered views plus diffusion
+    // targets; it exposes no hook for injecting observed frames, and nothing in
+    // the workspace produces the per-frame camera poses such supervision needs
+    // (see the followups on `oxigaf_trainer::Trainer` and FLAME tracking).
+    // Say so loudly rather than pretending the footage was used.
+    tracing::warn!(
+        "The {} input frame(s) are validated but NOT yet used as photometric \
+         targets: per-frame camera poses and a trainer dataset hook are required. \
+         This run is self-supervised (rendered views + diffusion targets) and its \
+         result does not depend on {}.",
+        frames.paths.len(),
+        config.input_path.display(),
+    );
 
     // 1. Load FLAME model
     tracing::info!(
@@ -154,9 +294,13 @@ pub fn run_reconstruction(
     let raster_config = config.project_config.to_raster_config();
 
     // 4b. Request GPU device for the rasterizer
-    let (device, queue) =
-        request_gpu_device().context("Failed to initialise GPU device for rasterizer")?;
-    tracing::info!("GPU device acquired for rasterizer");
+    let (device, queue) = request_gpu_device(config.device_index).with_context(|| {
+        format!(
+            "Failed to initialise GPU device {} for rasterizer",
+            config.device_index
+        )
+    })?;
+    tracing::info!("GPU device {} acquired for rasterizer", config.device_index);
 
     // 5. Initialise or resume trainer
     let mut trainer = if let Some(ref ckpt_path) = config.resume_checkpoint {
@@ -457,28 +601,83 @@ pub fn run_reconstruction(
 // GPU device initialisation
 // ---------------------------------------------------------------------------
 
+/// Validate a `--device` index against the number of enumerated adapters.
+///
+/// Pure helper so the out-of-range branch is unit-testable without a GPU.
+///
+/// # Errors
+///
+/// Returns an error when no adapter is available at all, or when `requested`
+/// is not a valid index into the adapter list.
+fn select_adapter_index(num_adapters: usize, requested: usize) -> Result<usize> {
+    if num_adapters == 0 {
+        anyhow::bail!("No GPU adapters found (--device {requested} requested)");
+    }
+    if requested >= num_adapters {
+        anyhow::bail!(
+            "--device {requested} is out of range: {num_adapters} GPU adapter(s) available \
+             (valid indices 0..={})",
+            num_adapters - 1,
+        );
+    }
+    Ok(requested)
+}
+
 /// Request a wgpu device and queue for GPU-accelerated rasterization.
+///
+/// `device_index` is the `--device` GPU index:
+///
+/// * `0` means "let wgpu pick the best adapter" — a
+///   [`wgpu::PowerPreference::HighPerformance`] request.  Enumerating
+///   unconditionally and taking `adapters[0]` would regress this, because on a
+///   laptop the first *enumerated* adapter is usually the integrated GPU.
+/// * any other index selects `enumerate_adapters()[index]` explicitly and
+///   errors (listing the adapters) when the index is out of range.
+///
+/// A consequence of that asymmetry: `--device 0` and `--device N` can resolve
+/// to the same physical GPU when the high-performance pick happens to be
+/// adapter `N`.  The selected adapter name, backend, and `device_index` are
+/// logged on both paths so the mapping is visible.
 ///
 /// Uses `pollster` style blocking — safe to call from a tokio context because
 /// `wgpu::Instance::request_adapter` / `Adapter::request_device` only block on
 /// the GPU driver, not on tokio I/O.
-fn request_gpu_device() -> Result<(wgpu::Device, wgpu::Queue)> {
+fn request_gpu_device(device_index: usize) -> Result<(wgpu::Device, wgpu::Queue)> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::all(),
         ..wgpu::InstanceDescriptor::new_without_display_handle()
     });
 
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-        power_preference: wgpu::PowerPreference::HighPerformance,
-        compatible_surface: None,
-        force_fallback_adapter: false,
-        apply_limit_buckets: false,
-    }))
-    .map_err(|e| anyhow::anyhow!("No suitable GPU adapter found: {e}"))?;
+    let adapter = if device_index == 0 {
+        pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+            apply_limit_buckets: false,
+        }))
+        .map_err(|e| anyhow::anyhow!("No suitable GPU adapter found: {e}"))?
+    } else {
+        let adapters = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()));
+        let listing: Vec<String> = adapters
+            .iter()
+            .enumerate()
+            .map(|(i, a)| {
+                let info = a.get_info();
+                format!("[{i}] {} ({:?})", info.name, info.backend)
+            })
+            .collect();
+        let index = select_adapter_index(adapters.len(), device_index)
+            .with_context(|| format!("Enumerated GPU adapters: {}", listing.join(", ")))?;
+        adapters
+            .into_iter()
+            .nth(index)
+            .ok_or_else(|| anyhow::anyhow!("GPU adapter {index} vanished during selection"))?
+    };
 
     tracing::info!(
         adapter = adapter.get_info().name,
         backend = ?adapter.get_info().backend,
+        device_index,
         "Selected GPU adapter"
     );
 
@@ -562,33 +761,166 @@ pub fn default_orbit_cameras(width: u32, height: u32) -> Vec<Camera> {
 // Sparkline visualization
 // ---------------------------------------------------------------------------
 
+/// Number of loss samples rendered in the progress-bar sparkline.
+const SPARKLINE_WIDTH: usize = 20;
+
 /// Generate an ASCII sparkline from a sequence of loss values.
 ///
-/// Uses Unicode block characters to show trends over the last N iterations.
+/// Uses Unicode block characters to show the trend over the **most recent**
+/// [`SPARKLINE_WIDTH`] samples of `values`.  The min/max normalisation is
+/// computed over that same window, so the rendered glyphs always span the full
+/// block range for the segment being shown.
 fn generate_sparkline(values: &[f32]) -> String {
     if values.is_empty() {
         return String::new();
     }
 
-    let min = values.iter().copied().fold(f32::INFINITY, f32::min);
-    let max = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    // Tail window: `values` is an append-only history, so the newest samples
+    // live at the end.  (`take(N)` would render the *oldest* N and freeze the
+    // graphic once the history exceeded the window.)
+    let window = &values[values.len().saturating_sub(SPARKLINE_WIDTH)..];
+
+    let min = window.iter().copied().fold(f32::INFINITY, f32::min);
+    let max = window.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let range = max - min;
 
     if range < 1e-9 {
-        // All values are essentially the same
-        return "▄".repeat(values.len().min(20));
+        // All values in the window are essentially the same
+        return "▄".repeat(window.len());
     }
 
     let chars = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
     let num_chars = chars.len();
 
-    values
+    window
         .iter()
-        .take(20) // Show last 20 values max
         .map(|&v| {
             let normalized = (v - min) / range;
             let idx = (normalized * (num_chars - 1) as f32).round() as usize;
             chars[idx.min(num_chars - 1)]
         })
         .collect()
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+    use std::env;
+
+    #[test]
+    fn test_sparkline_renders_newest_samples() {
+        // Monotonically decreasing history of 50 samples (50.0 → 1.0), i.e.
+        // longer than the 20-wide window.  The rendered window must be the tail
+        // (20.0 → 1.0) normalised over itself: full block first, lowest block
+        // last.  Rendering the *oldest* 20 (50.0 → 31.0) normalised over the
+        // whole history would end on a mid-height block instead.
+        let values: Vec<f32> = (0..50).map(|i| 50.0 - i as f32).collect();
+        let spark = generate_sparkline(&values);
+        let glyphs: Vec<char> = spark.chars().collect();
+        assert_eq!(
+            glyphs.len(),
+            SPARKLINE_WIDTH,
+            "sparkline must render exactly the window width"
+        );
+        assert_eq!(
+            glyphs[0], '█',
+            "oldest sample of the tail window is the window maximum"
+        );
+        assert_eq!(
+            glyphs[SPARKLINE_WIDTH - 1],
+            '▁',
+            "newest sample is the window minimum — a mid-height block here means \
+             the oldest samples are being rendered"
+        );
+    }
+
+    #[test]
+    fn test_sparkline_window_tracks_latest_value() {
+        // With the old `take(20)` behaviour the glyphs stopped changing once
+        // the history exceeded 20 samples.  Appending a new extreme value must
+        // change the rendering.
+        let mut values: Vec<f32> = vec![1.0; 30];
+        values[29] = 0.5;
+        let before = generate_sparkline(&values);
+        values.push(0.0);
+        let after = generate_sparkline(&values);
+        assert_ne!(
+            before, after,
+            "appending a new sample must change the sparkline"
+        );
+        assert_eq!(after.chars().count(), SPARKLINE_WIDTH);
+    }
+
+    #[test]
+    fn test_sparkline_short_and_flat_histories() {
+        assert_eq!(generate_sparkline(&[]), "");
+        // Flat history → single mid-block per sample, window-limited.
+        assert_eq!(generate_sparkline(&[1.0; 3]).chars().count(), 3);
+        assert_eq!(
+            generate_sparkline(&[1.0; 40]).chars().count(),
+            SPARKLINE_WIDTH
+        );
+    }
+
+    #[test]
+    fn test_select_adapter_index() {
+        assert_eq!(
+            select_adapter_index(2, 1).expect("index 1 of 2 is valid"),
+            1
+        );
+        assert_eq!(
+            select_adapter_index(1, 0).expect("index 0 of 1 is valid"),
+            0
+        );
+        let err = select_adapter_index(2, 5).expect_err("index 5 of 2 must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("out of range"), "unexpected message: {msg}");
+        assert!(msg.contains("0..=1"), "must name the valid range: {msg}");
+        let none = select_adapter_index(0, 0).expect_err("no adapters must fail");
+        assert!(none.to_string().contains("No GPU adapters"));
+    }
+
+    #[test]
+    fn test_collect_input_frames_sorted_and_filtered() {
+        let dir = env::temp_dir().join("oxigaf_pipeline_input_frames");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        // Deliberately create out of lexical order plus a non-image file.
+        for name in ["frame_002.png", "frame_001.png", "notes.txt"] {
+            std::fs::write(dir.join(name), b"x").expect("write fixture");
+        }
+        let frames = collect_input_frames(&dir).expect("directory with frames must resolve");
+        assert_eq!(frames.len(), 2, "non-image files must be skipped");
+        assert!(frames[0].ends_with("frame_001.png"));
+        assert!(frames[1].ends_with("frame_002.png"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_collect_input_frames_rejects_empty_dir_and_video() {
+        let dir = env::temp_dir().join("oxigaf_pipeline_input_empty");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let err = collect_input_frames(&dir).expect_err("empty dir must fail");
+        assert!(err.to_string().contains("No decodable frames"));
+
+        let video = dir.join("clip.MP4");
+        std::fs::write(&video, b"not really a video").expect("write fixture");
+        let err = collect_input_frames(&video).expect_err("video input must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Video input is not supported"),
+            "unexpected message: {msg}"
+        );
+        assert!(
+            msg.contains("ffmpeg"),
+            "must suggest frame extraction: {msg}"
+        );
+
+        let missing = dir.join("nope").join("frames");
+        assert!(collect_input_frames(&missing).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

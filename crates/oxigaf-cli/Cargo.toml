@@ -2,22 +2,29 @@
 name = "oxigaf-cli"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/oxigaf-cli"
 description = "CLI for OxiGAF — Gaussian Avatar Reconstruction"
 readme = "README.md"
 keywords = ["cli", "gaussian-splatting", "3d", "avatar", "tool"]
 categories = ["command-line-utilities", "graphics", "multimedia"]
+
+[package.metadata.docs.rs]
+features = ["parallel", "flash_attention", "mixed_precision", "gpu_debug"]
+rustdoc-args = ["--cfg", "docsrs"]
 
 [[bin]]
 name = "oxigaf"
 path = "src/main.rs"
 
 [dependencies]
-oxigaf = { version = "0.1.1", path = "../oxigaf" }
-oxigaf-flame = { version = "0.1.1", path = "../oxigaf-flame" }
-oxigaf-trainer = { version = "0.1.1", path = "../oxigaf-trainer" }
+oxigaf = { workspace = true }
+oxigaf-flame = { workspace = true }
+oxigaf-trainer = { workspace = true }
 clap = { workspace = true }
 clap_complete = { workspace = true }
 anyhow = { workspace = true }

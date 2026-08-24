@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.1.2] - Unreleased
 
+### Changed
+
+- **candle-core / candle-nn** updated 0.10 → 0.11, and switched from
+  upstream `huggingface/candle` to the COOLJAPAN fork published as
+  `oxicandle-core` / `oxicandle-nn` (dependency *keys* stay `candle-core` /
+  `candle-nn`, so no source changes were needed). The fork selects
+  `fancy-regex` instead of `onig` in its `tokenizers` dependency.
+- **wgpu** updated 29 → 30
+- **oxiarc-archive** updated 0.3.3 → 0.4.1
+- **torsh-core / torsh-tensor / torsh-nn** (oxigaf-bridge) updated 0.1.2 → 0.2.0
+- **pollster** updated 0.4 → 1
+- **oxigaf-diffusion**: `flash_attention` is no longer enabled by default.
+  Previously `default = ["flash_attention"]` on `oxigaf-diffusion` meant the
+  `flash_attention` forwarding feature on `oxigaf` / `oxigaf-cli` could never
+  actually be turned off; it is now a real opt-in (`--features
+  flash_attention`, or the `full_performance` / `all_features` bundles).
+
+### Fixed
+
+- **C Oniguruma removed from the default build** — `candle-core` → `tokenizers`
+  previously pulled in `onig`/`onig_sys`, compiling the C Oniguruma library
+  via `cc`/`pkg-config` on every default build. Fixed by the `oxicandle-core`
+  switch above (verified: `Cargo.lock` now has zero `onig`/`onig_sys`
+  entries). This was a COOLJAPAN Pure-Rust policy violation.
+- **C OpenSSL removed from `oxigaf-cli`** — `hf-hub`'s default features
+  pulled in `native-tls` → `openssl`/`openssl-sys`, even though
+  `oxigaf-cli` only uses the sync `ureq` API
+  (`hf_hub::api::sync::ApiBuilder`). Fixed by declaring `hf-hub` with
+  `default-features = false, features = ["ureq"]` (verified:
+  `Cargo.lock` no longer lists `openssl-sys`).
+
+### Removed
+
+- **`candle-transformers`** — declared as a workspace dependency of
+  `oxigaf-diffusion` but never referenced anywhere in the codebase; removed
+  to avoid dragging upstream `candle-core` (and therefore `onig`) back into
+  the graph alongside the `oxicandle-core` fork.
+- **`.github/workflows/ci.yml.disabled`** — a disabled, non-functional GitHub
+  Actions workflow. It also targeted `branches: [main]`, but this
+  repository's default branch is `master`, so it would never have run even
+  if re-enabled as-is. Project policy permits only `pypi-publish.yml` /
+  `npm-publish.yml` under `.github/workflows/`.
+
+### Added
+
+- **deny.toml** — workspace-level `cargo-deny` configuration enforcing the
+  COOLJAPAN banned-crate list (compression, BLAS/LAPACK, TLS, tokenizer C
+  backends, etc.), with documented `wrappers`/skip exceptions for crates not
+  yet migrated off their C dependency.
+
 ## [0.1.1] - 2026-06-19
 
 ### Added

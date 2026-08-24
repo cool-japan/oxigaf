@@ -1,4 +1,5 @@
-//! Point cloud registration: align two Gaussian clouds via ICP + Procrustes.
+//! Point cloud registration: align two Gaussian clouds via ICP, with each step
+//! solved in closed form by the Umeyama similarity estimator.
 //!
 //! Finds the optimal rigid transform (rotation + translation + optional uniform scale)
 //! that aligns a source cloud to a target cloud.
@@ -7,13 +8,16 @@
 //! ```rust,no_run
 //! use oxigaf_cli::cloud_registration::{register_point_clouds, RegistrationConfig};
 //!
-//! let source = vec![0.0f32, 0.0, 0.0,  1.0, 0.0, 0.0];
-//! let target = vec![1.0f32, 0.0, 0.0,  2.0, 0.0, 0.0];
+//! let source = vec![0.0f32, 0.0, 0.0,  1.0, 0.0, 0.0,  0.0, 1.0, 0.0];
+//! let target = vec![1.0f32, 0.0, 0.0,  2.0, 0.0, 0.0,  1.0, 1.0, 0.0];
 //! let cfg = RegistrationConfig::default();
-//! let result = register_point_clouds(&source, &target, &cfg).expect("registration failed");
-//! println!("RMSE: {:.4e}", result.final_rmse);
+//! match register_point_clouds(&source, &target, &cfg) {
+//!     Ok(result) => println!("RMSE: {:.4e}", result.final_rmse),
+//!     Err(e) => eprintln!("registration failed: {e}"),
+//! }
 //! ```
 
+use rayon::prelude::*;
 use thiserror::Error;
 
 // ---------------------------------------------------------------------------
@@ -42,6 +46,10 @@ pub enum RegistrationError {
     /// Too few points for a meaningful registration.
     #[error("Insufficient points: need at least {need}, got {got}")]
     InsufficientPoints { need: usize, got: usize },
+
+    /// Not a single valid source/target pair could be established.
+    #[error("No valid correspondences: every distance was non-finite or above the cutoff")]
+    NoCorrespondences,
 
     /// Scale factor is not positive.
     #[error("Invalid scale factor {scale}: must be > 0")]
@@ -243,13 +251,6 @@ fn vec3_sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
 }
 
-/// Element-wise vector addition.
-#[cfg(test)]
-#[inline]
-fn vec3_add(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
-    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
-}
-
 /// Scalar multiplication of a vector.
 #[inline]
 fn vec3_scale(v: [f32; 3], s: f32) -> [f32; 3] {
@@ -307,6 +308,94 @@ fn quat_normalize(qx: f32, qy: f32, qz: f32, qw: f32) -> (f32, f32, f32, f32) {
 }
 
 // ---------------------------------------------------------------------------
+// Nearest-neighbour acceleration
+// ---------------------------------------------------------------------------
+
+/// Source-cloud size from which nearest-neighbour queries are run on the rayon
+/// pool. Below it the pool hand-off costs more than the queries themselves.
+const PAR_QUERY_THRESHOLD: usize = 1024;
+
+/// Balanced k-d tree over a target cloud, stored as a permuted index array.
+///
+/// Every subtree occupies one contiguous slice laid out as
+/// `[left | median | right]` and is split on axis `depth % 3`, so the whole tree
+/// is a single `Vec<usize>` with no per-node allocation. Queries prune with the
+/// squared distance to the splitting plane, which turns the per-point cost from
+/// the `O(n_tgt)` of a brute-force scan into `O(log n_tgt)` on average while
+/// returning exactly the same match (ties resolved towards the lower index).
+struct KdTree {
+    /// Target point indices, permuted into k-d tree order.
+    order: Vec<usize>,
+}
+
+impl KdTree {
+    /// Build the tree over the first `n` points of `target` (flat xyz).
+    fn build(target: &[f32], n: usize) -> Self {
+        let mut order: Vec<usize> = (0..n).collect();
+        Self::split(&mut order, target, 0);
+        Self { order }
+    }
+
+    /// Recursively partition `idx` around its median along axis `depth % 3`.
+    fn split(idx: &mut [usize], target: &[f32], depth: usize) {
+        if idx.len() <= 1 {
+            return;
+        }
+        let axis = depth % 3;
+        let mid = idx.len() / 2;
+        let (left, _median, right) = idx.select_nth_unstable_by(mid, |&a, &b| {
+            target[a * 3 + axis]
+                .partial_cmp(&target[b * 3 + axis])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        Self::split(left, target, depth + 1);
+        Self::split(right, target, depth + 1);
+    }
+
+    /// Nearest target point to `p`, as `(index, squared distance)`.
+    ///
+    /// Returns `None` when the cloud is empty or no finite distance exists
+    /// (non-finite coordinates compare as "not better" and are skipped).
+    fn nearest(&self, target: &[f32], p: [f32; 3]) -> Option<(usize, f32)> {
+        let mut best = (usize::MAX, f32::MAX);
+        Self::search(&self.order, target, p, 0, &mut best);
+        (best.0 != usize::MAX).then_some(best)
+    }
+
+    /// Depth-first search with splitting-plane pruning.
+    ///
+    /// The far subtree is only skipped when the splitting plane is strictly
+    /// farther than the incumbent — and never on a non-finite comparison — so
+    /// every point at exactly the minimum distance is still visited and the
+    /// lower-index tie-break matches a brute-force scan.
+    fn search(idx: &[usize], target: &[f32], p: [f32; 3], depth: usize, best: &mut (usize, f32)) {
+        if idx.is_empty() {
+            return;
+        }
+        let axis = depth % 3;
+        let mid = idx.len() / 2;
+        let ti = idx[mid];
+        let tp = [target[ti * 3], target[ti * 3 + 1], target[ti * 3 + 2]];
+        let diff = vec3_sub(p, tp);
+        let sq = vec3_dot(diff, diff);
+        if sq < best.1 || (sq == best.1 && ti < best.0) {
+            *best = (ti, sq);
+        }
+        let delta = p[axis] - tp[axis];
+        let (near, far) = if delta < 0.0 {
+            (&idx[..mid], &idx[mid + 1..])
+        } else {
+            (&idx[mid + 1..], &idx[..mid])
+        };
+        Self::search(near, target, p, depth + 1, best);
+        let plane_sq = delta * delta;
+        if plane_sq.is_nan() || plane_sq <= best.1 {
+            Self::search(far, target, p, depth + 1, best);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Core registration functions
 // ---------------------------------------------------------------------------
 
@@ -332,8 +421,11 @@ pub fn compute_centroid_3d(positions: &[f32]) -> Result<[f32; 3], RegistrationEr
     Ok([sum[0] / n, sum[1] / n, sum[2] / n])
 }
 
-/// For each source point, find the nearest target point by brute-force search.
+/// For each source point, find the nearest target point.
 ///
+/// A balanced k-d tree is built over the target cloud once per call, so the
+/// search costs `O(n_tgt log n_tgt + n_src log n_tgt)` instead of the
+/// `O(n_src n_tgt)` of a brute-force scan, and returns the identical matches.
 /// Only correspondences with distance < `max_dist` are included.
 pub fn find_correspondences(
     source: &[f32],
@@ -355,32 +447,30 @@ pub fn find_correspondences(
 
     let n_src = source.len() / 3;
     let n_tgt = target.len() / 3;
-    let mut correspondences = Vec::with_capacity(n_src);
+    let tree = KdTree::build(target, n_tgt);
 
-    for si in 0..n_src {
-        let sp = [source[si * 3], source[si * 3 + 1], source[si * 3 + 2]];
-        let mut best_dist = f32::MAX;
-        let mut best_ti = 0usize;
+    let match_one = |source_idx: usize| -> Option<Correspondence> {
+        let sp = [
+            source[source_idx * 3],
+            source[source_idx * 3 + 1],
+            source[source_idx * 3 + 2],
+        ];
+        let (target_idx, sq) = tree.nearest(target, sp)?;
+        let distance = sq.sqrt();
+        (distance < max_dist).then_some(Correspondence {
+            source_idx,
+            target_idx,
+            distance,
+        })
+    };
 
-        for ti in 0..n_tgt {
-            let tp = [target[ti * 3], target[ti * 3 + 1], target[ti * 3 + 2]];
-            let d = vec3_len(vec3_sub(sp, tp));
-            if d < best_dist {
-                best_dist = d;
-                best_ti = ti;
-            }
-        }
-
-        if best_dist < max_dist {
-            correspondences.push(Correspondence {
-                source_idx: si,
-                target_idx: best_ti,
-                distance: best_dist,
-            });
-        }
-    }
-
-    Ok(correspondences)
+    // Queries are independent, so they parallelise once the cloud is large
+    // enough to outweigh the thread-pool hand-off. `collect` keeps source order.
+    Ok(if n_src >= PAR_QUERY_THRESHOLD {
+        (0..n_src).into_par_iter().filter_map(match_one).collect()
+    } else {
+        (0..n_src).filter_map(match_one).collect()
+    })
 }
 
 /// Remove the worst `outlier_fraction` of correspondences (by distance).
@@ -405,135 +495,184 @@ pub fn filter_correspondences(
     sorted
 }
 
-/// Estimate the best-fit transform aligning `source_pts` to `target_pts`
-/// using simplified Procrustes via quaternion gradient descent.
+/// Eigenvector belonging to the largest eigenvalue of a symmetric 4×4 matrix.
+///
+/// Cyclic Jacobi rotations: every sweep zeroes the six off-diagonal entries in
+/// turn while accumulating the rotations in `v`, whose columns converge to the
+/// eigenvectors. Four sweeps normally suffice for a 4×4; a few more are run so
+/// that near-degenerate inputs also settle. Entries that are already negligible
+/// against their diagonals are skipped, so converged sweeps cost nothing.
+fn largest_eigenvector_sym4(input: &[f32; 16]) -> [f32; 4] {
+    let mut a = *input;
+    let mut v = [0.0f32; 16];
+    v[0] = 1.0;
+    v[5] = 1.0;
+    v[10] = 1.0;
+    v[15] = 1.0;
+
+    for _sweep in 0..16 {
+        for p in 0..3 {
+            for q in (p + 1)..4 {
+                let apq = a[p * 4 + q];
+                let app = a[p * 4 + p];
+                let aqq = a[q * 4 + q];
+                if apq.abs() <= 1e-12 * (app.abs() + aqq.abs() + 1e-12) {
+                    continue;
+                }
+                // Rotation that annihilates a[p][q]: t = tan(theta) chosen as the
+                // smaller root so that the transform stays well conditioned.
+                let theta = (aqq - app) / (2.0 * apq);
+                let sign = if theta >= 0.0 { 1.0 } else { -1.0 };
+                let t = sign / (theta.abs() + (theta * theta + 1.0).sqrt());
+                let c = 1.0 / (t * t + 1.0).sqrt();
+                let s = t * c;
+                a[p * 4 + p] = app - t * apq;
+                a[q * 4 + q] = aqq + t * apq;
+                a[p * 4 + q] = 0.0;
+                a[q * 4 + p] = 0.0;
+                for k in 0..4 {
+                    if k != p && k != q {
+                        let akp = a[k * 4 + p];
+                        let akq = a[k * 4 + q];
+                        a[k * 4 + p] = c * akp - s * akq;
+                        a[k * 4 + q] = s * akp + c * akq;
+                        a[p * 4 + k] = a[k * 4 + p];
+                        a[q * 4 + k] = a[k * 4 + q];
+                    }
+                    let vkp = v[k * 4 + p];
+                    let vkq = v[k * 4 + q];
+                    v[k * 4 + p] = c * vkp - s * vkq;
+                    v[k * 4 + q] = s * vkp + c * vkq;
+                }
+            }
+        }
+    }
+
+    let mut best = 0usize;
+    for i in 1..4 {
+        if a[i * 5] > a[best * 5] {
+            best = i;
+        }
+    }
+    [v[best], v[4 + best], v[8 + best], v[12 + best]]
+}
+
+/// Estimate the best-fit transform aligning `source_pts` to `target_pts` with
+/// the closed-form Umeyama (1991) solution.
 ///
 /// `source_pts` and `target_pts` are flat `[x0,y0,z0, x1,y1,z1, ...]` arrays
 /// of the same length (already matched by correspondence).
 ///
-/// When `allow_scale` is `false`, scale is clamped to 1.0 after each step.
+/// Both clouds are centred, the 3×3 cross-covariance `Σ = Σᵢ xsᵢ · xtᵢᵀ` is
+/// accumulated, and the rotation is read off the eigenvector belonging to the
+/// largest eigenvalue of Horn's symmetric 4×4 quaternion matrix built from `Σ`.
+/// That maximises `Σᵢ ⟨R·xsᵢ, xtᵢ⟩` over *proper* rotations, so the result is
+/// always orthonormal with `det(R) = +1`: the same answer as the SVD form with
+/// its `diag(1, 1, det(U·Vᵀ))` reflection correction, without needing an SVD.
+///
+/// When `allow_scale` is `true` the optimal uniform scale
+/// `s = Σᵢ ⟨R·xsᵢ, xtᵢ⟩ / Σᵢ ⟨xsᵢ, xsᵢ⟩` is estimated as well; when it is
+/// `false` scale is fixed at 1.0 and no scale term is computed at all.
+///
+/// # Errors
+///
+/// Returns [`RegistrationError::SizeMismatch`] when the two arrays differ in
+/// length and [`RegistrationError::InvalidPositionLength`] when that length is
+/// not a multiple of 3. Empty (but valid) input yields the identity transform.
 pub fn estimate_transform_umeyama_approx(
     source_pts: &[f32],
     target_pts: &[f32],
     allow_scale: bool,
-) -> RegistrationTransform {
-    debug_assert_eq!(source_pts.len(), target_pts.len());
+) -> Result<RegistrationTransform, RegistrationError> {
+    if source_pts.len() != target_pts.len() {
+        return Err(RegistrationError::SizeMismatch {
+            src: source_pts.len(),
+            tgt: target_pts.len(),
+        });
+    }
+    if !source_pts.len().is_multiple_of(3) {
+        return Err(RegistrationError::InvalidPositionLength {
+            len: source_pts.len(),
+        });
+    }
     let n = source_pts.len() / 3;
     if n == 0 {
-        return RegistrationTransform::identity();
+        return Ok(RegistrationTransform::identity());
     }
 
-    // Compute centroids
-    let cs = {
-        let mut s = [0.0f32; 3];
-        for i in 0..n {
-            s[0] += source_pts[i * 3];
-            s[1] += source_pts[i * 3 + 1];
-            s[2] += source_pts[i * 3 + 2];
-        }
-        [s[0] / n as f32, s[1] / n as f32, s[2] / n as f32]
-    };
-    let ct = {
-        let mut t = [0.0f32; 3];
-        for i in 0..n {
-            t[0] += target_pts[i * 3];
-            t[1] += target_pts[i * 3 + 1];
-            t[2] += target_pts[i * 3 + 2];
-        }
-        [t[0] / n as f32, t[1] / n as f32, t[2] / n as f32]
-    };
+    // Centroids of both clouds.
+    let mut cs = [0.0f32; 3];
+    let mut ct = [0.0f32; 3];
+    for (s, t) in source_pts.chunks_exact(3).zip(target_pts.chunks_exact(3)) {
+        cs = [cs[0] + s[0], cs[1] + s[1], cs[2] + s[2]];
+        ct = [ct[0] + t[0], ct[1] + t[1], ct[2] + t[2]];
+    }
+    let inv_n = 1.0 / n as f32;
+    let cs = vec3_scale(cs, inv_n);
+    let ct = vec3_scale(ct, inv_n);
 
-    // Centre the clouds
-    let mut xs: Vec<[f32; 3]> = Vec::with_capacity(n);
-    let mut xt: Vec<[f32; 3]> = Vec::with_capacity(n);
-    for i in 0..n {
-        xs.push(vec3_sub(
-            [
-                source_pts[i * 3],
-                source_pts[i * 3 + 1],
-                source_pts[i * 3 + 2],
-            ],
-            cs,
-        ));
-        xt.push(vec3_sub(
-            [
-                target_pts[i * 3],
-                target_pts[i * 3 + 1],
-                target_pts[i * 3 + 2],
-            ],
-            ct,
-        ));
+    // Cross-covariance sigma[a * 3 + b] = Σᵢ (xsᵢ)ₐ · (xtᵢ)_b, plus the source
+    // variance the optimal scale is normalised by.
+    let mut sigma = [0.0f32; 9];
+    let mut var_src = 0.0f32;
+    for (s, t) in source_pts.chunks_exact(3).zip(target_pts.chunks_exact(3)) {
+        let xs = vec3_sub([s[0], s[1], s[2]], cs);
+        let xt = vec3_sub([t[0], t[1], t[2]], ct);
+        var_src += vec3_dot(xs, xs);
+        for (a, &xa) in xs.iter().enumerate() {
+            sigma[a * 3] += xa * xt[0];
+            sigma[a * 3 + 1] += xa * xt[1];
+            sigma[a * 3 + 2] += xa * xt[2];
+        }
     }
 
-    // Gradient descent on quaternion parameters + scale
-    let mut qx = 0.0f32;
-    let mut qy = 0.0f32;
-    let mut qz = 0.0f32;
-    let mut qw = 1.0f32;
-    let mut scale = 1.0f32;
+    // Horn's symmetric 4×4 matrix N, whose quadratic form qᵀ·N·q equals
+    // Σᵢ ⟨R(q)·xsᵢ, xtᵢ⟩ for unit q ordered as (w, x, y, z).
+    let [sxx, sxy, sxz, syx, syy, syz, szx, szy, szz] = sigma;
+    let trace = sxx + syy + szz;
+    let n_mat = [
+        trace,
+        syz - szy,
+        szx - sxz,
+        sxy - syx,
+        syz - szy,
+        sxx - syy - szz,
+        sxy + syx,
+        szx + sxz,
+        szx - sxz,
+        sxy + syx,
+        -sxx + syy - szz,
+        syz + szy,
+        sxy - syx,
+        szx + sxz,
+        syz + szy,
+        -sxx - syy + szz,
+    ];
+    let q = largest_eigenvector_sym4(&n_mat);
+    let (qx, qy, qz, qw) = quat_normalize(q[1], q[2], q[3], q[0]);
+    let rotation = quat_to_mat3(qx, qy, qz, qw);
 
-    let eps = 1e-3f32;
-    let lr = 0.01f32;
-
-    // Compute loss for current params
-    let compute_loss = |qx: f32, qy: f32, qz: f32, qw: f32, sc: f32| -> f32 {
-        let (nqx, nqy, nqz, nqw) = quat_normalize(qx, qy, qz, qw);
-        let r = quat_to_mat3(nqx, nqy, nqz, nqw);
-        let mut loss = 0.0f32;
-        for i in 0..n {
-            let rotated = mat3_vec(r, xs[i]);
-            let diff = vec3_sub(vec3_scale(rotated, sc), xt[i]);
-            loss += vec3_dot(diff, diff);
+    let scale = if allow_scale && var_src > 0.0 {
+        // Σᵢ ⟨R·xsᵢ, xtᵢ⟩ = trace(R · Σ).
+        let mut num = 0.0f32;
+        for a in 0..3 {
+            for b in 0..3 {
+                num += rotation[a * 3 + b] * sigma[b * 3 + a];
+            }
         }
-        loss
+        (num / var_src).max(1e-6)
+    } else {
+        1.0
     };
-
-    for _ in 0..50 {
-        let base_loss = compute_loss(qx, qy, qz, qw, scale);
-
-        // Finite-difference gradient for qx
-        let d_qx = (compute_loss(qx + eps, qy, qz, qw, scale) - base_loss) / eps;
-        // Finite-difference gradient for qy
-        let d_qy = (compute_loss(qx, qy + eps, qz, qw, scale) - base_loss) / eps;
-        // Finite-difference gradient for qz
-        let d_qz = (compute_loss(qx, qy, qz + eps, qw, scale) - base_loss) / eps;
-        // Finite-difference gradient for qw
-        let d_qw = (compute_loss(qx, qy, qz, qw + eps, scale) - base_loss) / eps;
-        // Finite-difference gradient for scale
-        let d_sc = if allow_scale {
-            (compute_loss(qx, qy, qz, qw, scale + eps) - base_loss) / eps
-        } else {
-            0.0
-        };
-
-        qx -= lr * d_qx;
-        qy -= lr * d_qy;
-        qz -= lr * d_qz;
-        qw -= lr * d_qw;
-        if allow_scale {
-            scale = (scale - lr * d_sc).max(1e-6);
-        }
-
-        // Normalize quaternion after each step
-        let (nqx, nqy, nqz, nqw) = quat_normalize(qx, qy, qz, qw);
-        qx = nqx;
-        qy = nqy;
-        qz = nqz;
-        qw = nqw;
-    }
-
-    let (nqx, nqy, nqz, nqw) = quat_normalize(qx, qy, qz, qw);
-    let r = quat_to_mat3(nqx, nqy, nqz, nqw);
 
     // translation = ct - scale * R * cs
-    let r_cs = mat3_vec(r, cs);
-    let t = vec3_sub(ct, vec3_scale(r_cs, scale));
+    let translation = vec3_sub(ct, vec3_scale(mat3_vec(rotation, cs), scale));
 
-    RegistrationTransform {
-        rotation: r,
-        translation: t,
+    Ok(RegistrationTransform {
+        rotation,
+        translation,
         scale,
-    }
+    })
 }
 
 /// Perform one ICP iteration:
@@ -578,7 +717,7 @@ pub fn icp_step(
     }
 
     // Estimate delta transform on the matched subsets
-    let delta = estimate_transform_umeyama_approx(&src_pts, &tgt_pts, config.allow_scale);
+    let delta = estimate_transform_umeyama_approx(&src_pts, &tgt_pts, config.allow_scale)?;
 
     // Compose: apply delta on top of the existing transform
     let new_transform = delta.compose(&transform);
@@ -664,6 +803,14 @@ pub fn register_point_clouds(
     }
 
     let final_rmse = prev_rmse;
+    // `f32::MAX` is the sentinel `icp_step` returns when it could not match a
+    // single pair, so a run that never improved on it produced nothing usable.
+    if config.max_iterations > 0 && (final_rmse.is_nan() || final_rmse >= f32::MAX) {
+        return Err(RegistrationError::Diverged {
+            iters: iter,
+            rmse: final_rmse,
+        });
+    }
 
     Ok(RegistrationResult {
         transform,
@@ -678,6 +825,11 @@ pub fn register_point_clouds(
 /// Apply a registration transform to every point in a flat positions array.
 ///
 /// Returns a new flat positions array of the same length.
+///
+/// # Errors
+///
+/// Fails on an empty or mis-sized array, and on a transform whose scale is not
+/// finite and positive (which would silently turn the cloud into garbage).
 pub fn apply_registration_transform(
     positions: &[f32],
     transform: &RegistrationTransform,
@@ -688,6 +840,11 @@ pub fn apply_registration_transform(
     if !positions.len().is_multiple_of(3) {
         return Err(RegistrationError::InvalidPositionLength {
             len: positions.len(),
+        });
+    }
+    if !transform.scale.is_finite() || transform.scale <= 0.0 {
+        return Err(RegistrationError::InvalidScale {
+            scale: transform.scale,
         });
     }
     let mut out = Vec::with_capacity(positions.len());
@@ -737,6 +894,12 @@ pub fn compute_registration_stats(
 /// Compute the initial RMSE between source and target using the identity transform.
 ///
 /// Finds correspondences without applying any transform, then computes RMSE.
+///
+/// # Errors
+///
+/// Fails on empty or mis-sized clouds, and with
+/// [`RegistrationError::NoCorrespondences`] when not a single pair could be
+/// matched — reporting `0.0` there would read as a perfect alignment.
 pub fn compute_initial_rmse(source: &[f32], target: &[f32]) -> Result<f32, RegistrationError> {
     if source.is_empty() {
         return Err(RegistrationError::EmptyCloud);
@@ -753,7 +916,7 @@ pub fn compute_initial_rmse(source: &[f32], target: &[f32]) -> Result<f32, Regis
 
     let corr = find_correspondences(source, target, f32::MAX)?;
     if corr.is_empty() {
-        return Ok(0.0);
+        return Err(RegistrationError::NoCorrespondences);
     }
 
     let mut sq_sum = 0.0f32;
@@ -831,6 +994,28 @@ mod tests {
         (a - b).abs() <= tol
     }
 
+    // Helper: assert two 3-vectors approximately equal
+    fn close3(a: [f32; 3], b: [f32; 3]) -> bool {
+        vec3_len(vec3_sub(a, b)) <= 1e-5
+    }
+
+    // Helper: determinant of a row-major 3×3 matrix
+    fn mat3_det(m: [f32; 9]) -> f32 {
+        m[0] * (m[4] * m[8] - m[5] * m[7]) - m[1] * (m[3] * m[8] - m[5] * m[6])
+            + m[2] * (m[3] * m[7] - m[4] * m[6])
+    }
+
+    // Helper: deterministic pseudo-random cloud of N points in [0, span)³
+    fn pseudo_cloud(n: usize, seed: u32, span: f32) -> Vec<f32> {
+        let mut state = seed;
+        (0..n * 3)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                ((state >> 8) as f32 / 16_777_216.0) * span
+            })
+            .collect()
+    }
+
     // Helper: build a grid of N points centred near origin
     fn grid_positions(n: usize, spacing: f32) -> Vec<f32> {
         let side = (n as f32).cbrt().ceil() as usize;
@@ -855,27 +1040,15 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_identity_apply_zero() {
-        let t = RegistrationTransform::identity();
-        let p = t.apply([0.0, 0.0, 0.0]);
-        assert!(approx_eq(p[0], 0.0, 1e-6));
-        assert!(approx_eq(p[1], 0.0, 1e-6));
-        assert!(approx_eq(p[2], 0.0, 1e-6));
-    }
-
-    #[test]
-    fn test_identity_apply_arbitrary() {
-        let t = RegistrationTransform::identity();
-        let p = t.apply([3.0, -2.0, 1.5]);
-        assert!(approx_eq(p[0], 3.0, 1e-6));
-        assert!(approx_eq(p[1], -2.0, 1e-6));
-        assert!(approx_eq(p[2], 1.5, 1e-6));
-    }
-
-    #[test]
-    fn test_identity_scale_is_one() {
+    fn test_identity_transform() {
         let t = RegistrationTransform::identity();
         assert_eq!(t.scale, 1.0);
+        for p in [[0.0f32, 0.0, 0.0], [3.0, -2.0, 1.5]] {
+            let q = t.apply(p);
+            for k in 0..3 {
+                assert!(approx_eq(q[k], p[k], 1e-6), "coord {}", k);
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -883,43 +1056,23 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_apply_pure_translation() {
-        let t = RegistrationTransform {
-            rotation: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
-            translation: [1.0, 2.0, 3.0],
-            scale: 1.0,
+    fn test_apply_known_transforms() {
+        let id = [1.0f32, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+        let mk = |rotation: [f32; 9], translation: [f32; 3], scale: f32| RegistrationTransform {
+            rotation,
+            translation,
+            scale,
         };
-        let p = t.apply([0.0, 0.0, 0.0]);
-        assert!(approx_eq(p[0], 1.0, 1e-6));
-        assert!(approx_eq(p[1], 2.0, 1e-6));
-        assert!(approx_eq(p[2], 3.0, 1e-6));
-    }
-
-    #[test]
-    fn test_apply_scale_only() {
-        let t = RegistrationTransform {
-            rotation: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
-            translation: [0.0, 0.0, 0.0],
-            scale: 2.0,
-        };
-        let p = t.apply([1.0, 1.0, 1.0]);
-        assert!(approx_eq(p[0], 2.0, 1e-6));
-        assert!(approx_eq(p[1], 2.0, 1e-6));
-        assert!(approx_eq(p[2], 2.0, 1e-6));
-    }
-
-    #[test]
-    fn test_apply_90deg_rotation_z() {
+        // Pure translation.
+        let t = mk(id, [1.0, 2.0, 3.0], 1.0);
+        assert!(close3(t.apply([0.0, 0.0, 0.0]), [1.0, 2.0, 3.0]));
+        // Pure scale.
+        let t = mk(id, [0.0; 3], 2.0);
+        assert!(close3(t.apply([1.0, 1.0, 1.0]), [2.0, 2.0, 2.0]));
         // 90° rotation around z: x->y, y->-x, z->z
-        let t = RegistrationTransform {
-            rotation: [0.0, -1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
-            translation: [0.0, 0.0, 0.0],
-            scale: 1.0,
-        };
-        let p = t.apply([1.0, 0.0, 0.0]);
-        assert!(approx_eq(p[0], 0.0, 1e-6));
-        assert!(approx_eq(p[1], 1.0, 1e-6));
-        assert!(approx_eq(p[2], 0.0, 1e-6));
+        let rot_z90 = [0.0, -1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+        let t = mk(rot_z90, [0.0; 3], 1.0);
+        assert!(close3(t.apply([1.0, 0.0, 0.0]), [0.0, 1.0, 0.0]));
     }
 
     // -----------------------------------------------------------------------
@@ -927,56 +1080,22 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_compose_identity_is_neutral() {
+    fn test_compose() {
         let id = RegistrationTransform::identity();
-        let t = RegistrationTransform {
-            rotation: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
-            translation: [1.0, 2.0, 3.0],
-            scale: 1.5,
+        let mk = |translation: [f32; 3], scale: f32| RegistrationTransform {
+            rotation: id.rotation,
+            translation,
+            scale,
         };
-        let composed = id.compose(&t);
         // identity ∘ t should equal t
+        let t = mk([1.0, 2.0, 3.0], 1.5);
         let p = [0.5, -0.5, 1.0];
-        let r1 = t.apply(p);
-        let r2 = composed.apply(p);
-        assert!(approx_eq(r1[0], r2[0], 1e-5));
-        assert!(approx_eq(r1[1], r2[1], 1e-5));
-        assert!(approx_eq(r1[2], r2[2], 1e-5));
-    }
-
-    #[test]
-    fn test_compose_two_translations() {
-        let t1 = RegistrationTransform {
-            rotation: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
-            translation: [1.0, 0.0, 0.0],
-            scale: 1.0,
-        };
-        let t2 = RegistrationTransform {
-            rotation: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
-            translation: [0.0, 1.0, 0.0],
-            scale: 1.0,
-        };
-        let composed = t1.compose(&t2);
-        let p = composed.apply([0.0, 0.0, 0.0]);
-        assert!(approx_eq(p[0], 1.0, 1e-6));
-        assert!(approx_eq(p[1], 1.0, 1e-6));
-        assert!(approx_eq(p[2], 0.0, 1e-6));
-    }
-
-    #[test]
-    fn test_compose_scale_multiplies() {
-        let t1 = RegistrationTransform {
-            rotation: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
-            translation: [0.0, 0.0, 0.0],
-            scale: 2.0,
-        };
-        let t2 = RegistrationTransform {
-            rotation: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
-            translation: [0.0, 0.0, 0.0],
-            scale: 3.0,
-        };
-        let composed = t1.compose(&t2);
+        assert!(close3(id.compose(&t).apply(p), t.apply(p)));
+        // Translations add (the outer scale applies to the inner one) and
+        // scales multiply.
+        let composed = mk([1.0, 0.0, 0.0], 2.0).compose(&mk([0.0, 1.0, 0.0], 3.0));
         assert!(approx_eq(composed.scale, 6.0, 1e-6));
+        assert!(close3(composed.apply([0.0; 3]), [1.0, 2.0, 0.0]));
     }
 
     // -----------------------------------------------------------------------
@@ -1135,15 +1254,53 @@ mod tests {
     }
 
     #[test]
-    fn test_find_correspondences_empty_source_error() {
-        let result = find_correspondences(&[], &[0.0, 0.0, 0.0], f32::MAX);
-        assert!(matches!(result, Err(RegistrationError::EmptyCloud)));
+    fn test_find_correspondences_empty_errors() {
+        let no_source = find_correspondences(&[], &[0.0, 0.0, 0.0], f32::MAX);
+        assert!(matches!(no_source, Err(RegistrationError::EmptyCloud)));
+        let no_target = find_correspondences(&[0.0, 0.0, 0.0], &[], f32::MAX);
+        assert!(matches!(no_target, Err(RegistrationError::EmptyCloud)));
     }
 
     #[test]
-    fn test_find_correspondences_empty_target_error() {
-        let result = find_correspondences(&[0.0, 0.0, 0.0], &[], f32::MAX);
-        assert!(matches!(result, Err(RegistrationError::EmptyCloud)));
+    fn test_find_correspondences_matches_brute_force() {
+        // The k-d tree must return exactly what an exhaustive scan would.
+        let src = pseudo_cloud(60, 12_345, 10.0);
+        let tgt = pseudo_cloud(80, 987, 10.0);
+        let corr = find_correspondences(&src, &tgt, f32::MAX).unwrap();
+        assert_eq!(corr.len(), 60);
+        for c in &corr {
+            let sp = [
+                src[c.source_idx * 3],
+                src[c.source_idx * 3 + 1],
+                src[c.source_idx * 3 + 2],
+            ];
+            // Same rule as the tree: smallest squared distance, lowest index.
+            let mut best = (usize::MAX, f32::MAX);
+            for ti in 0..80 {
+                let tp = [tgt[ti * 3], tgt[ti * 3 + 1], tgt[ti * 3 + 2]];
+                let diff = vec3_sub(sp, tp);
+                let sq = vec3_dot(diff, diff);
+                if sq < best.1 {
+                    best = (ti, sq);
+                }
+            }
+            assert_eq!(c.target_idx, best.0, "source {}", c.source_idx);
+            assert!(approx_eq(c.distance, best.1.sqrt(), 1e-5));
+        }
+    }
+
+    #[test]
+    fn test_find_correspondences_parallel_path_keeps_order() {
+        // Above the threshold the queries run on the rayon pool; the output
+        // must still be one correspondence per source point, in source order.
+        let n = PAR_QUERY_THRESHOLD + 16;
+        let src = pseudo_cloud(n, 7, 25.0);
+        let tgt = pseudo_cloud(n, 99, 25.0);
+        let corr = find_correspondences(&src, &tgt, f32::MAX).unwrap();
+        assert_eq!(corr.len(), n);
+        for (i, c) in corr.iter().enumerate() {
+            assert_eq!(c.source_idx, i);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1151,26 +1308,21 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_filter_correspondences_zero_fraction() {
-        let corr = vec![
-            Correspondence {
-                source_idx: 0,
-                target_idx: 0,
-                distance: 5.0,
-            },
-            Correspondence {
-                source_idx: 1,
-                target_idx: 1,
-                distance: 1.0,
-            },
-            Correspondence {
-                source_idx: 2,
-                target_idx: 2,
-                distance: 9.0,
-            },
-        ];
-        let filtered = filter_correspondences(corr, 0.0);
-        assert_eq!(filtered.len(), 3);
+    fn test_filter_correspondences_edge_cases() {
+        let corr: Vec<Correspondence> = [5.0f32, 1.0, 9.0]
+            .iter()
+            .enumerate()
+            .map(|(i, &distance)| Correspondence {
+                source_idx: i,
+                target_idx: i,
+                distance,
+            })
+            .collect();
+        // A zero fraction keeps everything.
+        assert_eq!(filter_correspondences(corr.clone(), 0.0).len(), 3);
+        // Discarding everything still keeps one correspondence.
+        assert!(!filter_correspondences(corr, 1.0).is_empty());
+        assert!(filter_correspondences(vec![], 0.5).is_empty());
     }
 
     #[test]
@@ -1195,31 +1347,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_filter_correspondences_empty() {
-        let filtered = filter_correspondences(vec![], 0.5);
-        assert!(filtered.is_empty());
-    }
-
-    #[test]
-    fn test_filter_correspondences_one_hundred_pct() {
-        let corr = vec![
-            Correspondence {
-                source_idx: 0,
-                target_idx: 0,
-                distance: 3.0,
-            },
-            Correspondence {
-                source_idx: 1,
-                target_idx: 1,
-                distance: 1.0,
-            },
-        ];
-        let filtered = filter_correspondences(corr, 1.0);
-        // At least 1 correspondence must remain
-        assert!(!filtered.is_empty());
-    }
-
     // -----------------------------------------------------------------------
     // estimate_transform_umeyama_approx
     // -----------------------------------------------------------------------
@@ -1229,20 +1356,11 @@ mod tests {
         let pts = vec![
             0.0f32, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0,
         ];
-        let t = estimate_transform_umeyama_approx(&pts, &pts, false);
-        // Should be close to identity: points barely move
+        let t = estimate_transform_umeyama_approx(&pts, &pts, false).unwrap();
+        // The closed form is exact here: every point maps onto itself.
         for chunk in pts.chunks_exact(3) {
             let p_in = [chunk[0], chunk[1], chunk[2]];
-            let p_out = t.apply(p_in);
-            for k in 0..3 {
-                assert!(
-                    approx_eq(p_in[k], p_out[k], 0.1),
-                    "umeyama same cloud: coord {} mismatch: {} vs {}",
-                    k,
-                    p_in[k],
-                    p_out[k]
-                );
-            }
+            assert!(close3(t.apply(p_in), p_in), "point moved: {:?}", p_in);
         }
     }
 
@@ -1254,20 +1372,65 @@ mod tests {
             .enumerate()
             .map(|(i, &v)| if i % 3 == 0 { v + 5.0 } else { v })
             .collect();
-        let t = estimate_transform_umeyama_approx(&src, &tgt, false);
-        // Translation should be approximately (5, 0, 0)
-        assert!(
-            approx_eq(t.translation[0], 5.0, 0.5),
-            "expected tx ~5.0, got {}",
-            t.translation[0]
-        );
+        let t = estimate_transform_umeyama_approx(&src, &tgt, false).unwrap();
+        // Exactly (5, 0, 0) with a proper identity rotation.
+        let tr = t.translation;
+        assert!(close3(tr, [5.0, 0.0, 0.0]), "{:?}", tr);
+        assert!(approx_eq(mat3_det(t.rotation), 1.0, 1e-5));
     }
 
     #[test]
     fn test_umeyama_empty_returns_identity() {
-        let t = estimate_transform_umeyama_approx(&[], &[], false);
+        let t = estimate_transform_umeyama_approx(&[], &[], false).unwrap();
         assert!(approx_eq(t.scale, 1.0, 1e-6));
-        assert!(approx_eq(t.translation[0], 0.0, 1e-6));
+        assert!(close3(t.translation, [0.0; 3]));
+    }
+
+    #[test]
+    fn test_umeyama_rejects_mismatched_inputs() {
+        let six = vec![0.0f32; 6];
+        let three = vec![0.0f32; 3];
+        assert!(matches!(
+            estimate_transform_umeyama_approx(&six, &three, false),
+            Err(RegistrationError::SizeMismatch { src: 6, tgt: 3 })
+        ));
+        let four = vec![0.0f32; 4];
+        assert!(matches!(
+            estimate_transform_umeyama_approx(&four, &four, false),
+            Err(RegistrationError::InvalidPositionLength { len: 4 })
+        ));
+    }
+
+    #[test]
+    fn test_umeyama_recovers_known_rigid_transform() {
+        // 30° about the normalised axis (1, 2, 3), plus a translation.
+        let inv = 1.0 / 14.0f32.sqrt();
+        let half = 15.0f32.to_radians();
+        let (sn, cs) = (half.sin(), half.cos());
+        let r_known = quat_to_mat3(inv * sn, 2.0 * inv * sn, 3.0 * inv * sn, cs);
+        let t_known = [0.7f32, -1.3, 2.1];
+        let src = grid_positions(64, 1.0);
+        let mut tgt = Vec::with_capacity(src.len());
+        for p in src.chunks_exact(3) {
+            let q = mat3_vec(r_known, [p[0], p[1], p[2]]);
+            tgt.extend_from_slice(&[q[0] + t_known[0], q[1] + t_known[1], q[2] + t_known[2]]);
+        }
+        let est = estimate_transform_umeyama_approx(&src, &tgt, false).unwrap();
+        for i in 0..9 {
+            assert!(
+                approx_eq(est.rotation[i], r_known[i], 1e-3),
+                "R[{}]: {} vs {}",
+                i,
+                est.rotation[i],
+                r_known[i]
+            );
+        }
+        for k in 0..3 {
+            assert!(approx_eq(est.translation[k], t_known[k], 1e-3), "t[{}]", k);
+        }
+        assert!(approx_eq(est.scale, 1.0, 1e-6));
+        // A proper rotation, never a reflection.
+        assert!(approx_eq(mat3_det(est.rotation), 1.0, 1e-4));
     }
 
     // -----------------------------------------------------------------------
@@ -1281,8 +1444,8 @@ mod tests {
         let id = RegistrationTransform::identity();
         let (new_t, rmse, n) = icp_step(&pts, &pts, id, &cfg).unwrap();
         assert!(
-            rmse < 0.5,
-            "RMSE on identical clouds should be small, got {}",
+            rmse < 1e-5,
+            "RMSE on identical clouds should vanish, got {}",
             rmse
         );
         assert!(n > 0);
@@ -1313,13 +1476,75 @@ mod tests {
             ..Default::default()
         };
         let result = register_point_clouds(&pts, &pts, &cfg).unwrap();
-        // Gradient-descent Procrustes in ≤10 iterations on a same-cloud problem
-        // converges to a low RMSE but the exact value depends on step count.
+        // The closed-form estimator returns the identity on the first pass, so
+        // the residual collapses immediately instead of creeping down.
         assert!(
-            result.final_rmse < 2.0,
-            "RMSE should be small for same cloud: {}",
+            result.final_rmse < 1e-4,
+            "RMSE should vanish for same cloud: {}",
             result.final_rmse
         );
+    }
+
+    #[test]
+    fn test_register_recovers_small_rigid_transform() {
+        // 5° about z through the cloud centre plus a sub-cell translation moves
+        // every point by at most 2 * 2.83 * sin(2.5°) + 0.13 ≈ 0.37, well under
+        // half the 1.0 grid spacing, so the very first correspondence set is the
+        // true one and ICP must land on the exact transform.
+        let src = grid_positions(125, 1.0);
+        let angle = 5.0f32.to_radians();
+        let (sa, ca) = (angle.sin(), angle.cos());
+        let r_known = [ca, -sa, 0.0, sa, ca, 0.0, 0.0, 0.0, 1.0];
+        let t_known = [0.1f32, -0.05, 0.05];
+        let centre = compute_centroid_3d(&src).unwrap();
+        let mut tgt = Vec::with_capacity(src.len());
+        for p in src.chunks_exact(3) {
+            let q = mat3_vec(r_known, vec3_sub([p[0], p[1], p[2]], centre));
+            tgt.extend_from_slice(&[
+                q[0] + centre[0] + t_known[0],
+                q[1] + centre[1] + t_known[1],
+                q[2] + centre[2] + t_known[2],
+            ]);
+        }
+        let cfg = RegistrationConfig {
+            max_iterations: 20,
+            tolerance: 1e-6,
+            ..Default::default()
+        };
+        let result = register_point_clouds(&src, &tgt, &cfg).unwrap();
+        assert!(
+            result.final_rmse < 1e-3,
+            "RMSE should collapse, got {}",
+            result.final_rmse
+        );
+        for i in 0..9 {
+            assert!(
+                approx_eq(result.transform.rotation[i], r_known[i], 1e-3),
+                "R[{}]: {} vs {}",
+                i,
+                result.transform.rotation[i],
+                r_known[i]
+            );
+        }
+        // Orthonormal, proper rotation (composed over every iteration).
+        assert!(approx_eq(mat3_det(result.transform.rotation), 1.0, 1e-4));
+    }
+
+    #[test]
+    fn test_register_diverges_without_correspondences() {
+        let src = grid_positions(8, 1.0);
+        let tgt: Vec<f32> = src
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| if i % 3 == 0 { v + 100.0 } else { v })
+            .collect();
+        let cfg = RegistrationConfig {
+            max_iterations: 3,
+            max_correspondence_dist: 1.0,
+            ..Default::default()
+        };
+        let result = register_point_clouds(&src, &tgt, &cfg);
+        assert!(matches!(result, Err(RegistrationError::Diverged { .. })));
     }
 
     #[test]
@@ -1466,6 +1691,14 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn test_apply_transform_rejects_non_positive_scale() {
+        let mut t = RegistrationTransform::identity();
+        t.scale = 0.0;
+        let err = apply_registration_transform(&[1.0, 2.0, 3.0], &t);
+        assert!(matches!(err, Err(RegistrationError::InvalidScale { .. })));
+    }
+
     // -----------------------------------------------------------------------
     // compute_registration_stats
     // -----------------------------------------------------------------------
@@ -1542,6 +1775,16 @@ mod tests {
         assert!(matches!(result, Err(RegistrationError::EmptyCloud)));
     }
 
+    #[test]
+    fn test_initial_rmse_without_correspondences_errors() {
+        // A non-finite target yields no valid pair; 0.0 would read as a
+        // perfect alignment, so an error must come back instead.
+        let src = vec![0.0f32, 0.0, 0.0];
+        let tgt = vec![f32::NAN, 0.0, 0.0];
+        let result = compute_initial_rmse(&src, &tgt);
+        assert!(matches!(result, Err(RegistrationError::NoCorrespondences)));
+    }
+
     // -----------------------------------------------------------------------
     // format_registration_result
     // -----------------------------------------------------------------------
@@ -1583,48 +1826,26 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_subsample_stride_one() {
+    fn test_subsample_strides() {
         let pts = grid_positions(8, 1.0);
-        let out = subsample_positions(&pts, 1).unwrap();
-        assert_eq!(out.len(), pts.len());
-    }
-
-    #[test]
-    fn test_subsample_stride_two() {
-        let pts = grid_positions(8, 1.0);
-        let out = subsample_positions(&pts, 2).unwrap();
-        // Should be roughly half the points
-        let expected = 4 * 3; // 4 points, 3 floats each
-        assert!(
-            out.len() == expected,
-            "expected {} floats, got {}",
-            expected,
-            out.len()
-        );
-    }
-
-    #[test]
-    fn test_subsample_stride_large() {
-        let pts = vec![
+        assert_eq!(subsample_positions(&pts, 1).unwrap().len(), pts.len());
+        // 4 of 8 points survive, 3 floats each.
+        assert_eq!(subsample_positions(&pts, 2).unwrap().len(), 12);
+        let four = vec![
             0.0f32, 0.0, 0.0, 1.0, 0.0, 0.0, 2.0, 0.0, 0.0, 3.0, 0.0, 0.0,
         ];
         // stride=4 → only first point
-        let out = subsample_positions(&pts, 4).unwrap();
+        let out = subsample_positions(&four, 4).unwrap();
         assert_eq!(out.len(), 3);
         assert!(approx_eq(out[0], 0.0, 1e-6));
     }
 
     #[test]
-    fn test_subsample_empty_error() {
-        let result = subsample_positions(&[], 2);
-        assert!(matches!(result, Err(RegistrationError::EmptyCloud)));
-    }
-
-    #[test]
-    fn test_subsample_invalid_length_error() {
-        let result = subsample_positions(&[1.0, 2.0], 1);
+    fn test_subsample_errors() {
+        let empty = subsample_positions(&[], 2);
+        assert!(matches!(empty, Err(RegistrationError::EmptyCloud)));
         assert!(matches!(
-            result,
+            subsample_positions(&[1.0, 2.0], 1),
             Err(RegistrationError::InvalidPositionLength { len: 2 })
         ));
     }
@@ -1634,56 +1855,30 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_error_empty_cloud_display() {
-        let e = RegistrationError::EmptyCloud;
-        let s = format!("{}", e);
-        assert!(s.contains("Empty"));
-    }
-
-    #[test]
-    fn test_error_invalid_position_length_display() {
-        let e = RegistrationError::InvalidPositionLength { len: 7 };
-        let s = format!("{}", e);
-        assert!(s.contains("7"));
-    }
-
-    #[test]
-    fn test_error_size_mismatch_display() {
-        let e = RegistrationError::SizeMismatch { src: 10, tgt: 20 };
-        let s = format!("{}", e);
-        assert!(s.contains("10") && s.contains("20"));
-    }
-
-    #[test]
-    fn test_error_diverged_display() {
-        let e = RegistrationError::Diverged {
-            iters: 100,
-            rmse: 0.5,
-        };
-        let s = format!("{}", e);
-        assert!(s.contains("100"));
-    }
-
-    #[test]
-    fn test_error_insufficient_points_display() {
-        let e = RegistrationError::InsufficientPoints { need: 3, got: 2 };
-        let s = format!("{}", e);
-        assert!(s.contains("3") && s.contains("2"));
-    }
-
-    #[test]
-    fn test_error_invalid_scale_display() {
-        let e = RegistrationError::InvalidScale { scale: -1.0 };
-        let s = format!("{}", e);
-        assert!(s.contains("-1"));
+    fn test_error_displays() {
+        use RegistrationError as E;
+        let rmse = 0.5;
+        let cases: Vec<(E, &str)> = vec![
+            (E::EmptyCloud, "Empty"),
+            (E::InvalidPositionLength { len: 7 }, "7"),
+            (E::SizeMismatch { src: 10, tgt: 20 }, "20"),
+            (E::Diverged { iters: 42, rmse }, "42"),
+            (E::InsufficientPoints { need: 3, got: 2 }, "2"),
+            (E::InvalidScale { scale: -1.0 }, "-1"),
+            (E::NoCorrespondences, "correspondence"),
+        ];
+        for (e, needle) in cases {
+            let rendered = format!("{}", e);
+            assert!(rendered.contains(needle), "{:?} -> {}", e, rendered);
+        }
     }
 
     // -----------------------------------------------------------------------
-    // Correspondence fields
+    // Plain data carriers
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_correspondence_fields() {
+    fn test_result_and_correspondence_fields() {
         let c = Correspondence {
             source_idx: 5,
             target_idx: 3,
@@ -1692,14 +1887,6 @@ mod tests {
         assert_eq!(c.source_idx, 5);
         assert_eq!(c.target_idx, 3);
         assert!(approx_eq(c.distance, 0.25, 1e-7));
-    }
-
-    // -----------------------------------------------------------------------
-    // RegistrationResult fields
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_registration_result_fields() {
         let result = RegistrationResult {
             transform: RegistrationTransform::identity(),
             final_rmse: 0.05,
@@ -1735,50 +1922,19 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_vec3_sub() {
-        let r = vec3_sub([3.0, 2.0, 1.0], [1.0, 1.0, 1.0]);
-        assert!(approx_eq(r[0], 2.0, 1e-6));
-        assert!(approx_eq(r[1], 1.0, 1e-6));
-        assert!(approx_eq(r[2], 0.0, 1e-6));
-    }
-
-    #[test]
-    fn test_vec3_add() {
-        let r = vec3_add([1.0, 2.0, 3.0], [4.0, 5.0, 6.0]);
-        assert!(approx_eq(r[0], 5.0, 1e-6));
-        assert!(approx_eq(r[1], 7.0, 1e-6));
-        assert!(approx_eq(r[2], 9.0, 1e-6));
-    }
-
-    #[test]
-    fn test_vec3_scale() {
-        let r = vec3_scale([1.0, 2.0, 3.0], 2.0);
-        assert!(approx_eq(r[0], 2.0, 1e-6));
-        assert!(approx_eq(r[1], 4.0, 1e-6));
-        assert!(approx_eq(r[2], 6.0, 1e-6));
-    }
-
-    #[test]
-    fn test_vec3_dot() {
-        let d = vec3_dot([1.0, 0.0, 0.0], [0.0, 1.0, 0.0]);
-        assert!(approx_eq(d, 0.0, 1e-6));
-        let d2 = vec3_dot([1.0, 2.0, 3.0], [1.0, 2.0, 3.0]);
-        assert!(approx_eq(d2, 14.0, 1e-5));
-    }
-
-    #[test]
-    fn test_vec3_len() {
-        let l = vec3_len([3.0, 4.0, 0.0]);
-        assert!(approx_eq(l, 5.0, 1e-5));
-    }
-
-    #[test]
-    fn test_mat3_vec() {
-        let m = [2.0f32, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0, 0.0, 4.0];
-        let v = mat3_vec(m, [1.0, 2.0, 3.0]);
-        assert!(approx_eq(v[0], 2.0, 1e-6));
-        assert!(approx_eq(v[1], 6.0, 1e-6));
-        assert!(approx_eq(v[2], 12.0, 1e-6));
+    fn test_vector_helpers() {
+        let ex = [1.0f32, 0.0, 0.0];
+        let ey = [0.0f32, 1.0, 0.0];
+        let v = [1.0f32, 2.0, 3.0];
+        let ones = [1.0f32, 1.0, 1.0];
+        assert!(close3(vec3_sub([3.0, 2.0, 1.0], ones), [2.0, 1.0, 0.0]));
+        assert!(close3(vec3_scale(v, 2.0), [2.0, 4.0, 6.0]));
+        assert!(approx_eq(vec3_dot(ex, ey), 0.0, 1e-6));
+        assert!(approx_eq(vec3_dot(v, v), 14.0, 1e-5));
+        assert!(approx_eq(vec3_len([3.0, 4.0, 0.0]), 5.0, 1e-5));
+        let diag = [2.0f32, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0, 0.0, 4.0];
+        assert!(close3(mat3_vec(diag, [1.0, 2.0, 3.0]), [2.0, 6.0, 12.0]));
+        assert!(approx_eq(mat3_det(diag), 24.0, 1e-4));
     }
 
     // -----------------------------------------------------------------------
@@ -1823,8 +1979,9 @@ mod tests {
         ];
         // Scale target by 2.0
         let tgt: Vec<f32> = src.iter().map(|&v| v * 2.0).collect();
-        let t = estimate_transform_umeyama_approx(&src, &tgt, true);
-        // Scale should be > 1.0 when scaling is allowed
-        assert!(t.scale > 1.0, "scale should be > 1.0, got {}", t.scale);
+        let t = estimate_transform_umeyama_approx(&src, &tgt, true).unwrap();
+        // The closed form recovers the factor exactly.
+        let sc = t.scale;
+        assert!(approx_eq(sc, 2.0, 1e-4), "expected 2.0, got {}", sc);
     }
 }

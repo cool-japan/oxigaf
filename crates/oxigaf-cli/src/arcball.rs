@@ -85,6 +85,13 @@ pub fn mat4_mul(a: &Mat4, b: &Mat4) -> Mat4 {
 ///
 /// If `eye` and `center` are coincident, the forward vector degenerates to
 /// zero; in that case the identity matrix is returned to avoid NaN.
+///
+/// If `up` is (near-)parallel to the forward direction `f` — e.g. looking
+/// straight up or down while `up` is the default `[0, 1, 0]` — then
+/// `cross(f, up)` is (near-)zero, which would otherwise collapse the whole
+/// rotation basis (`r` and `u` both zero, a singular 3×3 block, though not
+/// NaN). In that case a fallback up vector guaranteed not to be parallel to
+/// `f` is substituted before computing `r`.
 pub fn look_at(eye: Vec3, center: Vec3, up: Vec3) -> Mat4 {
     let f = vec3_normalize(vec3_sub(center, eye)); // forward
     if vec3_length(f) < 1e-12 {
@@ -92,6 +99,20 @@ pub fn look_at(eye: Vec3, center: Vec3, up: Vec3) -> Mat4 {
             1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
         ];
     }
+    let up = if vec3_length(vec3_cross(f, up)) < 1e-6 {
+        // This module's convention is Y-up (see `world_up` in
+        // `ArcballCamera::view_matrix`/`pan`), so "nearly vertical" means
+        // `f` is close to the Y axis. In that case fall back to Z, which is
+        // then guaranteed not to be parallel to `f`; otherwise Y itself is
+        // a safe fallback since `f` is not aligned with it.
+        if f[1].abs() > 0.99 {
+            [0.0, 0.0, 1.0]
+        } else {
+            [0.0, 1.0, 0.0]
+        }
+    } else {
+        up
+    };
     let r = vec3_normalize(vec3_cross(f, up)); // right
     let u = vec3_cross(r, f); // camera-local up
 
@@ -116,7 +137,34 @@ pub fn look_at(eye: Vec3, center: Vec3, up: Vec3) -> Mat4 {
 
 /// Build a perspective projection matrix (column-major, OpenGL convention,
 /// maps depth to [-1, 1]).
+///
+/// Degenerate inputs are clamped rather than left to produce non-finite
+/// matrix entries that would silently poison every subsequent
+/// `view_projection` product:
+/// - `fov_y` is clamped to `(1e-4, PI - 1e-4)` radians — outside that range
+///   `tan(fov_y / 2)` is zero (→ infinite focal length) or wraps sign past
+///   `PI`.
+/// - `aspect` has its magnitude floored at `1e-6` (preserving sign), so a
+///   zero-width viewport cannot produce an infinite `f / aspect`.
+/// - `near` and `far` are pushed apart by at least `1e-6` if they would
+///   otherwise coincide, avoiding an infinite `1 / (near - far)`.
 pub fn perspective(fov_y: f32, aspect: f32, near: f32, far: f32) -> Mat4 {
+    let fov_y = fov_y.clamp(1e-4, PI - 1e-4);
+    let aspect = if aspect.abs() < 1e-6 {
+        if aspect.is_sign_negative() {
+            -1e-6
+        } else {
+            1e-6
+        }
+    } else {
+        aspect
+    };
+    let (near, far) = if (near - far).abs() < 1e-6 {
+        (near, far + 1e-6)
+    } else {
+        (near, far)
+    };
+
     let f = 1.0 / (fov_y * 0.5).tan();
     let nf = 1.0 / (near - far);
 
@@ -448,6 +496,91 @@ mod tests {
 
         // w-component of the projection row should be -1
         assert!(approx_eq(w_near, -1.0, 1e-6), "w_near row should be -1");
+    }
+
+    #[test]
+    fn test_perspective_zero_aspect_stays_finite() {
+        let m = perspective(PI / 4.0, 0.0, 0.01, 100.0);
+        assert!(
+            m.iter().all(|v| v.is_finite()),
+            "matrix has non-finite entries: {m:?}"
+        );
+    }
+
+    #[test]
+    fn test_perspective_near_equals_far_stays_finite() {
+        let m = perspective(PI / 4.0, 1.0, 10.0, 10.0);
+        assert!(
+            m.iter().all(|v| v.is_finite()),
+            "matrix has non-finite entries: {m:?}"
+        );
+    }
+
+    #[test]
+    fn test_perspective_zero_fov_stays_finite() {
+        let m = perspective(0.0, 1.0, 0.01, 100.0);
+        assert!(
+            m.iter().all(|v| v.is_finite()),
+            "matrix has non-finite entries: {m:?}"
+        );
+    }
+
+    #[test]
+    fn test_perspective_fov_beyond_pi_stays_finite() {
+        let m = perspective(2.0 * PI, 1.0, 0.01, 100.0);
+        assert!(
+            m.iter().all(|v| v.is_finite()),
+            "matrix has non-finite entries: {m:?}"
+        );
+    }
+
+    #[test]
+    fn test_perspective_valid_input_unaffected_by_clamping() {
+        // Sanity check: normal, non-degenerate inputs still produce the
+        // expected near/far NDC mapping (mirrors test_projection_matrix_shape).
+        let near = 0.01f32;
+        let far = 100.0f32;
+        let p = perspective(PI / 4.0, 1.5, near, far);
+        let a = p[10];
+        let b = p[14];
+        let ndc_near = (a * (-near) + b) / near;
+        assert!(approx_eq(ndc_near, -1.0, 1e-4), "got {ndc_near}");
+    }
+
+    #[test]
+    fn test_look_at_up_parallel_to_forward_stays_non_singular() {
+        // Looking straight up with the default Y-up vector: `f` is parallel
+        // to `up`, which would otherwise collapse the rotation basis.
+        let m = look_at([0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 1.0, 0.0]);
+        assert!(
+            m.iter().all(|v| v.is_finite()),
+            "matrix has non-finite entries: {m:?}"
+        );
+        let col0 = [m[0], m[1], m[2]];
+        let col1 = [m[4], m[5], m[6]];
+        assert!(
+            vec3_length(col0) > 0.5,
+            "right vector collapsed to (near-)zero: {col0:?}"
+        );
+        assert!(
+            vec3_length(col1) > 0.5,
+            "up vector collapsed to (near-)zero: {col1:?}"
+        );
+    }
+
+    #[test]
+    fn test_look_at_up_antiparallel_to_forward_stays_non_singular() {
+        // Looking straight down: `f` is anti-parallel to the default up.
+        let m = look_at([0.0, 5.0, 0.0], [0.0, 0.0, 0.0], [0.0, 1.0, 0.0]);
+        assert!(
+            m.iter().all(|v| v.is_finite()),
+            "matrix has non-finite entries: {m:?}"
+        );
+        let col0 = [m[0], m[1], m[2]];
+        assert!(
+            vec3_length(col0) > 0.5,
+            "right vector collapsed to (near-)zero: {col0:?}"
+        );
     }
 
     #[test]

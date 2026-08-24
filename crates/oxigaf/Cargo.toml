@@ -11,22 +11,21 @@ keywords = ["gaussian-splatting", "3d-reconstruction", "avatar", "flame", "ai"]
 categories = ["graphics", "multimedia", "science"]
 
 [dependencies]
-oxigaf-flame = { version = "0.1.1", path = "../oxigaf-flame" }
-oxigaf-diffusion = { version = "0.1.1", path = "../oxigaf-diffusion" }
-oxigaf-render = { version = "0.1.1", path = "../oxigaf-render" }
-oxigaf-trainer = { version = "0.1.1", path = "../oxigaf-trainer" }
+oxigaf-flame = { workspace = true }
+oxigaf-diffusion = { workspace = true }
+oxigaf-render = { workspace = true }
+oxigaf-trainer = { workspace = true }
 thiserror = { workspace = true }
 wgpu = { workspace = true }
 pollster = { workspace = true }
 
 [dev-dependencies]
-# Async runtime for blocking on wgpu operations
-pollster = { workspace = true }
+# `wgpu` and `pollster` are already in [dependencies] above (pipeline.rs uses
+# both), and Cargo already exposes [dependencies] to examples/tests/benches,
+# so they are intentionally not re-declared here.
 # Logging for examples
 tracing-subscriber = { workspace = true }
 tracing = { workspace = true }
-# GPU compute backend
-wgpu = { workspace = true }
 # Image output
 image = { workspace = true }
 # Tensor operations for diffusion example
@@ -46,7 +45,10 @@ flash_attention = ["oxigaf-diffusion/flash_attention"]
 mixed_precision = ["oxigaf-diffusion/mixed_precision"]
 
 # Render features
-gpu_debug = ["oxigaf-render/gpu_debug"]
+# Also forwards to oxigaf-diffusion, whose debug_hooks.rs gates NaN/Inf
+# checking behind this same feature name — without this, `--features
+# gpu_debug` at this crate silently left the diffusion debug hooks off.
+gpu_debug = ["oxigaf-render/gpu_debug", "oxigaf-diffusion/gpu_debug"]
 
 # Convenience feature bundles
 full_performance = ["simd", "parallel", "flash_attention"]

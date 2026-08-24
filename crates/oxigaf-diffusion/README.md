@@ -15,10 +15,14 @@ This crate implements the multi-view diffusion pipeline for Gaussian Avatar Fram
 - **DDIM scheduling** — Fast sampling with 50-100 steps (vs 1000 for DDPM)
 - **Flash Attention** — Memory-efficient O(N) attention for large images
 
-The pipeline takes a single input image and generates multiple novel views of the subject at **512×512 resolution**, which are then used to initialize and optimize 3D Gaussians.
+The pipeline takes a single input image and generates multiple novel views of
+the subject, which are then used to initialize and optimize 3D Gaussians.
+Output is **256×256 by default** (`DiffusionConfig::image_size`); setting
+`upsampler_mode: Some(UpsamplerMode::SdX2)` (or `BilinearVae`) upsamples to
+**512×512**.
 
 **v0.1.2 — what's included:**
-- Full 512×512 multi-view generation pipeline (Latent Upsampler + IP-Adapter + CFG)
+- Multi-view generation pipeline (Latent Upsampler + IP-Adapter + CFG) — 256×256 by default, 512×512 with the upsampler enabled
 - 66 tests (all passing)
 - Benchmarks: standard vs Flash Attention, sequence lengths, DDIM scheduler
 
@@ -33,46 +37,43 @@ oxigaf-diffusion = "0.1"
 
 | Feature | Description |
 |---------|-------------|
-| `default` | `["accelerate", "flash_attention"]` — CPU with optimizations |
-| `accelerate` | Platform-native BLAS/LAPACK (Accelerate on macOS, OpenBLAS on Linux) |
-| `cuda` | NVIDIA GPU acceleration (requires CUDA toolkit) |
-| `metal` | Apple Silicon GPU acceleration (M1/M2/M3) |
+| `default` | `["flash_attention"]` — CPU with memory-efficient attention |
 | `flash_attention` | Memory-efficient O(N) attention (enabled by default) |
 | `mixed_precision` | FP16/BF16 inference (planned, not yet implemented) |
+| `gpu_debug` | NaN/Inf debug hooks (`debug_hooks::assert_finite`, `DebugConfig`) |
 
 ### Feature Details
-
-- **`accelerate`**: Uses native BLAS/LAPACK for tensor operations
-  - macOS: Apple Accelerate framework
-  - Linux: OpenBLAS or Intel MKL
-  - Windows: OpenBLAS
-
-- **`cuda`**: NVIDIA GPU acceleration via candle CUDA backend
-  - Requires CUDA toolkit (11.8+ recommended)
-  - Requires compute capability 7.0+ (Volta and newer)
-  - Not available on macOS
-
-- **`metal`**: Apple Silicon GPU acceleration via Metal
-  - macOS only
-  - Optimized for M1/M2/M3 chips
-  - Automatic selection on compatible hardware
 
 - **`flash_attention`**: Block-based attention computation
   - Reduces memory usage by 2-4× for large images
   - Maintains quality while being faster
-  - Enabled by default for efficiency
+  - Enabled by default (part of the `default` feature set)
 
-### Example Usage
+- **`mixed_precision`**: FP16/BF16 inference — the flag exists but the
+  implementation is not yet in place (see `Cargo.toml`: "currently a
+  placeholder")
+
+- **`gpu_debug`**: Turns on NaN/Inf assertions (`debug_hooks::assert_finite`,
+  configured via `DebugConfig`) during the diffusion forward pass, useful
+  for diagnosing numerical instability
+
+### GPU / BLAS Backends
+
+This crate has no `accelerate`, `cuda`, or `metal` feature of its own —
+platform-specific BLAS/GPU backends were removed from it in v0.1.2.
+`candle-core`/`candle-nn` resolve (at the workspace level) to the COOLJAPAN
+fork `oxicandle-core`/`oxicandle-nn` with `default-features = false`, so by
+default this crate is Pure Rust / CPU-only. To opt into a backend, enable
+the feature on the same resolved package from your own `Cargo.toml`:
 
 ```toml
-# CPU-only with flash attention (default)
+[dependencies]
 oxigaf-diffusion = "0.1"
-
-# Apple Silicon with Metal acceleration
-oxigaf-diffusion = { version = "0.1", features = ["metal", "flash_attention"] }
-
-# NVIDIA GPU with CUDA
-oxigaf-diffusion = { version = "0.1", features = ["cuda", "flash_attention"] }
+# candle-core/-nn resolve to the COOLJAPAN fork; opt into a backend feature
+# on that same package (see oxigaf-diffusion/Cargo.toml for this note):
+candle-core = { package = "oxicandle-core", version = "0.11.0", features = ["metal"] } # macOS GPU
+candle-nn   = { package = "oxicandle-nn",   version = "0.11.0", features = ["metal"] }
+# Swap "metal" for "accelerate" (macOS BLAS) or "cuda" (NVIDIA GPU) instead.
 ```
 
 ## Usage
@@ -80,49 +81,92 @@ oxigaf-diffusion = { version = "0.1", features = ["cuda", "flash_attention"] }
 ### Basic Multi-View Inference
 
 ```rust
-use oxigaf_diffusion::{
-    MultiViewDiffusionPipeline,
-    DiffusionConfig,
-    PredictionType
-};
-use image;
+use std::path::Path;
 
-fn main() -> Result<(), oxigaf_diffusion::DiffusionError> {
-    // Load input image
-    let input_image = image::open("portrait.jpg").map_err(|e| {
-        oxigaf_diffusion::DiffusionError::ImageLoad(
-            format!("Failed to load image: {}", e)
-        )
-    })?;
+use candle_core::{DType, Device, Tensor};
+use image::imageops::FilterType;
+use oxigaf_diffusion::{DiffusionConfig, DiffusionError, MultiViewDiffusionPipeline};
 
-    // Configure diffusion pipeline
+/// Load an image and lay it out as the `(1, 3, 224, 224)` tensor that
+/// `generate()` expects for CLIP conditioning (see `pipeline.rs`).
+fn load_reference_image(path: &str, device: &Device) -> Result<Tensor, DiffusionError> {
+    let img = image::open(path)
+        .map_err(|e| DiffusionError::ImageProcessingError(format!("failed to open {path}: {e}")))?
+        .resize_exact(224, 224, FilterType::Triangle)
+        .into_rgb32f(); // HWC, values already in [0, 1]
+
+    let mut chw = vec![0f32; 3 * 224 * 224];
+    for y in 0..224u32 {
+        for x in 0..224u32 {
+            let px = img.get_pixel(x, y);
+            for c in 0..3 {
+                chw[c * 224 * 224 + (y * 224 + x) as usize] = px[c];
+            }
+        }
+    }
+    Ok(Tensor::from_vec(chw, (1, 3, 224, 224), device)?)
+}
+
+/// Convert a `(3, H, W)` `[0, 1]` output tensor to a PNG file.
+fn save_tensor_as_png(t: &Tensor, width: u32, height: u32, path: &str) -> Result<(), DiffusionError> {
+    let data = t.contiguous()?.flatten_all()?.to_vec1::<f32>()?; // CHW, row-major
+    let (w, h) = (width as usize, height as usize);
+    let mut buf = image::RgbImage::new(width, height);
+    for y in 0..h {
+        for x in 0..w {
+            let px = [0usize, 1, 2].map(|c| (data[c * h * w + y * w + x].clamp(0.0, 1.0) * 255.0) as u8);
+            buf.put_pixel(x as u32, y as u32, image::Rgb(px));
+        }
+    }
+    buf.save(path)
+        .map_err(|e| DiffusionError::ImageProcessingError(format!("failed to save {path}: {e}")))
+}
+
+fn main() -> Result<(), DiffusionError> {
+    let device = Device::Cpu;
+
+    // Configure diffusion pipeline. DiffusionConfig has ~25 fields covering
+    // U-Net architecture, attention, and CFG — override what you need and
+    // take the rest from Default (num_views: 4, guidance_scale: 3.0, ...).
     let config = DiffusionConfig {
         num_views: 4,
-        num_inference_steps: 50,
-        guidance_scale: 7.5,
-        use_flash_attention: true,
-        prediction_type: PredictionType::VPrediction,
+        ..Default::default()
     };
 
-    // Load pre-trained model weights
-    let pipeline = MultiViewDiffusionPipeline::from_pretrained(
-        "path/to/model/weights",
-        &config,
+    // Load pre-trained model weights from a directory containing
+    // unet/, vae/, and image_encoder/ safetensors files.
+    let mut pipeline = MultiViewDiffusionPipeline::load(
+        config.clone(),
+        Path::new("path/to/model/weights"),
+        &device,
     )?;
 
-    // Generate multiple views
-    let output = pipeline.generate(&input_image, None)?;
+    let reference_image = load_reference_image("portrait.jpg", &device)?;
 
-    // Save generated views
-    for (i, view) in output.views.iter().enumerate() {
-        view.save(format!("view_{}.png", i)).map_err(|e| {
-            oxigaf_diffusion::DiffusionError::ImageSave(
-                format!("Failed to save view {}: {}", i, e)
-            )
-        })?;
+    // Normal-map latents: `(num_views, latent_channels, latent_size, latent_size)`.
+    // Zeroed here as a placeholder — a real caller renders per-view normal
+    // maps and VAE-encodes them (see `DiffusionTargetGenerator` in
+    // `oxigaf-trainer` for a worked, production example).
+    let normal_map_latents = Tensor::zeros(
+        (config.num_views, config.latent_channels, config.latent_size, config.latent_size),
+        DType::F32,
+        &device,
+    )?;
+
+    // Camera poses: `(num_views, camera_pose_dim)` flattened 4x3 extrinsics
+    // per view. Zeroed here — see "Custom Camera Poses" below for how to
+    // build this from real camera rotation/translation.
+    let camera_poses = Tensor::zeros((config.num_views, config.camera_pose_dim), DType::F32, &device)?;
+
+    // Generate multiple views (note: `generate` requires `&mut pipeline`).
+    let output = pipeline.generate(&reference_image, &normal_map_latents, &camera_poses, 0)?;
+
+    // output.images is Vec<Tensor>, each (3, H, W) in [0, 1].
+    for (i, view) in output.images.iter().enumerate() {
+        save_tensor_as_png(view, output.width, output.height, &format!("view_{i}.png"))?;
     }
 
-    println!("Generated {} novel views", output.views.len());
+    println!("Generated {} novel views", output.images.len());
 
     Ok(())
 }
@@ -130,55 +174,76 @@ fn main() -> Result<(), oxigaf_diffusion::DiffusionError> {
 
 ### Custom Camera Poses
 
+`generate()` takes camera poses as a `(num_views, 12)` tensor — each row is a
+flattened 4×3 world-to-camera extrinsics matrix (9 rotation floats, then 3
+translation floats), not a struct of azimuth/elevation/distance. Build it
+from `oxigaf_flame::Camera` the same way `oxigaf-trainer`'s
+`cameras_to_tensor` (`src/diffusion_target.rs`) does. This needs
+`oxigaf-flame` and `nalgebra` as direct dependencies too (both are already
+transitive dependencies of `oxigaf-diffusion`, but Cargo does not expose a
+crate's own dependencies to its downstream users):
+
 ```rust
-use oxigaf_diffusion::{
-    MultiViewDiffusionPipeline,
-    DiffusionConfig,
-    camera::CameraParams
-};
+use candle_core::{DType, Device, Tensor};
 use nalgebra as na;
+use oxigaf_diffusion::{DiffusionConfig, DiffusionError, MultiViewDiffusionPipeline};
+use oxigaf_flame::Camera;
 
-fn main() -> Result<(), oxigaf_diffusion::DiffusionError> {
-    let input_image = image::open("portrait.jpg").map_err(|e| {
-        oxigaf_diffusion::DiffusionError::ImageLoad(
-            format!("Failed to load image: {}", e)
-        )
-    })?;
+/// Flatten cameras into the `(N, 12)` pose tensor `generate()` expects:
+/// row-major rotation (9 floats) then translation (3 floats) per view.
+fn cameras_to_pose_tensor(cameras: &[Camera], device: &Device) -> Result<Tensor, DiffusionError> {
+    let mut data = vec![0.0f32; cameras.len() * 12];
+    for (i, cam) in cameras.iter().enumerate() {
+        for r in 0..3 {
+            for c in 0..3 {
+                data[i * 12 + r * 3 + c] = cam.rotation[(r, c)];
+            }
+        }
+        data[i * 12 + 9] = cam.translation.x;
+        data[i * 12 + 10] = cam.translation.y;
+        data[i * 12 + 11] = cam.translation.z;
+    }
+    Ok(Tensor::from_vec(data, (cameras.len(), 12), device)?)
+}
 
-    let config = DiffusionConfig::default();
-    let pipeline = MultiViewDiffusionPipeline::from_pretrained(
-        "path/to/model/weights",
-        &config,
+fn main() -> Result<(), DiffusionError> {
+    let device = Device::Cpu;
+
+    // Four views around the subject: 0°, 90°, 180°, 270° yaw about Y.
+    let cameras: Vec<Camera> = [0.0f32, 90.0, 180.0, 270.0]
+        .into_iter()
+        .map(|deg| {
+            let mut cam = Camera::default_front(512, 512);
+            let (s, c) = deg.to_radians().sin_cos();
+            cam.rotation = na::Matrix3::new(c, 0.0, s, 0.0, 1.0, 0.0, -s, 0.0, c);
+            cam.translation.z = 2.0;
+            cam
+        })
+        .collect();
+    let camera_poses = cameras_to_pose_tensor(&cameras, &device)?;
+
+    let config = DiffusionConfig {
+        num_views: cameras.len(),
+        ..Default::default()
+    };
+    let mut pipeline = MultiViewDiffusionPipeline::load(
+        config.clone(),
+        std::path::Path::new("path/to/model/weights"),
+        &device,
     )?;
 
-    // Define custom camera poses (4 views around the subject)
-    let camera_poses = vec![
-        CameraParams {
-            azimuth: 0.0,       // Front view
-            elevation: 0.0,
-            distance: 2.0,
-        },
-        CameraParams {
-            azimuth: std::f32::consts::FRAC_PI_4,  // 45° right
-            elevation: 0.0,
-            distance: 2.0,
-        },
-        CameraParams {
-            azimuth: -std::f32::consts::FRAC_PI_4, // 45° left
-            elevation: 0.0,
-            distance: 2.0,
-        },
-        CameraParams {
-            azimuth: 0.0,
-            elevation: std::f32::consts::FRAC_PI_6,  // 30° up
-            distance: 2.0,
-        },
-    ];
+    // See `load_reference_image` under "Basic Multi-View Inference" above.
+    let reference_image = load_reference_image("portrait.jpg", &device)?;
+    let normal_map_latents = Tensor::zeros(
+        (config.num_views, config.latent_channels, config.latent_size, config.latent_size),
+        DType::F32,
+        &device,
+    )?;
 
     // Generate views with custom cameras
-    let output = pipeline.generate(&input_image, Some(&camera_poses))?;
+    let output = pipeline.generate(&reference_image, &normal_map_latents, &camera_poses, 0)?;
 
-    println!("Generated {} views with custom camera poses", output.views.len());
+    println!("Generated {} views with custom camera poses", output.images.len());
 
     Ok(())
 }
@@ -187,62 +252,59 @@ fn main() -> Result<(), oxigaf_diffusion::DiffusionError> {
 ### DDIM Scheduler Configuration
 
 ```rust
-use oxigaf_diffusion::{
-    DdimScheduler,
-    PredictionType
-};
+use oxigaf_diffusion::{DdimScheduler, PredictionType};
 
-fn main() -> Result<(), oxigaf_diffusion::DiffusionError> {
-    // Create DDIM scheduler for fast sampling
-    let scheduler = DdimScheduler::new(
-        1000,                        // num_train_timesteps
-        50,                          // num_inference_steps
-        0.0,                         // beta_start
-        0.02,                        // beta_end
-        PredictionType::VPrediction, // prediction_type
-    )?;
+fn main() {
+    // Create a DDIM scheduler (SD-2.1 defaults: scaled-linear beta schedule,
+    // 1000 training timesteps). `new` is infallible — it only builds the
+    // alpha-cumprod table; call `set_timesteps` to pick the inference stride.
+    let mut scheduler = DdimScheduler::new(1000, PredictionType::VPrediction);
+    scheduler.set_timesteps(50);
 
-    // Get timesteps for inference
     let timesteps = scheduler.timesteps();
-
     println!("Using {} inference steps", timesteps.len());
     println!("Timesteps: {:?}", timesteps);
-
-    Ok(())
 }
 ```
 
 ### Memory-Efficient Inference with Flash Attention
 
 ```rust
-use oxigaf_diffusion::{MultiViewDiffusionPipeline, DiffusionConfig};
+use candle_core::{DType, Device, Tensor};
+use oxigaf_diffusion::{DiffusionConfig, DiffusionError, MultiViewDiffusionPipeline};
 
-fn main() -> Result<(), oxigaf_diffusion::DiffusionError> {
-    let input_image = image::open("high_res_portrait.jpg").map_err(|e| {
-        oxigaf_diffusion::DiffusionError::ImageLoad(
-            format!("Failed to load image: {}", e)
-        )
-    })?;
+fn main() -> Result<(), DiffusionError> {
+    let device = Device::Cpu;
 
-    // Enable flash attention for large images
+    // Enable flash attention for larger batches of views (already the
+    // default when the `flash_attention` feature is active — set here
+    // explicitly for clarity).
     let config = DiffusionConfig {
         num_views: 8,
-        num_inference_steps: 50,
-        guidance_scale: 7.5,
-        use_flash_attention: true,  // Reduces memory by 2-4×
-        prediction_type: PredictionType::VPrediction,
+        use_flash_attention: true,
+        ..Default::default()
     };
 
-    let pipeline = MultiViewDiffusionPipeline::from_pretrained(
-        "path/to/model/weights",
-        &config,
+    let mut pipeline = MultiViewDiffusionPipeline::load(
+        config.clone(),
+        std::path::Path::new("path/to/model/weights"),
+        &device,
     )?;
 
-    let output = pipeline.generate(&input_image, None)?;
+    // See `load_reference_image` under "Basic Multi-View Inference" above.
+    let reference_image = load_reference_image("high_res_portrait.jpg", &device)?;
+    let normal_map_latents = Tensor::zeros(
+        (config.num_views, config.latent_channels, config.latent_size, config.latent_size),
+        DType::F32,
+        &device,
+    )?;
+    let camera_poses = Tensor::zeros((config.num_views, config.camera_pose_dim), DType::F32, &device)?;
+
+    let output = pipeline.generate(&reference_image, &normal_map_latents, &camera_poses, 0)?;
 
     println!(
-        "Generated {} high-resolution views with flash attention",
-        output.views.len()
+        "Generated {} views with flash attention",
+        output.images.len()
     );
 
     Ok(())
@@ -253,11 +315,11 @@ fn main() -> Result<(), oxigaf_diffusion::DiffusionError> {
 
 ### CLIP Image Encoder
 
-Extracts semantic features from input images using CLIP ViT (Vision Transformer):
+Extracts semantic features from input images using CLIP ViT-H/14 (Vision Transformer):
 
 - Input: RGB image (224×224)
-- Output: 768-dimensional feature vector
-- Pre-trained on 400M image-text pairs
+- Output: 1280-dimensional feature vector (`DiffusionConfig::clip_embed_dim`)
+- Loads externally-supplied pre-trained weights (`image_encoder/model.safetensors`)
 
 ### Multi-View U-Net
 
@@ -274,7 +336,7 @@ Decodes latent representations to RGB images:
 
 - Latent space: 4 channels
 - RGB output: 3 channels
-- Upsampling factor: 8× (e.g., 64×64 latent → 512×512 RGB)
+- Upsampling factor: 8× (e.g., with the latent upsampler enabled, 64×64 latent → 512×512 RGB; by default, 32×32 latent → 256×256 RGB)
 
 ### Latent Upsampler (v0.1.1)
 
@@ -299,7 +361,7 @@ Improves generation quality via dual forward pass:
 - Conditional: full CLIP + IP embeddings
 - Unconditional: zero embeddings
 - `noise_pred = uncond + guidance_scale * (cond - uncond)`
-- Configurable `guidance_scale` (default: 7.5, range: 1.0–20.0)
+- Configurable `guidance_scale` (default: 3.0, range: 1.0–20.0)
 
 ### DDIM Scheduler
 
@@ -312,14 +374,19 @@ Fast sampling with fewer steps than DDPM:
 
 ## Performance
 
-Inference times on various hardware (512×512 resolution, 4 views, 50 steps):
+Inference times on various hardware (512×512 resolution — i.e. with
+`upsampler_mode` enabled —, 4 views, 50 steps):
 
 | Hardware | Time (with flash attention) | Time (without) |
 |----------|----------------------------|----------------|
 | CPU (Apple M2 Max) | ~12s | ~25s |
-| Apple M2 Max (Metal) | ~3s | ~6s |
-| NVIDIA RTX 4090 (CUDA) | ~1.5s | ~3s |
-| NVIDIA RTX 3080 (CUDA) | ~2.5s | ~5s |
+| Apple M2 Max (Metal)\* | ~3s | ~6s |
+| NVIDIA RTX 4090 (CUDA)\* | ~1.5s | ~3s |
+| NVIDIA RTX 3080 (CUDA)\* | ~2.5s | ~5s |
+
+\* Requires enabling the `metal`/`cuda` feature on `candle-core`/`candle-nn`
+from your own `Cargo.toml` — see "GPU / BLAS Backends" above. This crate
+itself has no `metal`/`cuda` feature.
 
 Memory usage:
 

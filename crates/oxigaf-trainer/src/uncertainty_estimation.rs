@@ -278,10 +278,21 @@ pub fn mc_dropout_stats(samples: &[Vec<f32>]) -> Result<(Vec<f32>, Vec<f32>), Un
     Ok((means, variances))
 }
 
-/// Apply a simulated dropout mask to a parameter vector.
+/// Apply an inverted-dropout mask to a parameter vector.
 ///
 /// Uses an xorshift64 PRNG; each element is zeroed with probability
-/// `dropout_rate`. The seed guard ensures the PRNG state is non-zero.
+/// `dropout_rate` and every surviving element is rescaled by
+/// `1 / (1 - dropout_rate)` so that the expectation of the masked vector
+/// equals the input. That rescale is what makes repeated masks feed
+/// [`mc_dropout_stats`] an unbiased Monte Carlo dropout estimator: without it
+/// the means come out low by a factor of `1 - dropout_rate` and the variances
+/// by `(1 - dropout_rate)^2`. The seed guard ensures the PRNG state is
+/// non-zero.
+///
+/// # Errors
+///
+/// Returns [`UncertaintyError::InvalidConfig`] unless `dropout_rate` lies in
+/// `[0, 1)`.
 pub fn apply_dropout_mask(
     params: &[f32],
     dropout_rate: f32,
@@ -293,6 +304,16 @@ pub fn apply_dropout_mask(
             dropout_rate
         )));
     }
+    // Guaranteed positive by the range check above; guarded anyway so the
+    // inverted-dropout scale can never become infinite.
+    let keep_prob = 1.0 - dropout_rate;
+    if keep_prob <= 0.0 {
+        return Err(UncertaintyError::NumericalError(format!(
+            "keep probability 1 - dropout_rate must be > 0, got {}",
+            keep_prob
+        )));
+    }
+    let scale = 1.0 / keep_prob;
     let mut state = seed.max(1);
     let threshold = (dropout_rate as f64 * u64::MAX as f64) as u64;
     let mut out = Vec::with_capacity(params.len());
@@ -301,7 +322,7 @@ pub fn apply_dropout_mask(
         if state < threshold {
             out.push(0.0f32);
         } else {
-            out.push(p);
+            out.push(p * scale);
         }
     }
     Ok(out)
@@ -563,13 +584,30 @@ pub fn variance_to_confidence(variance_map: &[f32]) -> Vec<f32> {
     variance_map.iter().map(|&v| (-v).exp()).collect()
 }
 
-/// Decompose uncertainty into aleatoric and epistemic components.
+/// Decompose the uncertainty of *point* predictions into aleatoric and
+/// epistemic components.
 ///
-/// - Epistemic: variance of the sample means around `model_mean`.
-/// - Aleatoric: mean of the per-sample variances (estimated from each sample
-///   relative to its local neighbourhood; approximated here as the mean
-///   squared deviation of each sample from the overall mean, which is the
-///   standard MC decomposition: aleatoric ≈ total - epistemic).
+/// Each row of `samples` is one stochastic forward pass (an MC-dropout pass or
+/// an ensemble member) and `model_mean` is the reference prediction the spread
+/// is measured against — usually the mean of `samples`, though a deterministic
+/// forward pass works equally well.
+///
+/// Point predictions carry no estimate of observation noise, so the law of
+/// total variance degenerates: the per-pass predictive variances are
+/// identically zero, hence so is the data term, and all the spread is model
+/// uncertainty. Concretely, for every output dimension `d`:
+///
+/// - `total[d]` — second moment of the passes about `model_mean[d]`, i.e.
+///   `E_t[(samples[t][d] - model_mean[d])^2]`.
+/// - `aleatoric[d]` — exactly `0.0`; observation noise is not identifiable
+///   from point predictions alone and is therefore not invented here.
+/// - `epistemic[d]` — equal to `total[d]`. It reduces to `Var_t(samples[t][d])`
+///   when `model_mean` is the mean of `samples`, and otherwise also carries the
+///   squared bias between that mean and `model_mean`.
+///
+/// Use [`decompose_uncertainty_with_variances`] when the model has a variance
+/// head: feeding it the per-pass predictive variances is the only way to
+/// obtain a genuine aleatoric/epistemic split.
 pub fn decompose_uncertainty(
     samples: &[Vec<f32>],
     model_mean: &[f32],
@@ -598,64 +636,118 @@ pub fn decompose_uncertainty(
     for tv in &mut total_var {
         *tv /= n;
     }
-    // Aleatoric ≈ mean of per-sample squared deviations from per-sample mean.
-    // Since we only have one forward pass per sample, we estimate aleatoric
-    // as the within-sample variance approximation using consecutive pairs
-    // (or simply as total * 0.5 as a prior-free lower bound). Instead we use
-    // the proper MC decomposition:
-    //   total    = epistemic + aleatoric
-    //   epistemic = Var_theta[E_x[p(y|x,theta)]]
-    //            ≈ Var across samples of their predictions (around model_mean)
-    //   aleatoric = E_theta[Var_x[p(y|x,theta)]]
-    //
-    // With only the raw samples we estimate:
-    //   sample_mean[d] already in model_mean
-    //   epistemic[d] = Var of sample predictions = total_var[d]
-    //   aleatoric[d] = total_var[d] - epistemic[d]  -- would be zero
-    //
-    // A better approximation: use the split into "between sample" vs
-    // "within sample" variance. Without per-sample noise access, the standard
-    // approach is:
-    //   epistemic = total (all variance is model uncertainty)
-    //   aleatoric = 0  -- unless we have predictive distributions per sample
-    //
-    // For the spec's purpose (decompose into reasonable parts), we use the
-    // common approximation that aleatoric ≈ mean sample variance (mean of
-    // (sample_i - grand_mean)^2) and epistemic = total - aleatoric
-    // which yields epistemic ≈ 0. That's incorrect. We therefore use the
-    // canonical MC estimate:
-    //   total = E[(f - mu)^2]
-    //   epistemic = Var[f] = total  (variance of predictions across samples)
-    //   aleatoric = total - epistemic = 0 without noise model.
-    //
-    // To make this useful, we split variance using the standard decomposition
-    // assuming each sample has additive homoscedastic noise equal to the
-    // grand mean residual variance. Practically: we treat half as aleatoric.
-    // This matches standard uncertainty decomposition for regression without
-    // explicit noise heads.
-    //
-    // For a real system with noise heads: aleatoric = mean predicted sigma^2.
-    let mut result = Vec::with_capacity(dim);
-    for d in 0..dim {
-        let total = total_var[d];
-        // Epistemic: between-sample (model) uncertainty
-        // Aleatoric: within-sample (data) noise — here approximated as the
-        // minimum per-sample deviation from the sample mean (proxy for noise floor).
-        // Simple split: use mean absolute deviation as aleatoric proxy.
-        let mut mad = 0.0f32;
-        for s in samples {
-            mad += (s[d] - model_mean[d]).abs();
-        }
-        mad /= n;
-        // Aleatoric estimate: mad^2 (as a variance-like quantity), capped at total.
-        let aleatoric = (mad * mad).min(total);
-        let epistemic = (total - aleatoric).max(0.0);
-        result.push(UncertaintyDecomposition {
+    // Law of total variance with per-pass predictive variances identically
+    // zero: aleatoric = E_t[0] = 0, so the whole second moment about
+    // `model_mean` is model (epistemic) uncertainty. No split is fabricated;
+    // callers with a variance head should use
+    // `decompose_uncertainty_with_variances` instead.
+    let result = total_var
+        .into_iter()
+        .map(|total| UncertaintyDecomposition {
             total,
-            aleatoric,
-            epistemic,
+            aleatoric: 0.0,
+            epistemic: total,
+        })
+        .collect();
+    Ok(result)
+}
+
+/// Decompose predictive uncertainty via the law of total variance.
+///
+/// `means[t]` and `variances[t]` are the predictive mean and the predicted
+/// (observation-noise) variance of stochastic forward pass `t` — one
+/// MC-dropout pass or ensemble member of a model with a variance head.
+/// `model_mean` is the reference prediction the per-pass means are measured
+/// against, normally the mean of `means`.
+///
+/// For every output dimension `d`:
+///
+/// - `aleatoric[d] = E_t[variances[t][d]]` — the data noise the model itself
+///   predicts, i.e. `E_θ[Var(y | θ)]`. Irreducible: more data will not shrink
+///   it.
+/// - `epistemic[d] = E_t[(means[t][d] - model_mean[d])^2]` — the second moment
+///   of the per-pass means about `model_mean[d]`. It equals `Var_θ(E[y | θ])`
+///   when `model_mean` is the mean of `means`, and otherwise also carries the
+///   squared bias between the two. Reducible: this is the term that flags
+///   where more data or more capacity would help.
+/// - `total[d] = aleatoric[d] + epistemic[d]`.
+///
+/// # Errors
+///
+/// Returns [`UncertaintyError::EmptyPredictions`] when `means` is empty,
+/// [`UncertaintyError::DimensionMismatch`] when `variances` does not pair up
+/// with `means` or a row length differs from `model_mean.len()`, and
+/// [`UncertaintyError::NumericalError`] for a negative or non-finite predicted
+/// variance — a broken variance head is reported rather than silently clamped.
+pub fn decompose_uncertainty_with_variances(
+    means: &[Vec<f32>],
+    variances: &[Vec<f32>],
+    model_mean: &[f32],
+) -> Result<Vec<UncertaintyDecomposition>, UncertaintyError> {
+    if means.is_empty() {
+        return Err(UncertaintyError::EmptyPredictions);
+    }
+    if variances.len() != means.len() {
+        return Err(UncertaintyError::DimensionMismatch {
+            expected: means.len(),
+            actual: variances.len(),
         });
     }
+    let dim = model_mean.len();
+    for (m, v) in means.iter().zip(variances.iter()) {
+        if m.len() != dim {
+            return Err(UncertaintyError::DimensionMismatch {
+                expected: dim,
+                actual: m.len(),
+            });
+        }
+        if v.len() != dim {
+            return Err(UncertaintyError::DimensionMismatch {
+                expected: dim,
+                actual: v.len(),
+            });
+        }
+        for &sigma_sq in v.iter() {
+            if !sigma_sq.is_finite() || sigma_sq < 0.0 {
+                return Err(UncertaintyError::NumericalError(format!(
+                    "predicted variance must be finite and non-negative, got {}",
+                    sigma_sq
+                )));
+            }
+        }
+    }
+    let n = means.len() as f32;
+    // Aleatoric: E_theta[Var(y | theta)] — mean of the predicted variances.
+    let mut aleatoric_sum = vec![0.0f32; dim];
+    for v in variances {
+        for (acc, &sigma_sq) in aleatoric_sum.iter_mut().zip(v.iter()) {
+            *acc += sigma_sq;
+        }
+    }
+    // Epistemic: spread of the per-pass means about the reference prediction.
+    let mut epistemic_sum = vec![0.0f32; dim];
+    for m in means {
+        for (acc, (&mu_t, &mu)) in epistemic_sum
+            .iter_mut()
+            .zip(m.iter().zip(model_mean.iter()))
+        {
+            let diff = mu_t - mu;
+            *acc += diff * diff;
+        }
+    }
+    let result = aleatoric_sum
+        .into_iter()
+        .zip(epistemic_sum)
+        .map(|(a_sum, e_sum)| {
+            let aleatoric = a_sum / n;
+            let epistemic = e_sum / n;
+            UncertaintyDecomposition {
+                total: aleatoric + epistemic,
+                aleatoric,
+                epistemic,
+            }
+        })
+        .collect();
     Ok(result)
 }
 
@@ -946,6 +1038,30 @@ mod tests {
     }
 
     #[test]
+    fn test_apply_dropout_mask_rescales_survivors() {
+        // Regression: inverted dropout must scale survivors by 1/(1-p), so the
+        // expectation of the masked vector matches the input. Without the
+        // rescale the mean collapses to (1-p) = 0.5.
+        let params = vec![1.0f32; 10_000];
+        let out = apply_dropout_mask(&params, 0.5, 2024).expect("dropout failed");
+        // Structural: every element is either dropped or exactly 1/(1-0.5) = 2.
+        assert!(out.iter().all(|&v| v == 0.0 || v == 2.0));
+        assert!(out.iter().any(|&v| v == 0.0), "expected some drops");
+        assert!(out.iter().any(|&v| v == 2.0), "expected some survivors");
+        // Statistical: mean preserved (0.5 away from the un-rescaled value).
+        let mean: f32 = out.iter().sum::<f32>() / out.len() as f32;
+        assert!(approx(mean, 1.0, 0.1), "expected mean ~1.0, got {}", mean);
+    }
+
+    #[test]
+    fn test_apply_dropout_mask_scale_matches_rate() {
+        let params = vec![4.0f32; 256];
+        let out = apply_dropout_mask(&params, 0.2, 99).expect("dropout failed");
+        // Survivors: 4 * 1/(1 - 0.2) = 5.
+        assert!(out.iter().all(|&v| v == 0.0 || approx(v, 5.0, 1e-4)));
+    }
+
+    #[test]
     fn test_apply_dropout_mask_high_rate_mostly_zero() {
         let params = vec![1.0f32; 1000];
         // dropout_rate of 0.99 — nearly all zeroed
@@ -1178,6 +1294,102 @@ mod tests {
     #[test]
     fn test_decompose_uncertainty_empty_error() {
         assert!(decompose_uncertainty(&[], &[1.0f32]).is_err());
+    }
+
+    #[test]
+    fn test_decompose_uncertainty_point_samples_are_fully_epistemic() {
+        // Regression: point predictions carry no observation-noise estimate, so
+        // no aleatoric share may be invented (the earlier implementation
+        // reported a fixed ~0.64 * total via a mean-absolute-deviation proxy).
+        let samples = vec![vec![0.0f32], vec![2.0f32], vec![1.0f32]];
+        let model_mean = vec![1.0f32];
+        let decomp = decompose_uncertainty(&samples, &model_mean).expect("decompose failed");
+        assert_eq!(decomp.len(), 1);
+        // total = ((0-1)^2 + (2-1)^2 + (1-1)^2) / 3 = 2/3
+        assert!(approx(decomp[0].total, 2.0 / 3.0, 1e-5));
+        assert_eq!(decomp[0].aleatoric, 0.0);
+        assert!(approx(decomp[0].epistemic, decomp[0].total, 1e-6));
+    }
+
+    // --- decompose_uncertainty_with_variances ---
+
+    #[test]
+    fn test_decompose_with_variances_pure_epistemic() {
+        // Disagreeing passes with zero predicted noise → all epistemic.
+        let means = vec![vec![0.0f32], vec![2.0f32]];
+        let variances = vec![vec![0.0f32], vec![0.0f32]];
+        let model_mean = vec![1.0f32];
+        let decomp = decompose_uncertainty_with_variances(&means, &variances, &model_mean)
+            .expect("decompose failed");
+        assert_eq!(decomp[0].aleatoric, 0.0);
+        assert!(approx(decomp[0].epistemic, 1.0, 1e-5));
+        assert!(approx(decomp[0].total, 1.0, 1e-5));
+    }
+
+    #[test]
+    fn test_decompose_with_variances_pure_aleatoric() {
+        // Identical passes → no model disagreement; all uncertainty is data noise.
+        let means = vec![vec![1.0f32], vec![1.0f32], vec![1.0f32]];
+        let variances = vec![vec![0.25f32], vec![0.75f32], vec![0.5f32]];
+        let model_mean = vec![1.0f32];
+        let decomp = decompose_uncertainty_with_variances(&means, &variances, &model_mean)
+            .expect("decompose failed");
+        assert!(approx(decomp[0].aleatoric, 0.5, 1e-5));
+        assert_eq!(decomp[0].epistemic, 0.0);
+        assert!(approx(decomp[0].total, 0.5, 1e-5));
+    }
+
+    #[test]
+    fn test_decompose_with_variances_law_of_total_variance() {
+        let means = vec![vec![0.0f32, 1.0], vec![2.0f32, 1.0]];
+        let variances = vec![vec![0.1f32, 0.4], vec![0.3f32, 0.6]];
+        let model_mean = vec![1.0f32, 1.0];
+        let decomp = decompose_uncertainty_with_variances(&means, &variances, &model_mean)
+            .expect("decompose failed");
+        assert_eq!(decomp.len(), 2);
+        // dim 0: aleatoric = (0.1 + 0.3)/2 = 0.2, epistemic = ((0-1)^2 + (2-1)^2)/2 = 1
+        assert!(approx(decomp[0].aleatoric, 0.2, 1e-5));
+        assert!(approx(decomp[0].epistemic, 1.0, 1e-5));
+        // dim 1: aleatoric = (0.4 + 0.6)/2 = 0.5, epistemic = 0
+        assert!(approx(decomp[1].aleatoric, 0.5, 1e-5));
+        assert!(approx(decomp[1].epistemic, 0.0, 1e-6));
+        for d in &decomp {
+            assert!(approx(d.total, d.aleatoric + d.epistemic, 1e-6));
+        }
+    }
+
+    #[test]
+    fn test_decompose_with_variances_empty_error() {
+        assert!(decompose_uncertainty_with_variances(&[], &[], &[1.0f32]).is_err());
+    }
+
+    #[test]
+    fn test_decompose_with_variances_count_mismatch_error() {
+        let means = vec![vec![1.0f32], vec![2.0f32]];
+        let variances = vec![vec![0.1f32]];
+        assert!(decompose_uncertainty_with_variances(&means, &variances, &[1.0f32]).is_err());
+    }
+
+    #[test]
+    fn test_decompose_with_variances_row_dim_mismatch_error() {
+        let means = vec![vec![1.0f32, 2.0]];
+        let variances = vec![vec![0.1f32, 0.2]];
+        // model_mean has dim 1, rows have dim 2
+        assert!(decompose_uncertainty_with_variances(&means, &variances, &[1.0f32]).is_err());
+    }
+
+    #[test]
+    fn test_decompose_with_variances_negative_variance_error() {
+        let means = vec![vec![1.0f32]];
+        let variances = vec![vec![-0.5f32]];
+        assert!(decompose_uncertainty_with_variances(&means, &variances, &[1.0f32]).is_err());
+    }
+
+    #[test]
+    fn test_decompose_with_variances_non_finite_variance_error() {
+        let means = vec![vec![1.0f32]];
+        let variances = vec![vec![f32::NAN]];
+        assert!(decompose_uncertainty_with_variances(&means, &variances, &[1.0f32]).is_err());
     }
 
     // --- high_uncertainty_indices ---

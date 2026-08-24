@@ -26,11 +26,22 @@ confidence-threshold = 0.9
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# Internal path deps (oxigaf-* referencing each other) carry no version and
+# would otherwise trip the wildcard check.
+allow-wildcard-paths = true
 deny = [
     # --- compression: use oxiarc-* ---
-    { name = "zip",                 reason = "COOLJAPAN: use oxiarc-archive" },
-    { name = "flate2",              reason = "COOLJAPAN: use oxiarc-deflate" },
-    { name = "miniz_oxide",         reason = "COOLJAPAN: use oxiarc-deflate" },
+    # Phase-1 exceptions ("wrappers" = the only direct parents allowed to pull
+    # the banned crate in). Every wrapper below is a TODO with a named
+    # prerequisite; remove the wrappers list as soon as its migration lands.
+    #   zip 8.6 <- oxicandle-core (.pth/pickle loading; upstream oxiarc swap)
+    #   zip 6.0 <- ndarray-npy `npz` (oxiarc-archive-backed .npz reader)
+    #   flate2/miniz_oxide <- image's png/tiff/exr decoders + ureq gzip
+    #     (pure-Rust, but COOLJAPAN prefers oxiarc-deflate; EXR output is a
+    #     live CLI feature so `exr` cannot just be dropped)
+    { name = "zip",                 reason = "COOLJAPAN: use oxiarc-archive", wrappers = ["oxicandle-core", "ndarray-npy"] },
+    { name = "flate2",              reason = "COOLJAPAN: use oxiarc-deflate", wrappers = ["png", "tiff", "ureq", "zip"] },
+    { name = "miniz_oxide",         reason = "COOLJAPAN: use oxiarc-deflate", wrappers = ["exr", "flate2", "png"] },
     { name = "zstd",                reason = "COOLJAPAN: use oxiarc-zstd" },
     { name = "zstd-safe",           reason = "C wrapper; use oxiarc-zstd" },
     { name = "zstd-sys",            reason = "C libzstd; use oxiarc-zstd" },
@@ -72,7 +83,10 @@ deny = [
     # --- regex / tokenizer C backends ---
     { name = "onig",                reason = "C Oniguruma; use oxicandle-* (fancy-regex)" },
     { name = "onig_sys",            reason = "C Oniguruma; use oxicandle-* (fancy-regex)" },
-    { name = "esaxx-rs",            reason = "optional C++ suffix-array backend" },
+    # esaxx-rs compiles C++ only behind its `cpp` feature (tokenizers'
+    # `esaxx_fast`). oxicandle-core pins tokenizers with default-features =
+    # false + ["fancy-regex"], so the pure-Rust path is what builds here.
+    { name = "esaxx-rs",            reason = "C++ behind its `cpp` feature; pure-Rust path only", wrappers = ["tokenizers"] },
 
     # --- TLS / crypto native code ---
     { name = "openssl",             reason = "C OpenSSL; use rustls" },
@@ -80,40 +94,16 @@ deny = [
     { name = "native-tls",          reason = "pulls C OpenSSL / SChannel; use rustls" },
     { name = "aws-lc-sys",          reason = "C/asm crypto" },
     { name = "aws-lc-rs",           reason = "wraps aws-lc-sys (C)" },
-    { name = "ring",                reason = "C + hand-written asm" },
+    # TODO(pure-rust): ring <- rustls <- ureq <- hf-hub. Prerequisite: a
+    # pure-Rust rustls CryptoProvider (e.g. rustls-rustcrypto) or an hf-hub
+    # alternative. Residual C/asm on the default feature set is ring ONLY.
+    { name = "ring",                reason = "C + hand-written asm", wrappers = ["rustls", "rustls-webpki"] },
 
     # --- misc native shims ---
-    { name = "alloca",              reason = "compiles alloca.c through cc" },
-    { name = "libfuzzer-sys",       reason = "C++ libFuzzer" },
-]
-
-# ---------------------------------------------------------------------------
-# Phase-1 exceptions. Every entry is a TODO with a named prerequisite; delete
-# the entry as soon as its migration lands. Do not add entries without a TODO.
-# ---------------------------------------------------------------------------
-skip-tree = [
-    # TODO(pure-rust): image -> png/tiff/exr -> flate2 -> miniz_oxide.
-    # Prerequisite: oxiarc-deflate backend for png/tiff/exr. EXR output is a
-    # live feature (oxigaf-cli/src/main.rs:524), so `exr` cannot just be dropped.
-    { name = "image", version = "0.25", depth = 4 },
-
-    # TODO(pure-rust): ndarray-npy `npz` feature -> zip 6.x.
-    # Prerequisite: oxiarc-archive-backed .npz reader in oxigaf-flame::sequence.
-    { name = "ndarray-npy", version = "0.10", depth = 3 },
-
-    # TODO(pure-rust): oxicandle-core still declares zip 8.6 for .pth/pickle
-    # loading. Prerequisite: upstream oxicandle swap to oxiarc-archive.
-    { name = "candle-core", version = "0.11", depth = 2 },
-
-    # TODO(pure-rust): hf-hub -> ureq -> rustls(ring) + flate2 (ureq `gzip`
-    # default, not disableable from here because hf-hub does not set
-    # default-features = false on ureq). Prerequisite: hf-hub patch or a
-    # pure-Rust HF client.
-    { name = "hf-hub", version = "0.5", depth = 4 },
-
     # TODO(pure-rust, dev-only): criterion -> alloca (compiles alloca.c).
     # Prerequisite: criterion dropping alloca, or a different bench harness.
-    { name = "criterion", version = "0.8", depth = 2 },
+    { name = "alloca",              reason = "compiles alloca.c through cc", wrappers = ["criterion"] },
+    { name = "libfuzzer-sys",       reason = "C++ libFuzzer" },
 ]
 
 [sources]

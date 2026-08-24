@@ -1,10 +1,16 @@
 //! Head pose estimation from 2D facial landmark observations.
 //!
 //! Recovers FLAME head pose parameters (rotation and translation) from 2D
-//! landmark observations using a simplified `PnP` approach with a weak-perspective
-//! / orthographic approximation and temporal smoothing.
+//! landmark observations using a weak-perspective (scaled orthographic) `PnP`
+//! solve with optional RANSAC robustification and quaternion-based temporal
+//! smoothing.  The solver recovers the two scaled rotation rows by linear least
+//! squares, projects them onto `SO(3)` and derives the translation from the
+//! centroid correspondence — rotation **and** translation are estimated, not
+//! assumed.
 
 use thiserror::Error;
+
+use crate::rigid_alignment::svd_3x3;
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -261,8 +267,18 @@ impl HeadPose {
         let cos_pitch = pitch.cos();
 
         if cos_pitch.abs() < 1e-6 {
-            // Gimbal lock: roll is undefined, set to 0
-            let yaw = r[1][2].atan2(r[1][1]);
+            // Gimbal lock: roll is undefined and folds into yaw, so it is set to 0.
+            //
+            // With `R = Rz(yaw)·Ry(pitch)·Rx(roll)` and `roll = 0`:
+            //   pitch = +π/2 → R[1][1] = cos(yaw − roll), R[1][2] =  sin(yaw − roll)
+            //   pitch = −π/2 → R[1][1] = cos(yaw + roll), R[1][2] = −sin(yaw + roll)
+            // so the sine term must be negated in the −π/2 branch, otherwise the
+            // recovered yaw comes out mirrored.
+            let yaw = if sin_pitch > 0.0 {
+                r[1][2].atan2(r[1][1])
+            } else {
+                (-r[1][2]).atan2(r[1][1])
+            };
             return [yaw, pitch, 0.0];
         }
 
@@ -334,7 +350,6 @@ impl PoseConfig {
 // ---------------------------------------------------------------------------
 
 /// Multiply two 3×3 matrices: `A * B`.
-#[allow(dead_code)]
 fn mat3_mul(a: &[[f32; 3]; 3], b: &[[f32; 3]; 3]) -> [[f32; 3]; 3] {
     let mut c = [[0.0f32; 3]; 3];
     for i in 0..3 {
@@ -357,7 +372,6 @@ fn mat3_vec3_mul(m: &[[f32; 3]; 3], v: [f32; 3]) -> [f32; 3] {
 }
 
 /// Transpose a 3×3 matrix.
-#[allow(dead_code)]
 fn mat3_transpose(m: &[[f32; 3]; 3]) -> [[f32; 3]; 3] {
     [
         [m[0][0], m[1][0], m[2][0]],
@@ -371,27 +385,243 @@ fn mat3_identity() -> [[f32; 3]; 3] {
     [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
 }
 
+/// Convert a row-major flat 3×3 matrix into nested-array form.
+fn mat3_from_flat(m: &[f32; 9]) -> [[f32; 3]; 3] {
+    [[m[0], m[1], m[2]], [m[3], m[4], m[5]], [m[6], m[7], m[8]]]
+}
+
+/// Convert a nested-array 3×3 matrix into row-major flat form.
+fn mat3_to_flat(m: &[[f32; 3]; 3]) -> [f32; 9] {
+    [
+        m[0][0], m[0][1], m[0][2], m[1][0], m[1][1], m[1][2], m[2][0], m[2][1], m[2][2],
+    ]
+}
+
+/// Project an arbitrary 3×3 matrix onto the closest proper rotation (`SO(3)`).
+///
+/// Polar factor of the SVD, `R = U·Vᵀ`; `svd_3x3` guarantees `det(U) = det(V) =
+/// +1`, so the result is proper.  A fully degenerate input yields the identity.
+fn orthonormalize_rotation(m: &[[f32; 3]; 3]) -> [[f32; 3]; 3] {
+    let (u, sv, vt) = svd_3x3(&mat3_to_flat(m));
+    if sv[0] < 1e-9 {
+        return mat3_identity();
+    }
+    mat3_mul(&mat3_from_flat(&u), &mat3_from_flat(&vt))
+}
+
+/// Moore–Penrose pseudo-inverse of a 3×3 matrix.
+///
+/// Singular values below `1e-5 · σ_max` are treated as zero, so coplanar model
+/// points (common for facial landmarks) yield the minimum-norm solution instead
+/// of a blow-up along the degenerate direction.
+fn mat3_pseudo_inverse(m: &[[f32; 3]; 3]) -> [[f32; 3]; 3] {
+    let (u, sv, vt) = svd_3x3(&mat3_to_flat(m));
+    let tol = sv[0] * 1e-5;
+
+    let mut s_inv = [[0.0f32; 3]; 3];
+    for (i, row) in s_inv.iter_mut().enumerate() {
+        if sv[i] > tol && sv[i] > 0.0 {
+            row[i] = 1.0 / sv[i];
+        }
+    }
+
+    let v_mat = mat3_transpose(&mat3_from_flat(&vt));
+    let u_t = mat3_transpose(&mat3_from_flat(&u));
+    mat3_mul(&mat3_mul(&v_mat, &s_inv), &u_t)
+}
+
+/// Euclidean norm of a 3-vector.
+fn vec3_norm(v: [f32; 3]) -> f32 {
+    (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt()
+}
+
+// ---------------------------------------------------------------------------
+// Quaternion helpers (private) — used for rotation-preserving smoothing
+// ---------------------------------------------------------------------------
+
+/// Normalize a quaternion `[w, x, y, z]`; returns the identity for a zero input.
+fn quat_normalize(q: [f32; 4]) -> [f32; 4] {
+    let n = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
+    if n < 1e-12 {
+        [1.0, 0.0, 0.0, 0.0]
+    } else {
+        [q[0] / n, q[1] / n, q[2] / n, q[3] / n]
+    }
+}
+
+/// Convert a rotation matrix into a unit quaternion `[w, x, y, z]`.
+///
+/// Uses Shepperd's method (largest-diagonal branch) for numerical stability.
+fn mat3_to_quat(r: &[[f32; 3]; 3]) -> [f32; 4] {
+    let trace = r[0][0] + r[1][1] + r[2][2];
+    let q = if trace > 0.0 {
+        let s = (trace + 1.0).max(1e-12).sqrt() * 2.0;
+        [
+            0.25 * s,
+            (r[2][1] - r[1][2]) / s,
+            (r[0][2] - r[2][0]) / s,
+            (r[1][0] - r[0][1]) / s,
+        ]
+    } else if r[0][0] > r[1][1] && r[0][0] > r[2][2] {
+        let s = (1.0 + r[0][0] - r[1][1] - r[2][2]).max(1e-12).sqrt() * 2.0;
+        [
+            (r[2][1] - r[1][2]) / s,
+            0.25 * s,
+            (r[0][1] + r[1][0]) / s,
+            (r[0][2] + r[2][0]) / s,
+        ]
+    } else if r[1][1] > r[2][2] {
+        let s = (1.0 + r[1][1] - r[0][0] - r[2][2]).max(1e-12).sqrt() * 2.0;
+        [
+            (r[0][2] - r[2][0]) / s,
+            (r[0][1] + r[1][0]) / s,
+            0.25 * s,
+            (r[1][2] + r[2][1]) / s,
+        ]
+    } else {
+        let s = (1.0 + r[2][2] - r[0][0] - r[1][1]).max(1e-12).sqrt() * 2.0;
+        [
+            (r[1][0] - r[0][1]) / s,
+            (r[0][2] + r[2][0]) / s,
+            (r[1][2] + r[2][1]) / s,
+            0.25 * s,
+        ]
+    };
+    quat_normalize(q)
+}
+
+/// Convert a unit quaternion `[w, x, y, z]` into a rotation matrix.
+fn quat_to_mat3(q: [f32; 4]) -> [[f32; 3]; 3] {
+    let [w, x, y, z] = quat_normalize(q);
+    [
+        [
+            1.0 - 2.0 * (y * y + z * z),
+            2.0 * (x * y - w * z),
+            2.0 * (x * z + w * y),
+        ],
+        [
+            2.0 * (x * y + w * z),
+            1.0 - 2.0 * (x * x + z * z),
+            2.0 * (y * z - w * x),
+        ],
+        [
+            2.0 * (x * z - w * y),
+            2.0 * (y * z + w * x),
+            1.0 - 2.0 * (x * x + y * y),
+        ],
+    ]
+}
+
+/// Spherical linear interpolation between two quaternions.
+///
+/// `t = 0` returns `q0`, `t = 1` returns `q1`.  Antipodal inputs are handled by
+/// negating `q1` so the interpolation always takes the shorter arc.
+fn quat_slerp(q0: [f32; 4], q1: [f32; 4], t: f32) -> [f32; 4] {
+    let q0 = quat_normalize(q0);
+    let mut q1 = quat_normalize(q1);
+
+    let mut dot = q0[0] * q1[0] + q0[1] * q1[1] + q0[2] * q1[2] + q0[3] * q1[3];
+    if dot < 0.0 {
+        q1 = [-q1[0], -q1[1], -q1[2], -q1[3]];
+        dot = -dot;
+    }
+
+    // Nearly parallel: slerp is numerically unstable, use normalized lerp.
+    let (wa, wb) = if dot > 0.9995 {
+        (1.0 - t, t)
+    } else {
+        let theta = dot.clamp(-1.0, 1.0).acos();
+        let sin_theta = theta.sin();
+        if sin_theta.abs() < 1e-9 {
+            return q0;
+        }
+        (
+            ((1.0 - t) * theta).sin() / sin_theta,
+            (t * theta).sin() / sin_theta,
+        )
+    };
+    quat_normalize([
+        wa * q0[0] + wb * q1[0],
+        wa * q0[1] + wb * q1[1],
+        wa * q0[2] + wb * q1[2],
+        wa * q0[3] + wb * q1[3],
+    ])
+}
+
+// ---------------------------------------------------------------------------
+// Deterministic RNG for RANSAC sampling (private)
+// ---------------------------------------------------------------------------
+
+/// Seed for the RANSAC sampler: deterministic on purpose, so two runs over the
+/// same correspondences always produce the same pose.
+const RANSAC_SEED: u64 = 0x2545_F491_4F6C_DD1D;
+
+/// Minimal `SplitMix64` generator (deterministic, dependency-free).
+struct SplitMix64 {
+    state: u64,
+}
+
+impl SplitMix64 {
+    fn new(seed: u64) -> Self {
+        Self { state: seed }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// Uniform index in `[0, n)`.  Returns `0` when `n == 0`.
+    fn next_index(&mut self, n: usize) -> usize {
+        if n == 0 {
+            return 0;
+        }
+        (self.next_u64() % n as u64) as usize
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Pose solvers
 // ---------------------------------------------------------------------------
 
-/// Estimate head pose using a weak-perspective (orthographic) approximation.
+/// Estimate head pose using a weak-perspective (scaled orthographic) solve.
 ///
-/// This approach works well when the face occupies a moderate field of view.
+/// This approach works well when the face occupies a moderate field of view
+/// (its depth extent is small compared to its distance from the camera).
 /// At least `config.min_correspondences` (≥ 4) correspondences with confidence
 /// ≥ `config.min_confidence` are required.
 ///
 /// # Algorithm
-/// 1. Compute the 3D centroid of the model points.
-/// 2. Compute the 2D centroid of the image observations.
-/// 3. Estimate a uniform scale factor from XY deviations.
-/// 4. Derive translation from centroid alignment.
-/// 5. Use the identity rotation (simplified — no in-plane rotation fitted).
-/// 6. Compute reprojection error.
+///
+/// With `x̃ᵢ` the centered model points and `(ũᵢ, ṽᵢ)` the centered
+/// observations, the weak-perspective projection is `ũᵢ = s·(r₁·x̃ᵢ)` and
+/// `ṽᵢ = −s·(r₂·x̃ᵢ)` (image +v points down), where `r₁`, `r₂` are the first two
+/// rotation rows and `s = f / t_z`.
+///
+/// 1. Compute the model and image centroids.
+/// 2. Solve the two 3-parameter least-squares problems for `s·r₁` and `−s·r₂`
+///    (pseudo-inverse of `Σ x̃ᵢ x̃ᵢᵀ`, well behaved for coplanar landmark sets).
+/// 3. Recover the scale as the mean of the two row norms.
+/// 4. Complete the rotation with `r₃ = r₁ × r₂` and project onto `SO(3)` via SVD.
+/// 5. Derive the translation from the centroid correspondence: `t_z = f / s`,
+///    `t' = ((ū − cx)·t_z/f, −(v̄ − cy)·t_z/f, t_z)` and `t = t' − R·c₃`
+///    (`c₃` = model centroid), so an off-origin model centroid is handled.
+/// 6. Compute the confidence-weighted reprojection error.
+///
+/// When `config.ransac_iterations > 0` the solve is wrapped in RANSAC: minimal
+/// subsets are sampled, scored with [`count_inliers`] against
+/// `config.max_reprojection_error`, and the best consensus set is refit — in
+/// which case `reprojection_error` is reported over the final inlier set.
 ///
 /// # Errors
 ///
-/// Returns an error if the operation fails.
+/// [`PoseEstimationError::InvalidConfig`] for an invalid configuration or
+/// non-positive focal length, [`PoseEstimationError::InsufficientPoints`] when
+/// too few correspondences pass the confidence filter, and
+/// [`PoseEstimationError::NumericalError`] for degenerate correspondence sets.
 pub fn estimate_pose_weak_perspective(
     correspondences: &[PointCorrespondence],
     camera: &PosePinholeCamera,
@@ -400,8 +630,9 @@ pub fn estimate_pose_weak_perspective(
     config.validate()?;
 
     // Filter by minimum confidence
-    let filtered: Vec<&PointCorrespondence> = correspondences
+    let filtered: Vec<PointCorrespondence> = correspondences
         .iter()
+        .copied()
         .filter(|c| c.point_2d.confidence >= config.min_confidence)
         .collect();
 
@@ -413,77 +644,199 @@ pub fn estimate_pose_weak_perspective(
         });
     }
 
+    if config.ransac_iterations > 0 {
+        solve_weak_perspective_ransac(&filtered, camera, config)
+    } else {
+        solve_weak_perspective(&filtered, camera)
+    }
+}
+
+/// Core weak-perspective solve over **all** supplied correspondences (no
+/// configuration handling, no confidence filtering).
+fn solve_weak_perspective(
+    points: &[PointCorrespondence],
+    camera: &PosePinholeCamera,
+) -> Result<HeadPose, PoseEstimationError> {
+    let n = points.len();
+    if n < 4 {
+        return Err(PoseEstimationError::InsufficientPoints {
+            got: n,
+            required: 4,
+        });
+    }
+    if camera.focal_length <= 0.0 || !camera.focal_length.is_finite() {
+        return Err(PoseEstimationError::InvalidConfig(format!(
+            "focal_length must be > 0, got {}",
+            camera.focal_length
+        )));
+    }
+
     let nf = n as f32;
 
-    // Step 1: 3D centroid
-    let centroid_3d_x = filtered.iter().map(|c| c.point_3d.x).sum::<f32>() / nf;
-    let centroid_3d_y = filtered.iter().map(|c| c.point_3d.y).sum::<f32>() / nf;
-    let _centroid_3d_z = filtered.iter().map(|c| c.point_3d.z).sum::<f32>() / nf;
+    // Step 1: centroids
+    let centroid_3d = [
+        points.iter().map(|c| c.point_3d.x).sum::<f32>() / nf,
+        points.iter().map(|c| c.point_3d.y).sum::<f32>() / nf,
+        points.iter().map(|c| c.point_3d.z).sum::<f32>() / nf,
+    ];
+    let centroid_2d_u = points.iter().map(|c| c.point_2d.u).sum::<f32>() / nf;
+    let centroid_2d_v = points.iter().map(|c| c.point_2d.v).sum::<f32>() / nf;
 
-    // Step 2: 2D centroid
-    let centroid_2d_u = filtered.iter().map(|c| c.point_2d.u).sum::<f32>() / nf;
-    let centroid_2d_v = filtered.iter().map(|c| c.point_2d.v).sum::<f32>() / nf;
+    // Step 2: normal equations for the two scaled rotation rows.
+    let mut normal_mat = [[0.0f32; 3]; 3];
+    let mut rhs_u = [0.0f32; 3];
+    let mut rhs_v = [0.0f32; 3];
 
-    // Step 3: estimate scale from XY deviations
-    // scale ≈ |Δu| / |Δx|  and  |Δv| / |Δy|, averaged
-    let mut scale_samples: Vec<f32> = Vec::with_capacity(2 * n);
+    for c in points {
+        let x = [
+            c.point_3d.x - centroid_3d[0],
+            c.point_3d.y - centroid_3d[1],
+            c.point_3d.z - centroid_3d[2],
+        ];
+        let du = c.point_2d.u - centroid_2d_u;
+        let dv = c.point_2d.v - centroid_2d_v;
 
-    for c in &filtered {
-        let dx = (c.point_3d.x - centroid_3d_x).abs();
-        let du = (c.point_2d.u - centroid_2d_u).abs();
-        if dx > 1e-6 {
-            scale_samples.push(du / dx);
+        for (i, row) in normal_mat.iter_mut().enumerate() {
+            for (j, cell) in row.iter_mut().enumerate() {
+                *cell += x[i] * x[j];
+            }
         }
-
-        let dy = (c.point_3d.y - centroid_3d_y).abs();
-        let dv = (c.point_2d.v - centroid_2d_v).abs();
-        if dy > 1e-6 {
-            scale_samples.push(dv / dy);
+        for (i, r) in rhs_u.iter_mut().enumerate() {
+            *r += du * x[i];
+        }
+        for (i, r) in rhs_v.iter_mut().enumerate() {
+            *r += dv * x[i];
         }
     }
 
-    if scale_samples.is_empty() {
+    let pinv = mat3_pseudo_inverse(&normal_mat);
+    let row_u = mat3_vec3_mul(&pinv, rhs_u); //  s · r₁
+    let row_v = mat3_vec3_mul(&pinv, rhs_v); // −s · r₂
+
+    let norm_u = vec3_norm(row_u);
+    let norm_v = vec3_norm(row_v);
+    if norm_u < 1e-9 || norm_v < 1e-9 {
         return Err(PoseEstimationError::NumericalError(
-            "All 3D model points are coincident; scale cannot be estimated".to_string(),
+            "Degenerate correspondence set; weak-perspective scale cannot be estimated".to_string(),
         ));
     }
 
-    let scale = scale_samples.iter().sum::<f32>() / scale_samples.len() as f32;
+    // Step 3: scale = mean of the two scaled-row norms
+    let scale = 0.5 * (norm_u + norm_v);
 
-    if scale < 1e-9 {
-        return Err(PoseEstimationError::NumericalError(
-            "Estimated scale is near zero; degenerate correspondence set".to_string(),
-        ));
-    }
+    // Step 4: rotation rows, completed and re-orthonormalized
+    let r1 = [row_u[0] / norm_u, row_u[1] / norm_u, row_u[2] / norm_u];
+    let r2 = [-row_v[0] / norm_v, -row_v[1] / norm_v, -row_v[2] / norm_v];
+    let r3 = [
+        r1[1] * r2[2] - r1[2] * r2[1],
+        r1[2] * r2[0] - r1[0] * r2[2],
+        r1[0] * r2[1] - r1[1] * r2[0],
+    ];
+    let rotation = orthonormalize_rotation(&[r1, r2, r3]);
 
-    // Step 4: derive translation
-    let t_x = (centroid_2d_u - camera.cx) / camera.focal_length;
-    let t_y = -(centroid_2d_v - camera.cy) / camera.focal_length;
+    // Step 5: translation from the centroid correspondence
     let t_z = camera.focal_length / scale;
-
-    // Step 5: identity rotation (simplified)
-    let rotation = mat3_identity();
-    let translation = [t_x, t_y, t_z];
+    let t_prime = [
+        (centroid_2d_u - camera.cx) * t_z / camera.focal_length,
+        -(centroid_2d_v - camera.cy) * t_z / camera.focal_length,
+        t_z,
+    ];
+    let rotated_centroid = mat3_vec3_mul(&rotation, centroid_3d);
+    let translation = [
+        t_prime[0] - rotated_centroid[0],
+        t_prime[1] - rotated_centroid[1],
+        t_prime[2] - rotated_centroid[2],
+    ];
 
     let mut pose = HeadPose::new(rotation, translation);
 
-    // Step 6: compute reprojection error on all (filtered) correspondences
-    let corr_vec: Vec<PointCorrespondence> = filtered.iter().map(|c| **c).collect();
-    pose.reprojection_error = reprojection_error(&corr_vec, &pose, camera);
+    // Step 6: reprojection error over the supplied correspondences
+    pose.reprojection_error = reprojection_error(points, &pose, camera);
 
     Ok(pose)
+}
+
+/// RANSAC wrapper around [`solve_weak_perspective`]: samples
+/// `config.ransac_iterations` minimal subsets, scores each with
+/// [`count_inliers`] at `config.max_reprojection_error`, then refits on the best
+/// consensus set.
+fn solve_weak_perspective_ransac(
+    points: &[PointCorrespondence],
+    camera: &PosePinholeCamera,
+    config: &PoseConfig,
+) -> Result<HeadPose, PoseEstimationError> {
+    let n = points.len();
+    let sample_size = config.min_correspondences.max(4).min(n);
+    if sample_size < 4 {
+        return Err(PoseEstimationError::InsufficientPoints {
+            got: n,
+            required: 4,
+        });
+    }
+
+    let mut rng = SplitMix64::new(RANSAC_SEED);
+    let mut order: Vec<usize> = (0..n).collect();
+    let mut best_pose: Option<HeadPose> = None;
+    let mut best_inliers = 0usize;
+
+    for _ in 0..config.ransac_iterations {
+        // Partial Fisher–Yates shuffle: the first `sample_size` entries of
+        // `order` become a uniform subset drawn without replacement.
+        for i in 0..sample_size {
+            let j = i + rng.next_index(n - i);
+            order.swap(i, j);
+        }
+        let subset: Vec<PointCorrespondence> =
+            order[..sample_size].iter().map(|&i| points[i]).collect();
+
+        let Ok(candidate) = solve_weak_perspective(&subset, camera) else {
+            continue;
+        };
+
+        let inliers = count_inliers(points, &candidate, camera, config.max_reprojection_error);
+        if inliers > best_inliers {
+            best_inliers = inliers;
+            best_pose = Some(candidate);
+        }
+    }
+
+    // No candidate could be fitted at all (every sampled subset was degenerate):
+    // fall back to a plain fit over the full correspondence set.
+    let Some(mut best) = best_pose else {
+        return solve_weak_perspective(points, camera);
+    };
+
+    let inlier_points: Vec<PointCorrespondence> = points
+        .iter()
+        .copied()
+        .filter(|c| is_inlier(c, &best, camera, config.max_reprojection_error))
+        .collect();
+
+    if inlier_points.len() < config.min_correspondences.max(4) {
+        // Consensus set too small to refit: keep the best sampled model but
+        // report its error over every correspondence.
+        let error = reprojection_error(points, &best, camera);
+        best.reprojection_error = error;
+        return Ok(best);
+    }
+
+    solve_weak_perspective(&inlier_points, camera)
 }
 
 /// Estimate yaw angle from the horizontal asymmetry of symmetric landmark pairs.
 ///
 /// Each element of `left_points` and `right_points` is a `[u, v]` image
 /// coordinate; the arrays must have the same length and at least one element.
-///
 /// Returns the estimated yaw in radians (positive = turned right).
+///
+/// Standalone heuristic for callers who only have the two landmark groups —
+/// [`estimate_pose_weak_perspective`] recovers yaw as part of a full rotation
+/// and needs no initial guess from here.
 ///
 /// # Errors
 ///
-/// Returns an error if the operation fails.
+/// [`PoseEstimationError::InsufficientPoints`] if either slice is empty or the
+/// slices differ in length.
 pub fn estimate_yaw_from_symmetry(
     left_points: &[[f32; 2]],
     right_points: &[[f32; 2]],
@@ -545,72 +898,131 @@ pub fn estimate_yaw_from_symmetry(
     Ok(yaw)
 }
 
-/// Estimate pitch from the vertical positions of upper and lower face landmarks.
+/// Model-space reference required to turn a vertical foreshortening into an
+/// actual pitch angle.
+///
+/// There is deliberately no `Default`: the group centroids and the
+/// weak-perspective scale are properties of the caller's landmark set and
+/// camera, and guessing them would silently fabricate the resulting angle.
+#[derive(Debug, Clone, Copy)]
+pub struct PitchReference {
+    /// Model-space centroid of the upper landmark group (e.g. brow/eye centre),
+    /// in the neutral (unrotated) model pose.
+    pub upper_3d: Landmark3D,
+    /// Model-space centroid of the lower landmark group (e.g. mouth/chin centre),
+    /// in the neutral (unrotated) model pose.
+    pub lower_3d: Landmark3D,
+    /// Weak-perspective scale in **pixels per model unit** (`focal_length / t_z`).
+    ///
+    /// Available from a previous solve as
+    /// `camera.focal_length / pose.translation[2]`, or from a known metric
+    /// landmark distance divided by its pixel distance.
+    pub scale: f32,
+}
+
+impl PitchReference {
+    /// Create a pitch reference.
+    #[must_use]
+    pub fn new(upper_3d: Landmark3D, lower_3d: Landmark3D, scale: f32) -> Self {
+        Self {
+            upper_3d,
+            lower_3d,
+            scale,
+        }
+    }
+}
+
+/// Estimate head pitch from the vertical foreshortening of two landmark groups.
 ///
 /// `upper_points` and `lower_points` are `[u, v]` image coordinates (v
-/// increases downward).  Both slices must be non-empty.
+/// increases downward); only the group **centroids** are used, so the two
+/// groups may have different sizes without biasing the result.
 ///
-/// ## Algorithm
+/// ## Geometry
 ///
-/// 1. Compute `upper_centroid_y`: mean v-coordinate of `upper_points`.
-/// 2. Compute `lower_centroid_y`: mean v-coordinate of `lower_points`.
-/// 3. Compute `vertical_span = |upper_centroid_y − lower_centroid_y|`.
-///    Guard: if `vertical_span < 1e-6` return `Ok(0.0)` — groups coincide.
-/// 4. Compute `center_y`: mean v-coordinate across **all** points.
-/// 5. `sin_pitch = (upper_centroid_y + lower_centroid_y − 2·center_y) /
-///    (vertical_span + 1e-6)`.
-///    For a symmetric face both centroids are equidistant from `center_y`
-///    with opposite signs → numerator is zero → frontal pose.
-///    When group sizes differ or the face rotates in pitch the numerator
-///    becomes non-zero.
-/// 6. Return `Ok(sin_pitch.clamp(−1, 1).asin())`.
+/// Let `Δy = upper.y − lower.y`, `Δz = upper.z − lower.z` be the model-space
+/// offset between the group centroids and `θ` a rotation about the camera
+/// x-axis (`y' = y·cos θ − z·sin θ`).  The observed camera-space separation is
 ///
-/// **Sign convention**: positive pitch means the upper landmarks are
-/// displaced away from the overall centroid more than the lower ones
-/// (face tilted back / looking up in image space).
+/// ```text
+/// Δy_cam = (v_lower − v_upper) / scale = Δy·cos θ − Δz·sin θ = A·cos(θ + φ)
+/// ```
+///
+/// with `A = hypot(Δy, Δz)`, `φ = atan2(Δz, Δy)`, so `θ = ±acos(Δy_cam/A) − φ`.
+///
+/// ## Return value
+///
+/// The two candidate pitch angles in radians, ascending.  A single
+/// foreshortening measurement genuinely cannot distinguish them (they collapse
+/// to `±θ` when both groups sit at the same model depth, `Δz = 0`), so both are
+/// returned rather than one being picked silently.  Use
+/// [`select_pitch_candidate`] with a prior (e.g. the previous frame's pitch), or
+/// [`estimate_pose_weak_perspective`] on the full landmark set for a fully
+/// disambiguated rotation.
 ///
 /// # Errors
 ///
-/// Returns [`PoseEstimationError::InsufficientPoints`] if either slice is
-/// empty.
+/// [`PoseEstimationError::InsufficientPoints`] if either slice is empty, and
+/// [`PoseEstimationError::InvalidConfig`] when the reference scale is not
+/// positive and finite or the two reference centroids coincide.
 pub fn estimate_pitch_from_vertical(
     upper_points: &[[f32; 2]],
     lower_points: &[[f32; 2]],
-) -> Result<f32, PoseEstimationError> {
-    if upper_points.is_empty() {
+    reference: &PitchReference,
+) -> Result<[f32; 2], PoseEstimationError> {
+    if upper_points.is_empty() || lower_points.is_empty() {
         return Err(PoseEstimationError::InsufficientPoints {
-            got: 0,
+            got: upper_points.len().min(lower_points.len()),
             required: 1,
         });
     }
-    if lower_points.is_empty() {
-        return Err(PoseEstimationError::InsufficientPoints {
-            got: 0,
-            required: 1,
-        });
+    if !reference.scale.is_finite() || reference.scale <= 0.0 {
+        return Err(PoseEstimationError::InvalidConfig(format!(
+            "PitchReference::scale must be a positive finite value, got {}",
+            reference.scale
+        )));
     }
 
     let n_upper = upper_points.len() as f32;
     let n_lower = lower_points.len() as f32;
+    let upper_v = upper_points.iter().map(|p| p[1]).sum::<f32>() / n_upper;
+    let lower_v = lower_points.iter().map(|p| p[1]).sum::<f32>() / n_lower;
 
-    let upper_centroid_y = upper_points.iter().map(|p| p[1]).sum::<f32>() / n_upper;
-    let lower_centroid_y = lower_points.iter().map(|p| p[1]).sum::<f32>() / n_lower;
+    // Image v grows downward while camera y grows upward, hence the flip.
+    let dy_cam = (lower_v - upper_v) / reference.scale;
 
-    let vertical_span = (upper_centroid_y - lower_centroid_y).abs();
-    if vertical_span < 1e-6 {
-        return Ok(0.0);
+    let dy = reference.upper_3d.y - reference.lower_3d.y;
+    let dz = reference.upper_3d.z - reference.lower_3d.z;
+    let amplitude = dy.hypot(dz);
+    if amplitude < 1e-6 {
+        return Err(PoseEstimationError::InvalidConfig(
+            "PitchReference upper_3d and lower_3d coincide; pitch is unobservable".to_string(),
+        ));
     }
 
-    let sum_all: f32 = upper_points
-        .iter()
-        .chain(lower_points.iter())
-        .map(|p| p[1])
-        .sum();
-    let center_y = sum_all / (n_upper + n_lower);
+    let phi = dz.atan2(dy);
+    let base = (dy_cam / amplitude).clamp(-1.0, 1.0).acos();
 
-    let sin_pitch = (upper_centroid_y + lower_centroid_y - 2.0 * center_y) / (vertical_span + 1e-6);
+    let first = base - phi;
+    let second = -base - phi;
+    Ok(if first <= second {
+        [first, second]
+    } else {
+        [second, first]
+    })
+}
 
-    Ok(sin_pitch.clamp(-1.0, 1.0).asin())
+/// Pick the pitch candidate closest to `prior` (radians).
+///
+/// Companion to [`estimate_pitch_from_vertical`]: pass the previous frame's
+/// pitch when tracking, or `0.0` to prefer the solution nearest frontal.
+#[must_use]
+pub fn select_pitch_candidate(candidates: [f32; 2], prior: f32) -> f32 {
+    if (candidates[0] - prior).abs() <= (candidates[1] - prior).abs() {
+        candidates[0]
+    } else {
+        candidates[1]
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -652,8 +1064,27 @@ pub fn reprojection_error(
     total_error / total_weight
 }
 
+/// Return `true` when the correspondence reprojects within `threshold` pixels
+/// (points that do not project in front of the camera are never inliers).
+fn is_inlier(
+    correspondence: &PointCorrespondence,
+    pose: &HeadPose,
+    camera: &PosePinholeCamera,
+    threshold: f32,
+) -> bool {
+    pose.project_point(correspondence.point_3d, camera)
+        .is_some_and(|(proj_u, proj_v)| {
+            let du = proj_u - correspondence.point_2d.u;
+            let dv = proj_v - correspondence.point_2d.v;
+            (du * du + dv * dv).sqrt() < threshold
+        })
+}
+
 /// Count the number of correspondences whose reprojection error is below
 /// `threshold` (in pixels).
+///
+/// Used by [`estimate_pose_weak_perspective`] to score RANSAC hypotheses, and
+/// available to callers running their own robust loop.
 #[must_use]
 pub fn count_inliers(
     correspondences: &[PointCorrespondence],
@@ -663,16 +1094,7 @@ pub fn count_inliers(
 ) -> usize {
     correspondences
         .iter()
-        .filter(|c| {
-            if let Some((proj_u, proj_v)) = pose.project_point(c.point_3d, camera) {
-                let du = proj_u - c.point_2d.u;
-                let dv = proj_v - c.point_2d.v;
-                let dist = (du * du + dv * dv).sqrt();
-                dist < threshold
-            } else {
-                false
-            }
-        })
+        .filter(|c| is_inlier(c, pose, camera, threshold))
         .count()
 }
 
@@ -681,10 +1103,15 @@ pub fn count_inliers(
 // ---------------------------------------------------------------------------
 
 /// Track head pose over time using exponential moving average (EMA) smoothing.
+///
+/// Translation and reprojection error are smoothed with a plain EMA; the
+/// rotation is smoothed on the quaternion sphere (slerp), so the tracked
+/// rotation is always a proper rotation matrix.
 pub struct PoseTracker {
     /// EMA decay factor.  Higher values produce smoother (lagging) output.
     pub ema_decay: f32,
-    current_rotation: Option<[[f32; 3]; 3]>,
+    /// Smoothed rotation, stored as a unit quaternion `[w, x, y, z]`.
+    current_rotation: Option<[f32; 4]>,
     current_translation: Option<[f32; 3]>,
     current_error: f32,
 }
@@ -703,20 +1130,23 @@ impl PoseTracker {
 
     /// Incorporate a new pose estimate into the tracker.
     ///
-    /// On the first call the pose is accepted directly.  On subsequent calls
-    /// element-wise EMA blending is applied, and each row of the blended
-    /// rotation is renormalized to unit length (approximate orthogonalization).
+    /// The first pose is accepted directly.  Afterwards translation and error
+    /// are blended with an EMA while the rotation is interpolated on the unit
+    /// quaternion sphere (`slerp` with `t = 1 − α`, shorter-arc / antipodal
+    /// safe), which keeps the smoothed rotation in `SO(3)` — an element-wise
+    /// matrix blend does not.
     pub fn update(&mut self, pose: &HeadPose) {
-        let alpha = self.ema_decay;
+        let alpha = self.ema_decay.clamp(0.0, 1.0);
+        let observed = mat3_to_quat(&pose.rotation);
 
         match (self.current_rotation, self.current_translation) {
             (None, _) | (_, None) => {
                 // First observation: accept directly
-                self.current_rotation = Some(pose.rotation);
+                self.current_rotation = Some(observed);
                 self.current_translation = Some(pose.translation);
                 self.current_error = pose.reprojection_error;
             }
-            (Some(prev_r), Some(prev_t)) => {
+            (Some(prev_q), Some(prev_t)) => {
                 // EMA for translation
                 let new_t = [
                     alpha * prev_t[0] + (1.0 - alpha) * pose.translation[0],
@@ -724,25 +1154,11 @@ impl PoseTracker {
                     alpha * prev_t[2] + (1.0 - alpha) * pose.translation[2],
                 ];
 
-                // EMA for rotation (element-wise) then normalize rows
-                let mut new_r = [[0.0f32; 3]; 3];
-                for i in 0..3 {
-                    for j in 0..3 {
-                        new_r[i][j] = alpha * prev_r[i][j] + (1.0 - alpha) * pose.rotation[i][j];
-                    }
-                    // Normalize each row to unit length
-                    let row_len = (new_r[i][0] * new_r[i][0]
-                        + new_r[i][1] * new_r[i][1]
-                        + new_r[i][2] * new_r[i][2])
-                        .sqrt();
-                    if row_len > 1e-9 {
-                        new_r[i][0] /= row_len;
-                        new_r[i][1] /= row_len;
-                        new_r[i][2] /= row_len;
-                    }
-                }
+                // Slerp for rotation: t = 1 − α moves toward the observation by
+                // the same weight the EMA gives it.
+                let new_q = quat_slerp(prev_q, observed, 1.0 - alpha);
 
-                self.current_rotation = Some(new_r);
+                self.current_rotation = Some(new_q);
                 self.current_translation = Some(new_t);
                 self.current_error =
                     alpha * self.current_error + (1.0 - alpha) * pose.reprojection_error;
@@ -751,12 +1167,13 @@ impl PoseTracker {
     }
 
     /// Return the current smoothed pose, or `None` if no updates have been
-    /// received.
+    /// received.  The `rotation` is rebuilt from the tracked quaternion, so it
+    /// is always orthonormal with `det = +1`.
     #[must_use]
     pub fn current_pose(&self) -> Option<HeadPose> {
         match (self.current_rotation, self.current_translation) {
-            (Some(r), Some(t)) => {
-                let mut p = HeadPose::new(r, t);
+            (Some(q), Some(t)) => {
+                let mut p = HeadPose::new(quat_to_mat3(q), t);
                 p.reprojection_error = self.current_error;
                 Some(p)
             }
@@ -858,18 +1275,8 @@ mod tests {
             .project(orig_3d.0, orig_3d.1, orig_3d.2)
             .expect("should project");
         let (rx, ry, rz) = cam.unproject(u, v, orig_3d.2);
-        assert!(
-            (rx - orig_3d.0).abs() < 1e-4,
-            "x mismatch: {} vs {}",
-            rx,
-            orig_3d.0
-        );
-        assert!(
-            (ry - orig_3d.1).abs() < 1e-4,
-            "y mismatch: {} vs {}",
-            ry,
-            orig_3d.1
-        );
+        assert!((rx - orig_3d.0).abs() < 1e-4, "x: {rx} vs {}", orig_3d.0);
+        assert!((ry - orig_3d.1).abs() < 1e-4, "y: {ry} vs {}", orig_3d.1);
         assert!((rz - orig_3d.2).abs() < 1e-6);
     }
 
@@ -897,10 +1304,7 @@ mod tests {
     #[test]
     fn test_headpose_rotation_axis_angle_identity() {
         let pose = HeadPose::new(mat3_identity(), [0.0, 0.0, 1.0]);
-        let aa = pose.rotation_axis_angle();
-        assert!(aa[0].abs() < 1e-5);
-        assert!(aa[1].abs() < 1e-5);
-        assert!(aa[2].abs() < 1e-5);
+        assert!(vec3_norm(pose.rotation_axis_angle()) < 1e-5);
     }
 
     #[test]
@@ -924,39 +1328,27 @@ mod tests {
     }
 
     #[test]
-    fn test_pose_config_validate_too_few_correspondences() {
-        let cfg = PoseConfig {
-            min_correspondences: 3,
-            ..Default::default()
-        };
-        assert!(matches!(
-            cfg.validate(),
-            Err(PoseEstimationError::InvalidConfig(_))
-        ));
-    }
-
-    #[test]
-    fn test_pose_config_validate_negative_reprojection_error() {
-        let cfg = PoseConfig {
-            max_reprojection_error: -1.0,
-            ..Default::default()
-        };
-        assert!(matches!(
-            cfg.validate(),
-            Err(PoseEstimationError::InvalidConfig(_))
-        ));
-    }
-
-    #[test]
-    fn test_pose_config_validate_bad_confidence() {
-        let cfg = PoseConfig {
-            min_confidence: 1.5,
-            ..Default::default()
-        };
-        assert!(matches!(
-            cfg.validate(),
-            Err(PoseEstimationError::InvalidConfig(_))
-        ));
+    fn test_pose_config_validate_rejects_bad_fields() {
+        let bad = [
+            PoseConfig {
+                min_correspondences: 3,
+                ..Default::default()
+            },
+            PoseConfig {
+                max_reprojection_error: -1.0,
+                ..Default::default()
+            },
+            PoseConfig {
+                min_confidence: 1.5,
+                ..Default::default()
+            },
+        ];
+        for cfg in &bad {
+            assert!(matches!(
+                cfg.validate(),
+                Err(PoseEstimationError::InvalidConfig(_))
+            ));
+        }
     }
 
     // -- estimate_pose_weak_perspective --
@@ -984,26 +1376,19 @@ mod tests {
 
     #[test]
     fn test_estimate_pose_weak_perspective_front_facing() {
-        // Front-facing head: 3D points in XY plane at z=1, 2D observations
-        // aligned with their perspective projections.
+        // Front-facing head: cross of model points at z=0 observed at unit
+        // depth (u = cx + f*x, v = cy - f*y), so t_z ≈ 1 and R ≈ I.
         let camera = PosePinholeCamera::new(500.0, 320.0, 240.0);
         let config = PoseConfig {
             min_confidence: 0.0,
             ..Default::default()
         };
-
-        // Place model points in a cross pattern centered at origin at z=0.
-        // The solver will estimate t_z ≈ 1 from scale, so camera-space z ≈ 1,
-        // matching the observations generated with unit depth.
         let model_pts = [
             Landmark3D::new(-0.1, 0.0, 0.0),
             Landmark3D::new(0.1, 0.0, 0.0),
             Landmark3D::new(0.0, -0.1, 0.0),
             Landmark3D::new(0.0, 0.1, 0.0),
         ];
-
-        // Corresponding image observations at unit depth (z=1):
-        //   u = cx + f*x,  v = cy - f*y
         let corrs: Vec<PointCorrespondence> = model_pts
             .iter()
             .map(|p| {
@@ -1013,26 +1398,12 @@ mod tests {
             })
             .collect();
 
-        let result = estimate_pose_weak_perspective(&corrs, &camera, &config);
-        assert!(result.is_ok(), "Expected Ok, got {result:?}");
-        let pose = result.unwrap();
-        // Translation should be small (head centered)
-        assert!(
-            pose.translation[0].abs() < 0.1,
-            "tx={}",
-            pose.translation[0]
-        );
-        assert!(
-            pose.translation[1].abs() < 0.1,
-            "ty={}",
-            pose.translation[1]
-        );
-        // Reprojection error should be small
-        assert!(
-            pose.reprojection_error < 5.0,
-            "reprojection_error={}",
-            pose.reprojection_error
-        );
+        let pose = estimate_pose_weak_perspective(&corrs, &camera, &config)
+            .expect("front-facing solve should succeed");
+        let (tx, ty) = (pose.translation[0], pose.translation[1]);
+        assert!(tx.abs() < 0.1 && ty.abs() < 0.1, "tx={tx} ty={ty}");
+        let err = pose.reprojection_error;
+        assert!(err < 5.0, "reprojection_error={err}");
     }
 
     #[test]
@@ -1081,24 +1452,18 @@ mod tests {
 
     #[test]
     fn test_estimate_yaw_asymmetry_sign() {
-        // Use multi-point inputs so that spread asymmetry is visible.
         // Frontal face: both sides have equal internal spread (20 px each).
-        let left_frontal = vec![[90.0_f32, 200.0], [110.0, 200.0]]; // spread = 20
-        let right_frontal = vec![[290.0_f32, 200.0], [310.0, 200.0]]; // spread = 20
+        let left_frontal = [[90.0_f32, 200.0], [110.0, 200.0]];
+        let right_frontal = [[290.0_f32, 200.0], [310.0, 200.0]];
         let yaw_frontal =
             estimate_yaw_from_symmetry(&left_frontal, &right_frontal).expect("should succeed");
 
-        // Turned right: left side expands (larger spread), right side stays (smaller spread).
-        let left_turned = vec![[80.0_f32, 200.0], [130.0, 200.0]]; // spread = 50
-        let right_turned = vec![[290.0_f32, 200.0], [310.0, 200.0]]; // spread = 20
+        // Turned right: the left side expands (spread 50) while the right stays.
+        let left_turned = [[80.0_f32, 200.0], [130.0, 200.0]];
         let yaw_turned =
-            estimate_yaw_from_symmetry(&left_turned, &right_turned).expect("should succeed");
+            estimate_yaw_from_symmetry(&left_turned, &right_frontal).expect("should succeed");
 
-        // Frontal should be near 0 (equal spreads), turned should have larger absolute yaw.
-        assert!(
-            yaw_frontal.abs() < 0.01,
-            "frontal yaw should be ~0, got {yaw_frontal}"
-        );
+        assert!(yaw_frontal.abs() < 0.01, "frontal yaw={yaw_frontal}");
         assert!(
             yaw_turned.abs() > yaw_frontal.abs(),
             "frontal={yaw_frontal}, turned={yaw_turned}"
@@ -1127,9 +1492,32 @@ mod tests {
 
     // -- estimate_pitch_from_vertical --
 
+    /// Upper group 0.12 above and 0.03 in front of the lower group, at 250 px
+    /// per model unit.
+    fn pitch_reference() -> PitchReference {
+        PitchReference::new(
+            Landmark3D::new(0.0, 0.06, 0.05),
+            Landmark3D::new(0.0, -0.06, 0.02),
+            250.0,
+        )
+    }
+
+    /// Weak-perspective projection (`v = −scale·y_cam`; the constant `cy`
+    /// cancels because only the difference is used) of the two reference group
+    /// centroids after a pitch rotation of `theta` about the camera x-axis.
+    fn project_pitched_groups(theta: f32, reference: &PitchReference) -> ([f32; 2], [f32; 2]) {
+        let rot = |p: Landmark3D| p.y * theta.cos() - p.z * theta.sin();
+        let upper_y = rot(reference.upper_3d);
+        let lower_y = rot(reference.lower_3d);
+        (
+            [10.0, -reference.scale * upper_y],
+            [10.0, -reference.scale * lower_y],
+        )
+    }
+
     #[test]
     fn test_estimate_pitch_empty_upper_error() {
-        let result = estimate_pitch_from_vertical(&[], &[[200.0_f32, 350.0]]);
+        let result = estimate_pitch_from_vertical(&[], &[[200.0_f32, 350.0]], &pitch_reference());
         assert!(matches!(
             result,
             Err(PoseEstimationError::InsufficientPoints { .. })
@@ -1138,7 +1526,7 @@ mod tests {
 
     #[test]
     fn test_estimate_pitch_empty_lower_error() {
-        let result = estimate_pitch_from_vertical(&[[200.0_f32, 100.0]], &[]);
+        let result = estimate_pitch_from_vertical(&[[200.0_f32, 100.0]], &[], &pitch_reference());
         assert!(matches!(
             result,
             Err(PoseEstimationError::InsufficientPoints { .. })
@@ -1170,27 +1558,17 @@ mod tests {
     // -- count_inliers --
 
     #[test]
-    fn test_count_inliers_all_below_threshold() {
+    fn test_count_inliers_threshold_split() {
         let camera = PosePinholeCamera::new(500.0, 320.0, 240.0);
         let pose = HeadPose::new(mat3_identity(), [0.0, 0.0, 1.0]);
-        // Perfect correspondence → 0 error → inlier
         let pt3d = Landmark3D::new(0.0, 0.0, 0.0);
         let (pu, pv) = camera.project(0.0, 0.0, 1.0).expect("should project");
-        let corr = PointCorrespondence::new(pt3d, Landmark2D::new(pu, pv));
-        let count = count_inliers(&[corr], &pose, &camera, 1.0);
-        assert_eq!(count, 1);
-    }
-
-    #[test]
-    fn test_count_inliers_none_below_threshold() {
-        let camera = PosePinholeCamera::new(500.0, 320.0, 240.0);
-        let pose = HeadPose::new(mat3_identity(), [0.0, 0.0, 1.0]);
-        // Observation far from projection → outlier
-        let pt3d = Landmark3D::new(0.0, 0.0, 0.0);
-        // Projected to cx,cy = 320,240 but observed far away
-        let corr = PointCorrespondence::new(pt3d, Landmark2D::new(0.0, 0.0));
-        let count = count_inliers(&[corr], &pose, &camera, 1.0);
-        assert_eq!(count, 0);
+        // Perfect correspondence → 0 error → inlier
+        let good = PointCorrespondence::new(pt3d, Landmark2D::new(pu, pv));
+        assert_eq!(count_inliers(&[good], &pose, &camera, 1.0), 1);
+        // Observation far from the projection (cx, cy) → outlier
+        let bad = PointCorrespondence::new(pt3d, Landmark2D::new(0.0, 0.0));
+        assert_eq!(count_inliers(&[bad], &pose, &camera, 1.0), 0);
     }
 
     // -- PoseTracker --
@@ -1245,108 +1623,373 @@ mod tests {
     // -- mat3 helpers (internal sanity) --
 
     #[test]
-    fn test_mat3_mul_identity() {
+    fn test_mat3_mul_and_transpose() {
         let id = mat3_identity();
-        let result = mat3_mul(&id, &id);
-        for (i, row) in result.iter().enumerate() {
-            for (j, &val) in row.iter().enumerate() {
-                let expected = if i == j { 1.0 } else { 0.0 };
-                assert!((val - expected).abs() < 1e-6);
-            }
-        }
-    }
-
-    #[test]
-    fn test_mat3_transpose() {
         let m = [[1.0_f32, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]];
-        let t = mat3_transpose(&m);
-        for (i, row) in t.iter().enumerate() {
+        let product = mat3_mul(&id, &m);
+        let transposed = mat3_transpose(&m);
+        for (i, row) in m.iter().enumerate() {
             for (j, &val) in row.iter().enumerate() {
-                assert!((val - m[j][i]).abs() < 1e-6);
+                assert!((product[i][j] - val).abs() < 1e-6, "I*M != M");
+                assert!((transposed[j][i] - val).abs() < 1e-6, "transpose");
             }
         }
     }
 
-    // -- estimate_pitch_from_vertical (algorithm: asymmetry-based centroid formula) --
-
-    /// Symmetric equal-count distribution → numerator (sum_centroids - 2*center) = 0 → pitch ≈ 0.
     #[test]
-    fn test_pitch_symmetric_distribution_near_zero() {
-        // 2 upper at 0.2/0.25, 2 lower at 0.75/0.80: equal count, symmetric around 0.5
-        // upper_centroid=0.225, lower_centroid=0.775, center_y=0.5
-        // sin_pitch = (0.225+0.775 - 2*0.5) / span = 0.0 / 0.55 = 0
-        let upper = vec![[0.5_f32, 0.2], [0.5, 0.25]];
-        let lower = vec![[0.5_f32, 0.75], [0.5, 0.8]];
-        let pitch = estimate_pitch_from_vertical(&upper, &lower).unwrap();
+    fn test_mat3_flat_roundtrip_and_pseudo_inverse() {
+        let m = [[2.0_f32, 0.0, 0.0], [0.0, 4.0, 0.0], [0.0, 0.0, 0.0]];
+        assert_eq!(mat3_from_flat(&mat3_to_flat(&m)), m);
+        // Rank-2 input: the pseudo-inverse inverts the non-zero directions and
+        // leaves the degenerate one at zero.
+        let pinv = mat3_pseudo_inverse(&m);
+        assert!((pinv[0][0] - 0.5).abs() < 1e-5, "{pinv:?}");
+        assert!((pinv[1][1] - 0.25).abs() < 1e-5, "{pinv:?}");
+        assert!(pinv[2][2].abs() < 1e-5, "{pinv:?}");
+    }
+
+    // -- estimate_pitch_from_vertical (geometric foreshortening solve) --
+
+    /// Smallest distance between `theta` and either returned candidate.
+    fn pitch_candidate_error(candidates: [f32; 2], theta: f32) -> f32 {
+        (candidates[0] - theta)
+            .abs()
+            .min((candidates[1] - theta).abs())
+    }
+
+    /// Synthetically rotated landmarks must be recovered at known angles
+    /// (including the frontal case), with the candidates sorted ascending.
+    #[test]
+    fn test_pitch_recovers_known_rotation_both_signs() {
+        let reference = pitch_reference();
+        for &theta in &[-0.45_f32, -0.3, -0.1, 0.0, 0.1, 0.3, 0.45] {
+            let (upper, lower) = project_pitched_groups(theta, &reference);
+            let cands = estimate_pitch_from_vertical(&[upper], &[lower], &reference)
+                .expect("pitch solve should succeed");
+            let err = pitch_candidate_error(cands, theta);
+            assert!(err < 1e-3, "theta={theta}: candidates={cands:?} err={err}");
+            assert!(cands[0] <= cands[1], "unsorted candidates: {cands:?}");
+        }
+    }
+
+    /// Regression for the cardinality bug: the previous implementation returned
+    /// exactly 0 whenever both groups had the same number of points, whatever
+    /// the actual geometry, and otherwise measured only the size imbalance.
+    #[test]
+    fn test_pitch_uses_geometry_not_group_cardinality() {
+        let reference = pitch_reference();
+        let theta = 0.25_f32;
+        let (upper_c, lower_c) = project_pitched_groups(theta, &reference);
+
+        // Two points per group, spread symmetrically about each centroid.
+        let upper = [[8.0_f32, upper_c[1] - 3.0], [12.0, upper_c[1] + 3.0]];
+        let lower = [[8.0_f32, lower_c[1] - 5.0], [12.0, lower_c[1] + 5.0]];
+        let equal = estimate_pitch_from_vertical(&upper, &lower, &reference)
+            .expect("pitch solve should succeed");
         assert!(
-            pitch.abs() < 0.05,
-            "symmetric distribution should give pitch near 0, got {pitch}"
+            pitch_candidate_error(equal, theta) < 1e-3,
+            "equal-size groups must still recover theta={theta}, got {equal:?}"
+        );
+        assert!(
+            equal.iter().all(|c| c.abs() > 1e-2),
+            "a rotated face must not report a zero pitch: {equal:?}"
+        );
+
+        // Same centroids, different group sizes → identical answer.
+        let lower_many = [
+            lower_c,
+            [lower_c[0], lower_c[1] - 7.0],
+            [lower_c[0], lower_c[1] + 7.0],
+        ];
+        let uneven = estimate_pitch_from_vertical(&[upper_c], &lower_many, &reference)
+            .expect("pitch solve should succeed");
+        assert!(
+            (equal[0] - uneven[0]).abs() < 1e-4 && (equal[1] - uneven[1]).abs() < 1e-4,
+            "group cardinality must not change the estimate: {equal:?} vs {uneven:?}"
         );
     }
 
-    /// Unequal group sizes shift center_y, making sum_centroids ≠ 2*center_y → nonzero pitch.
-    ///
-    /// upper=[0.1] (1 pt), lower=[0.4,0.5,0.6] (3 pts):
-    ///   upper_centroid=0.1, lower_centroid=0.5, center_y=0.4
-    ///   span=0.4, sin_pitch=(0.1+0.5-0.8)/0.4 = -0.2/0.4 = -0.5 → pitch≈-0.524
     #[test]
-    fn test_pitch_unequal_groups_nonzero() {
-        let upper = vec![[0.5_f32, 0.1]];
-        let lower = vec![[0.5_f32, 0.4], [0.5, 0.5], [0.5, 0.6]];
-        let pitch = estimate_pitch_from_vertical(&upper, &lower).unwrap();
-        assert!(
-            pitch != 0.0,
-            "unequal-count groups should give nonzero pitch, got {pitch}"
-        );
+    fn test_pitch_invalid_reference_errors() {
+        let (upper, lower) = ([[0.0_f32, 0.0]], [[0.0_f32, 30.0]]);
+        let up = Landmark3D::new(0.0, 0.06, 0.05);
+        let low = Landmark3D::new(0.0, -0.06, 0.02);
+        for bad in [
+            PitchReference::new(up, low, 0.0),  // non-positive scale
+            PitchReference::new(up, up, 250.0), // coincident centroids
+        ] {
+            assert!(matches!(
+                estimate_pitch_from_vertical(&upper, &lower, &bad),
+                Err(PoseEstimationError::InvalidConfig(_))
+            ));
+        }
     }
 
-    /// Monotonicity: adding more lower points (compressing upper relative to center) makes
-    /// pitch more negative — the asymmetry grows consistently in one direction.
     #[test]
-    fn test_pitch_monotone_with_increasing_lower_asymmetry() {
-        // upper=[0.1] fixed; grow lower group downward → center_y rises → sin_pitch becomes more negative.
-        // Equal-size groups (1 vs 1) cancel out, so lower_small uses 2 lower points.
-        let upper = vec![[0.5_f32, 0.1]];
-        let lower_small = vec![[0.5_f32, 0.6], [0.5, 0.7]];
-        let lower_large = vec![[0.5_f32, 0.6], [0.5, 0.7], [0.5, 0.8], [0.5, 0.9]];
-        let pitch_small = estimate_pitch_from_vertical(&upper, &lower_small).unwrap();
-        let pitch_large = estimate_pitch_from_vertical(&upper, &lower_large).unwrap();
-        // Both should be negative (upper centroid < center_y from large lower group)
-        // and larger lower group means more negative pitch
-        assert!(pitch_small < 0.0, "pitch_small={pitch_small}");
-        assert!(pitch_large < 0.0, "pitch_large={pitch_large}");
-        assert!(
-            pitch_large < pitch_small,
-            "more lower points should push pitch more negative: small={pitch_small} large={pitch_large}"
-        );
+    fn test_select_pitch_candidate_prefers_prior() {
+        let candidates = [-0.79_f32, 0.3];
+        assert!((select_pitch_candidate(candidates, 0.35) - 0.3).abs() < 1e-6);
+        assert!((select_pitch_candidate(candidates, -0.9) + 0.79).abs() < 1e-6);
     }
 
-    /// Single-point degenerate case: one point in each group → must not panic.
-    #[test]
-    fn test_pitch_single_point_each_group_no_panic() {
-        let upper = vec![[0.5_f32, 0.3]];
-        let lower = vec![[0.5_f32, 0.7]];
-        let result = estimate_pitch_from_vertical(&upper, &lower);
-        assert!(
-            result.is_ok(),
-            "single-point groups should succeed: {result:?}"
-        );
-        let pitch = result.unwrap();
-        assert!(
-            pitch.abs() < 0.05,
-            "single symmetric points → pitch near 0, got {pitch}"
-        );
+    // -- rotation recovery (weak-perspective solver) --
+
+    /// Build a rotation about the model y-axis.
+    fn rot_y(theta: f32) -> [[f32; 3]; 3] {
+        let (s, c) = theta.sin_cos();
+        [[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]]
     }
 
-    /// Coincident centroids (vertical_span < 1e-6) → must return Ok(0.0).
+    /// Non-planar model point set (full-rank scatter matrix), centred at origin.
+    fn spatial_model() -> [Landmark3D; 6] {
+        [
+            Landmark3D::new(-0.1, 0.0, 0.0),
+            Landmark3D::new(0.1, 0.0, 0.0),
+            Landmark3D::new(0.0, -0.1, 0.0),
+            Landmark3D::new(0.0, 0.1, 0.0),
+            Landmark3D::new(0.0, 0.0, 0.08),
+            Landmark3D::new(0.0, 0.0, -0.08),
+        ]
+    }
+
     #[test]
-    fn test_pitch_zero_span_returns_zero() {
-        let upper = vec![[0.3_f32, 0.5], [0.5, 0.5]];
-        let lower = vec![[0.7_f32, 0.5], [0.4, 0.5]];
-        let pitch = estimate_pitch_from_vertical(&upper, &lower).unwrap();
+    fn test_weak_perspective_recovers_rotation_not_identity() {
+        let camera = PosePinholeCamera::new(500.0, 320.0, 240.0);
+        let config = PoseConfig {
+            min_confidence: 0.0,
+            ..Default::default()
+        };
+        let theta = 25.0_f32.to_radians();
+        let r_true = rot_y(theta);
+        let t_true = [0.0_f32, 0.0, 2.0];
+        let scale = camera.focal_length / t_true[2];
+
+        // Weak-perspective observations of the rotated model.
+        let corrs: Vec<PointCorrespondence> = spatial_model()
+            .iter()
+            .map(|p| {
+                let rp = mat3_vec3_mul(&r_true, [p.x, p.y, p.z]);
+                let u = camera.cx + scale * (rp[0] + t_true[0]);
+                let v = camera.cy - scale * (rp[1] + t_true[1]);
+                PointCorrespondence::new(*p, Landmark2D::new(u, v))
+            })
+            .collect();
+
+        let pose =
+            estimate_pose_weak_perspective(&corrs, &camera, &config).expect("solve should succeed");
+
+        for (i, row) in r_true.iter().enumerate() {
+            for (j, &expected) in row.iter().enumerate() {
+                assert!(
+                    (pose.rotation[i][j] - expected).abs() < 2e-3,
+                    "R[{i}][{j}] = {} expected {expected}",
+                    pose.rotation[i][j]
+                );
+            }
+        }
+        // The out-of-plane term must be non-zero — the old solver returned identity.
+        let out_of_plane = pose.rotation[0][2].abs();
         assert!(
-            pitch.abs() < 1e-5,
-            "zero-span input should return pitch 0.0, got {pitch}"
+            out_of_plane > 0.3,
+            "rotation still ~identity: {out_of_plane}"
+        );
+        let t_z = pose.translation[2];
+        assert!((t_z - 2.0).abs() < 5e-3, "t_z={t_z}");
+        // The observations are weak-perspective while the error uses the exact
+        // pinhole projection, so a sub-pixel residual is expected.
+        let err = pose.reprojection_error;
+        assert!(err < 2.0, "reprojection_error={err}");
+    }
+
+    #[test]
+    fn test_weak_perspective_translation_with_depth_and_offset_centroid() {
+        // Model centroid at (0.05, 0, 0.05) — deliberately not the origin — and
+        // a true depth of 1.95 so that t_z != 1.  All points share one depth,
+        // making the perspective projection exactly weak-perspective.
+        let camera = PosePinholeCamera::new(500.0, 320.0, 240.0);
+        let config = PoseConfig {
+            min_confidence: 0.0,
+            ..Default::default()
+        };
+        let model = [
+            Landmark3D::new(-0.05, 0.0, 0.05),
+            Landmark3D::new(0.15, 0.0, 0.05),
+            Landmark3D::new(0.05, -0.1, 0.05),
+            Landmark3D::new(0.05, 0.1, 0.05),
+        ];
+        let t_true = [0.4_f32, -0.2, 1.95];
+
+        let corrs: Vec<PointCorrespondence> = model
+            .iter()
+            .map(|p| {
+                let cam = [p.x + t_true[0], p.y + t_true[1], p.z + t_true[2]];
+                let (u, v) = camera
+                    .project(cam[0], cam[1], cam[2])
+                    .expect("model point must be in front of the camera");
+                PointCorrespondence::new(*p, Landmark2D::new(u, v))
+            })
+            .collect();
+
+        let pose =
+            estimate_pose_weak_perspective(&corrs, &camera, &config).expect("solve should succeed");
+
+        // The pre-fix formula dropped the t_z factor and the model centroid,
+        // which yielded t_x = 0.2 / t_y = -0.1 here instead of 0.4 / -0.2.
+        for (axis, (&got, &want)) in pose.translation.iter().zip(t_true.iter()).enumerate() {
+            assert!(
+                (got - want).abs() < 1e-3,
+                "t[{axis}]={got}, expected {want}"
+            );
+        }
+        let err = pose.reprojection_error;
+        assert!(err < 1.0, "reprojection_error={err}");
+    }
+
+    // -- RANSAC --
+
+    #[test]
+    fn test_ransac_rejects_gross_outliers() {
+        let camera = PosePinholeCamera::new(500.0, 320.0, 240.0);
+        let t_true = [0.0_f32, 0.0, 2.0];
+        let scale = camera.focal_length / t_true[2];
+
+        // Ten clean correspondences (identity rotation) on a non-planar ring …
+        let mut corrs: Vec<PointCorrespondence> = Vec::new();
+        for i in 0..10 {
+            let angle = i as f32 * std::f32::consts::TAU / 10.0;
+            let p = Landmark3D::new(
+                0.08 * angle.cos(),
+                0.08 * angle.sin(),
+                0.02 * (2.0 * angle).cos(),
+            );
+            let u = camera.cx + scale * p.x;
+            let v = camera.cy - scale * p.y;
+            corrs.push(PointCorrespondence::new(p, Landmark2D::new(u, v)));
+        }
+        // … plus three wildly wrong observations.
+        for i in 0..3 {
+            let p = Landmark3D::new(0.05, -0.05 + i as f32 * 0.01, 0.0);
+            corrs.push(PointCorrespondence::new(
+                p,
+                Landmark2D::new(40.0 + i as f32 * 12.0, 430.0),
+            ));
+        }
+
+        let plain = PoseConfig {
+            min_confidence: 0.0,
+            ..Default::default()
+        };
+        let robust = PoseConfig {
+            min_confidence: 0.0,
+            ransac_iterations: 64,
+            max_reprojection_error: 5.0,
+            ..Default::default()
+        };
+
+        let plain_err = estimate_pose_weak_perspective(&corrs, &camera, &plain)
+            .expect("solve should succeed")
+            .reprojection_error;
+        let pose_robust =
+            estimate_pose_weak_perspective(&corrs, &camera, &robust).expect("solve should succeed");
+        let robust_err = pose_robust.reprojection_error;
+        let robust_tz = pose_robust.translation[2];
+
+        assert!(robust_err < plain_err, "RANSAC {robust_err} vs {plain_err}");
+        assert!(
+            (robust_tz - t_true[2]).abs() < 0.1,
+            "robust t_z={robust_tz}"
+        );
+        // Deterministic: the sampler is seeded, so repeated runs agree exactly.
+        let again =
+            estimate_pose_weak_perspective(&corrs, &camera, &robust).expect("solve should succeed");
+        assert!((again.reprojection_error - robust_err).abs() < 1e-6);
+    }
+
+    // -- euler gimbal lock --
+
+    /// Build `R = Rz(yaw)·Ry(pitch)·Rx(roll)` (the convention `euler_angles` inverts).
+    fn rot_zyx(yaw: f32, pitch: f32, roll: f32) -> [[f32; 3]; 3] {
+        let (sy, cy) = yaw.sin_cos();
+        let (sp, cp) = pitch.sin_cos();
+        let (sr, cr) = roll.sin_cos();
+        [
+            [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+            [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+            [-sp, cp * sr, cp * cr],
+        ]
+    }
+
+    /// At both gimbal-lock poles the recovered yaw must keep its sign; the
+    /// pre-fix code mirrored it at pitch = −π/2 (a +30° turn read as −30°).
+    #[test]
+    fn test_euler_gimbal_lock_yaw_sign_both_poles() {
+        let yaw_true = 30.0_f32.to_radians();
+        for &pitch_true in &[PI / 2.0, -PI / 2.0] {
+            let r = rot_zyx(yaw_true, pitch_true, 0.0);
+            let [yaw, pitch, roll] = HeadPose::new(r, [0.0, 0.0, 1.0]).euler_angles();
+            assert!((pitch - pitch_true).abs() < 1e-3, "pitch={pitch}");
+            assert!((yaw - yaw_true).abs() < 1e-3, "yaw={yaw} at {pitch_true}");
+            assert!(roll.abs() < 1e-6);
+        }
+    }
+
+    // -- PoseTracker rotation stays in SO(3) --
+
+    fn mat3_det(m: &[[f32; 3]; 3]) -> f32 {
+        m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+            - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+            + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])
+    }
+
+    #[test]
+    fn test_pose_tracker_smoothed_rotation_is_orthonormal() {
+        let mut tracker = PoseTracker::new(0.6);
+        let poses = [
+            HeadPose::new(mat3_identity(), [0.0, 0.0, 2.0]),
+            HeadPose::new(rot_y(40.0_f32.to_radians()), [0.1, 0.0, 2.0]),
+            HeadPose::new(rot_y(-35.0_f32.to_radians()), [0.0, 0.1, 2.0]),
+            HeadPose::new(rot_y(80.0_f32.to_radians()), [0.0, 0.0, 2.1]),
+            // The last two are >180° apart as quaternions (dot < 0), which
+            // exercises the antipodal branch of the slerp.
+            HeadPose::new(rot_y(170.0_f32.to_radians()), [0.0, 0.0, 2.0]),
+            HeadPose::new(rot_y(-170.0_f32.to_radians()), [0.0, 0.0, 2.0]),
+        ];
+
+        for pose in &poses {
+            tracker.update(pose);
+            let current = tracker.current_pose().expect("tracker has a pose");
+            let r = current.rotation;
+            let rrt = mat3_mul(&r, &mat3_transpose(&r));
+            for (i, row) in rrt.iter().enumerate() {
+                for (j, &value) in row.iter().enumerate() {
+                    let expected = if i == j { 1.0 } else { 0.0 };
+                    assert!((value - expected).abs() < 1e-5, "RRᵀ[{i}][{j}]={value}");
+                }
+            }
+            let det = mat3_det(&r);
+            assert!((det - 1.0).abs() < 1e-5, "det(R)={det}");
+            // Euler extraction must stay in range for a proper rotation.
+            let [_yaw, pitch, _roll] = current.euler_angles();
+            assert!(pitch.is_finite(), "pitch must be finite, got {pitch}");
+        }
+    }
+
+    #[test]
+    fn test_pose_tracker_slerp_moves_toward_observation() {
+        let mut tracker = PoseTracker::new(0.5);
+        tracker.update(&HeadPose::new(mat3_identity(), [0.0, 0.0, 2.0]));
+        tracker.update(&HeadPose::new(
+            rot_y(60.0_f32.to_radians()),
+            [0.0, 0.0, 2.0],
+        ));
+
+        let smoothed = tracker.current_pose().expect("tracker has a pose");
+        let aa = smoothed.rotation_axis_angle();
+        let magnitude = vec3_norm(aa);
+        // Half-way between 0° and 60° on the quaternion sphere.
+        assert!(
+            (magnitude - 30.0_f32.to_radians()).abs() < 1e-3,
+            "expected ~30°, got {magnitude} rad"
         );
     }
 }

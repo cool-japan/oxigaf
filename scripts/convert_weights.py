@@ -5,6 +5,19 @@ Usage:
     python convert_weights.py <checkpoint.pt> <output_dir/>
 
 Requires: torch, safetensors
+
+Scope note: this is a one-time, offline asset-conversion step, not part of
+the OxiGAF Pure Rust runtime. It exists because PyTorch `.pt` checkpoints
+are pickle-serialized; reading them requires `torch.load`, which is why this
+script depends on Python + PyTorch. The OxiGAF crates themselves (oxigaf,
+oxigaf-bridge, etc.) have no Python or C/C++ dependency in their default
+build — that claim is about the Rust runtime, not about how you get a
+third-party `.pt` checkpoint into `.safetensors` form in the first place.
+`oxigaf-bridge` currently reads/writes `.safetensors` only; it does not yet
+ingest raw `.pt`/`.pkl` pickle files, so this script (and
+`convert_flame.py` for `.pkl` FLAME models) is still required for that
+first-mile conversion. Once you have `.safetensors` output, the rest of the
+pipeline is Pure Rust.
 """
 
 import sys

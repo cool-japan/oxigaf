@@ -346,12 +346,21 @@ struct UpBlock {
 }
 
 impl UpBlock {
+    /// Build one decoder stage.
+    ///
+    /// `skip_channels` carries the width of the skip connection consumed by
+    /// each resnet, in the order they are consumed. Diffusers'
+    /// `CrossAttnUpBlock2D` does **not** use a single width for the whole
+    /// stage: the first `num_layers - 1` resnets receive a skip of
+    /// `out_ch` channels while the last receives the block's own
+    /// `in_channels` (the next stage's width). `skip_channels.len()` must
+    /// equal `num_layers`.
     #[allow(clippy::too_many_arguments)]
     fn new(
         vs: nn::VarBuilder,
         in_ch: usize,
         out_ch: usize,
-        skip_ch: usize,
+        skip_channels: &[usize],
         time_dim: usize,
         num_layers: usize,
         has_attn: bool,
@@ -365,14 +374,20 @@ impl UpBlock {
         use_linear: bool,
         has_upsample: bool,
     ) -> Result<Self> {
+        if skip_channels.len() != num_layers {
+            return Err(candle_core::Error::Msg(format!(
+                "UpBlock expects one skip width per layer: got {} widths for {num_layers} layers",
+                skip_channels.len()
+            )));
+        }
+
         let vs_res = vs.pp("resnets");
         let mut resnets = Vec::with_capacity(num_layers);
         for i in 0..num_layers {
-            let ich = if i == 0 {
-                in_ch + skip_ch
-            } else {
-                out_ch + skip_ch
-            };
+            // Resnet input = previous stage output (first layer only) or this
+            // stage's own output, concatenated with that layer's skip.
+            let resnet_in = if i == 0 { in_ch } else { out_ch };
+            let ich = resnet_in + skip_channels[i];
             resnets.push(ResBlock::new(
                 vs_res.pp(i.to_string()),
                 ich,
@@ -447,6 +462,88 @@ impl UpBlock {
 }
 
 // ---------------------------------------------------------------------------
+// Config-derived geometry helpers
+// ---------------------------------------------------------------------------
+
+/// Resolve `(num_heads, head_dim)` for one attention stage.
+///
+/// [`DiffusionConfig::attention_head_dim`] follows the diffusers SD 2.1 UNet
+/// config, where the vector `[5, 10, 20, 20]` holds the **number of attention
+/// heads** per stage and the per-head dimension is derived as
+/// `stage_channels / num_heads` (64 for every SD 2.1 stage). Reading the vector
+/// as the head *dimension* instead yields 64 heads of dim 5, which keeps
+/// `inner_dim` — and therefore the projection weight shapes — unchanged while
+/// computing attention over the wrong head partition and with a `1/sqrt(5)`
+/// scale instead of `1/sqrt(64)`.
+///
+/// `DiffusionConfig` is user-constructible and never validated, so the vector
+/// length, a zero head count and a non-divisible channel count are all
+/// reported as errors rather than panicking.
+fn resolve_attention_heads(
+    config: &DiffusionConfig,
+    stage: usize,
+    stage_channels: usize,
+) -> Result<(usize, usize)> {
+    let n_heads = config
+        .attention_head_dim
+        .get(stage)
+        .copied()
+        .ok_or_else(|| {
+            candle_core::Error::Msg(format!(
+                "attention_head_dim has {} entries but stage {stage} was requested",
+                config.attention_head_dim.len()
+            ))
+        })?;
+    if n_heads == 0 {
+        return Err(candle_core::Error::Msg(format!(
+            "attention_head_dim[{stage}] must be non-zero"
+        )));
+    }
+    if stage_channels % n_heads != 0 {
+        return Err(candle_core::Error::Msg(format!(
+            "stage {stage} has {stage_channels} channels, which is not divisible by \
+             attention_head_dim[{stage}] = {n_heads}"
+        )));
+    }
+    Ok((n_heads, stage_channels / n_heads))
+}
+
+/// Number of transformer blocks for one attention stage.
+///
+/// Guards the same user-supplied-vector indexing panic as
+/// [`resolve_attention_heads`].
+fn resolve_transformer_depth(config: &DiffusionConfig, stage: usize) -> Result<usize> {
+    config
+        .transformer_layers_per_block
+        .get(stage)
+        .copied()
+        .ok_or_else(|| {
+            candle_core::Error::Msg(format!(
+                "transformer_layers_per_block has {} entries but stage {stage} was requested",
+                config.transformer_layers_per_block.len()
+            ))
+        })
+}
+
+/// Skip-connection widths consumed by one decoder stage, in consumption order.
+///
+/// Mirrors diffusers' `CrossAttnUpBlock2D`:
+/// `res_skip = out_channels` for the first `num_layers - 1` resnets and
+/// `res_skip = block_in_channels` for the last, where `block_in_channels` is
+/// the *next* (lower-resolution-index) stage's channel count.
+fn up_block_skip_channels(out_ch: usize, block_in_ch: usize, num_layers: usize) -> Vec<usize> {
+    (0..num_layers)
+        .map(|layer| {
+            if layer + 1 == num_layers {
+                block_in_ch
+            } else {
+                out_ch
+            }
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // Multi-view U-Net
 // ---------------------------------------------------------------------------
 
@@ -478,9 +575,24 @@ pub struct MultiViewUNet {
 
 impl MultiViewUNet {
     /// Build the U-Net from a DiffusionConfig and VarBuilder.
+    ///
+    /// # Errors
+    ///
+    /// `DiffusionConfig` is user-constructible and never validated, so this
+    /// reports a mis-shaped config (no stages, a stage vector shorter than
+    /// `channel_mult`, a zero or non-dividing head count) as an error rather
+    /// than panicking.
     pub fn new(vs: nn::VarBuilder, config: &DiffusionConfig) -> Result<Self> {
         let base = config.base_channels;
         let time_embed_dim = config.time_embed_dim;
+
+        // `num_stages - 1` indexes the deepest stage throughout; an empty
+        // `channel_mult` would underflow it.
+        if config.num_stages() == 0 {
+            return Err(candle_core::Error::Msg(
+                "channel_mult must declare at least one U-Net stage".to_string(),
+            ));
+        }
 
         // Input conv
         let conv_in = nn::conv2d(
@@ -511,9 +623,8 @@ impl MultiViewUNet {
         let mut input_ch = base;
         for i in 0..num_stages {
             let output_ch = config.stage_channels(i);
-            let n_heads = output_ch / config.attention_head_dim[i];
-            let d_head = config.attention_head_dim[i];
-            let depth = config.transformer_layers_per_block[i];
+            let (n_heads, d_head) = resolve_attention_heads(config, i, output_ch)?;
+            let depth = resolve_transformer_depth(config, i)?;
             let has_ds = i < num_stages - 1;
 
             down_blocks.push(DownBlock::new(
@@ -538,9 +649,8 @@ impl MultiViewUNet {
 
         // Mid block
         let last_ch = config.stage_channels(num_stages - 1);
-        let mid_n_heads = last_ch / config.attention_head_dim[num_stages - 1];
-        let mid_d_head = config.attention_head_dim[num_stages - 1];
-        let mid_depth = config.transformer_layers_per_block[num_stages - 1];
+        let (mid_n_heads, mid_d_head) = resolve_attention_heads(config, num_stages - 1, last_ch)?;
+        let mid_depth = resolve_transformer_depth(config, num_stages - 1)?;
         let mid_block = MidBlock::new(
             vs.pp("mid_block"),
             last_ch,
@@ -563,26 +673,28 @@ impl MultiViewUNet {
             .map(|i| config.stage_channels(i))
             .collect();
         let mut prev_ch = last_ch;
+        // Each decoder stage consumes `layers_per_block + 1` skips: one per
+        // encoder resnet of the mirrored stage plus the stage's downsample
+        // output (the shallowest stage instead re-uses the `conv_in` output).
+        let up_layers = config.layers_per_block + 1;
         for i in 0..num_stages {
             let output_ch = reversed_channels[i];
-            let skip_ch = if i == 0 {
-                last_ch
-            } else {
-                reversed_channels[i - 1]
-            };
+            // Diffusers' `input_channel` for this up block: the channel count
+            // of the next (shallower) stage, clamped at the last entry.
+            let block_in_ch = reversed_channels[(i + 1).min(num_stages - 1)];
+            let skip_channels = up_block_skip_channels(output_ch, block_in_ch, up_layers);
             let stage_idx = num_stages - 1 - i;
-            let n_heads = output_ch / config.attention_head_dim[stage_idx];
-            let d_head = config.attention_head_dim[stage_idx];
-            let depth = config.transformer_layers_per_block[stage_idx];
+            let (n_heads, d_head) = resolve_attention_heads(config, stage_idx, output_ch)?;
+            let depth = resolve_transformer_depth(config, stage_idx)?;
             let has_us = i < num_stages - 1;
 
             up_blocks.push(UpBlock::new(
                 vs_up.pp(i.to_string()),
                 prev_ch,
                 output_ch,
-                skip_ch,
+                &skip_channels,
                 time_embed_dim,
-                config.layers_per_block + 1, // +1 for the skip connection layer
+                up_layers, // +1 for the conv_in / downsample skip
                 true,
                 n_heads,
                 d_head,
@@ -638,8 +750,10 @@ impl MultiViewUNet {
     ///
     /// # Errors
     ///
-    /// Returns `DiffusionError::SkipConnectionUnderflow` if skip connections are
-    /// exhausted before all up blocks have consumed them.
+    /// Returns `DiffusionError::SkipConnectionUnderflow` if the encoder produced
+    /// fewer skip connections than the decoder consumes, and
+    /// `DiffusionError::Inference` if it produced more. Both indicate a
+    /// mis-wired configuration rather than bad input.
     pub fn forward(
         &self,
         sample: &Tensor,
@@ -667,12 +781,34 @@ impl MultiViewUNet {
         // 3. Input conv
         let mut h = self.conv_in.forward(sample)?;
 
-        // 4. Down blocks — collect skip connections
-        let mut all_skips: Vec<Tensor> = Vec::new();
+        // 4. Down blocks — collect skip connections.
+        //
+        // The `conv_in` output is itself a skip: diffusers seeds
+        // `down_block_res_samples = (sample,)` before the first down block.
+        // Without it the encoder yields exactly one skip fewer than the decoder
+        // pops, and the last resnet of the shallowest up block underflows.
+        let mut all_skips: Vec<Tensor> = vec![h.clone()];
         for down in &self.down_blocks {
             let (out, skips) = down.forward(&h, &emb, context, ip_tokens)?;
             h = out;
             all_skips.extend(skips);
+        }
+
+        // Encoder and decoder must agree on the skip budget: one per resnet of
+        // every up block.
+        let expected_skips: usize = self.up_blocks.iter().map(|up| up.resnets.len()).sum();
+        if all_skips.len() < expected_skips {
+            return Err(DiffusionError::SkipConnectionUnderflow {
+                expected: expected_skips,
+                available: all_skips.len(),
+            });
+        }
+        if all_skips.len() > expected_skips {
+            return Err(DiffusionError::Inference(format!(
+                "skip connection surplus: encoder produced {} skips but the decoder \
+                 consumes only {expected_skips}",
+                all_skips.len()
+            )));
         }
 
         // 5. Mid block
@@ -686,5 +822,261 @@ impl MultiViewUNet {
         // 7. Output
         h = self.conv_norm_out.forward(&h)?.silu()?;
         Ok(self.conv_out.forward(&h)?)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::{DType, Device};
+
+    /// A miniature but structurally faithful U-Net config.
+    ///
+    /// `ResBlock` group-normalises with 32 groups, so every channel width the
+    /// decoder concatenates has to stay a multiple of 32; base 32 with
+    /// `channel_mult = [1, 2]` is the smallest configuration that satisfies it.
+    fn tiny_config() -> DiffusionConfig {
+        DiffusionConfig {
+            num_views: 1,
+            base_channels: 32,
+            channel_mult: vec![1, 2],
+            layers_per_block: 1,
+            attention_head_dim: vec![2, 4],
+            transformer_layers_per_block: vec![1, 1],
+            time_embed_dim: 64,
+            cross_attention_dim: 32,
+            clip_embed_dim: 16,
+            unet_in_channels: 4,
+            unet_out_channels: 4,
+            image_size: 64,
+            latent_size: 8,
+            ..DiffusionConfig::default()
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Attention head partition
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_attention_head_dim_is_read_as_head_count() -> Result<()> {
+        // SD 2.1 lists [5, 10, 20, 20] as the *head count*; every stage then
+        // has a 64-wide head, not 5.
+        let config = DiffusionConfig::default();
+        let expected = [(5usize, 64usize), (10, 64), (20, 64), (20, 64)];
+        for (stage, &(want_heads, want_dim)) in expected.iter().enumerate() {
+            let channels = config.stage_channels(stage);
+            let (heads, dim) = resolve_attention_heads(&config, stage, channels)?;
+            assert_eq!(heads, want_heads, "stage {stage} head count");
+            assert_eq!(dim, want_dim, "stage {stage} head dim");
+            assert_eq!(heads * dim, channels, "inner_dim must equal stage channels");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_resolve_attention_heads_rejects_zero_head_count() {
+        let config = DiffusionConfig {
+            attention_head_dim: vec![0, 10, 20, 20],
+            ..DiffusionConfig::default()
+        };
+        assert!(resolve_attention_heads(&config, 0, 320).is_err());
+    }
+
+    #[test]
+    fn test_resolve_attention_heads_rejects_short_vector() {
+        let config = DiffusionConfig {
+            attention_head_dim: vec![5],
+            ..DiffusionConfig::default()
+        };
+        assert!(resolve_attention_heads(&config, 2, 1280).is_err());
+    }
+
+    #[test]
+    fn test_resolve_attention_heads_rejects_indivisible_channels() {
+        let config = DiffusionConfig {
+            attention_head_dim: vec![7, 10, 20, 20],
+            ..DiffusionConfig::default()
+        };
+        assert!(resolve_attention_heads(&config, 0, 320).is_err());
+    }
+
+    #[test]
+    fn test_new_rejects_empty_channel_mult() {
+        let varmap = nn::VarMap::new();
+        let vs = nn::VarBuilder::from_varmap(&varmap, DType::F32, &Device::Cpu);
+        let config = DiffusionConfig {
+            channel_mult: Vec::new(),
+            ..tiny_config()
+        };
+        // `num_stages - 1` would underflow rather than report the bad config.
+        assert!(MultiViewUNet::new(vs, &config).is_err());
+    }
+
+    #[test]
+    fn test_resolve_transformer_depth_rejects_short_vector() {
+        let config = DiffusionConfig {
+            transformer_layers_per_block: vec![1, 1],
+            ..DiffusionConfig::default()
+        };
+        assert!(resolve_transformer_depth(&config, 3).is_err());
+        assert_eq!(resolve_transformer_depth(&config, 1).unwrap_or(0), 1);
+    }
+
+    // ------------------------------------------------------------------
+    // Skip-connection wiring
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_up_block_skip_channels_are_per_layer() {
+        // Diffusers: `out_channels` for the first num_layers-1 resnets, then
+        // the block's own `in_channels`.
+        assert_eq!(up_block_skip_channels(1280, 640, 3), vec![1280, 1280, 640]);
+        assert_eq!(up_block_skip_channels(640, 320, 3), vec![640, 640, 320]);
+        assert_eq!(up_block_skip_channels(320, 320, 3), vec![320, 320, 320]);
+        assert_eq!(up_block_skip_channels(64, 32, 2), vec![64, 32]);
+    }
+
+    #[test]
+    fn test_default_config_skip_budget_balances() {
+        // Encoder must emit exactly as many skips as the decoder pops; the
+        // conv_in output is what used to be missing.
+        let config = DiffusionConfig::default();
+        let num_stages = config.num_stages();
+
+        let mut produced = 1; // conv_in
+        for i in 0..num_stages {
+            produced += config.layers_per_block;
+            if i < num_stages - 1 {
+                produced += 1; // downsample output
+            }
+        }
+        let consumed = num_stages * (config.layers_per_block + 1);
+
+        assert_eq!(produced, 12);
+        assert_eq!(consumed, 12);
+    }
+
+    #[test]
+    fn test_default_config_skip_widths_line_up() {
+        let config = DiffusionConfig::default();
+        let num_stages = config.num_stages();
+
+        // Encoder skip stack, bottom → top.
+        let mut stack: Vec<usize> = vec![config.base_channels]; // conv_in output
+        for i in 0..num_stages {
+            let out_ch = config.stage_channels(i);
+            for _ in 0..config.layers_per_block {
+                stack.push(out_ch);
+            }
+            if i < num_stages - 1 {
+                stack.push(out_ch); // downsample output
+            }
+        }
+        assert_eq!(
+            stack,
+            vec![320, 320, 320, 320, 640, 640, 640, 1280, 1280, 1280, 1280, 1280]
+        );
+
+        // The decoder pops LIFO and must find exactly the width each resnet
+        // was declared for.
+        let reversed: Vec<usize> = (0..num_stages)
+            .rev()
+            .map(|i| config.stage_channels(i))
+            .collect();
+        let up_layers = config.layers_per_block + 1;
+        for i in 0..num_stages {
+            let out_ch = reversed[i];
+            let block_in_ch = reversed[(i + 1).min(num_stages - 1)];
+            for want in up_block_skip_channels(out_ch, block_in_ch, up_layers) {
+                let got = stack.pop().expect("skip stack must not underflow");
+                assert_eq!(got, want, "up block {i} skip width mismatch");
+            }
+        }
+        assert!(stack.is_empty(), "every encoder skip must be consumed");
+    }
+
+    #[test]
+    fn test_up_block_rejects_mismatched_skip_widths() {
+        let varmap = nn::VarMap::new();
+        let vs = nn::VarBuilder::from_varmap(&varmap, DType::F32, &Device::Cpu);
+        // 2 skip widths supplied for 3 layers.
+        let result = UpBlock::new(
+            vs.pp("up"),
+            64,
+            64,
+            &[64, 32],
+            64,
+            3,
+            false,
+            2,
+            32,
+            1,
+            32,
+            16,
+            1,
+            32,
+            true,
+            false,
+        );
+        assert!(result.is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // End-to-end forward pass
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_tiny_unet_forward_runs_end_to_end() -> Result<()> {
+        let device = Device::Cpu;
+        let varmap = nn::VarMap::new();
+        let vs = nn::VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let config = tiny_config();
+        let unet = MultiViewUNet::new(vs, &config)?;
+
+        // The decoder consumes one skip per up-block resnet.
+        let consumed: usize = unet.up_blocks.iter().map(|up| up.resnets.len()).sum();
+        assert_eq!(
+            consumed,
+            config.num_stages() * (config.layers_per_block + 1)
+        );
+
+        let bv = config.num_views; // batch 1 × num_views
+        let sample = Tensor::randn(0f32, 1f32, (bv, config.unet_in_channels, 8, 8), &device)?;
+        let context = Tensor::randn(0f32, 1f32, (bv, 2, config.cross_attention_dim), &device)?;
+        let poses = Tensor::randn(0f32, 1f32, (bv, config.camera_pose_dim), &device)?;
+        let ip_tokens = Tensor::randn(0f32, 1f32, (bv, 3, config.clip_embed_dim), &device)?;
+
+        let out = unet
+            .forward(&sample, 10, Some(&context), Some(&poses), Some(&ip_tokens))
+            .map_err(|e| candle_core::Error::Msg(format!("{e}")))?;
+
+        assert_eq!(out.dims(), &[bv, config.unet_out_channels, 8, 8]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_tiny_unet_forward_without_ip_tokens() -> Result<()> {
+        // The CFG unconditional pass skips the IP-adapter layer entirely.
+        let device = Device::Cpu;
+        let varmap = nn::VarMap::new();
+        let vs = nn::VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let config = tiny_config();
+        let unet = MultiViewUNet::new(vs, &config)?;
+
+        let bv = config.num_views;
+        let sample = Tensor::randn(0f32, 1f32, (bv, config.unet_in_channels, 8, 8), &device)?;
+        let context = Tensor::randn(0f32, 1f32, (bv, 2, config.cross_attention_dim), &device)?;
+
+        let out = unet
+            .forward(&sample, 0, Some(&context), None, None)
+            .map_err(|e| candle_core::Error::Msg(format!("{e}")))?;
+
+        assert_eq!(out.dims(), &[bv, config.unet_out_channels, 8, 8]);
+        Ok(())
     }
 }

@@ -14,7 +14,7 @@ FLAME is a statistical 3D head model that represents shape, expression, and pose
 - Mesh surface sampling for Gaussian initialization
 - **Safetensors I/O** — load/save FLAME models in `.safetensors` format (`io_safetensors.rs`)
 - **FlameSequence** — video frame processing with LRU caching and temporal interpolation (`sequence.rs`)
-- 124 tests (all passing)
+- 2231 tests (all passing)
 
 ## Installation
 
@@ -285,7 +285,7 @@ cargo bench -p oxigaf-flame
 
 ## Statistics
 
-- **Tests**: 124 (all passing)
+- **Tests**: 2231 (all passing)
 - **Benchmark files**: 5 (`flame_bench`, `lbs_forward`, `rodrigues`, `normal_map`, `simd_ops`)
 - **Key source files**: `model.rs`, `sequence.rs`, `normal_map.rs`, `io_safetensors.rs`, `io.rs`
 
@@ -298,4 +298,4 @@ cargo bench -p oxigaf-flame
 
 ## License
 
-Licensed under the Apache License, Version 2.0 ([LICENSE](../../LICENSE))
+Licensed under the Apache License, Version 2.0 ([LICENSE](https://github.com/cool-japan/oxigaf/blob/master/LICENSE))

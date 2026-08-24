@@ -4,6 +4,27 @@
 //! values, expression blending, parameter constraints, and extension methods
 //! on [`FlameParams`] for convenient expression application.
 //!
+//! # Where expression coefficients come from
+//!
+//! FLAME's expression space is a *data-driven* PCA basis: component `k` has no
+//! fixed, model-independent meaning, and the same coefficient vector produces
+//! different faces under different `expressiondirs` matrices.  There is
+//! therefore no such thing as a universal "smile vector".
+//!
+//! Consequently this module offers three ways to obtain coefficients, in
+//! decreasing order of fidelity:
+//!
+//! 1. [`NamedExpression::fit_to_basis`] — project a reference expression mesh
+//!    onto the expression basis of the FLAME model you actually use.  This is
+//!    the only way to obtain coefficients that are correct for that model.
+//! 2. [`ExpressionLibrary::from_json_file`] — load coefficients that were
+//!    fitted earlier (e.g. by step 1) and serialised with
+//!    [`ExpressionLibrary::to_json_string`].
+//! 3. [`ExpressionLibrary::placeholder_expressions`] — hand-authored,
+//!    *illustrative* values used for smoke tests, examples and UI wiring.
+//!    They are **not** fitted to any FLAME basis and will not reproduce the
+//!    named expression on a real model.
+//!
 //! # Quick Start
 //!
 //! ```rust
@@ -11,8 +32,8 @@
 //!     ExpressionLibrary, ExpressionBlend, FlameParams, FlameParamConstraints,
 //! };
 //!
-//! // Load built-in expressions
-//! let lib = ExpressionLibrary::default_expressions();
+//! // Load the illustrative placeholder presets (see the caveat above)
+//! let lib = ExpressionLibrary::placeholder_expressions();
 //!
 //! // Apply a single expression to neutral params
 //! let params = FlameParams::neutral();
@@ -28,15 +49,50 @@
 //! assert!(violations.is_empty());
 //! ```
 
+use crate::blend_shape_solver::{fit_expression_coefficients, BlendSolverConfig};
 use crate::error::FlameError;
 use crate::params::FlameParams;
+use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
 // Constants — number of expression PCA components in the presets
 // ---------------------------------------------------------------------------
 
-/// Number of expression parameters used in the built-in presets.
+/// Number of expression parameters used in the placeholder presets.
 const PRESET_NUM_PARAMS: usize = 10;
+
+// ---------------------------------------------------------------------------
+// Provenance
+// ---------------------------------------------------------------------------
+
+/// Where the coefficients of a [`NamedExpression`] came from.
+///
+/// FLAME's expression basis is data-driven, so coefficients are only
+/// meaningful relative to the basis they were fitted against. This enum makes
+/// that provenance explicit instead of leaving callers to guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExpressionProvenance {
+    /// Coefficients were fitted to a concrete FLAME expression basis by
+    /// [`NamedExpression::fit_to_basis`] (or an equivalent offline fit) and
+    /// reproduce the named expression on *that* model.
+    Fitted,
+    /// Coefficients were loaded from a user-supplied data file. Fidelity is
+    /// the responsibility of whoever produced the file.
+    Loaded,
+    /// Hand-authored illustrative values. They are **not** fitted to any FLAME
+    /// basis and will not reproduce the named expression on a real model — see
+    /// [`ExpressionLibrary::placeholder_expressions`].
+    Placeholder,
+}
+
+impl ExpressionProvenance {
+    /// `true` when the coefficients are not tied to any real FLAME basis.
+    #[inline]
+    #[must_use]
+    pub fn is_placeholder(self) -> bool {
+        matches!(self, Self::Placeholder)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // NamedExpression
@@ -47,7 +103,11 @@ const PRESET_NUM_PARAMS: usize = 10;
 /// The `params` vector contains the first N non-zero FLAME expression
 /// coefficients. When the actual model uses more components, the remainder
 /// are treated as zero. When the model uses fewer, the preset is truncated.
-#[derive(Debug, Clone)]
+///
+/// Coefficients are only meaningful with respect to the expression basis they
+/// were fitted against; [`NamedExpression::provenance`] records which basis (if
+/// any) that was.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NamedExpression {
     /// Unique identifier for this expression.
     pub name: String,
@@ -57,10 +117,23 @@ pub struct NamedExpression {
     pub params: Vec<f32>,
     /// Intensity scaling factor in `[0, 1]`. 1.0 means full expression.
     pub intensity: f32,
+    /// Where `params` came from. Defaults to [`ExpressionProvenance::Loaded`]
+    /// when absent from a deserialised data file.
+    #[serde(default = "default_provenance")]
+    pub provenance: ExpressionProvenance,
+}
+
+/// Provenance assumed for entries in a data file that do not declare one.
+fn default_provenance() -> ExpressionProvenance {
+    ExpressionProvenance::Loaded
 }
 
 impl NamedExpression {
-    /// Create a new named expression.
+    /// Create a new named expression from coefficients of unspecified origin.
+    ///
+    /// The result is tagged [`ExpressionProvenance::Loaded`]; use
+    /// [`NamedExpression::with_provenance`] to state the origin explicitly, or
+    /// [`NamedExpression::fit_to_basis`] to derive coefficients from a mesh.
     #[must_use]
     pub fn new(
         name: impl Into<String>,
@@ -73,7 +146,88 @@ impl NamedExpression {
             description: description.into(),
             params,
             intensity,
+            provenance: ExpressionProvenance::Loaded,
         }
+    }
+
+    /// Override the recorded provenance (builder-style).
+    #[must_use]
+    pub fn with_provenance(mut self, provenance: ExpressionProvenance) -> Self {
+        self.provenance = provenance;
+        self
+    }
+
+    /// Fit expression coefficients by projecting a reference mesh onto a FLAME
+    /// expression basis.
+    ///
+    /// This is the only way to obtain coefficients that actually reproduce the
+    /// named expression: the resulting values are specific to
+    /// `expression_basis` and must be re-fitted for any other FLAME model.
+    ///
+    /// - `neutral_verts` — the model's neutral (expression-zero) vertices as a
+    ///   flat `[x0, y0, z0, x1, …]` array of length `3 * n_vertices`.
+    /// - `target_verts` — the reference expression mesh in the same layout and
+    ///   vertex order.
+    /// - `expression_basis` — one displacement vector per PCA component, each
+    ///   the same length as `neutral_verts` (i.e. `expressiondirs[:, :, k]`
+    ///   flattened row-major).
+    /// - `n_coeffs` — how many leading components to solve for.
+    ///
+    /// The returned expression is tagged [`ExpressionProvenance::Fitted`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FlameError::InvalidParams`] when the inputs are empty or
+    /// inconsistent, and [`FlameError::Numerical`] when the underlying solver
+    /// fails to converge.
+    pub fn fit_to_basis(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        neutral_verts: &[f32],
+        target_verts: &[f32],
+        expression_basis: Vec<Vec<f32>>,
+        n_coeffs: usize,
+    ) -> Result<Self, FlameError> {
+        if n_coeffs == 0 {
+            return Err(FlameError::InvalidParams(
+                "n_coeffs must be greater than zero".to_owned(),
+            ));
+        }
+        if expression_basis.is_empty() {
+            return Err(FlameError::InvalidParams(
+                "expression_basis must contain at least one displacement vector".to_owned(),
+            ));
+        }
+        if neutral_verts.is_empty() || neutral_verts.len() % 3 != 0 {
+            return Err(FlameError::InvalidParams(format!(
+                "neutral_verts must be a non-empty multiple of 3, got {}",
+                neutral_verts.len()
+            )));
+        }
+        if neutral_verts.len() != target_verts.len() {
+            return Err(FlameError::InvalidParams(format!(
+                "vertex count mismatch: neutral has {} scalars, target has {}",
+                neutral_verts.len(),
+                target_verts.len()
+            )));
+        }
+
+        let params = fit_expression_coefficients(
+            neutral_verts,
+            target_verts,
+            expression_basis,
+            n_coeffs,
+            &BlendSolverConfig::default(),
+        )
+        .map_err(|e| FlameError::numerical(format!("expression basis fit failed: {e}")))?;
+
+        Ok(Self {
+            name: name.into(),
+            description: description.into(),
+            params,
+            intensity: 1.0,
+            provenance: ExpressionProvenance::Fitted,
+        })
     }
 }
 
@@ -83,9 +237,18 @@ impl NamedExpression {
 
 /// A collection of named facial expressions.
 ///
-/// Use [`ExpressionLibrary::default_expressions`] to load all built-in
-/// presets, or start with [`ExpressionLibrary::new`] and add your own.
+/// Populate it by fitting against a real FLAME basis
+/// ([`NamedExpression::fit_to_basis`]), by loading a data file
+/// ([`ExpressionLibrary::from_json_file`]), or — for demos and smoke tests
+/// only — with [`ExpressionLibrary::placeholder_expressions`].
 pub struct ExpressionLibrary {
+    expressions: Vec<NamedExpression>,
+}
+
+/// On-disk representation of an [`ExpressionLibrary`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ExpressionLibraryJson {
+    /// Named expressions in file order.
     expressions: Vec<NamedExpression>,
 }
 
@@ -98,12 +261,28 @@ impl ExpressionLibrary {
         }
     }
 
-    /// Create a library pre-populated with all built-in expressions.
+    /// Create a library of hand-authored **placeholder** expressions.
     ///
-    /// Built-in expressions cover the most common facial expressions based on
-    /// plausible FLAME PCA component values (10 components).
+    /// # These coefficients are illustrative, not fitted
+    ///
+    /// FLAME's expression space is a data-driven PCA basis whose components
+    /// carry no fixed semantics, so no hard-coded coefficient vector can encode
+    /// "smile" across models. The values returned here were chosen by hand to
+    /// exercise the blending, constraint and animation machinery; applying them
+    /// to a real FLAME model produces *some* deformation, but not the named
+    /// expression. `"winking"` cannot be expressed at all through this basis —
+    /// FLAME drives eyelid closure through the eye-joint pose parameters, not
+    /// through expression coefficients.
+    ///
+    /// Every entry is tagged [`ExpressionProvenance::Placeholder`], so callers
+    /// can detect the situation at runtime via
+    /// [`ExpressionLibrary::has_placeholders`].
+    ///
+    /// For coefficients that actually reproduce an expression, fit them against
+    /// the model you use with [`NamedExpression::fit_to_basis`] and persist the
+    /// result with [`ExpressionLibrary::to_json_string`].
     #[must_use]
-    pub fn default_expressions() -> Self {
+    pub fn placeholder_expressions() -> Self {
         let mut lib = Self::new();
 
         // Helper: build a params Vec of PRESET_NUM_PARAMS elements with
@@ -118,84 +297,147 @@ impl ExpressionLibrary {
             p
         };
 
-        lib.add(NamedExpression::new(
-            "neutral",
-            "Resting / neutral face with no deformation",
-            vec![0.0_f32; PRESET_NUM_PARAMS],
-            1.0,
-        ));
+        // Helper: tag every entry as a placeholder.
+        let placeholder = |name: &str, description: &str, params: Vec<f32>| {
+            NamedExpression::new(name, description, params, 1.0)
+                .with_provenance(ExpressionProvenance::Placeholder)
+        };
 
-        lib.add(NamedExpression::new(
+        // "neutral" is exact regardless of basis: zero coefficients always mean
+        // the neutral face, so it is the one entry that is genuinely correct.
+        lib.add(
+            NamedExpression::new(
+                "neutral",
+                "Resting / neutral face with no deformation",
+                vec![0.0_f32; PRESET_NUM_PARAMS],
+                1.0,
+            )
+            .with_provenance(ExpressionProvenance::Fitted),
+        );
+
+        lib.add(placeholder(
             "smile",
-            "Gentle smile with upturned lip corners",
+            "Placeholder: gentle smile with upturned lip corners (not fitted)",
             make_params(&[(0, 0.3), (1, 1.5), (2, -0.3), (3, 0.2)]),
-            1.0,
         ));
 
-        lib.add(NamedExpression::new(
+        lib.add(placeholder(
             "grin",
-            "Broad grin with wide lip spread",
+            "Placeholder: broad grin with wide lip spread (not fitted)",
             make_params(&[(0, 0.5), (1, 2.0), (2, -0.8), (3, 0.4)]),
-            1.0,
         ));
 
-        lib.add(NamedExpression::new(
+        lib.add(placeholder(
             "frown",
-            "Downturned lip corners indicating displeasure",
+            "Placeholder: downturned lip corners indicating displeasure (not fitted)",
             make_params(&[(0, 0.2), (1, -1.2), (2, 0.3), (3, -0.2)]),
-            1.0,
         ));
 
-        lib.add(NamedExpression::new(
+        lib.add(placeholder(
             "surprised",
-            "Raised brows, wide eyes, and slightly open mouth",
+            "Placeholder: raised brows, wide eyes, slightly open mouth (not fitted)",
             make_params(&[(0, -1.5), (1, 0.5), (2, 1.2), (3, 0.3), (4, 0.8)]),
-            1.0,
         ));
 
-        lib.add(NamedExpression::new(
+        lib.add(placeholder(
             "angry",
-            "Furrowed brows and tightened mouth",
+            "Placeholder: furrowed brows and tightened mouth (not fitted)",
             make_params(&[(0, 1.0), (1, -0.8), (2, -1.5), (3, 0.5), (5, -0.4)]),
-            1.0,
         ));
 
-        lib.add(NamedExpression::new(
+        lib.add(placeholder(
             "sad",
-            "Drooping mouth corners and downcast brows",
+            "Placeholder: drooping mouth corners and downcast brows (not fitted)",
             make_params(&[(0, 0.4), (1, -0.5), (2, 0.7), (3, -0.8), (4, -0.3)]),
-            1.0,
         ));
 
-        lib.add(NamedExpression::new(
+        lib.add(placeholder(
             "disgusted",
-            "Raised upper lip and furrowed nose",
+            "Placeholder: raised upper lip and furrowed nose (not fitted)",
             make_params(&[(0, 0.7), (1, -1.0), (2, 1.2), (3, -0.3), (5, 0.6)]),
-            1.0,
         ));
 
-        lib.add(NamedExpression::new(
+        lib.add(placeholder(
             "fearful",
-            "Wide eyes and tense brow indicating fear",
+            "Placeholder: wide eyes and tense brow indicating fear (not fitted)",
             make_params(&[(0, -0.8), (1, 0.4), (2, 0.9), (3, 0.5), (4, 0.7)]),
-            1.0,
         ));
 
-        lib.add(NamedExpression::new(
+        lib.add(placeholder(
             "winking",
-            "Right eye wink",
+            "Placeholder: right eye wink — NOT expressible through the FLAME \
+             expression basis; drive the eye joints in `pose` instead",
             make_params(&[(0, 0.1), (6, 2.0), (7, -1.5)]),
-            1.0,
         ));
 
-        lib.add(NamedExpression::new(
+        lib.add(placeholder(
             "open_mouth",
-            "Open jaw / mouth wide open",
+            "Placeholder: open jaw / mouth wide open — prefer the jaw pose \
+             parameter `pose[6]` for a real jaw opening",
             make_params(&[(0, -1.8), (1, 0.2)]),
-            1.0,
         ));
 
         lib
+    }
+
+    /// Deprecated alias for [`ExpressionLibrary::placeholder_expressions`].
+    ///
+    /// Renamed because the values it returns are illustrative placeholders, not
+    /// coefficients fitted to any FLAME expression basis.
+    #[must_use]
+    #[deprecated(
+        since = "0.1.2",
+        note = "renamed to `placeholder_expressions`: these coefficients are illustrative, \
+                not fitted to any FLAME basis. Use `NamedExpression::fit_to_basis` or \
+                `ExpressionLibrary::from_json_file` for real coefficients."
+    )]
+    pub fn default_expressions() -> Self {
+        Self::placeholder_expressions()
+    }
+
+    /// Load a library from a JSON file produced by
+    /// [`ExpressionLibrary::to_json_string`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FlameError::IoError`] when the file cannot be read and
+    /// [`FlameError::InvalidParams`] when its contents are not a valid library.
+    pub fn from_json_file(path: impl AsRef<std::path::Path>) -> Result<Self, FlameError> {
+        let path = path.as_ref();
+        let json_str = std::fs::read_to_string(path).map_err(|e| FlameError::IoError {
+            source: e,
+            path: path.to_path_buf(),
+        })?;
+        Self::from_json_str(&json_str)
+    }
+
+    /// Parse a library from a JSON string.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FlameError::InvalidParams`] when the JSON does not describe a
+    /// valid library.
+    pub fn from_json_str(json_str: &str) -> Result<Self, FlameError> {
+        let parsed: ExpressionLibraryJson = serde_json::from_str(json_str).map_err(|e| {
+            FlameError::InvalidParams(format!("failed to parse expression library JSON: {e}"))
+        })?;
+        Ok(Self {
+            expressions: parsed.expressions,
+        })
+    }
+
+    /// Serialise the library to a pretty-printed JSON string.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FlameError::InvalidParams`] if serialisation fails.
+    pub fn to_json_string(&self) -> Result<String, FlameError> {
+        let doc = ExpressionLibraryJson {
+            expressions: self.expressions.clone(),
+        };
+        serde_json::to_string_pretty(&doc).map_err(|e| {
+            FlameError::InvalidParams(format!("failed to serialise expression library: {e}"))
+        })
     }
 
     /// Add an expression to the library.
@@ -220,6 +462,25 @@ impl ExpressionLibrary {
     pub fn count(&self) -> usize {
         self.expressions.len()
     }
+
+    /// `true` when any entry carries [`ExpressionProvenance::Placeholder`]
+    /// coefficients, i.e. values that are not fitted to a real FLAME basis.
+    #[must_use]
+    pub fn has_placeholders(&self) -> bool {
+        self.expressions
+            .iter()
+            .any(|e| e.provenance.is_placeholder())
+    }
+
+    /// Names of every entry whose coefficients are placeholders.
+    #[must_use]
+    pub fn placeholder_names(&self) -> Vec<&str> {
+        self.expressions
+            .iter()
+            .filter(|e| e.provenance.is_placeholder())
+            .map(|e| e.name.as_str())
+            .collect()
+    }
 }
 
 impl Default for ExpressionLibrary {
@@ -242,7 +503,7 @@ impl Default for ExpressionLibrary {
 /// ```rust
 /// use oxigaf_flame::{ExpressionBlend, ExpressionLibrary};
 ///
-/// let lib = ExpressionLibrary::default_expressions();
+/// let lib = ExpressionLibrary::placeholder_expressions();
 /// let params = ExpressionBlend::single("smile", 1.0)
 ///     .evaluate(&lib, 10)
 ///     .expect("evaluate failed");
@@ -358,10 +619,27 @@ pub trait ExpressionExt {
     /// - `t = 1.0` → target expression
     ///
     /// If the current expression vector is shorter than the target, it is
-    /// extended with zeros before interpolation. If longer, the extra elements
-    /// are left unchanged.
+    /// extended with zeros before interpolation. If it is longer, the trailing
+    /// coefficients beyond the target's length are **preserved unchanged** —
+    /// a short preset therefore edits only the leading coefficients it covers
+    /// and never silently fades out the rest. Use
+    /// [`ExpressionExt::blend_expression_toward_zero`] for the opposite
+    /// convention, where the target is treated as zero-padded and the trailing
+    /// coefficients decay toward zero.
     #[must_use]
     fn blend_expression(self, target: &NamedExpression, t: f32) -> Self
+    where
+        Self: Sized;
+
+    /// Linearly interpolate toward `target`, treating the target as
+    /// zero-padded to the current expression length.
+    ///
+    /// Identical to [`ExpressionExt::blend_expression`] for the leading
+    /// coefficients the target covers; trailing coefficients beyond the
+    /// target's length are scaled by `1 - t` so that `t = 1.0` yields exactly
+    /// the target expression (zero-padded).
+    #[must_use]
+    fn blend_expression_toward_zero(self, target: &NamedExpression, t: f32) -> Self
     where
         Self: Sized;
 
@@ -413,18 +691,44 @@ impl ExpressionExt for FlameParams {
         }
 
         let mut new_expr = vec![0.0_f32; out_len];
-        for i in 0..out_len {
+        for (i, out) in new_expr.iter_mut().enumerate() {
             let cur = if i < current_len {
                 self.expression[i]
             } else {
                 0.0
             };
-            let tgt = if i < target_params.len() {
-                target_params[i]
+            // Indices the target does not cover keep the current value, as
+            // documented on the trait: a short preset must not fade out
+            // coefficients it says nothing about.
+            *out = match target_params.get(i) {
+                Some(&tgt) => cur + (tgt - cur) * t,
+                None => cur,
+            };
+        }
+        self.expression = new_expr;
+        self
+    }
+
+    fn blend_expression_toward_zero(mut self, target: &NamedExpression, t: f32) -> Self {
+        let t = t.clamp(0.0, 1.0);
+        let current_len = self.expression.len();
+        let target_params = &target.params;
+
+        let out_len = current_len.max(target_params.len());
+        if out_len == 0 {
+            return self;
+        }
+
+        let mut new_expr = vec![0.0_f32; out_len];
+        for (i, out) in new_expr.iter_mut().enumerate() {
+            let cur = if i < current_len {
+                self.expression[i]
             } else {
                 0.0
             };
-            new_expr[i] = cur + (tgt - cur) * t;
+            // Target is zero-padded: uncovered indices decay toward zero.
+            let tgt = target_params.get(i).copied().unwrap_or(0.0);
+            *out = cur + (tgt - cur) * t;
         }
         self.expression = new_expr;
         self
@@ -688,15 +992,124 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_library_default_expressions_count() {
-        let lib = ExpressionLibrary::default_expressions();
-        // Verify all 11 built-in expressions are present
-        assert_eq!(lib.count(), 11, "expected 11 built-in expressions");
+    fn test_library_placeholder_expressions_count() {
+        let lib = ExpressionLibrary::placeholder_expressions();
+        // Verify all 11 built-in presets are present
+        assert_eq!(lib.count(), 11, "expected 11 built-in presets");
+    }
+
+    #[test]
+    fn test_placeholder_library_is_flagged_as_placeholder() {
+        let lib = ExpressionLibrary::placeholder_expressions();
+        assert!(
+            lib.has_placeholders(),
+            "hand-authored presets must report themselves as placeholders"
+        );
+        let names = lib.placeholder_names();
+        // Everything except "neutral" (exact for any basis) is a placeholder.
+        assert_eq!(
+            names.len(),
+            10,
+            "expected 10 placeholder entries: {names:?}"
+        );
+        assert!(
+            !names.contains(&"neutral"),
+            "zero coefficients are exact for any basis, so neutral is not a placeholder"
+        );
+        assert!(names.contains(&"winking"));
+        let neutral = lib.get("neutral").expect("neutral must exist");
+        assert_eq!(neutral.provenance, ExpressionProvenance::Fitted);
+        let smile = lib.get("smile").expect("smile must exist");
+        assert_eq!(smile.provenance, ExpressionProvenance::Placeholder);
+    }
+
+    #[test]
+    fn test_fit_to_basis_recovers_known_coefficients() {
+        // Two orthogonal displacement directions over 2 vertices (6 scalars).
+        let neutral = vec![0.0_f32; 6];
+        let basis = vec![
+            vec![1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0, 0.0, 1.0, 0.0],
+        ];
+        // Target = 0.5 * basis[0] + (-0.25) * basis[1]
+        let target = vec![0.5, -0.25, 0.0, 0.5, -0.25, 0.0];
+
+        let expr = NamedExpression::fit_to_basis(
+            "fitted_smile",
+            "fitted against a synthetic basis",
+            &neutral,
+            &target,
+            basis,
+            2,
+        )
+        .expect("fit must succeed");
+
+        assert_eq!(expr.provenance, ExpressionProvenance::Fitted);
+        assert_eq!(expr.params.len(), 2);
+        assert!(
+            (expr.params[0] - 0.5).abs() < 0.05,
+            "coefficient 0 should be ~0.5, got {}",
+            expr.params[0]
+        );
+        assert!(
+            (expr.params[1] + 0.25).abs() < 0.05,
+            "coefficient 1 should be ~-0.25, got {}",
+            expr.params[1]
+        );
+    }
+
+    #[test]
+    fn test_fit_to_basis_rejects_mismatched_inputs() {
+        let neutral = vec![0.0_f32; 6];
+        let target = vec![0.0_f32; 3]; // wrong length
+        let basis = vec![vec![1.0, 0.0, 0.0, 1.0, 0.0, 0.0]];
+        let result = NamedExpression::fit_to_basis("bad", "bad", &neutral, &target, basis, 1);
+        assert!(
+            matches!(result, Err(FlameError::InvalidParams(_))),
+            "mismatched vertex counts must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_library_json_roundtrip() {
+        let lib = ExpressionLibrary::placeholder_expressions();
+        let json = lib.to_json_string().expect("serialisation must succeed");
+        let restored = ExpressionLibrary::from_json_str(&json).expect("parsing must succeed");
+
+        assert_eq!(restored.count(), lib.count());
+        let smile = restored.get("smile").expect("smile must survive roundtrip");
+        assert_eq!(smile.provenance, ExpressionProvenance::Placeholder);
+        assert!((smile.params[1] - 1.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_library_from_json_file_roundtrip() {
+        let lib = ExpressionLibrary::placeholder_expressions();
+        let json = lib.to_json_string().expect("serialisation must succeed");
+
+        let pid = std::process::id();
+        let mut path = std::env::temp_dir();
+        path.push(format!("oxigaf_expr_lib_roundtrip_{pid}.json"));
+        std::fs::write(&path, json).expect("test: writing temp file must succeed");
+
+        let restored = ExpressionLibrary::from_json_file(&path).expect("loading must succeed");
+        assert_eq!(restored.count(), lib.count());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_library_from_json_str_rejects_garbage() {
+        let result = ExpressionLibrary::from_json_str("{ not json ]");
+        assert!(
+            matches!(result, Err(FlameError::InvalidParams(_))),
+            "malformed JSON must be rejected"
+        );
     }
 
     #[test]
     fn test_library_get_neutral() {
-        let lib = ExpressionLibrary::default_expressions();
+        let lib = ExpressionLibrary::placeholder_expressions();
         let expr = lib.get("neutral").expect("neutral must exist");
         assert_eq!(expr.name, "neutral");
         assert!(
@@ -707,7 +1120,7 @@ mod tests {
 
     #[test]
     fn test_library_get_smile() {
-        let lib = ExpressionLibrary::default_expressions();
+        let lib = ExpressionLibrary::placeholder_expressions();
         let expr = lib.get("smile").expect("smile must exist");
         // params[1] = 1.5 per spec
         assert!(
@@ -719,13 +1132,13 @@ mod tests {
 
     #[test]
     fn test_library_get_nonexistent_returns_none() {
-        let lib = ExpressionLibrary::default_expressions();
+        let lib = ExpressionLibrary::placeholder_expressions();
         assert!(lib.get("does_not_exist").is_none());
     }
 
     #[test]
     fn test_library_names_contains_all() {
-        let lib = ExpressionLibrary::default_expressions();
+        let lib = ExpressionLibrary::placeholder_expressions();
         let names = lib.names();
         let expected = [
             "neutral",
@@ -771,7 +1184,7 @@ mod tests {
 
     #[test]
     fn test_expression_blend_evaluate_neutral_is_zeros() {
-        let lib = ExpressionLibrary::default_expressions();
+        let lib = ExpressionLibrary::placeholder_expressions();
         let result = ExpressionBlend::single("neutral", 1.0)
             .evaluate(&lib, 10)
             .expect("evaluate must succeed");
@@ -784,7 +1197,7 @@ mod tests {
 
     #[test]
     fn test_expression_blend_evaluate_smile() {
-        let lib = ExpressionLibrary::default_expressions();
+        let lib = ExpressionLibrary::placeholder_expressions();
         let result = ExpressionBlend::single("smile", 1.0)
             .evaluate(&lib, 10)
             .expect("evaluate must succeed");
@@ -804,7 +1217,7 @@ mod tests {
 
     #[test]
     fn test_expression_blend_evaluate_missing_name() {
-        let lib = ExpressionLibrary::default_expressions();
+        let lib = ExpressionLibrary::placeholder_expressions();
         let result = ExpressionBlend::single("nonexistent_expression", 1.0).evaluate(&lib, 10);
         assert!(result.is_err(), "missing expression must produce an error");
     }
@@ -852,7 +1265,7 @@ mod tests {
     #[test]
     fn test_flame_params_with_expression() {
         use crate::expressions::ExpressionExt;
-        let lib = ExpressionLibrary::default_expressions();
+        let lib = ExpressionLibrary::placeholder_expressions();
         let params = params_with_expr(vec![0.0; 10]);
         let result = params
             .with_expression("smile", &lib, 1.0)
@@ -867,7 +1280,7 @@ mod tests {
     #[test]
     fn test_flame_params_blend_expression() {
         use crate::expressions::ExpressionExt;
-        let lib = ExpressionLibrary::default_expressions();
+        let lib = ExpressionLibrary::placeholder_expressions();
         let smile = lib.get("smile").expect("smile must exist").clone();
 
         let params = params_with_expr(vec![0.0; 10]);
@@ -879,6 +1292,77 @@ mod tests {
             "expression[1] must be 0.75 at t=0.5, got {}",
             result.expression[1]
         );
+    }
+
+    #[test]
+    fn test_blend_expression_preserves_trailing_coefficients() {
+        use crate::expressions::ExpressionExt;
+        // 50-dim current expression, 10-dim target: coefficients 10..50 must be
+        // left untouched, exactly as the trait doc promises.
+        let current: Vec<f32> = (0..50).map(|i| 0.1 * (i as f32 + 1.0)).collect();
+        let params = params_with_expr(current.clone());
+        let target = NamedExpression::new("short", "10-dim preset", vec![1.0; 10], 1.0);
+
+        let result = params.blend_expression(&target, 0.5);
+        assert_eq!(result.expression.len(), 50);
+
+        // Leading 10: interpolated halfway toward 1.0
+        for i in 0..10 {
+            let expected = current[i] + (1.0 - current[i]) * 0.5;
+            assert!(
+                (result.expression[i] - expected).abs() < 1e-6,
+                "expression[{i}] must be {expected}, got {}",
+                result.expression[i]
+            );
+        }
+        // Trailing 40: bit-for-bit unchanged
+        for i in 10..50 {
+            assert!(
+                (result.expression[i] - current[i]).abs() < f32::EPSILON,
+                "expression[{i}] must stay at {}, got {}",
+                current[i],
+                result.expression[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_blend_expression_toward_zero_fades_trailing_coefficients() {
+        use crate::expressions::ExpressionExt;
+        let current: Vec<f32> = (0..20).map(|i| 0.1 * (i as f32 + 1.0)).collect();
+        let params = params_with_expr(current.clone());
+        let target = NamedExpression::new("short", "10-dim preset", vec![1.0; 10], 1.0);
+
+        let result = params.blend_expression_toward_zero(&target, 0.5);
+        assert_eq!(result.expression.len(), 20);
+        // Trailing coefficients are treated as target = 0 and halve.
+        for i in 10..20 {
+            let expected = current[i] * 0.5;
+            assert!(
+                (result.expression[i] - expected).abs() < 1e-6,
+                "expression[{i}] must be {expected}, got {}",
+                result.expression[i]
+            );
+        }
+        // At t = 1.0 the result is exactly the zero-padded target.
+        let params2 = params_with_expr(current);
+        let full = params2.blend_expression_toward_zero(&target, 1.0);
+        for i in 10..20 {
+            assert!(full.expression[i].abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn test_blend_expression_extends_shorter_current_with_zeros() {
+        use crate::expressions::ExpressionExt;
+        // Current shorter than target: extended with zeros before interpolation.
+        let params = params_with_expr(vec![2.0, 2.0]);
+        let target = NamedExpression::new("wide", "4-dim preset", vec![0.0, 0.0, 4.0, 4.0], 1.0);
+        let result = params.blend_expression(&target, 0.5);
+        assert_eq!(result.expression.len(), 4);
+        assert!((result.expression[0] - 1.0).abs() < 1e-6);
+        assert!((result.expression[2] - 2.0).abs() < 1e-6);
+        assert!((result.expression[3] - 2.0).abs() < 1e-6);
     }
 
     #[test]

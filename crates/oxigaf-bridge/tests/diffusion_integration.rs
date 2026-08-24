@@ -112,6 +112,21 @@ fn test_converted_weights_validate() {
         report.has_nan_inf.is_empty(),
         "Should have no NaN/Inf values"
     );
+    assert!(
+        report.missing_layers.is_empty(),
+        "Should have no missing required layers: {:?}",
+        report.missing_layers
+    );
+    assert!(
+        report.invalid_shapes.is_empty(),
+        "Should have no invalid shapes: {:?}",
+        report.invalid_shapes
+    );
+    // The above four checks are exactly `ValidationReport::is_valid`'s
+    // components (together with file_exists/safetensors_valid, already
+    // asserted); this final check just documents that equivalence and
+    // guards against the two of them drifting apart in the future.
+    assert!(report.is_valid(), "validation failed: {}", report.summary());
 
     // Cleanup
     let _ = std::fs::remove_file(&torsh_path);
@@ -119,12 +134,17 @@ fn test_converted_weights_validate() {
 }
 
 #[test]
-#[ignore] // GPU required
 fn test_converted_weights_load_in_diffusion() {
     // This test requires:
     // 1. A GAF checkpoint in ToRSh format
-    // 2. GPU available
-    // 3. oxigaf-diffusion dependency
+    // 2. oxigaf-diffusion dependency
+    //
+    // It was previously marked `#[ignore] // GPU required`, but device
+    // selection below already falls back to CPU via `cuda_if_available`,
+    // so it runs fine without a GPU -- the `#[ignore]` just meant this
+    // coverage (time_embedding, down_blocks, mid_block tensor loads, on top
+    // of what `test_varbuilder_can_load_converted_weights` checks) never ran
+    // in CI.
 
     use candle_core::{DType, Device};
     use candle_nn as nn;

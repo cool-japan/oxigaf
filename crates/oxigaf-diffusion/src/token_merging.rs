@@ -49,6 +49,9 @@ pub enum TokenMergeError {
 
     #[error("Merge index out of range: {idx} >= {n_tokens}")]
     IndexOutOfRange { idx: usize, n_tokens: usize },
+
+    #[error("Invalid merge pairing: {reason}")]
+    InvalidPairing { reason: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -74,8 +77,16 @@ pub struct ToMeConfig {
     /// Fraction of tokens to merge per pass. Must be in `[0, 1)`.
     /// The number of merged pairs is `r = floor(n_tokens * merge_ratio / 2)`.
     pub merge_ratio: f32,
-    /// When `true`, key vectors are used for similarity matching (default).
-    /// When `false`, the raw token vectors are used.
+    /// Selects the tensor used for bipartite similarity matching.
+    ///
+    /// When `true` (the default, and what the ToMe paper prescribes) the
+    /// attention **key** vectors decide which tokens get merged; when `false`
+    /// the raw token vectors are used instead. Either way the merge itself
+    /// always averages the *token* values.
+    ///
+    /// This flag is only meaningful for [`tome_merge_with_keys`], the entry
+    /// point that receives a key tensor. [`tome_merge`] has no keys to match
+    /// on and therefore always matches on the token values.
     pub use_keys_for_matching: bool,
     /// How paired tokens are averaged.
     pub merge_mode: MergeMode,
@@ -170,15 +181,32 @@ pub fn token_cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     if a.is_empty() || a.len() != b.len() {
         return 0.0;
     }
-    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
-    let norm_a = token_l2_norm(a);
-    let norm_b = token_l2_norm(b);
-    dot / (norm_a * norm_b + 1e-8)
+    token_dot(a, b) / (token_l2_norm(a) * token_l2_norm(b) + 1e-8)
 }
 
 /// L2 (Euclidean) norm of a slice.
 pub fn token_l2_norm(v: &[f32]) -> f32 {
     v.iter().map(|x| x * x).sum::<f32>().sqrt()
+}
+
+/// Dot product of two slices, truncating at the shorter length.
+///
+/// Kept in exactly the same iterator form the naive cosine used, so the
+/// cached-norm call sites below stay bit-identical to
+/// [`token_cosine_similarity`].
+#[inline]
+fn token_dot(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+}
+
+/// Precompute the L2 norm of every token in a flat token tensor.
+///
+/// One `O(n · d)` pass replaces the two norms that a naive cosine recomputes
+/// for every one of the `O(n²)` pairs.
+fn precompute_norms(tokens: &[f32], n_tokens: usize, d_model: usize) -> Vec<f32> {
+    (0..n_tokens)
+        .map(|i| token_l2_norm(&tokens[i * d_model..(i + 1) * d_model]))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -187,18 +215,24 @@ pub fn token_l2_norm(v: &[f32]) -> f32 {
 
 /// Compute an `n_tokens × n_tokens` pairwise cosine-similarity matrix
 /// (row-major, symmetric) for a flat token tensor.
+///
+/// The per-token L2 norms are computed once up front, so each of the
+/// `n_tokens²/2` distinct pairs costs a single dot product instead of a dot
+/// product plus two norms rebuilt from scratch.
 pub fn compute_similarity_matrix(
     tokens: &[f32],
     n_tokens: usize,
     d_model: usize,
 ) -> Result<Vec<f32>, TokenMergeError> {
     validate_shape(tokens, n_tokens, d_model)?;
+    let norms = precompute_norms(tokens, n_tokens, d_model);
     let mut matrix = vec![0.0f32; n_tokens * n_tokens];
     for i in 0..n_tokens {
         let a = &tokens[i * d_model..(i + 1) * d_model];
+        let norm_a = norms[i];
         for j in i..n_tokens {
             let b = &tokens[j * d_model..(j + 1) * d_model];
-            let sim = token_cosine_similarity(a, b);
+            let sim = token_dot(a, b) / (norm_a * norms[j] + 1e-8);
             matrix[i * n_tokens + j] = sim;
             matrix[j * n_tokens + i] = sim;
         }
@@ -210,6 +244,13 @@ pub fn compute_similarity_matrix(
 // bipartite_soft_matching
 // ---------------------------------------------------------------------------
 
+/// Number of A-side tokens held in registers per pass over the B side.
+///
+/// Larger tiles amortise the B-side memory traffic over more A tokens; 8 keeps
+/// the per-tile accumulator arrays small enough to stay in registers/L1 while
+/// cutting the B streaming by 8×.
+const A_TILE: usize = 8;
+
 /// Bipartite soft matching: find `r` (a, b) token-index pairs to merge.
 ///
 /// Groups:
@@ -219,6 +260,20 @@ pub fn compute_similarity_matrix(
 /// For each token in A the best (highest cosine similarity) unmatched B token
 /// is found. Matches are then sorted by descending similarity and the top `r`
 /// unique (deduped on B) pairs are returned as `(a_original_idx, b_original_idx)`.
+///
+/// ## Cost
+///
+/// The search is exact, so `|A| · |B|` similarities are unavoidable. Two
+/// constant-factor optimisations keep it from dominating the attention it is
+/// meant to accelerate:
+///
+/// 1. Every token's L2 norm is computed once up front, reducing each
+///    similarity from three passes over `d` to one.
+/// 2. The A side is walked in tiles of `A_TILE`, so the B tokens are
+///    streamed from memory once per tile instead of once per A token.
+///
+/// Both are arithmetic-preserving: the returned pairs are bit-identical to the
+/// naive formulation.
 pub fn bipartite_soft_matching(
     tokens: &[f32],
     n_tokens: usize,
@@ -244,21 +299,31 @@ pub fn bipartite_soft_matching(
         return Ok(Vec::new());
     }
 
+    // Cache every token's L2 norm once (O(n · d)) so the inner loop below is a
+    // bare dot product.
+    let norms = precompute_norms(tokens, n_tokens, d_model);
+
     // For each A token, compute similarity with all B tokens and pick the best.
+    // A tokens are processed in tiles so the B side is streamed once per tile.
     let mut candidates: Vec<(usize, usize, f32)> = Vec::with_capacity(a_indices.len());
-    for &ai in &a_indices {
-        let a_tok = &tokens[ai * d_model..(ai + 1) * d_model];
-        let mut best_sim = f32::NEG_INFINITY;
-        let mut best_bi = b_indices[0];
+    for a_chunk in a_indices.chunks(A_TILE) {
+        let mut best_sim = [f32::NEG_INFINITY; A_TILE];
+        let mut best_bi = [b_indices[0]; A_TILE];
         for &bi in &b_indices {
             let b_tok = &tokens[bi * d_model..(bi + 1) * d_model];
-            let sim = token_cosine_similarity(a_tok, b_tok);
-            if sim > best_sim {
-                best_sim = sim;
-                best_bi = bi;
+            let norm_b = norms[bi];
+            for (slot, &ai) in a_chunk.iter().enumerate() {
+                let a_tok = &tokens[ai * d_model..(ai + 1) * d_model];
+                let sim = token_dot(a_tok, b_tok) / (norms[ai] * norm_b + 1e-8);
+                if sim > best_sim[slot] {
+                    best_sim[slot] = sim;
+                    best_bi[slot] = bi;
+                }
             }
         }
-        candidates.push((ai, best_bi, best_sim));
+        for (slot, &ai) in a_chunk.iter().enumerate() {
+            candidates.push((ai, best_bi[slot], best_sim[slot]));
+        }
     }
 
     // Sort by descending similarity.
@@ -291,6 +356,13 @@ pub fn bipartite_soft_matching(
 /// 2. All b-side tokens that were **not** consumed by a pair.
 ///
 /// Returns `(merged_tokens_flat, MergeState)`.
+///
+/// # Errors
+///
+/// `pairs` must respect the a-side/b-side partition this function emits
+/// against: `ai` even, `bi` odd, and no index repeated on either side. A
+/// malformed pairing is rejected with [`TokenMergeError::InvalidPairing`]
+/// rather than silently dropping tokens.
 pub fn merge_tokens(
     tokens: &[f32],
     n_tokens: usize,
@@ -299,16 +371,7 @@ pub fn merge_tokens(
     mode: &MergeMode,
 ) -> Result<(Vec<f32>, MergeState), TokenMergeError> {
     validate_shape(tokens, n_tokens, d_model)?;
-
-    // Validate all pair indices.
-    for &(ai, bi) in pairs {
-        if ai >= n_tokens {
-            return Err(TokenMergeError::IndexOutOfRange { idx: ai, n_tokens });
-        }
-        if bi >= n_tokens {
-            return Err(TokenMergeError::IndexOutOfRange { idx: bi, n_tokens });
-        }
-    }
+    validate_pairs(pairs, n_tokens)?;
 
     // Build a map: a_idx -> b_idx for quick lookup.
     let mut a_to_b: std::collections::HashMap<usize, usize> =
@@ -425,12 +488,16 @@ pub fn unmerge_tokens(merged: &[f32], state: &MergeState) -> Result<Vec<f32>, To
 // tome_merge / tome_unmerge
 // ---------------------------------------------------------------------------
 
-/// Full ToMe forward pass.
+/// Full ToMe forward pass, matching on the token values.
 ///
 /// 1. Computes `r = floor(n_tokens * merge_ratio / 2)`.
 /// 2. If `r == 0`, returns an identity pass (no tokens merged).
-/// 3. Finds pairs via `bipartite_soft_matching`.
-/// 4. Merges with `merge_tokens`.
+/// 3. Finds pairs via [`bipartite_soft_matching`] over `tokens`.
+/// 4. Merges with [`merge_tokens`].
+///
+/// No key tensor is available here, so the token vectors themselves act as the
+/// matching keys and [`ToMeConfig::use_keys_for_matching`] has no effect. Use
+/// [`tome_merge_with_keys`] for the paper-faithful key-based partition.
 pub fn tome_merge(
     tokens: &[f32],
     n_tokens: usize,
@@ -451,6 +518,68 @@ pub fn tome_merge(
     }
 
     let pairs = bipartite_soft_matching(tokens, n_tokens, d_model, r)?;
+    merge_tokens(tokens, n_tokens, d_model, &pairs, &config.merge_mode)
+}
+
+/// Full ToMe forward pass with an explicit attention-key tensor.
+///
+/// This is the entry point the ToMe paper describes (Bolya et al., ICLR 2023):
+/// the merge partition is decided by the attention **keys**, which are far more
+/// stable than the token values and yield a materially better partition. The
+/// merge itself always averages the *token* values — keys are only ever used to
+/// score similarity.
+///
+/// - `tokens`: `n_tokens × d_model` flat token values (merged and returned).
+/// - `keys`: `n_tokens × d_key` flat key vectors (used for matching only).
+///
+/// [`ToMeConfig::use_keys_for_matching`] selects the matching tensor: `true`
+/// (the default) matches on `keys`, `false` falls back to matching on `tokens`
+/// exactly as [`tome_merge`] does.
+///
+/// # Errors
+///
+/// Returns [`TokenMergeError::EmptySequence`] for an empty sequence and
+/// [`TokenMergeError::DimensionMismatch`] when either `tokens` or `keys` does
+/// not match its declared shape.
+///
+/// # Example
+///
+/// ```rust
+/// use oxigaf_diffusion::token_merging::{tome_merge_with_keys, ToMeConfig};
+///
+/// let tokens: Vec<f32> = (0..16).map(|x| x as f32).collect(); // 4 tokens × 4 dims
+/// let keys: Vec<f32> = (0..8).map(|x| x as f32).collect(); // 4 tokens × 2 dims
+/// let config = ToMeConfig::default(); // use_keys_for_matching = true
+/// let (merged, state) = tome_merge_with_keys(&tokens, &keys, 4, 4, 2, &config).unwrap();
+/// assert_eq!(merged.len(), state.merged_n_tokens * 4);
+/// ```
+pub fn tome_merge_with_keys(
+    tokens: &[f32],
+    keys: &[f32],
+    n_tokens: usize,
+    d_model: usize,
+    d_key: usize,
+    config: &ToMeConfig,
+) -> Result<(Vec<f32>, MergeState), TokenMergeError> {
+    if n_tokens == 0 {
+        return Err(TokenMergeError::EmptySequence);
+    }
+    validate_merge_ratio(config.merge_ratio)?;
+    validate_shape(tokens, n_tokens, d_model)?;
+    validate_shape(keys, n_tokens, d_key)?;
+
+    let r = ((n_tokens as f32 * config.merge_ratio) / 2.0).floor() as usize;
+
+    if r == 0 {
+        let state = MergeState::identity(n_tokens, d_model);
+        return Ok((tokens.to_vec(), state));
+    }
+
+    let pairs = if config.use_keys_for_matching {
+        bipartite_soft_matching(keys, n_tokens, d_key, r)?
+    } else {
+        bipartite_soft_matching(tokens, n_tokens, d_model, r)?
+    };
     merge_tokens(tokens, n_tokens, d_model, &pairs, &config.merge_mode)
 }
 
@@ -630,6 +759,58 @@ fn validate_merge_ratio(ratio: f32) -> Result<(), TokenMergeError> {
     if !(0.0..1.0).contains(&ratio) {
         return Err(TokenMergeError::InvalidMergeRatio { ratio });
     }
+    Ok(())
+}
+
+/// Validate a caller-supplied pairing against the partition `merge_tokens`
+/// emits against: **A** = even original indices, **B** = odd original indices.
+///
+/// Every rejected case used to be a silent data-loss path:
+///
+/// - an out-of-range index would panic on the slice below;
+/// - an odd `ai` never fires a merge (the a-side loop only visits even
+///   indices) yet still suppresses its `bi`, dropping that token outright;
+/// - an even `bi` is emitted twice — once inside the merged token, once as its
+///   own a-side entry — and never suppressed;
+/// - a duplicate `ai` is overwritten in the `a_to_b` map while the discarded
+///   partner stays marked as consumed, so it disappears from the output and
+///   from `merge_groups`, leaving zeros behind after `unmerge_tokens`;
+/// - a duplicate `bi` merges the same token into two different a-side tokens.
+fn validate_pairs(pairs: &[(usize, usize)], n_tokens: usize) -> Result<(), TokenMergeError> {
+    let mut seen_a: std::collections::HashSet<usize> =
+        std::collections::HashSet::with_capacity(pairs.len());
+    let mut seen_b: std::collections::HashSet<usize> =
+        std::collections::HashSet::with_capacity(pairs.len());
+
+    for &(ai, bi) in pairs {
+        if ai >= n_tokens {
+            return Err(TokenMergeError::IndexOutOfRange { idx: ai, n_tokens });
+        }
+        if bi >= n_tokens {
+            return Err(TokenMergeError::IndexOutOfRange { idx: bi, n_tokens });
+        }
+        if ai % 2 != 0 {
+            return Err(TokenMergeError::InvalidPairing {
+                reason: format!("a-side index {ai} must be even"),
+            });
+        }
+        if bi % 2 == 0 {
+            return Err(TokenMergeError::InvalidPairing {
+                reason: format!("b-side index {bi} must be odd"),
+            });
+        }
+        if !seen_a.insert(ai) {
+            return Err(TokenMergeError::InvalidPairing {
+                reason: format!("a-side index {ai} appears in more than one pair"),
+            });
+        }
+        if !seen_b.insert(bi) {
+            return Err(TokenMergeError::InvalidPairing {
+                reason: format!("b-side index {bi} appears in more than one pair"),
+            });
+        }
+    }
+
     Ok(())
 }
 
@@ -1322,5 +1503,241 @@ mod tests {
         let pairs = bipartite_soft_matching(&tokens, 6, 4, 2).unwrap();
         let stats = compute_tome_stats(&tokens, 6, 4, &pairs).unwrap();
         assert!(stats.min_similarity_merged <= stats.mean_similarity_merged + 1e-5);
+    }
+
+    // ------------------------------------------------------------------
+    // 17. Regression: malformed pairings must be rejected, never silently
+    //     dropped (see `validate_pairs`).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_merge_rejects_duplicate_a_side() {
+        // Two pairs share ai=0: the second bi used to be marked consumed while
+        // its token was never emitted, so token 3 vanished from the output.
+        let tokens = make_tokens(4, 2);
+        let result = merge_tokens(&tokens, 4, 2, &[(0, 1), (0, 3)], &MergeMode::Mean);
+        assert!(matches!(
+            result,
+            Err(TokenMergeError::InvalidPairing { .. })
+        ));
+    }
+
+    #[test]
+    fn test_merge_rejects_odd_a_side() {
+        // ai=1 is on the b side, so the merge never fires, yet bi=3 was still
+        // suppressed — token 3 was dropped outright.
+        let tokens = make_tokens(4, 2);
+        let result = merge_tokens(&tokens, 4, 2, &[(1, 3)], &MergeMode::Mean);
+        assert!(matches!(
+            result,
+            Err(TokenMergeError::InvalidPairing { .. })
+        ));
+    }
+
+    #[test]
+    fn test_merge_rejects_even_b_side() {
+        // bi=2 is on the a side: it used to be emitted twice (merged and standalone).
+        let tokens = make_tokens(4, 2);
+        let result = merge_tokens(&tokens, 4, 2, &[(0, 2)], &MergeMode::Mean);
+        assert!(matches!(
+            result,
+            Err(TokenMergeError::InvalidPairing { .. })
+        ));
+    }
+
+    #[test]
+    fn test_merge_rejects_duplicate_b_side() {
+        let tokens = make_tokens(6, 2);
+        let result = merge_tokens(&tokens, 6, 2, &[(0, 1), (2, 1)], &MergeMode::Mean);
+        assert!(matches!(
+            result,
+            Err(TokenMergeError::InvalidPairing { .. })
+        ));
+    }
+
+    #[test]
+    fn test_merge_out_of_range_still_reported_as_index_error() {
+        let tokens = make_tokens(4, 2);
+        let result = merge_tokens(&tokens, 4, 2, &[(0, 9)], &MergeMode::Mean);
+        assert!(matches!(
+            result,
+            Err(TokenMergeError::IndexOutOfRange {
+                idx: 9,
+                n_tokens: 4
+            })
+        ));
+    }
+
+    #[test]
+    fn test_valid_pairing_covers_every_original_token_exactly_once() {
+        // Data-loss guard: every original index must appear in exactly one
+        // merge group, so `unmerge_tokens` never leaves a zeroed slot.
+        let n = 8;
+        let d = 3;
+        let tokens = make_tokens(n, d);
+        let pairs = bipartite_soft_matching(&tokens, n, d, 3).unwrap();
+        let (_, state) = merge_tokens(&tokens, n, d, &pairs, &MergeMode::Mean).unwrap();
+
+        let mut covered = vec![0usize; n];
+        for group in &state.merge_groups {
+            for &idx in group {
+                covered[idx] += 1;
+            }
+        }
+        assert!(
+            covered.iter().all(|&c| c == 1),
+            "each original token must be covered exactly once, got {covered:?}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // 18. Regression: key-based matching actually honours the config flag.
+    // ------------------------------------------------------------------
+
+    /// Tokens whose *value* similarity favours pair (0,1) and keys whose
+    /// similarity favours pair (2,1) — so the two matching tensors disagree.
+    fn keyed_fixture() -> (Vec<f32>, Vec<f32>) {
+        // tok0=[1,0] tok1=[1,0] tok2=[1,0] tok3=[0,1]
+        let tokens = vec![1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0];
+        // key0=[1,0] key1=[0,1] key2=[0,1] key3=[0,1]
+        let keys = vec![1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0];
+        (tokens, keys)
+    }
+
+    #[test]
+    fn test_tome_merge_with_keys_matches_on_keys() {
+        let (tokens, keys) = keyed_fixture();
+        let config = ToMeConfig::default(); // use_keys_for_matching = true
+        let (_, state) = tome_merge_with_keys(&tokens, &keys, 4, 2, 2, &config).unwrap();
+        assert!(
+            state.merge_groups.contains(&vec![2, 1]),
+            "key-based matching must merge (2,1), got {:?}",
+            state.merge_groups
+        );
+    }
+
+    #[test]
+    fn test_tome_merge_with_keys_flag_false_matches_on_values() {
+        let (tokens, keys) = keyed_fixture();
+        let config = ToMeConfig {
+            use_keys_for_matching: false,
+            ..Default::default()
+        };
+        let (_, state) = tome_merge_with_keys(&tokens, &keys, 4, 2, 2, &config).unwrap();
+        assert!(
+            state.merge_groups.contains(&vec![0, 1]),
+            "value-based matching must merge (0,1), got {:?}",
+            state.merge_groups
+        );
+    }
+
+    #[test]
+    fn test_tome_merge_with_keys_allows_different_key_dim() {
+        // Keys commonly have a smaller dimension than the token values.
+        let tokens = make_tokens(6, 8);
+        let keys = make_tokens(6, 4);
+        let config = ToMeConfig::default();
+        let (merged, state) = tome_merge_with_keys(&tokens, &keys, 6, 8, 4, &config).unwrap();
+        assert_eq!(state.d_model, 8);
+        assert_eq!(merged.len(), state.merged_n_tokens * 8);
+    }
+
+    #[test]
+    fn test_tome_merge_with_keys_rejects_bad_key_shape() {
+        let tokens = make_tokens(4, 4);
+        let keys = vec![0.0f32; 7]; // not 4 × 2
+        let config = ToMeConfig::default();
+        let result = tome_merge_with_keys(&tokens, &keys, 4, 4, 2, &config);
+        assert!(matches!(
+            result,
+            Err(TokenMergeError::DimensionMismatch { .. })
+        ));
+    }
+
+    // ------------------------------------------------------------------
+    // 19. Regression: the tiled / norm-cached similarity search must be
+    //     arithmetically identical to the naive formulation.
+    // ------------------------------------------------------------------
+
+    /// Deterministic pseudo-random tokens with no all-zero rows.
+    fn make_varied_tokens(n: usize, d: usize) -> Vec<f32> {
+        (0..n * d).map(|x| (((x * 37) % 19) as f32) - 9.0).collect()
+    }
+
+    /// Straightforward reference implementation of `bipartite_soft_matching`.
+    fn naive_bipartite(tokens: &[f32], n: usize, d: usize, r: usize) -> Vec<(usize, usize)> {
+        let a_indices: Vec<usize> = (0..n).step_by(2).collect();
+        let b_indices: Vec<usize> = (1..n).step_by(2).collect();
+        let mut candidates: Vec<(usize, usize, f32)> = Vec::new();
+        for &ai in &a_indices {
+            let a = &tokens[ai * d..(ai + 1) * d];
+            let mut best_sim = f32::NEG_INFINITY;
+            let mut best_bi = b_indices[0];
+            for &bi in &b_indices {
+                let b = &tokens[bi * d..(bi + 1) * d];
+                let sim = token_cosine_similarity(a, b);
+                if sim > best_sim {
+                    best_sim = sim;
+                    best_bi = bi;
+                }
+            }
+            candidates.push((ai, best_bi, best_sim));
+        }
+        candidates.sort_by(|x, y| y.2.partial_cmp(&x.2).unwrap_or(std::cmp::Ordering::Equal));
+
+        let mut used_b = vec![false; n];
+        let mut pairs = Vec::with_capacity(r);
+        for (ai, bi, _) in &candidates {
+            if pairs.len() >= r {
+                break;
+            }
+            if !used_b[*bi] {
+                used_b[*bi] = true;
+                pairs.push((*ai, *bi));
+            }
+        }
+        pairs
+    }
+
+    #[test]
+    fn test_bipartite_tiling_matches_naive_reference() {
+        // n = 26 → 13 A tokens, i.e. one full A_TILE plus a 5-wide tail.
+        let n = 26;
+        let d = 5;
+        let tokens = make_varied_tokens(n, d);
+        for r in [1usize, 4, 13] {
+            let got = bipartite_soft_matching(&tokens, n, d, r).unwrap();
+            assert_eq!(got, naive_bipartite(&tokens, n, d, r), "mismatch at r={r}");
+        }
+    }
+
+    #[test]
+    fn test_bipartite_tiling_exact_multiple_of_tile() {
+        // n = 32 → 16 A tokens = exactly two full tiles (no tail).
+        let n = 32;
+        let d = 6;
+        let tokens = make_varied_tokens(n, d);
+        let got = bipartite_soft_matching(&tokens, n, d, 6).unwrap();
+        assert_eq!(got, naive_bipartite(&tokens, n, d, 6));
+    }
+
+    #[test]
+    fn test_similarity_matrix_matches_naive_reference() {
+        let n = 7;
+        let d = 4;
+        let tokens = make_varied_tokens(n, d);
+        let mat = compute_similarity_matrix(&tokens, n, d).unwrap();
+        for i in 0..n {
+            for j in 0..n {
+                let a = &tokens[i * d..(i + 1) * d];
+                let b = &tokens[j * d..(j + 1) * d];
+                let expected = token_cosine_similarity(a, b);
+                let got = mat[i * n + j];
+                assert!(
+                    (got - expected).abs() < 1e-6,
+                    "({i},{j}): {got} vs {expected}"
+                );
+            }
+        }
     }
 }

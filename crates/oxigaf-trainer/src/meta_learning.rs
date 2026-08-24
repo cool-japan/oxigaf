@@ -1,15 +1,32 @@
-//! MAML (Model-Agnostic Meta-Learning) for few-shot avatar personalization.
+//! Reference CPU implementation of MAML (Model-Agnostic Meta-Learning).
 //!
-//! Implements a simplified CPU-side MAML framework for learning a parameter
-//! initialization that rapidly adapts to new subjects via inner-loop gradient steps.
+//! Learns a parameter initialization that adapts to a new task in a handful of
+//! inner-loop gradient steps.
 //!
 //! ## Design
 //! - **Inner loop**: adapt base params on each task's support set (few gradient steps).
 //! - **Outer loop**: update base params by gradient of query losses over adapted params.
 //! - **FOMAML**: first-order approximation, ignoring second-order meta-gradients.
 //! - **Full finite-difference meta-gradient**: perturbation-based second-order estimate.
-//! - Uses a `LinearModel` (y = W·x + b) as the learnable module.
 //! - Random task generation via xorshift64 + Box-Muller, no external PRNG crate.
+//!
+//! ## Scope — what this module does and does not do
+//!
+//! The inner/outer loops ([`adapt_on_support`], [`meta_gradient`], [`meta_step`])
+//! are generic over the [`MetaModel`] trait: any model exposing a flat `f32`
+//! parameter vector plus a `loss_and_grad` over a batch can be meta-trained here.
+//!
+//! The only implementation shipped in this crate is [`LinearModel`]
+//! (`y = W·x + b`), meta-trained on the synthetic linear-regression tasks drawn
+//! by [`TaskSampler`].  It is a *reference* implementation and a smoke test for
+//! the loops — **not** avatar personalization.
+//!
+//! Meta-learning a real `oxigaf_render::gaussian::GaussianModel` avatar requires
+//! a `loss_and_grad` backed by the differentiable rasterizer
+//! (`oxigaf_render::Rasterizer` backward pass, GPU + async), which is driven by
+//! [`crate::trainer::Trainer`] and is deliberately out of reach of this CPU-only
+//! module.  Wrapping that backward pass in a [`MetaModel`] implementation is the
+//! supported extension point: nothing else here needs to change.
 
 use thiserror::Error;
 
@@ -132,6 +149,26 @@ impl FewShotTask {
         }
 
         Ok(())
+    }
+
+    /// Convert into the model-agnostic [`MetaTask`] consumed by the generic
+    /// loops ([`adapt_on_support`], [`meta_gradient`], [`meta_step`]).
+    ///
+    /// Copies the four buffers once; call it outside hot loops.
+    pub fn to_meta_task(&self) -> MetaTask<RegressionBatch> {
+        MetaTask {
+            task_id: self.task_id,
+            support: RegressionBatch::new(
+                self.support_inputs.clone(),
+                self.support_targets.clone(),
+                self.n_support,
+            ),
+            query: RegressionBatch::new(
+                self.query_inputs.clone(),
+                self.query_targets.clone(),
+                self.n_query,
+            ),
+        }
     }
 }
 
@@ -355,33 +392,122 @@ pub fn mse_loss_and_grad(
 }
 
 // ---------------------------------------------------------------------------
+// MetaModel — the abstraction the inner/outer loops are written against
+// ---------------------------------------------------------------------------
+
+/// A model that can be meta-trained by the loops in this module.
+///
+/// The contract is deliberately small: expose the learnable state as one flat
+/// `f32` vector, be reconstructible from such a vector, and be able to report a
+/// loss together with `∂loss/∂params` for a batch.
+///
+/// # Implementing for a real avatar
+///
+/// [`LinearModel`] is the reference implementation shipped here.  To meta-train
+/// an actual Gaussian avatar, implement this trait for a wrapper around
+/// `oxigaf_render::gaussian::GaussianModel` whose [`MetaModel::loss_and_grad`]
+/// runs the differentiable rasterizer's backward pass and flattens the resulting
+/// [`crate::optimizer::Gradients`] into the same layout as
+/// [`MetaModel::params`].  No other code in this module needs to change.
+pub trait MetaModel: Sized {
+    /// The batch type consumed by [`MetaModel::loss_and_grad`] — one support or
+    /// query set.
+    type Batch;
+
+    /// Read-only view of the flat learnable parameter vector.
+    fn params(&self) -> &[f32];
+
+    /// Mutable view of the flat learnable parameter vector.
+    ///
+    /// Must alias exactly the same storage as [`MetaModel::params`].
+    fn params_mut(&mut self) -> &mut [f32];
+
+    /// Number of learnable parameters.
+    fn param_count(&self) -> usize {
+        self.params().len()
+    }
+
+    /// Rebuild this model with a replacement parameter vector.
+    ///
+    /// Returns [`MetaLearningError::DimensionMismatch`] when `params` does not
+    /// have [`MetaModel::param_count`] elements.
+    fn with_params(&self, params: Vec<f32>) -> Result<Self, MetaLearningError>;
+
+    /// Loss and gradient with respect to [`MetaModel::params`] on `batch`.
+    ///
+    /// The returned gradient must have [`MetaModel::param_count`] elements.
+    fn loss_and_grad(&self, batch: &Self::Batch) -> Result<(f32, Vec<f32>), MetaLearningError>;
+}
+
+/// A flat supervised-regression batch: `n` rows of inputs and targets.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RegressionBatch {
+    /// Inputs, flattened row-major: shape \[n, input_dim\].
+    pub inputs: Vec<f32>,
+    /// Targets, flattened row-major: shape \[n, output_dim\].
+    pub targets: Vec<f32>,
+    /// Number of examples in the batch.
+    pub n: usize,
+}
+
+impl RegressionBatch {
+    /// Bundle inputs and targets for `n` examples.
+    pub fn new(inputs: Vec<f32>, targets: Vec<f32>, n: usize) -> Self {
+        RegressionBatch { inputs, targets, n }
+    }
+}
+
+/// A model-agnostic few-shot task: a support set to adapt on and a query set to
+/// score the adaptation with.
+#[derive(Debug, Clone)]
+pub struct MetaTask<B> {
+    /// Unique identifier for this task.
+    pub task_id: usize,
+    /// Batch used for inner-loop adaptation.
+    pub support: B,
+    /// Batch used to evaluate the meta-objective after adaptation.
+    pub query: B,
+}
+
+impl MetaModel for LinearModel {
+    type Batch = RegressionBatch;
+
+    fn params(&self) -> &[f32] {
+        &self.params
+    }
+
+    fn params_mut(&mut self) -> &mut [f32] {
+        &mut self.params
+    }
+
+    fn with_params(&self, params: Vec<f32>) -> Result<Self, MetaLearningError> {
+        LinearModel::from_params(params, self.input_dim, self.output_dim)
+    }
+
+    fn loss_and_grad(&self, batch: &RegressionBatch) -> Result<(f32, Vec<f32>), MetaLearningError> {
+        mse_loss_and_grad(self, &batch.inputs, &batch.targets, batch.n)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Inner-loop adaptation
 // ---------------------------------------------------------------------------
 
-/// Perform inner-loop gradient descent to adapt model parameters for one task.
+/// Run `config.num_inner_steps` SGD steps on `support`, starting from
+/// `model`'s parameters.
 ///
-/// Uses the task's support set.  Returns the adapted parameter vector without
-/// modifying `model` in place.
-pub fn inner_loop_adapt(
-    model: &LinearModel,
-    task: &FewShotTask,
+/// Returns the adapted parameter vector; `model` is left untouched.
+pub fn adapt_on_support<M: MetaModel>(
+    model: &M,
+    support: &M::Batch,
     config: &MamlConfig,
 ) -> Result<Vec<f32>, MetaLearningError> {
-    task.validate()?;
-
-    // Work on a mutable copy of params
-    let mut adapted_params = model.params.clone();
+    let mut adapted_params = model.params().to_vec();
 
     for _step in 0..config.num_inner_steps {
-        // Build a temporary model from current adapted params
-        let tmp =
-            LinearModel::from_params(adapted_params.clone(), model.input_dim, model.output_dim)?;
-        let (_, grad) = mse_loss_and_grad(
-            &tmp,
-            &task.support_inputs,
-            &task.support_targets,
-            task.n_support,
-        )?;
+        // Build a temporary model from the current adapted params
+        let tmp = model.with_params(adapted_params.clone())?;
+        let (_, grad) = tmp.loss_and_grad(support)?;
 
         // SGD step
         apply_gradient_update(&mut adapted_params, &grad, config.inner_lr)?;
@@ -390,25 +516,59 @@ pub fn inner_loop_adapt(
     Ok(adapted_params)
 }
 
+/// Perform inner-loop gradient descent to adapt model parameters for one task.
+///
+/// Uses the task's support set.  Returns the adapted parameter vector without
+/// modifying `model` in place.
+///
+/// Thin [`LinearModel`] wrapper over [`adapt_on_support`].
+pub fn inner_loop_adapt(
+    model: &LinearModel,
+    task: &FewShotTask,
+    config: &MamlConfig,
+) -> Result<Vec<f32>, MetaLearningError> {
+    task.validate()?;
+
+    let support = RegressionBatch::new(
+        task.support_inputs.clone(),
+        task.support_targets.clone(),
+        task.n_support,
+    );
+
+    adapt_on_support(model, &support, config)
+}
+
 // ---------------------------------------------------------------------------
 // Query-loss evaluation
 // ---------------------------------------------------------------------------
 
+/// Evaluate `batch` loss for `model` re-parameterised with `adapted_params`.
+///
+/// `model` supplies only the model *shape*; its own parameters are ignored.
+pub fn query_loss_with_params<M: MetaModel>(
+    model: &M,
+    adapted_params: &[f32],
+    batch: &M::Batch,
+) -> Result<f32, MetaLearningError> {
+    let adapted = model.with_params(adapted_params.to_vec())?;
+    let (loss, _) = adapted.loss_and_grad(batch)?;
+    Ok(loss)
+}
+
 /// Evaluate query-set MSE for a model with the given adapted parameters.
+///
+/// Thin [`LinearModel`] wrapper over [`query_loss_with_params`].
 pub fn evaluate_query_loss(
     model: &LinearModel,
     adapted_params: &[f32],
     task: &FewShotTask,
 ) -> Result<f32, MetaLearningError> {
-    let adapted =
-        LinearModel::from_params(adapted_params.to_vec(), model.input_dim, model.output_dim)?;
-    let (loss, _) = mse_loss_and_grad(
-        &adapted,
-        &task.query_inputs,
-        &task.query_targets,
+    let query = RegressionBatch::new(
+        task.query_inputs.clone(),
+        task.query_targets.clone(),
         task.n_query,
-    )?;
-    Ok(loss)
+    );
+    query_loss_with_params(model, adapted_params, &query)
 }
 
 // ---------------------------------------------------------------------------
@@ -429,9 +589,9 @@ pub fn evaluate_query_loss(
 ///   provides a truer estimate of the meta-gradient.
 ///
 /// Returns `(mean_query_loss, meta_gradient)`.
-pub fn compute_meta_gradient(
-    model: &LinearModel,
-    tasks: &[FewShotTask],
+pub fn meta_gradient<M: MetaModel>(
+    model: &M,
+    tasks: &[MetaTask<M::Batch>],
     config: &MamlConfig,
 ) -> Result<(f32, Vec<f32>), MetaLearningError> {
     if tasks.is_empty() {
@@ -439,24 +599,29 @@ pub fn compute_meta_gradient(
     }
 
     let n_params = model.param_count();
+    if n_params == 0 {
+        // Without this guard a model that reports no learnable parameters would
+        // silently return a zero-length "gradient" — the finite-difference loop
+        // would simply never execute — instead of reporting the broken model.
+        return Err(MetaLearningError::InvalidConfig(
+            "model exposes zero learnable parameters".to_string(),
+        ));
+    }
     let mut meta_grad = vec![0.0_f32; n_params];
     let mut total_query_loss = 0.0_f32;
 
     if config.first_order {
         // FOMAML: gradient of query loss at adapted params
         for task in tasks {
-            let adapted_params = inner_loop_adapt(model, task, config)?;
-            let adapted = LinearModel::from_params(
-                adapted_params.clone(),
-                model.input_dim,
-                model.output_dim,
-            )?;
-            let (q_loss, q_grad) = mse_loss_and_grad(
-                &adapted,
-                &task.query_inputs,
-                &task.query_targets,
-                task.n_query,
-            )?;
+            let adapted_params = adapt_on_support(model, &task.support, config)?;
+            let adapted = model.with_params(adapted_params)?;
+            let (q_loss, q_grad) = adapted.loss_and_grad(&task.query)?;
+            if q_grad.len() != n_params {
+                return Err(MetaLearningError::DimensionMismatch {
+                    expected: n_params,
+                    actual: q_grad.len(),
+                });
+            }
             total_query_loss += q_loss;
             for (mg, qg) in meta_grad.iter_mut().zip(q_grad.iter()) {
                 *mg += qg;
@@ -470,26 +635,25 @@ pub fn compute_meta_gradient(
         let base_losses: Vec<f32> = tasks
             .iter()
             .map(|task| {
-                let ap = inner_loop_adapt(model, task, config)?;
-                evaluate_query_loss(model, &ap, task)
+                let ap = adapt_on_support(model, &task.support, config)?;
+                query_loss_with_params(model, &ap, &task.query)
             })
             .collect::<Result<Vec<f32>, MetaLearningError>>()?;
 
         total_query_loss = base_losses.iter().sum::<f32>();
 
         // Second pass: perturb each parameter and measure change
-        let base_params = model.params.clone();
+        let base_params = model.params().to_vec();
         for param_idx in 0..n_params {
             let mut perturbed_params = base_params.clone();
             perturbed_params[param_idx] += EPS;
 
-            let perturbed_model =
-                LinearModel::from_params(perturbed_params, model.input_dim, model.output_dim)?;
+            let perturbed_model = model.with_params(perturbed_params)?;
 
             let mut perturbed_total = 0.0_f32;
             for task in tasks {
-                let ap = inner_loop_adapt(&perturbed_model, task, config)?;
-                let pl = evaluate_query_loss(&perturbed_model, &ap, task)?;
+                let ap = adapt_on_support(&perturbed_model, &task.support, config)?;
+                let pl = query_loss_with_params(&perturbed_model, &ap, &task.query)?;
                 perturbed_total += pl;
             }
 
@@ -506,13 +670,61 @@ pub fn compute_meta_gradient(
     Ok((mean_query_loss, meta_grad))
 }
 
+/// Compute the meta-gradient over a batch of [`FewShotTask`]s.
+///
+/// Thin [`LinearModel`] wrapper over [`meta_gradient`]: validates every task and
+/// converts it to a [`MetaTask`] once, so the finite-difference branch does not
+/// re-validate or re-copy per perturbed parameter.
+pub fn compute_meta_gradient(
+    model: &LinearModel,
+    tasks: &[FewShotTask],
+    config: &MamlConfig,
+) -> Result<(f32, Vec<f32>), MetaLearningError> {
+    if tasks.is_empty() {
+        return Err(MetaLearningError::EmptyTaskBatch);
+    }
+
+    let meta_tasks = tasks
+        .iter()
+        .map(|task| task.validate().map(|_| task.to_meta_task()))
+        .collect::<Result<Vec<MetaTask<RegressionBatch>>, MetaLearningError>>()?;
+
+    meta_gradient(model, &meta_tasks, config)
+}
+
 // ---------------------------------------------------------------------------
 // Meta-update step
 // ---------------------------------------------------------------------------
 
+/// Perform one meta-update on any [`MetaModel`]: compute the meta-gradient,
+/// optionally clip it, and apply it to the model's parameters in place.
+///
+/// Returns the mean query loss across all tasks.
+pub fn meta_step<M: MetaModel>(
+    model: &mut M,
+    tasks: &[MetaTask<M::Batch>],
+    config: &MamlConfig,
+) -> Result<f32, MetaLearningError> {
+    config.validate()?;
+
+    // Turbofish: fixes the parameter type to `&M` so the `&mut M` reborrow
+    // coerces cleanly instead of leaving `M` to inference.
+    let (mean_loss, mut meta_grad) = meta_gradient::<M>(model, tasks, config)?;
+
+    if let Some(max_norm) = config.clip_grad_norm {
+        clip_gradient(&mut meta_grad, max_norm);
+    }
+
+    apply_gradient_update(model.params_mut(), &meta_grad, config.meta_lr)?;
+
+    Ok(mean_loss)
+}
+
 /// Perform one meta-update: compute meta-gradient and apply it to model params.
 ///
 /// Returns the mean query loss across all tasks.
+///
+/// Thin [`LinearModel`] wrapper over [`meta_step`].
 pub fn meta_update_step(
     model: &mut LinearModel,
     tasks: &[FewShotTask],
@@ -1481,5 +1693,246 @@ mod tests {
         }];
         let agg = aggregate_meta_stats(&[run_a, run_b]);
         assert!((agg[0].0 - 2.0).abs() < 1e-6, "mean should be 2.0");
+    }
+
+    // --- MetaModel abstraction ---
+
+    /// A second, deliberately non-linear [`MetaModel`] implementation, proving
+    /// the loops are genuinely model-agnostic rather than hard-wired to
+    /// [`LinearModel`].  Loss is `Σ (p_i − t_i)²` over an arbitrary batch type.
+    #[derive(Debug, Clone)]
+    struct QuadBatch(Vec<f32>);
+
+    #[derive(Debug, Clone)]
+    struct QuadModel {
+        p: Vec<f32>,
+    }
+
+    impl MetaModel for QuadModel {
+        type Batch = QuadBatch;
+
+        fn params(&self) -> &[f32] {
+            &self.p
+        }
+
+        fn params_mut(&mut self) -> &mut [f32] {
+            &mut self.p
+        }
+
+        fn with_params(&self, params: Vec<f32>) -> Result<Self, MetaLearningError> {
+            if params.len() != self.p.len() {
+                return Err(MetaLearningError::DimensionMismatch {
+                    expected: self.p.len(),
+                    actual: params.len(),
+                });
+            }
+            Ok(QuadModel { p: params })
+        }
+
+        fn loss_and_grad(&self, batch: &QuadBatch) -> Result<(f32, Vec<f32>), MetaLearningError> {
+            if batch.0.len() != self.p.len() {
+                return Err(MetaLearningError::DimensionMismatch {
+                    expected: self.p.len(),
+                    actual: batch.0.len(),
+                });
+            }
+            let mut loss = 0.0_f32;
+            let mut grad = vec![0.0_f32; self.p.len()];
+            for (i, (&p, &t)) in self.p.iter().zip(batch.0.iter()).enumerate() {
+                let d = p - t;
+                loss += d * d;
+                grad[i] = 2.0 * d;
+            }
+            Ok((loss, grad))
+        }
+    }
+
+    #[test]
+    fn test_meta_model_params_view_matches_field() {
+        let m = LinearModel::new(3, 2);
+        assert_eq!(MetaModel::params(&m).len(), m.params.len());
+        assert_eq!(MetaModel::param_count(&m), m.param_count());
+    }
+
+    #[test]
+    fn test_meta_model_with_params_wrong_size_errors() {
+        let m = LinearModel::new(3, 2);
+        assert!(m.with_params(vec![0.0_f32; 3]).is_err());
+    }
+
+    #[test]
+    fn test_to_meta_task_preserves_buffers() {
+        let mut s = TaskSampler::new(3, 2, 5, 4, 2024);
+        let task = s.sample_task(11);
+        let mt = task.to_meta_task();
+        assert_eq!(mt.task_id, 11);
+        assert_eq!(mt.support.n, task.n_support);
+        assert_eq!(mt.query.n, task.n_query);
+        assert_eq!(mt.support.inputs, task.support_inputs);
+        assert_eq!(mt.support.targets, task.support_targets);
+        assert_eq!(mt.query.inputs, task.query_inputs);
+        assert_eq!(mt.query.targets, task.query_targets);
+    }
+
+    /// Regression: the concrete `LinearModel` entry points must stay exact thin
+    /// wrappers over the generic loops (no behaviour drift after the
+    /// `MetaModel` generalisation).
+    #[test]
+    fn test_generic_adapt_matches_concrete() -> Result<(), MetaLearningError> {
+        let m = LinearModel::new(2, 1);
+        let mut s = TaskSampler::new(2, 1, 6, 3, 31);
+        let task = s.sample_task(0);
+        let cfg = MamlConfig::default();
+
+        let concrete = inner_loop_adapt(&m, &task, &cfg)?;
+        let generic = adapt_on_support(&m, &task.to_meta_task().support, &cfg)?;
+
+        assert_eq!(concrete.len(), generic.len());
+        for (a, b) in concrete.iter().zip(generic.iter()) {
+            assert!((a - b).abs() < 1e-9, "{} vs {}", a, b);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_generic_meta_gradient_matches_concrete() -> Result<(), MetaLearningError> {
+        let m = LinearModel::new(2, 1);
+        let mut s = TaskSampler::new(2, 1, 5, 3, 53);
+        let tasks = s.sample_batch(3, 0);
+        let cfg = MamlConfig::default();
+
+        let (loss_a, grad_a) = compute_meta_gradient(&m, &tasks, &cfg)?;
+        let meta_tasks: Vec<MetaTask<RegressionBatch>> =
+            tasks.iter().map(|t| t.to_meta_task()).collect();
+        let (loss_b, grad_b) = meta_gradient(&m, &meta_tasks, &cfg)?;
+
+        assert!((loss_a - loss_b).abs() < 1e-9);
+        for (a, b) in grad_a.iter().zip(grad_b.iter()) {
+            assert!((a - b).abs() < 1e-9, "{} vs {}", a, b);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_generic_meta_step_matches_meta_update_step() -> Result<(), MetaLearningError> {
+        let mut m_a = LinearModel::new(2, 1);
+        let mut m_b = LinearModel::new(2, 1);
+        let mut s = TaskSampler::new(2, 1, 5, 3, 71);
+        let tasks = s.sample_batch(4, 0);
+        let cfg = MamlConfig::default();
+
+        let loss_a = meta_update_step(&mut m_a, &tasks, &cfg)?;
+        let meta_tasks: Vec<MetaTask<RegressionBatch>> =
+            tasks.iter().map(|t| t.to_meta_task()).collect();
+        let loss_b = meta_step(&mut m_b, &meta_tasks, &cfg)?;
+
+        assert!((loss_a - loss_b).abs() < 1e-9);
+        for (a, b) in m_a.params.iter().zip(m_b.params.iter()) {
+            assert!((a - b).abs() < 1e-9, "{} vs {}", a, b);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_generic_meta_gradient_empty_tasks_error() {
+        let m = LinearModel::new(2, 1);
+        let tasks: Vec<MetaTask<RegressionBatch>> = Vec::new();
+        let result = meta_gradient(&m, &tasks, &MamlConfig::default());
+        assert!(matches!(result, Err(MetaLearningError::EmptyTaskBatch)));
+    }
+
+    /// Regression: a model reporting zero learnable parameters must error, not
+    /// hand back an empty gradient that every caller would treat as "converged".
+    #[test]
+    fn test_generic_meta_gradient_zero_params_error() {
+        let model = QuadModel { p: Vec::new() };
+        let tasks = vec![MetaTask {
+            task_id: 0,
+            support: QuadBatch(Vec::new()),
+            query: QuadBatch(Vec::new()),
+        }];
+        let result = meta_gradient(&model, &tasks, &MamlConfig::default());
+        assert!(matches!(result, Err(MetaLearningError::InvalidConfig(_))));
+    }
+
+    #[test]
+    fn test_custom_meta_model_adapts_towards_support() -> Result<(), MetaLearningError> {
+        let model = QuadModel {
+            p: vec![0.0, 0.0, 0.0],
+        };
+        let support = QuadBatch(vec![1.0, -2.0, 0.5]);
+        let cfg = MamlConfig {
+            inner_lr: 0.1,
+            num_inner_steps: 20,
+            ..MamlConfig::default()
+        };
+
+        let adapted = adapt_on_support(&model, &support, &cfg)?;
+        let (loss_before, _) = model.loss_and_grad(&support)?;
+        let loss_after = query_loss_with_params(&model, &adapted, &support)?;
+
+        assert!(
+            loss_after < loss_before,
+            "adapted loss {} should be below initial loss {}",
+            loss_after,
+            loss_before
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_custom_meta_model_meta_step_updates_params() -> Result<(), MetaLearningError> {
+        let mut model = QuadModel { p: vec![0.0, 0.0] };
+        let before = model.p.clone();
+        let tasks = vec![
+            MetaTask {
+                task_id: 0,
+                support: QuadBatch(vec![1.0, 1.0]),
+                query: QuadBatch(vec![1.0, 1.0]),
+            },
+            MetaTask {
+                task_id: 1,
+                support: QuadBatch(vec![-1.0, 2.0]),
+                query: QuadBatch(vec![-1.0, 2.0]),
+            },
+        ];
+        let cfg = MamlConfig {
+            inner_lr: 0.05,
+            meta_lr: 0.1,
+            num_inner_steps: 3,
+            task_batch_size: 2,
+            ..MamlConfig::default()
+        };
+
+        let loss = meta_step(&mut model, &tasks, &cfg)?;
+        assert!(loss.is_finite());
+        let changed = model
+            .p
+            .iter()
+            .zip(before.iter())
+            .any(|(a, b)| (a - b).abs() > 1e-10);
+        assert!(changed, "meta_step must update the model parameters");
+        Ok(())
+    }
+
+    #[test]
+    fn test_custom_meta_model_second_order_gradient_shape() -> Result<(), MetaLearningError> {
+        let model = QuadModel { p: vec![0.0, 0.0] };
+        let tasks = vec![MetaTask {
+            task_id: 0,
+            support: QuadBatch(vec![0.5, -0.5]),
+            query: QuadBatch(vec![0.5, -0.5]),
+        }];
+        let cfg = MamlConfig {
+            first_order: false,
+            num_inner_steps: 2,
+            ..MamlConfig::default()
+        };
+
+        let (loss, grad) = meta_gradient(&model, &tasks, &cfg)?;
+        assert!(loss.is_finite());
+        assert_eq!(grad.len(), 2);
+        assert!(grad.iter().all(|g| g.is_finite()));
+        Ok(())
     }
 }

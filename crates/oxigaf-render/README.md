@@ -49,63 +49,74 @@ oxigaf-render = { version = "0.1", features = ["gpu_debug"] }
 
 ## Usage
 
+All the examples below use `pollster` to block on the async GPU setup calls
+from a plain `fn main`; add `pollster = "1"` to your own `[dependencies]`
+to run them as-is (any other async executor works too).
+
 ### Basic Gaussian Rendering
 
 ```rust
 use oxigaf_render::{
-    Rasterizer,
-    RasterConfig,
-    RenderCamera,
-    gaussian::{GaussianAttributes, GaussianModel}
+    keyframe_to_render_camera, CameraKeyframe, GaussianAttributes, GaussianModel,
+    RasterConfig, Rasterizer,
 };
 
+// `Rasterizer::new` is async because wgpu device creation is async.
 fn main() -> Result<(), oxigaf_render::RenderError> {
-    // Create a simple Gaussian model
-    let gaussians = vec![
-        GaussianAttributes {
-            position: [0.0, 0.0, 0.0],
-            rotation: [0.0, 0.0, 0.0, 1.0],  // Identity quaternion
-            log_scale: [-4.0, -4.0, -4.0],   // exp(-4) ≈ 0.018 scale
-            opacity_logit: 2.0,               // sigmoid(2.0) ≈ 0.88 opacity
-        },
-    ];
+    pollster::block_on(run())
+}
 
-    // SH coefficients for color (DC component only, degree 0)
-    // RGB = [1.0, 0.5, 0.5] gives a reddish color
-    let sh_coeffs = vec![1.0, 0.5, 0.5];
+async fn run() -> Result<(), oxigaf_render::RenderError> {
+    // Create a simple Gaussian model (SH degree 0, one Gaussian).
+    let gaussians = vec![GaussianAttributes {
+        position: [0.0, 0.0, 0.0],
+        _pad0: 0.0,
+        rotation: [0.0, 0.0, 0.0, 1.0], // Identity quaternion (x, y, z, w)
+        scale: [-4.0, -4.0, -4.0],      // log-scale: exp(-4) ≈ 0.018
+        opacity: 2.0,                   // inverse-sigmoid: sigmoid(2.0) ≈ 0.88
+    }];
 
-    let model = GaussianModel::new(gaussians, sh_coeffs, 0)?;
+    // SH coefficients for color (DC component only, degree 0).
+    // The DC term is scaled by the Y_0^0 basis constant (≈0.2821) when
+    // evaluated, so pre-dividing by it gives ≈ RGB [1.0, 0.5, 0.5] on screen.
+    let sh_coeffs = vec![3.545, 1.772, 1.772];
 
-    // Initialize GPU rasterizer
-    let config = RasterConfig {
-        width: 512,
-        height: 512,
-        tile_size: 16,
-        ..Default::default()
+    let model = GaussianModel {
+        gaussians,
+        sh_coeffs,
+        sh_degree: 0,
+        // Only meaningful for FLAME-bound avatars; unused here.
+        face_indices: vec![0],
+        barycentric: vec![[1.0, 0.0, 0.0]],
+        local_offsets: vec![[0.0, 0.0, 0.0]],
+        is_rigid: vec![true],
     };
 
-    let mut rasterizer = Rasterizer::new(&config)?;
+    // Initialize the GPU rasterizer.
+    let config = RasterConfig::new()
+        .with_resolution(512, 512)
+        .with_sh_degree(0);
 
-    // Set up camera
-    let camera = RenderCamera::look_at(
-        [0.0, 0.0, 2.0],    // eye position (2 units back)
-        [0.0, 0.0, 0.0],    // look at origin
-        [0.0, 1.0, 0.0],    // up vector
-        std::f32::consts::FRAC_PI_4,  // 45° field of view
-        1.0,                // aspect ratio (width/height)
+    let mut rasterizer = Rasterizer::new(config.clone()).await?;
+
+    // Set up a look-at camera.
+    let camera = keyframe_to_render_camera(
+        &CameraKeyframe::look_from_to(0.0, [0.0, 0.0, 2.0], [0.0, 0.0, 0.0]),
+        config.image_width as usize,
+        config.image_height as usize,
     );
 
-    // Render frame
+    // Upload Gaussians once, then render.
+    rasterizer.upload_gaussians(&model);
     let output = rasterizer.forward(&model, &camera)?;
 
-    // Save rendered image
-    output.color.save("output.png").map_err(|e| {
-        oxigaf_render::RenderError::Io(
-            format!("Failed to save image: {}", e)
-        )
-    })?;
+    // Convert to an `image::RgbaImage` and save it.
+    let image = rasterizer.download_image(&output);
+    image
+        .save("output.png")
+        .map_err(|e| oxigaf_render::RenderError::ImageSaveFailed(e.to_string()))?;
 
-    println!("Rendered {} Gaussians", model.num_gaussians());
+    println!("Rendered {} Gaussians", model.len());
 
     Ok(())
 }
@@ -114,149 +125,164 @@ fn main() -> Result<(), oxigaf_render::RenderError> {
 ### Differentiable Rendering with Gradients
 
 ```rust
-use oxigaf_render::{Rasterizer, RasterConfig, RenderCamera, gaussian::GaussianModel};
-use image::Rgba;
+use oxigaf_render::{
+    keyframe_to_render_camera, CameraKeyframe, GaussianGradients, GaussianModel, RasterConfig,
+    Rasterizer, RenderCamera,
+};
 
 fn main() -> Result<(), oxigaf_render::RenderError> {
-    let mut rasterizer = Rasterizer::new(&RasterConfig::default())?;
-    let mut model = create_gaussian_model()?; // Your model
-    let camera = create_camera(); // Your camera
+    pollster::block_on(run())
+}
 
-    // Forward pass
+async fn run() -> Result<(), oxigaf_render::RenderError> {
+    let config = RasterConfig::default();
+    let mut rasterizer = Rasterizer::new(config.clone()).await?;
+    let mut model = create_gaussian_model(); // Your model
+    let camera = create_camera(config.image_width, config.image_height);
+
+    // Forward pass.
+    rasterizer.upload_gaussians(&model);
     let output = rasterizer.forward(&model, &camera)?;
 
-    // Compute target image difference (e.g., for training)
-    let target_image = load_target_image()?;
-    let grad_output = compute_image_gradients(&output.color, &target_image)?;
+    // Compute the per-pixel loss gradient against a target (e.g. L1).
+    let target = load_target_image(output.color_data.len());
+    let grad_image = l1_gradient(&output.color_data, &target);
 
-    // Backward pass to get parameter gradients
-    let gradients = rasterizer.backward(&grad_output)?;
+    // Backward pass: chains the image-space gradient back to per-Gaussian gradients.
+    let gradients = rasterizer.backward(&model, &grad_image)?;
 
-    // Access gradients for optimization
-    println!("Position gradients: {} values", gradients.positions.len());
-    println!("Rotation gradients: {} values", gradients.rotations.len());
-    println!("Scale gradients: {} values", gradients.scales.len());
-    println!("Opacity gradients: {} values", gradients.opacities.len());
-    println!("SH gradients: {} values", gradients.sh_coeffs.len());
+    // Access gradients for optimization.
+    println!("Position gradients: {} values", gradients.grad_positions.len());
+    println!("Rotation gradients: {} values", gradients.grad_rotations.len());
+    println!("Scale gradients: {} values", gradients.grad_scales.len());
+    println!("Opacity gradients: {} values", gradients.grad_opacities.len());
+    println!("SH gradients: {} values", gradients.grad_sh_coeffs.len());
 
-    // Apply gradients with optimizer (e.g., Adam)
-    apply_gradients(&mut model, &gradients, learning_rate)?;
+    // Apply gradients with a simple step (swap in Adam, etc. for real training).
+    apply_gradients(&mut model, &gradients, 0.001);
 
     Ok(())
 }
 
-// Helper functions (simplified for example)
-fn create_gaussian_model() -> Result<GaussianModel, oxigaf_render::RenderError> {
-    // Implementation details...
-    unimplemented!()
+// --- Helper functions (fill in for your training loop) ---
+
+fn create_gaussian_model() -> GaussianModel {
+    // e.g. GaussianModel::load_ply(Path::new("avatar.ply"))
+    //      or GaussianModel::load_safetensors(...)
+    unimplemented!("build or load a GaussianModel")
 }
 
-fn create_camera() -> RenderCamera {
-    RenderCamera::look_at(
-        [0.0, 0.0, 2.0],
-        [0.0, 0.0, 0.0],
-        [0.0, 1.0, 0.0],
-        std::f32::consts::FRAC_PI_4,
-        1.0,
+fn create_camera(width: u32, height: u32) -> RenderCamera {
+    keyframe_to_render_camera(
+        &CameraKeyframe::look_from_to(0.0, [0.0, 0.0, 2.0], [0.0, 0.0, 0.0]),
+        width as usize,
+        height as usize,
     )
 }
 
-fn load_target_image() -> Result<image::RgbaImage, oxigaf_render::RenderError> {
-    // Load your ground truth image
-    unimplemented!()
+fn load_target_image(len: usize) -> Vec<f32> {
+    // Load your ground-truth image as RGBA f32 pixels matching
+    // `output.color_data`'s layout (H * W * 4, row-major).
+    vec![0.0; len]
 }
 
-fn compute_image_gradients(
-    rendered: &image::RgbaImage,
-    target: &image::RgbaImage
-) -> Result<Vec<f32>, oxigaf_render::RenderError> {
-    // Compute L1 or L2 loss gradients
-    unimplemented!()
+/// L1 loss gradient: sign(rendered - target).
+fn l1_gradient(rendered: &[f32], target: &[f32]) -> Vec<f32> {
+    rendered
+        .iter()
+        .zip(target)
+        .map(|(r, t)| (r - t).signum())
+        .collect()
 }
 
-fn apply_gradients(
-    model: &mut GaussianModel,
-    gradients: &oxigaf_render::GaussianGradients,
-    learning_rate: f32
-) -> Result<(), oxigaf_render::RenderError> {
-    // Apply gradients with your optimizer
-    unimplemented!()
+fn apply_gradients(model: &mut GaussianModel, gradients: &GaussianGradients, learning_rate: f32) {
+    for (g, grad) in model
+        .gaussians
+        .iter_mut()
+        .zip(gradients.grad_positions.iter())
+    {
+        g.position[0] -= learning_rate * grad[0];
+        g.position[1] -= learning_rate * grad[1];
+        g.position[2] -= learning_rate * grad[2];
+    }
 }
 ```
 
 ### Custom Camera Trajectories
 
 ```rust
-use oxigaf_render::{Rasterizer, RasterConfig, RenderCamera, gaussian::GaussianModel};
-use std::f32::consts::PI;
+use oxigaf_render::{turntable_path, GaussianModel, RasterConfig, Rasterizer};
+use std::f32::consts::FRAC_PI_4;
 
 fn main() -> Result<(), oxigaf_render::RenderError> {
-    let mut rasterizer = Rasterizer::new(&RasterConfig::default())?;
-    let model = load_avatar_model()?;
+    pollster::block_on(run())
+}
 
-    // Generate circular camera trajectory
-    let num_frames = 360;
-    let radius = 2.0;
+async fn run() -> Result<(), oxigaf_render::RenderError> {
+    let config = RasterConfig::new().with_resolution(512, 512);
+    let mut rasterizer = Rasterizer::new(config.clone()).await?;
+    let model = load_avatar_model();
 
-    for frame in 0..num_frames {
-        let angle = 2.0 * PI * (frame as f32) / (num_frames as f32);
+    // Generate a 360-frame turntable orbit around the origin.
+    let num_frames: usize = 360;
+    let path = turntable_path(
+        [0.0, 0.0, 0.0], // center
+        2.0,             // radius
+        0.0,             // elevation
+        num_frames,      // keyframes
+        FRAC_PI_4,       // vertical FOV
+    );
+    let cameras = path.to_render_cameras(
+        num_frames,
+        config.image_width as usize,
+        config.image_height as usize,
+    );
 
-        // Camera orbits around origin
-        let eye_x = radius * angle.cos();
-        let eye_z = radius * angle.sin();
+    rasterizer.upload_gaussians(&model);
 
-        let camera = RenderCamera::look_at(
-            [eye_x, 0.0, eye_z],
-            [0.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0],
-            std::f32::consts::FRAC_PI_4,
-            1.0,
-        );
-
-        let output = rasterizer.forward(&model, &camera)?;
-
-        output.color.save(format!("frame_{:04}.png", frame)).map_err(|e| {
-            oxigaf_render::RenderError::Io(
-                format!("Failed to save frame {}: {}", frame, e)
-            )
+    for (frame, camera) in cameras.iter().enumerate() {
+        let output = rasterizer.forward(&model, camera)?;
+        let image = rasterizer.download_image(&output);
+        image.save(format!("frame_{frame:04}.png")).map_err(|e| {
+            oxigaf_render::RenderError::ImageSaveFailed(format!(
+                "Failed to save frame {frame}: {e}"
+            ))
         })?;
     }
 
-    println!("Rendered {} frames", num_frames);
+    println!("Rendered {} frames", cameras.len());
 
     Ok(())
 }
 
-fn load_avatar_model() -> Result<GaussianModel, oxigaf_render::RenderError> {
-    // Load your trained avatar model
-    unimplemented!()
+fn load_avatar_model() -> GaussianModel {
+    // e.g. GaussianModel::load_ply(Path::new("avatar.ply")).unwrap_or_else(...)
+    unimplemented!("load your trained avatar model")
 }
 ```
 
 ### High-Quality Rendering Configuration
 
 ```rust
-use oxigaf_render::{Rasterizer, RasterConfig};
+use oxigaf_render::{RasterConfig, Rasterizer};
 
 fn main() -> Result<(), oxigaf_render::RenderError> {
-    // High-quality rendering configuration
-    let config = RasterConfig {
-        width: 1920,           // Full HD width
-        height: 1080,          // Full HD height
-        tile_size: 16,         // Tile size for parallel rendering
-        near: 0.01,            // Near clipping plane
-        far: 100.0,            // Far clipping plane
-        max_sh_degree: 3,      // Maximum spherical harmonics degree
-        antialiasing: true,    // Enable antialiasing
-        depth_test: true,      // Enable depth testing
-    };
+    // High-quality rendering configuration.
+    let config = RasterConfig::new()
+        .with_resolution(1920, 1080) // Full HD
+        .with_sh_degree(3)           // Maximum spherical harmonics degree
+        .with_depth_output(true);    // Enable depth buffer output
 
-    let mut rasterizer = Rasterizer::new(&config)?;
+    println!("Initialized high-quality rasterizer config:");
+    println!(
+        "  Resolution: {}x{}",
+        config.image_width, config.image_height
+    );
+    println!("  Tile size: {}x{}", config.tile_size, config.tile_size);
+    println!("  Max SH degree: {}", config.sh_degree);
 
-    println!("Initialized high-quality rasterizer:");
-    println!("  Resolution: {}×{}", config.width, config.height);
-    println!("  Tile size: {}×{}", config.tile_size, config.tile_size);
-    println!("  Max SH degree: {}", config.max_sh_degree);
+    // `Rasterizer::new` is async because wgpu device creation is async.
+    let _rasterizer = pollster::block_on(Rasterizer::new(config))?;
 
     Ok(())
 }
@@ -265,24 +291,23 @@ fn main() -> Result<(), oxigaf_render::RenderError> {
 ### Buffer Pool for Memory Efficiency
 
 ```rust
-use oxigaf_render::{BufferPool, RasterConfig};
+use oxigaf_render::BufferPool;
 
-fn main() -> Result<(), oxigaf_render::RenderError> {
-    // Create a buffer pool for efficient GPU memory reuse
-    let pool = BufferPool::new(10 * 1024 * 1024); // 10 MB initial capacity
+fn main() {
+    // Create a buffer pool for efficient GPU memory reuse.
+    let pool = BufferPool::new(10 * 1024 * 1024); // 10 MB budget
 
-    // Get pool statistics
+    // Get pool statistics.
     let stats = pool.stats();
     println!("Buffer pool statistics:");
     println!("  Total allocations: {}", stats.total_allocations);
-    println!("  Cache hits: {}", stats.cache_hits);
-    println!("  Cache misses: {}", stats.cache_misses);
-    println!("  Active buffers: {}", stats.active_buffers);
-    println!("  Total memory: {} bytes", stats.total_memory);
+    println!("  Total acquisitions: {}", stats.total_acquisitions);
+    println!("  Hit rate: {:.1}%", stats.hit_rate * 100.0);
+    println!("  Available buffers: {}", stats.available_count);
+    println!("  In-use buffers: {}", stats.in_use_count);
+    println!("  Total allocated: {} bytes", stats.total_allocated_bytes);
 
-    // Buffers are automatically returned to the pool when dropped
-
-    Ok(())
+    // Buffers are automatically returned to the pool when dropped.
 }
 ```
 

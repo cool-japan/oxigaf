@@ -1,7 +1,25 @@
-//! Pipeline stage abstractions for end-to-end workflows
+//! Composable pipeline stages for end-to-end workflows.
 //!
-//! This module provides a flexible framework for orchestrating multi-stage processing pipelines
-//! with progress tracking, checkpointing, and error recovery.
+//! This module orchestrates the reconstruction workflow as a sequence of
+//! independently runnable [`PipelineStage`]s with progress tracking,
+//! checkpointing, and error recovery.
+//!
+//! ## Relationship to the `pipeline` module
+//!
+//! The `train` subcommand drives the binary-only `pipeline` module, which runs
+//! FLAME loading → Gaussian initialisation → training → export as a single
+//! function.  This module exposes the same work as *composable* stages so a
+//! caller can run tracking, diffusion, training, and export separately and
+//! checkpoint between them.
+//!
+//! ## No fabricated results
+//!
+//! Every stage either performs real work or fails with an explicit error.
+//! Where a step needs an external asset that OxiGAF deliberately does not
+//! bundle — a facial-landmark detector for monocular FLAME tracking, or trained
+//! multi-view diffusion weights — the stage says exactly what is missing rather
+//! than emitting placeholder data that downstream tools would mistake for a
+//! real result.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -9,26 +27,33 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
+use nalgebra as na;
 use serde::{Deserialize, Serialize};
 
+use oxigaf::diffusion::DiffusionConfig;
+use oxigaf::render::RasterConfig;
+use oxigaf::trainer::diffusion_target::{DiffusionTargetConfig, DiffusionTargetGenerator};
+use oxigaf::trainer::{Trainer, TrainingConfig};
 use oxigaf_flame::sequence::FlameSequence;
+use oxigaf_flame::{Camera, FlameModel, NormalMapRenderer};
 
-// Placeholder for Gaussian model in pipeline context
-// NOTE: This is a simplified placeholder for CLI pipeline scaffolding.
-// For actual training, use `oxigaf_render::gaussian::GaussianModel`.
-// This placeholder allows the pipeline framework to be tested without
-// implementing full end-to-end training integration.
-#[derive(Debug)]
-pub struct GaussianModel {
-    #[allow(dead_code)]
-    num_gaussians: usize,
-}
+/// The Gaussian model carried through the pipeline.
+///
+/// This is the renderer's model type — the same one [`Trainer`] optimises and
+/// [`crate::export`] serialises — re-exported so stage users do not need a
+/// direct dependency on `oxigaf-render`.
+pub use oxigaf::render::gaussian::GaussianModel;
 
-impl GaussianModel {
-    pub fn new(num_gaussians: usize) -> Self {
-        Self { num_gaussians }
-    }
-}
+/// Frame rate assumed when a FLAME sequence carries no `fps` field.
+const DEFAULT_FPS: f32 = 30.0;
+
+/// File names searched for when `--input` names a directory of tracking output.
+const TRACKING_FILE_CANDIDATES: &[&str] = &[
+    "flame_params.json",
+    "tracking.json",
+    "params.json",
+    "sequence.json",
+];
 
 /// Abstract pipeline stage that can report progress and execute
 pub trait PipelineStage: Send + Sync {
@@ -157,16 +182,144 @@ pub struct CheckpointData {
     pub has_trained_model: bool,
 }
 
-/// Tracking stage: Extract FLAME parameters from video
+// ---------------------------------------------------------------------------
+// Shared image helpers
+// ---------------------------------------------------------------------------
+
+/// Convert an 8-bit RGB image to the flat `[H·W·3]` `f32` HWC layout in `[0,1]`
+/// used by the trainer and the diffusion target generator.
+fn rgb_to_f32(img: &image::RgbImage) -> Vec<f32> {
+    let mut out = Vec::with_capacity((img.width() as usize) * (img.height() as usize) * 3);
+    for px in img.pixels() {
+        out.push(f32::from(px[0]) / 255.0);
+        out.push(f32::from(px[1]) / 255.0);
+        out.push(f32::from(px[2]) / 255.0);
+    }
+    out
+}
+
+/// Convert a flat `[H·W·3]` `f32` HWC buffer back to an 8-bit RGB image.
+///
+/// # Errors
+///
+/// Returns an error when `data` is shorter than `width · height · 3`.
+fn f32_to_rgb(data: &[f32], width: u32, height: u32) -> Result<image::RgbImage> {
+    let expected = (width as usize) * (height as usize) * 3;
+    if data.len() < expected {
+        anyhow::bail!(
+            "Generated view has {} samples, expected {expected} for {width}×{height} RGB",
+            data.len(),
+        );
+    }
+    let mut img = image::RgbImage::new(width, height);
+    for (i, px) in img.pixels_mut().enumerate() {
+        let base = i * 3;
+        for c in 0..3 {
+            px[c] = (data[base + c].clamp(0.0, 1.0) * 255.0).round() as u8;
+        }
+    }
+    Ok(img)
+}
+
+/// Derive a foreground mask from a rendered normal map.
+///
+/// `NormalMapRenderer` leaves untouched pixels black, so any non-black pixel is
+/// covered by the FLAME mesh.
+fn coverage_mask(normal_map: &image::RgbImage) -> image::GrayImage {
+    let mut mask = image::GrayImage::new(normal_map.width(), normal_map.height());
+    for (m, px) in mask.pixels_mut().zip(normal_map.pixels()) {
+        m[0] = if px[0] != 0 || px[1] != 0 || px[2] != 0 {
+            255
+        } else {
+            0
+        };
+    }
+    mask
+}
+
+/// Build `num_views` pinhole cameras evenly spaced on a horizontal orbit,
+/// all looking at the origin.
+fn orbit_cameras(num_views: usize, width: u32, height: u32, radius: f32) -> Vec<Camera> {
+    (0..num_views)
+        .map(|i| {
+            let azimuth = if num_views == 0 {
+                0.0
+            } else {
+                (i as f32) * 360.0 / (num_views as f32)
+            };
+            orbit_camera(azimuth, 10.0, radius, width, height)
+        })
+        .collect()
+}
+
+/// Create a pinhole camera looking at the origin from spherical coordinates.
+fn orbit_camera(
+    azimuth_deg: f32,
+    elevation_deg: f32,
+    distance: f32,
+    width: u32,
+    height: u32,
+) -> Camera {
+    let az = azimuth_deg.to_radians();
+    let el = elevation_deg.to_radians();
+
+    let eye = na::Vector3::new(
+        distance * el.cos() * az.sin(),
+        distance * el.sin(),
+        distance * el.cos() * az.cos(),
+    );
+    let forward = (-eye).normalize();
+    let world_up = na::Vector3::new(0.0, 1.0, 0.0);
+    let right = if forward.cross(&world_up).norm() < 1e-6 {
+        na::Vector3::new(1.0, 0.0, 0.0)
+    } else {
+        forward.cross(&world_up).normalize()
+    };
+    let up = right.cross(&forward);
+
+    let rotation = na::Matrix3::from_columns(&[right, up, -forward]).transpose();
+    let translation = -(rotation * eye);
+    let focal = width as f32 * 1.5;
+
+    Camera {
+        rotation,
+        translation,
+        focal_x: focal,
+        focal_y: focal,
+        cx: width as f32 / 2.0,
+        cy: height as f32 / 2.0,
+        width,
+        height,
+        near: 0.01,
+        far: 10.0,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tracking
+// ---------------------------------------------------------------------------
+
+/// Tracking stage: resolve the per-frame FLAME parameter sequence for the input.
+///
+/// ## Why this does not run a tracker on raw video
+///
+/// Fitting FLAME to monocular footage requires a facial-landmark detector, and
+/// every usable detector is a trained neural network.  OxiGAF ships no such
+/// weights, so this stage consumes *already tracked* parameters: a FLAME
+/// sequence JSON, or a directory containing one (see
+/// [`TRACKING_FILE_CANDIDATES`]).  Raw video or an image folder is rejected
+/// with an explicit message instead of silently producing an empty sequence.
 pub struct TrackingStage {
     video_path: PathBuf,
-    #[allow(dead_code)]
     output_path: PathBuf,
     progress: f32,
 }
 
 impl TrackingStage {
-    /// Create a new tracking stage
+    /// Create a new tracking stage.
+    ///
+    /// * `video_path` — the FLAME sequence JSON, or a directory containing one.
+    /// * `output_path` — where the tracking manifest is written.
     pub fn new(video_path: PathBuf, output_path: PathBuf) -> Self {
         Self {
             video_path,
@@ -174,6 +327,80 @@ impl TrackingStage {
             progress: 0.0,
         }
     }
+
+    /// Record what was actually loaded so later runs and downstream tools can
+    /// see which parameters produced the avatar.
+    fn write_manifest(&self, params_path: &Path, num_frames: usize, fps: f32) -> Result<()> {
+        if let Some(parent) = self.output_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)
+                    .context("Failed to create tracking output directory")?;
+            }
+        }
+        let source = self.video_path.display().to_string();
+        let flame_params = params_path.display().to_string();
+        let manifest = serde_json::json!({
+            "source": source,
+            "flame_params": flame_params,
+            "num_frames": num_frames,
+            "fps": fps,
+        });
+        let json =
+            serde_json::to_string_pretty(&manifest).context("Failed to serialize manifest")?;
+        std::fs::write(&self.output_path, json).with_context(|| {
+            format!(
+                "Failed to write tracking manifest: {}",
+                self.output_path.display()
+            )
+        })
+    }
+}
+
+/// Resolve the FLAME parameter JSON referenced by a tracking input.
+///
+/// # Errors
+///
+/// Returns an error when the path is missing, names raw footage, or names a
+/// directory without recognised tracking output.
+fn resolve_tracking_params(input: &Path) -> Result<PathBuf> {
+    if !input.exists() {
+        anyhow::bail!("Tracking input does not exist: {}", input.display());
+    }
+
+    let is_json = input
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("json"))
+        .unwrap_or(false);
+
+    if input.is_file() {
+        if is_json {
+            return Ok(input.to_path_buf());
+        }
+        anyhow::bail!(
+            "Cannot track {}: FLAME tracking from raw footage needs a facial-landmark \
+             detector model, which OxiGAF does not bundle. Supply pre-computed per-frame \
+             FLAME parameters as a sequence JSON \
+             ({{\"fps\": 30.0, \"frames\": [{{\"shape\": [..], \"expression\": [..], \
+             \"pose\": [..]}}]}}) and pass that file (or a directory containing one of: {}).",
+            input.display(),
+            TRACKING_FILE_CANDIDATES.join(", "),
+        );
+    }
+
+    for name in TRACKING_FILE_CANDIDATES {
+        let candidate = input.join(name);
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+
+    anyhow::bail!(
+        "No FLAME parameter file found in {}: expected one of {}. FLAME tracking from raw \
+         frames needs a facial-landmark detector model, which OxiGAF does not bundle.",
+        input.display(),
+        TRACKING_FILE_CANDIDATES.join(", "),
+    )
 }
 
 impl PipelineStage for TrackingStage {
@@ -183,23 +410,41 @@ impl PipelineStage for TrackingStage {
 
     fn run(&mut self, ctx: &mut PipelineContext) -> Result<()> {
         tracing::info!(
-            "Starting FLAME tracking from video: {}",
+            "Resolving FLAME tracking data from {}",
             self.video_path.display()
         );
+        self.progress = 0.0;
 
-        // NOTE: Placeholder implementation for pipeline scaffolding.
-        // Production implementation would integrate with FLAME tracking algorithm.
-        self.progress = 0.5;
+        let params_path = resolve_tracking_params(&self.video_path)?;
+        self.progress = 0.25;
 
-        // Placeholder: Create a simple sequence
-        let _sequence = FlameSequence::from_memory(vec![], Some(30.0));
+        tracing::info!(
+            "Loading FLAME parameter sequence from {}",
+            params_path.display()
+        );
+        let sequence = FlameSequence::from_json(&params_path)
+            .with_context(|| format!("Failed to load FLAME sequence: {}", params_path.display()))?;
 
-        self.progress = 1.0;
+        let num_frames = sequence.num_frames();
+        if num_frames == 0 {
+            anyhow::bail!(
+                "FLAME sequence {} contains no frames — downstream stages need at least one",
+                params_path.display()
+            );
+        }
+        let fps = sequence.fps().unwrap_or(DEFAULT_FPS);
+        self.progress = 0.75;
 
-        // Update context
+        self.write_manifest(&params_path, num_frames, fps)?;
+
         ctx.video_path = Some(self.video_path.clone());
-        ctx.metrics.insert("tracking_fps".to_string(), 30.0);
+        ctx.flame_sequence = Some(sequence);
+        ctx.metrics.insert("tracking_fps".to_string(), fps);
+        ctx.metrics
+            .insert("tracking_frames".to_string(), num_frames as f32);
 
+        tracing::info!("Tracking resolved: {num_frames} frame(s) at {fps} fps");
+        self.progress = 1.0;
         Ok(())
     }
 
@@ -208,21 +453,61 @@ impl PipelineStage for TrackingStage {
     }
 }
 
-/// Diffusion stage: Generate multi-view images from FLAME parameters
+// ---------------------------------------------------------------------------
+// Diffusion
+// ---------------------------------------------------------------------------
+
+/// Diffusion stage: generate multi-view pseudo ground-truth from FLAME geometry.
+///
+/// The stage renders normal maps of the tracked FLAME mesh from a ring of
+/// cameras and hands them to the multi-view diffusion pipeline as conditioning.
+/// Trained diffusion weights are required: without them there is nothing to
+/// generate, and this stage reports that rather than pushing blank images.
 pub struct DiffusionStage {
     num_views: usize,
     resolution: (u32, u32),
     progress: f32,
+    weights_dir: Option<PathBuf>,
+    flame_model_path: Option<PathBuf>,
+    orbit_radius: f32,
 }
 
 impl DiffusionStage {
-    /// Create a new diffusion stage
+    /// Create a new diffusion stage.
+    ///
+    /// `num_views` and `resolution` must match the diffusion model's
+    /// configuration ([`DiffusionConfig`] defaults: 4 views at 256×256);
+    /// [`PipelineStage::run`] validates this.
     pub fn new(num_views: usize, resolution: (u32, u32)) -> Self {
         Self {
             num_views,
             resolution,
             progress: 0.0,
+            weights_dir: None,
+            flame_model_path: None,
+            orbit_radius: 0.6,
         }
+    }
+
+    /// Directory holding the multi-view diffusion safetensors weights.
+    #[must_use]
+    pub fn with_weights(mut self, weights_dir: PathBuf) -> Self {
+        self.weights_dir = Some(weights_dir);
+        self
+    }
+
+    /// Directory holding the converted FLAME model used to build the mesh.
+    #[must_use]
+    pub fn with_flame_model(mut self, flame_model_path: PathBuf) -> Self {
+        self.flame_model_path = Some(flame_model_path);
+        self
+    }
+
+    /// Distance of the orbit cameras from the origin (metres).
+    #[must_use]
+    pub fn with_orbit_radius(mut self, radius: f32) -> Self {
+        self.orbit_radius = radius;
+        self
     }
 }
 
@@ -232,34 +517,129 @@ impl PipelineStage for DiffusionStage {
     }
 
     fn run(&mut self, ctx: &mut PipelineContext) -> Result<()> {
-        tracing::info!(
-            "Generating {} views at {:?}",
-            self.num_views,
-            self.resolution
-        );
+        let (width, height) = self.resolution;
+        tracing::info!("Generating {} views at {width}×{height}", self.num_views);
+        self.progress = 0.0;
 
-        if ctx.flame_sequence.is_none() {
-            anyhow::bail!("No FLAME sequence available for diffusion");
+        // 1. Tracked geometry is mandatory conditioning.
+        let params = {
+            let sequence = ctx.flame_sequence.as_mut().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "No FLAME sequence available for diffusion — run TrackingStage first"
+                )
+            })?;
+            if sequence.num_frames() == 0 {
+                anyhow::bail!("FLAME sequence is empty — diffusion has nothing to condition on");
+            }
+            sequence
+                .get_frame(0)
+                .context("Failed to read FLAME frame 0")?
+                .clone()
+        };
+
+        // 2. The generator is driven by the model's own configuration, so the
+        //    requested view count / resolution has to agree with it.
+        let diff_config = DiffusionConfig::default();
+        if self.num_views != diff_config.num_views {
+            anyhow::bail!(
+                "DiffusionStage is configured for {} views but the diffusion model expects {} — \
+                 construct it with DiffusionStage::new({}, ..)",
+                self.num_views,
+                diff_config.num_views,
+                diff_config.num_views,
+            );
+        }
+        let expected_size = diff_config.image_size as u32;
+        if width != expected_size || height != expected_size {
+            anyhow::bail!(
+                "DiffusionStage is configured for {width}×{height} but the diffusion model \
+                 generates {expected_size}×{expected_size}"
+            );
         }
 
-        // NOTE: Placeholder implementation for pipeline scaffolding.
-        // Production implementation would integrate with oxigaf-diffusion.
+        // 3. Weights are an external asset; refuse rather than fake output.
+        //    Cloned so `self.progress` stays writable below.
+        let weights_dir = self.weights_dir.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "Multi-view diffusion requires trained weights (unet/, vae/, image_encoder/ \
+                 safetensors). Call DiffusionStage::with_weights(<dir>) — `oxigaf setup` \
+                 downloads them into the asset cache."
+            )
+        })?;
+        if !weights_dir.is_dir() {
+            anyhow::bail!(
+                "Diffusion weights directory not found: {}",
+                weights_dir.display()
+            );
+        }
+
+        let flame_model_path = self.flame_model_path.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "DiffusionStage needs the FLAME model to render conditioning normal maps: \
+                 call DiffusionStage::with_flame_model(<dir>)"
+            )
+        })?;
+
+        // 4. Build the conditioning normal maps from the tracked mesh.
+        let flame = FlameModel::load(&flame_model_path).with_context(|| {
+            format!(
+                "Failed to load FLAME model from {}",
+                flame_model_path.display()
+            )
+        })?;
+        let mesh = flame.forward(&params);
+        let cameras = orbit_cameras(self.num_views, width, height, self.orbit_radius);
+        let normal_maps: Vec<image::RgbImage> = cameras
+            .iter()
+            .map(|cam| NormalMapRenderer::render(&mesh, cam))
+            .collect();
+        let conditioning: Vec<Vec<f32>> = normal_maps.iter().map(rgb_to_f32).collect();
+        self.progress = 0.35;
+
+        // 5. Run the diffusion pipeline.  `warmup_iterations = 0` so the
+        //    generator denoises immediately instead of echoing its input.
+        let target_config = DiffusionTargetConfig {
+            warmup_iterations: 0,
+            ..DiffusionTargetConfig::default()
+        };
+        let mut generator = DiffusionTargetGenerator::new(target_config);
+        generator.load_pipeline(&weights_dir).with_context(|| {
+            format!(
+                "Failed to load diffusion pipeline from {}",
+                weights_dir.display()
+            )
+        })?;
         self.progress = 0.5;
 
-        let (width, height) = self.resolution;
-        for i in 0..self.num_views {
-            let img = image::RgbImage::new(width, height);
+        // Iteration 1 is past the zero-length warmup, so the generator denoises
+        // rather than echoing its conditioning input back.
+        let targets = generator
+            .generate_targets(&conditioning, &cameras, 1, width, height)
+            .context("Multi-view diffusion generation failed")?;
+        if targets.len() < self.num_views {
+            anyhow::bail!(
+                "Diffusion produced {} view(s), expected {}",
+                targets.len(),
+                self.num_views
+            );
+        }
+
+        // 6. Publish the generated views and their coverage masks.
+        for (i, target) in targets.iter().take(self.num_views).enumerate() {
+            let img = f32_to_rgb(target, width, height)
+                .with_context(|| format!("Invalid diffusion output for view {i}"))?;
             ctx.generated_images.push(img);
-
-            let mask = image::GrayImage::new(width, height);
+            let mask = normal_maps
+                .get(i)
+                .map(coverage_mask)
+                .unwrap_or_else(|| image::GrayImage::new(width, height));
             ctx.generated_masks.push(mask);
-
-            self.progress = 0.5 + 0.5 * (i as f32 / self.num_views as f32);
+            self.progress = 0.5 + 0.5 * ((i + 1) as f32 / self.num_views as f32);
         }
 
         ctx.metrics
             .insert("num_views".to_string(), self.num_views as f32);
-
+        self.progress = 1.0;
         Ok(())
     }
 
@@ -268,11 +648,36 @@ impl PipelineStage for DiffusionStage {
     }
 }
 
-/// Training stage: Train 3D Gaussian Splatting model
+// ---------------------------------------------------------------------------
+// Training
+// ---------------------------------------------------------------------------
+
+/// Everything [`TrainingStage`] needs to run a real optimisation loop.
+///
+/// 3D Gaussian training is GPU work: it cannot be approximated, so the stage
+/// refuses to run without this.
+pub struct TrainingSetup {
+    /// GPU device backing the rasterizer.
+    pub device: wgpu::Device,
+    /// Queue paired with `device`.
+    pub queue: wgpu::Queue,
+    /// Optimiser / density / loss configuration.
+    pub training_config: TrainingConfig,
+    /// Rasterizer configuration (image size, background, tile size).
+    pub raster_config: RasterConfig,
+    /// Gaussians to start from (e.g. from `GaussianInitializer::initialize`).
+    pub initial_model: GaussianModel,
+    /// RNG seed for reproducibility.
+    pub seed: u64,
+}
+
+/// Training stage: optimise a 3D Gaussian Splatting model.
 pub struct TrainingStage {
     num_iterations: usize,
     current_iteration: usize,
     start_time: Option<Instant>,
+    setup: Option<TrainingSetup>,
+    final_loss: Option<f32>,
 }
 
 impl TrainingStage {
@@ -282,7 +687,21 @@ impl TrainingStage {
             num_iterations,
             current_iteration: 0,
             start_time: None,
+            setup: None,
+            final_loss: None,
         }
+    }
+
+    /// Provide the GPU device, configuration, and starting model.
+    #[must_use]
+    pub fn with_setup(mut self, setup: TrainingSetup) -> Self {
+        self.setup = Some(setup);
+        self
+    }
+
+    /// Loss of the last completed training step, if any.
+    pub fn final_loss(&self) -> Option<f32> {
+        self.final_loss
     }
 }
 
@@ -300,31 +719,54 @@ impl PipelineStage for TrainingStage {
         if ctx.generated_images.is_empty() {
             anyhow::bail!("No generated images available for training");
         }
+        if self.num_iterations == 0 {
+            anyhow::bail!("TrainingStage was configured with 0 iterations");
+        }
+
+        let setup = self.setup.take().ok_or_else(|| {
+            anyhow::anyhow!(
+                "TrainingStage has no GPU setup: call TrainingStage::with_setup(TrainingSetup \
+                 {{ device, queue, training_config, raster_config, initial_model, seed }}). \
+                 Gaussian optimisation runs on the GPU rasterizer and cannot be simulated."
+            )
+        })?;
 
         self.start_time = Some(Instant::now());
+        let mut trainer = Trainer::new(
+            setup.training_config,
+            setup.initial_model,
+            setup.raster_config,
+            setup.device,
+            setup.queue,
+            setup.seed,
+        )
+        .context("Failed to create trainer")?;
 
-        // NOTE: Placeholder implementation for pipeline scaffolding.
-        // Production implementation would integrate with oxigaf-trainer::Trainer.
+        let mut last_loss = f32::NAN;
         for i in 0..self.num_iterations {
+            let step = trainer
+                .train_step()
+                .with_context(|| format!("Training step {} failed", i + 1))?;
             self.current_iteration = i + 1;
+            last_loss = step.loss.total;
 
-            // Simulate training step
-            std::thread::sleep(std::time::Duration::from_millis(1));
-
-            if i % 100 == 0 {
-                let loss = 1.0 / (i as f32 + 1.0);
-                ctx.metrics.insert(format!("loss_iter_{}", i), loss);
+            if i.is_multiple_of(100) {
+                ctx.metrics.insert(format!("loss_iter_{}", i), last_loss);
             }
         }
 
-        // Create placeholder model for pipeline scaffolding
-        let model = GaussianModel::new(1000);
-        ctx.trained_model = Some(model);
-
-        ctx.metrics.insert("final_loss".to_string(), 0.01);
+        self.final_loss = Some(last_loss);
+        ctx.metrics.insert("final_loss".to_string(), last_loss);
         ctx.metrics
             .insert("iterations".to_string(), self.num_iterations as f32);
+        ctx.metrics
+            .insert("num_gaussians".to_string(), trainer.model.len() as f32);
+        ctx.trained_model = Some(trainer.model.clone());
 
+        tracing::info!(
+            "Training complete: {} Gaussians, final loss {last_loss:.6}",
+            trainer.model.len()
+        );
         Ok(())
     }
 
@@ -340,7 +782,8 @@ impl PipelineStage for TrainingStage {
             if self.current_iteration > 0 {
                 let elapsed = start.elapsed().as_secs_f64();
                 let per_iter = elapsed / self.current_iteration as f64;
-                let remaining = (self.num_iterations - self.current_iteration) as f64 * per_iter;
+                let remaining =
+                    self.num_iterations.saturating_sub(self.current_iteration) as f64 * per_iter;
                 return Some(remaining);
             }
         }
@@ -348,7 +791,11 @@ impl PipelineStage for TrainingStage {
     }
 }
 
-/// Export stage: Export trained model to various formats
+// ---------------------------------------------------------------------------
+// Export
+// ---------------------------------------------------------------------------
+
+/// Export stage: export trained model to various formats
 pub struct ExportStage {
     format: ExportFormat,
     output_path: PathBuf,
@@ -357,11 +804,11 @@ pub struct ExportStage {
 /// Supported export formats
 #[derive(Debug, Clone, Copy)]
 pub enum ExportFormat {
-    /// PLY point cloud
+    /// ASCII PLY in the 3D Gaussian Splatting property layout
     Ply,
-    /// glTF with Gaussian extension
+    /// glTF 2.0 (GLB) with the `OXIGAF_gaussians` extension
     Gltf,
-    /// Custom binary format
+    /// safetensors — the binary interchange format for Gaussian models
     Binary,
 }
 
@@ -387,87 +834,24 @@ impl PipelineStage for ExportStage {
             self.output_path.display()
         );
 
-        if let Some(model) = ctx.trained_model.as_ref() {
-            std::fs::create_dir_all(
-                self.output_path
-                    .parent()
-                    .unwrap_or_else(|| std::path::Path::new(".")),
-            )
-            .context("Failed to create output directory")?;
-
-            match self.format {
-                ExportFormat::Ply => {
-                    // Write a standards-compliant ASCII PLY file whose property layout
-                    // matches the 3D Gaussian Splatting convention understood by
-                    // `crate::export::load_ply`.  Each Gaussian is represented as a
-                    // zero-initialised vertex with the full property set (position,
-                    // normals, SH DC, opacity, scale, rotation) so that a round-trip
-                    // through `load_ply` reconstructs the correct vertex count.
-                    use std::io::Write as _;
-                    let file = std::fs::File::create(&self.output_path)
-                        .context("PLY export: failed to create file")?;
-                    let mut w = std::io::BufWriter::new(file);
-                    writeln!(w, "ply").context("PLY write")?;
-                    writeln!(w, "format ascii 1.0").context("PLY write")?;
-                    writeln!(w, "comment oxigaf pipeline export").context("PLY write")?;
-                    writeln!(w, "element vertex {}", model.num_gaussians).context("PLY write")?;
-                    for prop in ["x", "y", "z", "nx", "ny", "nz"] {
-                        writeln!(w, "property float {prop}").context("PLY write")?;
-                    }
-                    // SH DC (degree-0 coefficients for R/G/B)
-                    for c in 0..3u32 {
-                        writeln!(w, "property float f_dc_{c}").context("PLY write")?;
-                    }
-                    writeln!(w, "property float opacity").context("PLY write")?;
-                    for i in 0..3u32 {
-                        writeln!(w, "property float scale_{i}").context("PLY write")?;
-                    }
-                    // Rotation stored as (w,x,y,z) in PLY convention.
-                    for i in 0..4u32 {
-                        writeln!(w, "property float rot_{i}").context("PLY write")?;
-                    }
-                    writeln!(w, "end_header").context("PLY write")?;
-                    // Zero-initialised vertex data — one row per Gaussian.
-                    // 13 float columns: x y z nx ny nz f_dc_0..2 opacity scale_0..2 rot_0..3
-                    for _ in 0..model.num_gaussians {
-                        writeln!(w, "0 0 0 0 0 0 0 0 0 0 -5 -5 -5 1 0 0 0").context("PLY write")?;
-                    }
-                    w.flush().context("PLY export: flush failed")?;
-                }
-                ExportFormat::Gltf => {
-                    // Write a minimal valid glTF 2.0 JSON skeleton that records the
-                    // Gaussian count.  A real implementation would delegate to
-                    // `crate::export::export_gltf`.
-                    let json = serde_json::to_string_pretty(&serde_json::json!({
-                        "asset": { "version": "2.0", "generator": "oxigaf-pipeline" },
-                        "extensions": {
-                            "OXIGAF_gaussians": {
-                                "num_gaussians": model.num_gaussians
-                            }
-                        }
-                    }))
-                    .context("glTF metadata serialization failed")?;
-                    std::fs::write(&self.output_path, json).context("glTF export failed")?;
-                }
-                ExportFormat::Binary => {
-                    // Binary format: write a JSON metadata placeholder so the file
-                    // is at least valid and inspectable.
-                    let json = serde_json::to_string_pretty(&serde_json::json!({
-                        "format": "oxigaf_binary",
-                        "num_gaussians": model.num_gaussians,
-                    }))
-                    .context("JSON metadata serialization failed")?;
-                    std::fs::write(&self.output_path, json)
-                        .context("Binary metadata write failed")?;
-                }
-            }
-
-            ctx.metrics
-                .insert("num_gaussians".to_string(), model.num_gaussians as f32);
-        } else {
+        let Some(model) = ctx.trained_model.as_ref() else {
             anyhow::bail!("No trained model in context");
+        };
+
+        // Delegate to the crate's real serialisers so the stage output is byte
+        // for byte the same as `oxigaf export`.
+        match self.format {
+            ExportFormat::Ply => {
+                crate::export::export_ply(model, &self.output_path).context("PLY export failed")?
+            }
+            ExportFormat::Gltf => crate::export::export_gltf(model, &self.output_path, true)
+                .context("glTF export failed")?,
+            ExportFormat::Binary => crate::export::export_safetensors(model, &self.output_path)
+                .context("safetensors export failed")?,
         }
 
+        ctx.metrics
+            .insert("num_gaussians".to_string(), model.len() as f32);
         ctx.metrics.insert("exported".to_string(), 1.0);
 
         Ok(())
@@ -478,6 +862,10 @@ impl PipelineStage for ExportStage {
         1.0
     }
 }
+
+// ---------------------------------------------------------------------------
+// Executor
+// ---------------------------------------------------------------------------
 
 /// Pipeline executor that runs stages sequentially
 pub struct PipelineExecutor {
@@ -570,7 +958,57 @@ impl Default for PipelineExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oxigaf::render::gaussian::GaussianAttributes;
     use tempfile::TempDir;
+
+    /// Build a real `n`-Gaussian model with distinguishable, non-zero data so
+    /// export round-trips assert on content rather than only on vertex count.
+    fn test_model(n: usize) -> GaussianModel {
+        let gaussians: Vec<GaussianAttributes> = (0..n)
+            .map(|i| GaussianAttributes {
+                position: [i as f32 * 0.1, i as f32 * 0.2, i as f32 * 0.3],
+                _pad0: 0.0,
+                rotation: [0.0, 0.0, 0.0, 1.0],
+                scale: [f32::ln(0.05); 3],
+                opacity: 2.0,
+            })
+            .collect();
+        GaussianModel {
+            gaussians,
+            sh_coeffs: (0..n * 3).map(|i| 0.25 + i as f32 * 0.01).collect(),
+            sh_degree: 0,
+            face_indices: vec![0u32; n],
+            barycentric: vec![[1.0_f32 / 3.0; 3]; n],
+            local_offsets: vec![[0.0_f32; 3]; n],
+            is_rigid: vec![true; n],
+        }
+    }
+
+    /// Write a minimal but valid FLAME sequence JSON, returning its path.
+    fn write_sequence_json(dir: &Path, name: &str, num_frames: usize) -> PathBuf {
+        let frames: Vec<serde_json::Value> = (0..num_frames)
+            .map(|i| {
+                let shape: Vec<f32> = vec![0.1 * i as f32, -0.2];
+                let expression: Vec<f32> = vec![0.0, 0.3];
+                let pose: Vec<f32> = vec![0.0; 15];
+                let translation: Vec<f32> = vec![0.0, 0.0, 0.0];
+                serde_json::json!({
+                    "shape": shape,
+                    "expression": expression,
+                    "pose": pose,
+                    "translation": translation,
+                })
+            })
+            .collect();
+        let doc = serde_json::json!({ "fps": 30.0, "frames": frames });
+        let path = dir.join(name);
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&doc).expect("test: serialize sequence"),
+        )
+        .expect("test: write sequence json");
+        path
+    }
 
     #[test]
     fn test_pipeline_context_creation() {
@@ -626,6 +1064,138 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    /// Regression test: `TrackingStage` must publish the loaded sequence into
+    /// the context.  It previously built a sequence and dropped it, so
+    /// `DiffusionStage` always bailed with "No FLAME sequence available".
+    #[test]
+    fn test_tracking_stage_publishes_sequence() {
+        let dir = std::env::temp_dir().join("oxigaf_stage_tracking_publish");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("test: create temp dir");
+        let params = write_sequence_json(&dir, "flame_params.json", 3);
+        let manifest = dir.join("tracking_manifest.json");
+
+        let mut stage = TrackingStage::new(params.clone(), manifest.clone());
+        let mut ctx = PipelineContext::new();
+        stage.run(&mut ctx).expect("test: tracking should succeed");
+
+        let sequence = ctx
+            .flame_sequence
+            .as_ref()
+            .expect("tracking must publish the FLAME sequence into the context");
+        assert_eq!(sequence.num_frames(), 3);
+        assert_eq!(ctx.metrics.get("tracking_frames"), Some(&3.0));
+        assert!(manifest.exists(), "tracking manifest must be written");
+        assert!((stage.progress() - 1.0).abs() < f32::EPSILON);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A directory of tracking output resolves through the candidate list.
+    #[test]
+    fn test_tracking_stage_resolves_directory() {
+        let dir = std::env::temp_dir().join("oxigaf_stage_tracking_dir");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("test: create temp dir");
+        write_sequence_json(&dir, "tracking.json", 2);
+
+        let resolved = resolve_tracking_params(&dir).expect("directory must resolve");
+        assert!(resolved.ends_with("tracking.json"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Raw footage is rejected with an explanation, not silently accepted.
+    #[test]
+    fn test_tracking_stage_rejects_raw_footage() {
+        let dir = std::env::temp_dir().join("oxigaf_stage_tracking_reject");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("test: create temp dir");
+        let clip = dir.join("clip.mp4");
+        std::fs::write(&clip, b"not a real video").expect("test: write fixture");
+
+        let err = resolve_tracking_params(&clip).expect_err("raw video must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("facial-landmark detector"),
+            "error must explain the missing asset: {msg}"
+        );
+
+        // Empty directory: also rejected.
+        let empty = dir.join("empty");
+        std::fs::create_dir_all(&empty).expect("test: create temp dir");
+        assert!(resolve_tracking_params(&empty).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `DiffusionStage` must not invent blank images when weights are absent.
+    #[test]
+    fn test_diffusion_stage_requires_weights() {
+        let dir = std::env::temp_dir().join("oxigaf_stage_diffusion_weights");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("test: create temp dir");
+        let params = write_sequence_json(&dir, "flame_params.json", 1);
+
+        let mut ctx = PipelineContext::new();
+        ctx.flame_sequence = Some(FlameSequence::from_json(&params).expect("test: load sequence"));
+
+        let mut stage = DiffusionStage::new(4, (256, 256));
+        let err = stage
+            .run(&mut ctx)
+            .expect_err("diffusion without weights must fail");
+        assert!(
+            err.to_string().contains("requires trained weights"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            ctx.generated_images.is_empty(),
+            "no placeholder images may be produced"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A view-count mismatch is reported before any weights are touched.
+    #[test]
+    fn test_diffusion_stage_validates_view_count() {
+        let dir = std::env::temp_dir().join("oxigaf_stage_diffusion_views");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("test: create temp dir");
+        let params = write_sequence_json(&dir, "flame_params.json", 1);
+
+        let mut ctx = PipelineContext::new();
+        ctx.flame_sequence = Some(FlameSequence::from_json(&params).expect("test: load sequence"));
+
+        let mut stage = DiffusionStage::new(7, (256, 256));
+        let err = stage.run(&mut ctx).expect_err("view mismatch must fail");
+        assert!(err.to_string().contains("views"), "unexpected error: {err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `TrainingStage` must refuse to run without a GPU setup instead of
+    /// sleeping and fabricating `loss = 1/(i+1)`.
+    #[test]
+    fn test_training_stage_requires_setup() {
+        let mut stage = TrainingStage::new(10);
+        let mut ctx = PipelineContext::new();
+        ctx.generated_images.push(image::RgbImage::new(4, 4));
+
+        let err = stage
+            .run(&mut ctx)
+            .expect_err("training without a GPU setup must fail");
+        assert!(
+            err.to_string().contains("with_setup"),
+            "error must name the missing setup: {err}"
+        );
+        assert!(
+            ctx.trained_model.is_none(),
+            "no placeholder model may be produced"
+        );
+        assert_eq!(ctx.metrics.get("final_loss"), None);
+    }
+
     #[test]
     fn test_export_stage() {
         let temp_dir = TempDir::new().expect("test: temp dir creation should succeed");
@@ -638,45 +1208,71 @@ mod tests {
         assert!(stage.run(&mut ctx).is_err());
 
         // Add model and retry
-        ctx.trained_model = Some(GaussianModel::new(10));
+        ctx.trained_model = Some(test_model(10));
         assert!(stage.run(&mut ctx).is_ok());
 
         // Check file was created
         assert!(output_path.exists());
     }
 
+    /// Regression test: the exported PLY must carry the model's real data.
+    ///
+    /// The stage used to emit `0 0 0 0 0 0 0 0 0 0 -5 -5 -5 1 0 0 0` per
+    /// Gaussian, so a vertex-count assertion passed while every splat sat at
+    /// the origin with zero colour.
     #[test]
-    fn test_export_stage_writes_ply() {
-        // ExportStage must produce a valid ASCII PLY that load_ply can round-trip.
+    fn test_export_stage_writes_real_gaussians() {
         let dir = std::env::temp_dir().join("oxigaf_stage_test");
         std::fs::create_dir_all(&dir).expect("test: create temp dir");
-        let out = dir.join("test_export_stage_writes_ply.ply");
+        let out = dir.join("test_export_stage_writes_real_gaussians.ply");
 
         let mut stage = ExportStage::new(ExportFormat::Ply, out.clone());
-        let model = GaussianModel::new(10);
+        let model = test_model(10);
         let mut ctx = PipelineContext::default();
         ctx.trained_model = Some(model);
 
         stage
             .run(&mut ctx)
             .expect("test: export stage should succeed");
-
         assert!(out.exists(), "PLY file should have been written");
 
-        // Round-trip through load_ply and verify vertex count.
         let loaded =
             crate::export::load_ply(&out).expect("test: load_ply should parse the written file");
         assert_eq!(loaded.len(), 10, "loaded model must have 10 Gaussians");
 
-        // Clean up
+        // Positions must round-trip — not collapse to the origin.
+        for (i, g) in loaded.gaussians.iter().enumerate() {
+            let expected = [i as f32 * 0.1, i as f32 * 0.2, i as f32 * 0.3];
+            for k in 0..3 {
+                assert!(
+                    (g.position[k] - expected[k]).abs() < 1e-4,
+                    "gaussian {i} axis {k}: got {}, expected {}",
+                    g.position[k],
+                    expected[k]
+                );
+            }
+        }
+        // Opacity and scale must survive too (the placeholder wrote 0 / -5).
+        assert!(
+            (loaded.gaussians[0].opacity - 2.0).abs() < 1e-4,
+            "opacity must round-trip, got {}",
+            loaded.gaussians[0].opacity
+        );
+        assert!(
+            (loaded.gaussians[0].scale[0] - f32::ln(0.05)).abs() < 1e-4,
+            "scale must round-trip, got {}",
+            loaded.gaussians[0].scale[0]
+        );
+        // Non-zero SH DC means the splats actually have colour.
+        assert!(
+            loaded.sh_coeffs.iter().any(|c| c.abs() > 1e-6),
+            "SH coefficients must not all be zero"
+        );
+
         let _ = std::fs::remove_file(&out);
     }
 
-    /// The output file from any `ExportStage` format must be non-empty (> 0 bytes).
-    ///
-    /// This exercises PLY, glTF, and Binary export paths with a minimal
-    /// 5-Gaussian model, asserting the output file both exists and contains
-    /// at least one byte.
+    /// Every `ExportStage` format must produce a non-empty file.
     #[test]
     fn test_export_stage_writes_nonempty_file() {
         let dir = std::env::temp_dir().join("oxigaf_stage_test_nonempty");
@@ -684,15 +1280,15 @@ mod tests {
 
         let formats: &[(ExportFormat, &str)] = &[
             (ExportFormat::Ply, "nonempty_model.ply"),
-            (ExportFormat::Gltf, "nonempty_model.gltf"),
-            (ExportFormat::Binary, "nonempty_model.bin"),
+            (ExportFormat::Gltf, "nonempty_model.glb"),
+            (ExportFormat::Binary, "nonempty_model.safetensors"),
         ];
 
         for (fmt, filename) in formats {
             let out = dir.join(filename);
             let mut stage = ExportStage::new(*fmt, out.clone());
             let mut ctx = PipelineContext::default();
-            ctx.trained_model = Some(GaussianModel::new(5));
+            ctx.trained_model = Some(test_model(5));
 
             stage
                 .run(&mut ctx)
@@ -708,6 +1304,46 @@ mod tests {
             );
 
             let _ = std::fs::remove_file(&out);
+        }
+    }
+
+    #[test]
+    fn test_image_conversion_round_trip() {
+        let mut img = image::RgbImage::new(2, 2);
+        img.put_pixel(0, 0, image::Rgb([255, 0, 0]));
+        img.put_pixel(1, 0, image::Rgb([0, 255, 0]));
+        img.put_pixel(0, 1, image::Rgb([0, 0, 255]));
+        img.put_pixel(1, 1, image::Rgb([0, 0, 0]));
+
+        let flat = rgb_to_f32(&img);
+        assert_eq!(flat.len(), 2 * 2 * 3);
+        let restored = f32_to_rgb(&flat, 2, 2).expect("test: conversion should succeed");
+        assert_eq!(restored.get_pixel(0, 0), &image::Rgb([255, 0, 0]));
+        assert_eq!(restored.get_pixel(1, 1), &image::Rgb([0, 0, 0]));
+
+        // A too-short buffer is an error, not a silently truncated image.
+        assert!(f32_to_rgb(&flat[..3], 2, 2).is_err());
+
+        // Coverage mask: only the black pixel is background.
+        let mask = coverage_mask(&img);
+        assert_eq!(mask.get_pixel(0, 0), &image::Luma([255]));
+        assert_eq!(mask.get_pixel(1, 1), &image::Luma([0]));
+    }
+
+    #[test]
+    fn test_orbit_cameras_are_evenly_spaced() {
+        let cams = orbit_cameras(4, 256, 256, 0.6);
+        assert_eq!(cams.len(), 4);
+        for cam in &cams {
+            assert_eq!(cam.width, 256);
+            assert_eq!(cam.height, 256);
+            // Camera centre is at distance `radius` from the origin.
+            let eye = -(cam.rotation.transpose() * cam.translation);
+            assert!(
+                (eye.norm() - 0.6).abs() < 1e-3,
+                "camera must sit on the orbit, got {}",
+                eye.norm()
+            );
         }
     }
 }

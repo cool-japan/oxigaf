@@ -30,11 +30,13 @@
 //! ```toml
 //! [dependencies]
 //! oxigaf = "0.1"
-//!
-//! # For GPU acceleration:
-//! # oxigaf = { version = "0.1", features = ["cuda"] }  # NVIDIA
-//! # oxigaf = { version = "0.1", features = ["metal"] } # Apple Silicon
 //! ```
+//!
+//! There is no `cuda` or `metal` Cargo feature on `oxigaf` itself. GPU
+//! acceleration for the [`render`] rasterizer is automatic (wgpu picks
+//! Vulkan/Metal/DX12 at runtime); GPU acceleration for [`diffusion`]
+//! inference is opted into by depending on `candle-core` directly and
+//! enabling its own `cuda` or `metal` feature.
 //!
 //! ### Minimal Example: Load FLAME and Generate a Mesh
 //!
@@ -106,13 +108,9 @@
 //!
 //! ## Feature Flags
 //!
-//! ### GPU Backend Features
-//!
-//! | Feature | Description |
-//! |---------|-------------|
-//! | `default` | Pure CPU inference (no CUDA/Metal dependencies) |
-//! | `cuda` | NVIDIA GPU acceleration via candle CUDA backend (requires CUDA toolkit) |
-//! | `metal` | Apple Silicon acceleration via Metal (automatic on macOS with M1/M2/M3) |
+//! GPU acceleration is not an `oxigaf` Cargo feature (there is no `cuda` or
+//! `metal` feature on this crate — see the Quick Start note above). The
+//! flags below only affect CPU-side behaviour.
 //!
 //! ### Performance Optimization Features
 //!
@@ -121,7 +119,7 @@
 //! | `simd` | SIMD-accelerated FLAME operations (requires nightly Rust) | 3-4× faster |
 //! | `parallel` | Parallel batch processing with rayon | Near-linear with cores |
 //! | `flash_attention` | Memory-efficient O(N) attention (enabled by default) | 2-4× less memory |
-//! | `mixed_precision` | FP16/BF16 inference (planned, not yet implemented) | 2× faster on GPUs |
+//! | `mixed_precision` | Switches the default `MixedPrecisionConfig::mode` to BF16 (rounding-simulation helpers only; nothing outside `oxigaf_diffusion::mixed_precision` reads this config yet, so no inference/training path is actually affected) | 2× faster on GPUs (once wired) |
 //!
 //! ### Debug Features
 //!
@@ -134,7 +132,7 @@
 //! | Feature | Enables |
 //! |---------|---------|
 //! | `full_performance` | `simd`, `parallel`, `flash_attention` |
-//! | `all_features` | All available features (except GPU backends) |
+//! | `all_features` | `simd`, `parallel`, `flash_attention`, `mixed_precision`, `gpu_debug` |
 //!
 //! ### Examples
 //!
@@ -142,14 +140,8 @@
 //! # CPU-only with all optimizations (requires nightly for SIMD)
 //! oxigaf = { version = "0.1", features = ["full_performance"] }
 //!
-//! # Apple Silicon with Metal acceleration
-//! oxigaf = { version = "0.1", features = ["metal", "parallel", "flash_attention"] }
-//!
 //! # Development with GPU debugging enabled
 //! oxigaf = { version = "0.1", features = ["gpu_debug"] }
-//!
-//! # NVIDIA GPU with all optimizations
-//! oxigaf = { version = "0.1", features = ["cuda", "full_performance"] }
 //! ```
 //!
 //! The wgpu rasterizer automatically selects the best available backend:
@@ -161,11 +153,19 @@
 //!
 //! | Component | Minimum Version | Tested Version |
 //! |-----------|-----------------|----------------|
-//! | Rust      | 1.75+           | 1.85.0         |
-//! | wgpu      | 27.x            | 27.x           |
-//! | candle    | 0.9.x           | 0.9.x          |
-//! | nalgebra  | 0.34.x          | 0.34.x         |
-//! | glam      | 0.31.x          | 0.31.x         |
+//! | Rust      | 1.85+           | 1.85.0         |
+//! | wgpu      | 30.x            | 30.x           |
+//! | candle    | 0.11.x          | 0.11.x         |
+//! | nalgebra  | 0.35.x          | 0.35.x         |
+//! | glam      | 0.33.x          | 0.33.x         |
+//!
+//! Note: the workspace declares `rust-version = "1.85"`, but at the time of
+//! writing it also calls `usize::is_multiple_of` (stabilized in Rust 1.87)
+//! from `oxigaf-bridge/src/precision.rs` and from
+//! `oxigaf-render`'s gradient-verification tests — verified to fail to
+//! compile on 1.85.0/1.86.0 and succeed on 1.87.0. Until those call sites
+//! are replaced (e.g. with `% 2 == 0` / `% 4 == 0`) or `rust-version` is
+//! raised to match, 1.87 is the true floor.
 //!
 //! ### GPU Requirements
 //!
@@ -200,7 +200,7 @@
 
 use thiserror::Error;
 
-mod pipeline;
+pub mod pipeline;
 
 /// FLAME parametric head model.
 ///
@@ -314,7 +314,7 @@ pub use pipeline::{
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```rust,no_run
 /// use oxigaf::prelude::*;
 ///
 /// fn load() -> oxigaf::Result<()> {
@@ -456,6 +456,7 @@ pub fn version() -> &'static str {
 /// ## Unified Types
 /// - [`OxigafError`] — Unified error type
 /// - [`Result`] — Type alias for `std::result::Result<T, OxigafError>`
+/// - [`ErrorContext`] — Extension trait providing `.with_ctx()` / `.with_ctx_fn()`
 pub mod prelude {
     // ---- FLAME types ----
     pub use oxigaf_flame::{
@@ -484,7 +485,8 @@ pub mod prelude {
     // ---- Unified types ----
     pub use super::{
         check_gpu, detect_best_backend, export, quick_train, render_from_file, validate_config,
-        verify_assets, ExportFormat, GpuInfo, OxigafError, PipelineBuilder, PipelineConfig, Result,
+        verify_assets, ErrorContext, ExportFormat, GpuInfo, OxigafError, PipelineBuilder,
+        PipelineConfig, Result,
     };
 }
 
@@ -602,6 +604,23 @@ mod tests {
             "lazy context".to_string()
         });
         assert!(called, "closure must be called on Err");
+    }
+
+    // Regression test for `ErrorContext` being reachable via
+    // `oxigaf::prelude::*` alone (the crate-level `with_ctx` doc example
+    // relies on exactly this). This lives in its own submodule with no
+    // `use super::*`, so it only compiles if `prelude::*` re-exports
+    // `ErrorContext` directly — it would have failed to compile before that
+    // re-export was added.
+    mod prelude_error_context_regression {
+        use crate::prelude::*;
+
+        #[test]
+        fn with_ctx_resolves_via_prelude_glob_alone() {
+            let r: std::result::Result<i32, OxigafError> = Err(OxigafError::NotInitialized);
+            let wrapped = r.with_ctx("prelude regression check");
+            assert!(matches!(wrapped, Err(OxigafError::Context { .. })));
+        }
     }
 
     #[test]

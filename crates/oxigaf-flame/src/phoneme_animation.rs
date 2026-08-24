@@ -1,8 +1,20 @@
 //! Phoneme-to-FLAME-parameter mapping and speech animation synthesis.
 //!
-//! Maps English phoneme symbols to FLAME expression and jaw parameters,
+//! Maps English phoneme symbols to FLAME jaw and expression parameters,
 //! enabling speech-driven avatar animation via viseme-based blending and
 //! coarticulation smoothing.
+//!
+//! # Calibration status
+//!
+//! Only `jaw_angle` is physically grounded: it drives the real FLAME jaw joint
+//! (`pose[6]`).  FLAME's *expression* parameters are coefficients of a learned
+//! PCA basis whose components carry no articulatory meaning, so writing lip
+//! protrusion or mouth width into individual coefficients — which
+//! [`PhonemeParams::from_viseme`] does — is an explicitly uncalibrated
+//! placeholder.  For lip-sync grounded in the FLAME basis, fit each viseme's
+//! target mesh with `blend_shape_solver::fit_expression_coefficients`, collect
+//! the vectors in a [`VisemeExpressionTargets`], and install them with
+//! [`PhonemeLibrary::apply_expression_targets`].
 //!
 //! # Quick Start
 //!
@@ -195,6 +207,79 @@ impl Viseme {
 }
 
 // ---------------------------------------------------------------------------
+// VisemeExpressionTargets
+// ---------------------------------------------------------------------------
+
+/// Per-viseme targets expressed in the FLAME expression basis.
+///
+/// FLAME expression parameters are coefficients of a learned PCA basis whose
+/// components carry no "lip protrusion" or "mouth width" semantics, so a
+/// viseme's real target has to be *fitted*: take the mesh (or measured lip
+/// landmarks) of that mouth shape, solve for its coefficients with
+/// `blend_shape_solver::fit_expression_coefficients`, and store the resulting
+/// full vector here.  Install the set with
+/// [`PhonemeLibrary::apply_expression_targets`], which replaces the placeholder
+/// vectors produced by [`PhonemeParams::from_viseme`].
+#[derive(Debug, Clone)]
+pub struct VisemeExpressionTargets {
+    targets: HashMap<Viseme, Vec<f32>>,
+    n_expression_coeffs: usize,
+}
+
+impl VisemeExpressionTargets {
+    /// Create an empty target set for `n_expression_coeffs`-long vectors.
+    #[must_use]
+    pub fn new(n_expression_coeffs: usize) -> Self {
+        Self {
+            targets: HashMap::new(),
+            n_expression_coeffs,
+        }
+    }
+
+    /// Number of expression coefficients every target carries.
+    #[inline]
+    #[must_use]
+    pub fn n_expression_coeffs(&self) -> usize {
+        self.n_expression_coeffs
+    }
+
+    /// Record the fitted coefficient vector for `viseme`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PhonemeError::ExpressionMismatch`] if `coefficients` does not
+    /// have exactly [`Self::n_expression_coeffs`] entries.
+    pub fn insert(&mut self, viseme: Viseme, coefficients: Vec<f32>) -> Result<(), PhonemeError> {
+        if coefficients.len() != self.n_expression_coeffs {
+            return Err(PhonemeError::ExpressionMismatch {
+                expected: self.n_expression_coeffs,
+                got: coefficients.len(),
+            });
+        }
+        self.targets.insert(viseme, coefficients);
+        Ok(())
+    }
+
+    /// Fitted coefficients recorded for `viseme`, if any.
+    #[must_use]
+    pub fn get(&self, viseme: &Viseme) -> Option<&[f32]> {
+        self.targets.get(viseme).map(Vec::as_slice)
+    }
+
+    /// Number of visemes with a recorded target.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.targets.len()
+    }
+
+    /// Is no target recorded yet?
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.targets.is_empty()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // PhonemeParams
 // ---------------------------------------------------------------------------
 
@@ -229,6 +314,19 @@ impl PhonemeParams {
     /// - `expr[0]` = `viseme.lip_protrusion() * intensity * 0.5`
     /// - `expr[1]` = `(viseme.mouth_width() - 1.0) * intensity * 0.3`
     /// - `expr[2..]` = `0.0`
+    ///
+    /// # Calibration warning
+    ///
+    /// Only `jaw_angle` is calibrated — it drives the real FLAME jaw joint.
+    /// The expression assignment is a **placeholder with no grounding in the
+    /// FLAME basis**: components 0 and 1 are the two highest-variance modes of
+    /// the training corpus and encode neither lip protrusion nor mouth width,
+    /// so they produce whatever deformation those modes happen to carry; the
+    /// scale factors (`0.5`, `0.3`) are likewise unmeasured.  Treat the output
+    /// as jaw-driven mouth motion, not as lip-synced animation, and prefer
+    /// [`PhonemeParams::from_viseme_calibrated`] /
+    /// [`PhonemeLibrary::apply_expression_targets`] with fitted
+    /// [`VisemeExpressionTargets`].
     #[must_use]
     pub fn from_viseme(viseme: &Viseme, n_expr: usize, intensity: f32) -> Self {
         let intensity = intensity.clamp(0.0, 1.0);
@@ -246,6 +344,37 @@ impl PhonemeParams {
             duration: 0.1,
             coarticulation: 0.05,
         }
+    }
+
+    /// Create parameters from a *calibrated* viseme target scaled by `intensity`.
+    ///
+    /// The expression vector is the fitted point in FLAME expression space for
+    /// this viseme (see [`VisemeExpressionTargets`]) scaled by `intensity`, so
+    /// no articulatory quantity is written into an arbitrary basis component.
+    /// `jaw_angle` keeps the same calibrated formula as
+    /// [`PhonemeParams::from_viseme`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PhonemeError::InvalidParam`] if `targets` has no entry for
+    /// `viseme`.
+    pub fn from_viseme_calibrated(
+        viseme: &Viseme,
+        targets: &VisemeExpressionTargets,
+        intensity: f32,
+    ) -> Result<Self, PhonemeError> {
+        let intensity = intensity.clamp(0.0, 1.0);
+        let coefficients = targets.get(viseme).ok_or_else(|| {
+            PhonemeError::InvalidParam(format!(
+                "no calibrated expression target for viseme {viseme:?}"
+            ))
+        })?;
+        Ok(Self {
+            jaw_angle: viseme.jaw_opening() * intensity * 0.3,
+            expression: coefficients.iter().map(|c| c * intensity).collect(),
+            duration: 0.1,
+            coarticulation: 0.05,
+        })
     }
 }
 
@@ -398,8 +527,18 @@ impl PhonemeLibrary {
     ///
     /// Intensity is set to `1.0` (full articulation) for all consonants and
     /// vowels, and `0.0` for silence markers.
+    ///
+    /// The jaw angles are calibrated; the expression vectors come from
+    /// [`PhonemeParams::from_viseme`] and are an uncalibrated placeholder.  Call
+    /// [`Self::apply_expression_targets`] with fitted
+    /// [`VisemeExpressionTargets`] to replace them.
     #[must_use]
     pub fn default_english(n_expression_coeffs: usize) -> Self {
+        tracing::warn!(
+            "PhonemeLibrary::default_english: expression vectors are an uncalibrated \
+             placeholder with no grounding in the FLAME expression basis (only jaw \
+             angles are calibrated); use apply_expression_targets for real lip-sync"
+        );
         let mut lib = Self::new(n_expression_coeffs);
 
         // Silence
@@ -462,6 +601,43 @@ impl PhonemeLibrary {
     #[must_use]
     pub fn n_phonemes(&self) -> usize {
         self.params.len()
+    }
+
+    /// Replace every entry's expression vector with the calibrated target for
+    /// its viseme, keeping the calibrated jaw angles and timings.
+    ///
+    /// This is the supported way to turn a placeholder library (see
+    /// [`Self::default_english`]) into one whose expression coefficients are
+    /// real points in the FLAME expression basis.
+    ///
+    /// # Errors
+    ///
+    /// - [`PhonemeError::ExpressionMismatch`] — `targets` has a different
+    ///   coefficient count than this library.
+    /// - [`PhonemeError::UnknownPhoneme`] — an entry's symbol has no viseme.
+    /// - [`PhonemeError::InvalidParam`] — a required viseme has no target.
+    pub fn apply_expression_targets(
+        &mut self,
+        targets: &VisemeExpressionTargets,
+    ) -> Result<(), PhonemeError> {
+        if targets.n_expression_coeffs() != self.n_expression_coeffs {
+            return Err(PhonemeError::ExpressionMismatch {
+                expected: self.n_expression_coeffs,
+                got: targets.n_expression_coeffs(),
+            });
+        }
+        for (phoneme, params) in &mut self.params {
+            let viseme = Viseme::from_phoneme(phoneme)
+                .ok_or_else(|| PhonemeError::UnknownPhoneme(phoneme.clone()))?;
+            let coefficients = targets.get(&viseme).ok_or_else(|| {
+                PhonemeError::InvalidParam(format!(
+                    "no calibrated expression target for viseme {viseme:?}"
+                ))
+            })?;
+            params.expression.clear();
+            params.expression.extend_from_slice(coefficients);
+        }
+        Ok(())
     }
 }
 
@@ -746,9 +922,18 @@ fn smooth_with_gaussian(keyframes: &[PhonemeKeyframe], sigma: f32) -> Vec<Phonem
 
 /// Generate subtle breathing (idle) animation without any phoneme input.
 ///
-/// Uses a deterministic sinusoidal model: jaw oscillates at `breath_rate`
-/// breaths per minute, and a secondary component adds micro-expression
-/// variation on expression coefficients.
+/// Uses a deterministic sinusoidal model: the jaw completes exactly one
+/// open/close cycle per breath, i.e. `breath_rate` cycles per minute, and a
+/// secondary component adds micro-expression variation on expression
+/// coefficients.
+///
+/// The jaw curve is `sin²(φ/2) = (1 - cos φ) / 2` with `φ = 2π · f · t` and
+/// `f = breath_rate / 60`.  Halving the phase inside the square keeps the jaw
+/// non-negative (it only ever opens) *without* halving the period — squaring
+/// the full-phase sine would double the visible breathing rate.
+///
+/// `expression[0]` follows the raw `sin φ` fundamental and `expression[1]`
+/// carries the genuine second harmonic `sin 2φ`.
 ///
 /// `amplitude` scales the overall magnitude (0.0–1.0 recommended).
 #[must_use]
@@ -773,15 +958,17 @@ pub fn generate_breath_animation(
         let t = frame_idx as f32 / sample_rate;
         let phase = 2.0 * PI * freq * t;
         let breath = phase.sin();
-        // Use sin^2 so jaw only opens (never negative)
-        let jaw_angle = amplitude * breath * breath * 0.05;
+        // Half-phase squared sine: non-negative (the jaw only opens) *and*
+        // period-preserving, so the jaw cycles at `breath_rate` per minute.
+        let half_breath = (0.5 * phase).sin();
+        let jaw_angle = amplitude * half_breath * half_breath * 0.05;
 
         let mut expression = vec![0.0_f32; n_expr];
         // Subtle chest/throat expansion on expr[0]
         if n_expr >= 1 {
             expression[0] = amplitude * breath * 0.01;
         }
-        // Second harmonic on expr[1] for realism
+        // Second harmonic on expr[1] for realism (2x the jaw's fundamental)
         if n_expr >= 2 {
             expression[1] = amplitude * (2.0 * phase).sin() * 0.005;
         }
@@ -975,16 +1162,9 @@ pub fn format_phoneme_clip(clip: &PhonemeClip) -> String {
 mod tests {
     use super::*;
 
-    // --- Viseme::jaw_opening ---
-
-    #[test]
-    fn test_jaw_opening_silence_is_zero() {
-        assert_eq!(Viseme::Silence.jaw_opening(), 0.0);
-    }
-
-    #[test]
-    fn test_jaw_opening_open_vowel_is_highest() {
-        let max = [
+    /// Every viseme variant, for exhaustive property checks.
+    fn all_visemes() -> [Viseme; 12] {
+        [
             Viseme::Silence,
             Viseme::Bilabial,
             Viseme::Labiodental,
@@ -998,29 +1178,27 @@ mod tests {
             Viseme::ClosedVowel,
             Viseme::RoundedVowel,
         ]
-        .iter()
-        .map(super::Viseme::jaw_opening)
-        .fold(0.0_f32, f32::max);
+    }
+
+    // --- Viseme::jaw_opening ---
+
+    #[test]
+    fn test_jaw_opening_silence_is_zero() {
+        assert_eq!(Viseme::Silence.jaw_opening(), 0.0);
+    }
+
+    #[test]
+    fn test_jaw_opening_open_vowel_is_highest() {
+        let max = all_visemes()
+            .iter()
+            .map(super::Viseme::jaw_opening)
+            .fold(0.0_f32, f32::max);
         assert_eq!(max, Viseme::OpenVowel.jaw_opening());
     }
 
     #[test]
     fn test_jaw_opening_all_variants_in_range() {
-        let variants = [
-            Viseme::Silence,
-            Viseme::Bilabial,
-            Viseme::Labiodental,
-            Viseme::Dental,
-            Viseme::Alveolar,
-            Viseme::Palatal,
-            Viseme::Velar,
-            Viseme::Glottal,
-            Viseme::OpenVowel,
-            Viseme::MidVowel,
-            Viseme::ClosedVowel,
-            Viseme::RoundedVowel,
-        ];
-        for v in &variants {
+        for v in &all_visemes() {
             let o = v.jaw_opening();
             assert!((0.0..=1.0).contains(&o), "{v:?}: jaw_opening={o}");
         }
@@ -1040,21 +1218,7 @@ mod tests {
 
     #[test]
     fn test_lip_protrusion_all_finite() {
-        let variants = [
-            Viseme::Silence,
-            Viseme::Bilabial,
-            Viseme::Labiodental,
-            Viseme::Dental,
-            Viseme::Alveolar,
-            Viseme::Palatal,
-            Viseme::Velar,
-            Viseme::Glottal,
-            Viseme::OpenVowel,
-            Viseme::MidVowel,
-            Viseme::ClosedVowel,
-            Viseme::RoundedVowel,
-        ];
-        for v in &variants {
+        for v in &all_visemes() {
             assert!(
                 v.lip_protrusion().is_finite(),
                 "{v:?}: lip_protrusion is not finite"
@@ -1076,21 +1240,7 @@ mod tests {
 
     #[test]
     fn test_mouth_width_all_positive() {
-        let variants = [
-            Viseme::Silence,
-            Viseme::Bilabial,
-            Viseme::Labiodental,
-            Viseme::Dental,
-            Viseme::Alveolar,
-            Viseme::Palatal,
-            Viseme::Velar,
-            Viseme::Glottal,
-            Viseme::OpenVowel,
-            Viseme::MidVowel,
-            Viseme::ClosedVowel,
-            Viseme::RoundedVowel,
-        ];
-        for v in &variants {
+        for v in &all_visemes() {
             assert!(
                 v.mouth_width() > 0.0,
                 "{:?}: mouth_width={} is not positive",
@@ -1240,6 +1390,74 @@ mod tests {
     fn test_from_viseme_expression_length() {
         let p = PhonemeParams::from_viseme(&Viseme::MidVowel, 8, 1.0);
         assert_eq!(p.expression.len(), 8);
+    }
+
+    // --- VisemeExpressionTargets (calibrated expression mapping) ---
+
+    #[test]
+    fn test_viseme_targets_reject_wrong_length() {
+        let mut targets = VisemeExpressionTargets::new(4);
+        assert!(targets.is_empty());
+        assert!(matches!(
+            targets.insert(Viseme::Silence, vec![0.0; 3]),
+            Err(PhonemeError::ExpressionMismatch {
+                expected: 4,
+                got: 3
+            })
+        ));
+        let mut lib = PhonemeLibrary::default_english(6);
+        assert!(matches!(
+            lib.apply_expression_targets(&targets),
+            Err(PhonemeError::ExpressionMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn test_from_viseme_calibrated_uses_fitted_vector() {
+        let mut targets = VisemeExpressionTargets::new(3);
+        targets
+            .insert(Viseme::OpenVowel, vec![0.4, -0.2, 0.1])
+            .expect("insert ok");
+        let p = PhonemeParams::from_viseme_calibrated(&Viseme::OpenVowel, &targets, 0.5)
+            .expect("calibrated params");
+        assert_eq!(p.expression.len(), 3);
+        assert!((p.expression[0] - 0.2).abs() < 1e-6, "{:?}", p.expression);
+        assert!((p.expression[1] + 0.1).abs() < 1e-6, "{:?}", p.expression);
+        assert!(p.jaw_angle > 0.0);
+        // A viseme without a fitted target is reported, never silently faked.
+        assert!(matches!(
+            PhonemeParams::from_viseme_calibrated(&Viseme::Bilabial, &targets, 1.0),
+            Err(PhonemeError::InvalidParam(_))
+        ));
+    }
+
+    #[test]
+    fn test_apply_expression_targets_replaces_placeholder() {
+        // The placeholder mapping writes lip/mouth quantities into expression
+        // components 0 and 1, which carry no such meaning in the FLAME PCA
+        // basis.  Fitted targets replace the whole vector instead.
+        let n = 6;
+        let mut targets = VisemeExpressionTargets::new(n);
+        for (i, viseme) in all_visemes().into_iter().enumerate() {
+            targets
+                .insert(viseme, vec![i as f32 * 0.1; n])
+                .expect("insert ok");
+        }
+        assert_eq!(targets.len(), 12);
+
+        let mut lib = PhonemeLibrary::default_english(n);
+        let placeholder = lib.get("ow").expect("ow present").expression.clone();
+        lib.apply_expression_targets(&targets).expect("apply ok");
+
+        let expected = targets
+            .get(&Viseme::RoundedVowel)
+            .expect("rounded vowel target")
+            .to_vec();
+        let updated = lib.get("ow").expect("ow present");
+        assert_eq!(updated.expression, expected);
+        assert_ne!(updated.expression, placeholder);
+        // Jaw angles stay calibrated.
+        assert!(updated.jaw_angle > 0.0);
     }
 
     // --- PhonemeLibrary ---
@@ -1494,6 +1712,27 @@ mod tests {
             assert!(kf.jaw_angle >= -1e-6, "jaw_angle should be non-negative");
             assert!(kf.jaw_angle < 1.0, "jaw_angle too large");
         }
+    }
+
+    #[test]
+    fn test_breath_animation_jaw_period_matches_breath_rate() {
+        // 12 breaths/min = 0.2 Hz → one full jaw cycle every 5 s: the jaw is
+        // fully open at t = 2.5 s (frame 75) and closed again at t = 5.0 s
+        // (frame 150).  The previous `sin²(2πft)` form ran at twice the
+        // documented rate and was ~0 at t = 2.5 s.
+        let kfs = generate_breath_animation(6.0, 12.0, 4, 1.0);
+        assert!(kfs.len() > 150, "expected >150 frames, got {}", kfs.len());
+        assert!(kfs[0].jaw_angle.abs() < 1e-6, "jaw should start closed");
+        let peak = kfs[75].jaw_angle;
+        let trough = kfs[150].jaw_angle;
+        assert!(
+            (peak - 0.05).abs() < 1e-4,
+            "jaw should be fully open at t = 2.5 s, got {peak}"
+        );
+        assert!(
+            trough.abs() < 1e-4,
+            "jaw should be closed again at t = 5.0 s, got {trough}"
+        );
     }
 
     #[test]

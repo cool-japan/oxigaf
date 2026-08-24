@@ -2,7 +2,8 @@
 //!
 //! Provides the `setup` command implementation: downloads required model weights
 //! (FLAME, diffusion U-Net, VAE, CLIP) into a local cache directory and
-//! verifies file integrity by size.
+//! verifies file integrity — via SHA-256 when a checksum has been
+//! published for the asset, otherwise via a size-floor sanity check.
 
 use std::path::{Path, PathBuf};
 
@@ -16,7 +17,6 @@ use crate::verbosity::Verbosity;
 // ---------------------------------------------------------------------------
 
 /// Metadata for a single downloadable model asset.
-#[allow(dead_code)]
 struct Asset {
     /// Human-readable name shown in progress output.
     name: &'static str,
@@ -24,11 +24,17 @@ struct Asset {
     url: &'static str,
     /// Filename within the cache directory.
     filename: &'static str,
-    /// Expected file size in bytes (used for progress reporting and simple
-    /// integrity checks). Set to 0 to skip the size check.
+    /// Expected file size in bytes (used for progress reporting and, when
+    /// `sha256` is empty, as a size-floor sanity check). Set to 0 to skip
+    /// the size check.
     expected_bytes: u64,
-    /// Optional SHA-256 hex digest. Left empty for now — a future release will
-    /// add checksums for all official model bundles.
+    /// SHA-256 hex digest of the published artifact, or empty when no
+    /// artifact has been published yet. When empty, `setup_cache` treats
+    /// this asset as unpublished and fails fast (see the `ASSETS` doc)
+    /// instead of attempting a download that is known to fail; once
+    /// populated, downloads for that asset flow through the normal
+    /// `download_file` → `finalize_download` path and are verified exactly
+    /// via SHA-256 rather than the size-floor heuristic.
     sha256: &'static str,
 }
 
@@ -105,78 +111,33 @@ impl HfModelSource {
         self
     }
 
-    /// Download the model from HuggingFace Hub.
-    ///
-    /// # Arguments
-    ///
-    /// * `token` - Optional HuggingFace authentication token for private models
-    ///
-    /// # Returns
-    ///
-    /// The path to the downloaded model file in the HuggingFace cache directory.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - The API client cannot be initialized
-    /// - The repository or file is not found
-    /// - Network errors occur during download
-    /// - Authentication fails for private models
-    #[allow(dead_code)]
-    pub fn download(&self, token: Option<&str>) -> Result<PathBuf> {
-        use hf_hub::api::sync::ApiBuilder;
-
-        println!("📥 Downloading from HuggingFace Hub: {}", self.repo_id);
-        if let Some(ref rev) = self.revision {
-            println!("   Revision: {}", rev);
-        }
-        println!("   File: {}", self.filename);
-
-        // Build API client with optional token
-        let mut api_builder = ApiBuilder::new();
-
-        if let Some(token_str) = token {
-            api_builder = api_builder.with_token(Some(token_str.to_string()));
-        }
-
-        let api = api_builder
-            .build()
-            .context("Failed to initialize HuggingFace Hub API client")?;
-
-        // Create Repo with revision
-        use hf_hub::{Repo, RepoType};
-        let repo_obj = if let Some(ref rev) = self.revision {
-            Repo::with_revision(self.repo_id.clone(), RepoType::Model, rev.clone())
-        } else {
-            Repo::new(self.repo_id.clone(), RepoType::Model)
-        };
-
-        // Get the repository handle from the API
-        let repo = api.repo(repo_obj);
-
-        // Download the file (hf-hub handles caching and resumable downloads)
-        let file_path = repo.get(&self.filename).with_context(|| {
-            format!(
-                "Failed to download '{}' from repository '{}'{}",
-                self.filename,
-                self.repo_id,
-                self.revision
-                    .as_ref()
-                    .map(|r| format!(" (revision: {})", r))
-                    .unwrap_or_default()
-            )
-        })?;
-
-        println!("✓ Downloaded to: {}", file_path.display());
-
-        Ok(file_path)
-    }
+    // Note: a `download` method used to live here as a thin(-ish) wrapper
+    // around HuggingFace Hub's API. It was never called (the CLI always
+    // goes through the free function `download_with_progress` instead),
+    // duplicated that function's logic almost line for line, and printed
+    // unconditionally regardless of verbosity/json-mode — so it was deleted
+    // rather than kept as unreachable, buggy dead code. Use
+    // `download_with_progress(&source.repo_id, &source.filename,
+    // source.revision.as_deref(), token, verbosity)` instead.
 }
 
 /// Placeholder asset manifest.
 ///
-/// The URLs below point at the project's GitHub releases page. Replace them
-/// with real artifact URLs once the model weights are published.
+/// The URLs below point at the project's GitHub releases page, but the
+/// referenced release artifacts do not exist yet (verified: they 404) and
+/// every `sha256` is empty. `setup_cache` treats an empty `sha256` as "this
+/// asset has not been published" and fails fast with a message pointing at
+/// `oxigaf setup --from-hub`, rather than attempting a download that is
+/// known to fail.
+///
+/// Once a real artifact is published: replace its `url` with the real
+/// download URL, fill in `sha256` with the file's real SHA-256 digest (not
+/// an estimate — `expected_bytes` is only ever used as a size *floor* when
+/// no checksum is available, never as an exact match, since it is a rough
+/// estimate), and the fail-fast branch for that entry stops firing
+/// automatically: `setup_cache` will download and cryptographically verify
+/// it through the normal `download_file` → `finalize_download` path like
+/// any other asset.
 static ASSETS: &[Asset] = &[
     Asset {
         name: "FLAME 2023 Head Model",
@@ -215,10 +176,18 @@ static ASSETS: &[Asset] = &[
 /// Ensure all required model assets are present in `cache_dir`.
 ///
 /// For each asset:
-/// 1. If the file already exists (and has a reasonable size), skip it.
-/// 2. Otherwise, attempt to download it via `curl` (or `wget` as a fallback).
+/// 1. If the file already exists and passes verification (SHA-256 when
+///    published, otherwise a size-floor sanity check), skip it.
+/// 2. If it has no published checksum yet (an unpublished placeholder entry
+///    — see the `ASSETS` doc), fail fast with a message pointing at
+///    `oxigaf setup --from-hub` instead of attempting a download known to
+///    fail.
+/// 3. Otherwise, download it (via `curl`, or `wget` as a fallback) to a
+///    `.part` staging file, verify it, and only then make it visible at its
+///    final path.
 ///
-/// This function prints user-facing progress directly to stdout.
+/// This function prints user-facing progress directly to stdout (suppressed
+/// when `json_mode` is set).
 pub fn setup_cache(cache_dir: &Path, verbosity: Verbosity, json_mode: bool) -> Result<()> {
     let cache_dir = ensure_cache_dir(cache_dir)?;
 
@@ -236,7 +205,7 @@ pub fn setup_cache(cache_dir: &Path, verbosity: Verbosity, json_mode: bool) -> R
     for asset in ASSETS {
         let dest = cache_dir.join(asset.filename);
 
-        if is_cached(&dest, asset.expected_bytes) {
+        if is_cached(&dest, asset.expected_bytes, asset.sha256) {
             if !json_mode {
                 println!("  ✓  {} (cached)", asset.name);
             }
@@ -244,11 +213,30 @@ pub fn setup_cache(cache_dir: &Path, verbosity: Verbosity, json_mode: bool) -> R
             continue;
         }
 
+        if asset.sha256.is_empty() {
+            anyhow::bail!(
+                "{} is not yet published (no release artifact or checksum is \
+                 available for it). Try `oxigaf setup --from-hub <org/repo>` to \
+                 fetch model weights from HuggingFace Hub instead, or place \
+                 `{}` in {} manually.",
+                asset.name,
+                asset.filename,
+                cache_dir.display()
+            );
+        }
+
         if !json_mode {
             println!("  ⬇  Downloading {} …", asset.name);
         }
-        download_file(asset.url, &dest, asset.expected_bytes, verbosity)
-            .with_context(|| format!("Failed to download {}", asset.name))?;
+        download_file(
+            asset.url,
+            &dest,
+            asset.expected_bytes,
+            asset.sha256,
+            verbosity,
+            json_mode,
+        )
+        .with_context(|| format!("Failed to download {}", asset.name))?;
         downloaded += 1;
         downloaded_assets.push(dest.clone());
     }
@@ -424,33 +412,163 @@ fn ensure_cache_dir(cache_dir: &Path) -> Result<PathBuf> {
     Ok(expanded)
 }
 
-/// Check whether a file exists and looks complete (non-zero, at least 90% of
-/// the expected size).
-fn is_cached(path: &Path, expected_bytes: u64) -> bool {
-    match std::fs::metadata(path) {
-        Ok(meta) => {
-            let size = meta.len();
-            if expected_bytes == 0 {
-                size > 0
-            } else {
-                // Accept if within 90% — compressed archives may vary slightly.
-                size >= expected_bytes * 9 / 10
-            }
-        }
-        Err(_) => false,
+/// Compute the lowercase-hex SHA-256 digest of a file's contents.
+fn sha256_hex(path: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+
+    let data = std::fs::read(path)
+        .with_context(|| format!("Failed to read file for checksum: {}", path.display()))?;
+    let hash = Sha256::digest(&data);
+    let mut checksum = String::with_capacity(hash.len() * 2);
+    for byte in hash {
+        // Writing a byte to a `String` is infallible, so the result is discarded.
+        let _ = write!(checksum, "{byte:02x}");
+    }
+    Ok(checksum)
+}
+
+/// Check whether a file exists and is verified complete.
+///
+/// If `expected_sha256` is non-empty, this recomputes the file's SHA-256
+/// digest and requires an exact (case-insensitive) match — the
+/// authoritative check. Otherwise (no published checksum yet) this falls
+/// back to a size floor: the file must be at least 90% of `expected_bytes`
+/// (compressed archives can vary slightly, and `expected_bytes` is only an
+/// estimate — not the true byte count — so exact equality is not
+/// meaningful here).
+///
+/// This size floor alone is a weak integrity signal (it cannot catch
+/// corruption of a similar length). The actual guarantee against a
+/// truncated or interrupted download being mistaken for a complete, cached
+/// file comes from `download_file`/`finalize_download`, which only ever
+/// renames a `.part` staging file to `path` after the transfer completed
+/// successfully and (when a checksum is available) passed verification.
+fn is_cached(path: &Path, expected_bytes: u64, expected_sha256: &str) -> bool {
+    let meta = match std::fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(_) => return false,
+    };
+    if !expected_sha256.is_empty() {
+        return sha256_hex(path)
+            .map(|digest| digest.eq_ignore_ascii_case(expected_sha256))
+            .unwrap_or(false);
+    }
+    if expected_bytes == 0 {
+        meta.len() > 0
+    } else {
+        meta.len() >= expected_bytes * 9 / 10
     }
 }
 
-/// Download a file from `url` to `dest` using `curl` or `wget`.
+/// Verify a downloaded `.part` staging file and, on success, rename it to
+/// its final `dest` path. On failure, the staging file is removed and an
+/// error is returned — `dest` is only ever created by the rename on the
+/// success path, so a caller that sees `Ok(())` knows the file at `dest` is
+/// verified and a caller that sees `Err` knows no file was left at `dest`.
 ///
-/// A progress bar is shown via `indicatif` while the download runs.
-fn download_file(url: &str, dest: &Path, expected_bytes: u64, verbosity: Verbosity) -> Result<()> {
+/// When `expected_sha256` is non-empty the downloaded bytes must hash to it
+/// exactly. Otherwise, when `expected_bytes > 0`, the file must be at least
+/// that many bytes (a truncated-transfer sanity check, not full integrity
+/// verification — see [`is_cached`]).
+fn finalize_download(
+    part_path: &Path,
+    dest: &Path,
+    expected_bytes: u64,
+    expected_sha256: &str,
+) -> Result<()> {
+    if !expected_sha256.is_empty() {
+        let digest = sha256_hex(part_path)?;
+        if !digest.eq_ignore_ascii_case(expected_sha256) {
+            let _ = std::fs::remove_file(part_path);
+            anyhow::bail!(
+                "Checksum mismatch for {}: expected {expected_sha256}, got {digest}",
+                dest.display()
+            );
+        }
+    } else if expected_bytes > 0 {
+        let actual = std::fs::metadata(part_path).map(|m| m.len()).unwrap_or(0);
+        if actual < expected_bytes {
+            let _ = std::fs::remove_file(part_path);
+            anyhow::bail!(
+                "Downloaded file for {} is smaller than expected ({actual} < \
+                 {expected_bytes} bytes); the transfer may have been truncated",
+                dest.display()
+            );
+        }
+    }
+
+    std::fs::rename(part_path, dest)
+        .with_context(|| format!("Failed to finalize download at {}", dest.display()))?;
+    Ok(())
+}
+
+/// Spawn `program` with `args` and poll `part_path`'s growing size to drive
+/// real progress-bar updates while it runs, instead of jumping straight to
+/// 100% only after the process exits.
+///
+/// Returns `None` if `program` could not be spawned at all (e.g. not
+/// installed), or `Some(true/false)` for whether it exited successfully.
+fn run_download_command<I, S>(
+    program: &str,
+    args: I,
+    pb: &indicatif::ProgressBar,
+    part_path: &Path,
+    expected_bytes: u64,
+) -> Option<bool>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    let mut child = std::process::Command::new(program)
+        .args(args)
+        .spawn()
+        .ok()?;
+    loop {
+        if expected_bytes > 0 {
+            if let Ok(meta) = std::fs::metadata(part_path) {
+                pb.set_position(meta.len().min(expected_bytes));
+            }
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status.success()),
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(150)),
+            Err(_) => return Some(false),
+        }
+    }
+}
+
+/// Download a file from `url` to `dest` using `curl` or `wget`, verifying
+/// its integrity before it becomes visible at `dest` (see
+/// [`finalize_download`]).
+///
+/// A progress bar is shown via `indicatif` while the download runs; its
+/// position is refreshed by polling the growing `.part` staging file's size
+/// so it reflects real transfer progress. Human-readable status lines are
+/// suppressed when `json_mode` is set, so stdout stays valid JSON-only.
+fn download_file(
+    url: &str,
+    dest: &Path,
+    expected_bytes: u64,
+    expected_sha256: &str,
+    verbosity: Verbosity,
+    json_mode: bool,
+) -> Result<()> {
     // Ensure parent directory exists.
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
-    let dest_str = dest.to_string_lossy().to_string();
+    let mut part_name = dest
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    part_name.push_str(".part");
+    let part_path = dest.with_file_name(part_name);
+    // Remove any stale partial file from a previous interrupted run so its
+    // size can't be misread as progress from this attempt.
+    let _ = std::fs::remove_file(&part_path);
+    let part_str = part_path.to_string_lossy().to_string();
 
     // Progress bar (indeterminate or sized).
     let pb = if expected_bytes > 0 {
@@ -459,53 +577,76 @@ fn download_file(url: &str, dest: &Path, expected_bytes: u64, verbosity: Verbosi
         progress::spinner("Downloading...", verbosity)
     };
 
-    // Try curl first (most common on Linux / macOS).
-    let curl_result = std::process::Command::new("curl")
-        .args([
+    // Try curl first (most common on Linux / macOS), falling back to wget.
+    let (success, binary_missing) = match run_download_command(
+        "curl",
+        [
             "--fail",
             "--location",
             "--output",
-            &dest_str,
+            part_str.as_str(),
             "--silent",
             "--show-error",
             url,
-        ])
-        .status();
-
-    let success = match curl_result {
-        Ok(status) if status.success() => true,
-        _ => {
-            // Fall back to wget.
-            tracing::debug!("curl not available or failed, trying wget");
-            let wget_result = std::process::Command::new("wget")
-                .args(["--quiet", "--output-document", &dest_str, url])
-                .status();
-
-            matches!(wget_result, Ok(status) if status.success())
+        ],
+        &pb,
+        &part_path,
+        expected_bytes,
+    ) {
+        Some(ok) => (ok, false),
+        None => {
+            tracing::debug!("curl not available, trying wget");
+            match run_download_command(
+                "wget",
+                ["--quiet", "--output-document", part_str.as_str(), url],
+                &pb,
+                &part_path,
+                expected_bytes,
+            ) {
+                Some(ok) => (ok, false),
+                None => (false, true),
+            }
         }
     };
 
-    if success {
-        // Update progress bar to completion.
-        if expected_bytes > 0 {
-            if let Ok(meta) = std::fs::metadata(dest) {
-                pb.set_position(meta.len());
-            }
-        }
-        pb.finish_and_clear();
-        println!("     ✓  Saved to {}", dest.display());
-        Ok(())
-    } else {
+    if !success {
         pb.abandon();
-        // Clean up partial download.
-        let _ = std::fs::remove_file(dest);
+        let _ = std::fs::remove_file(&part_path);
+        let dest_str = dest.to_string_lossy();
+        if binary_missing {
+            anyhow::bail!(
+                "Download failed: neither `curl` nor `wget` is available on PATH. \
+                 Please install one of them, or download manually:\n\
+                 \n\
+                 \x20  URL:  {url}\n\
+                 \x20  Save: {dest_str}\n"
+            )
+        }
         anyhow::bail!(
-            "Download failed. Please install `curl` or `wget`, or download manually:\n\
+            "Download failed (curl/wget exited with an error — the URL may be \
+             unreachable or returned a non-success HTTP status). Please verify \
+             the URL, or download manually:\n\
              \n\
              \x20  URL:  {url}\n\
              \x20  Save: {dest_str}\n"
         )
     }
+
+    if let Err(e) = finalize_download(&part_path, dest, expected_bytes, expected_sha256) {
+        pb.abandon();
+        return Err(e);
+    }
+
+    if expected_bytes > 0 {
+        if let Ok(meta) = std::fs::metadata(dest) {
+            pb.set_position(meta.len());
+        }
+    }
+    pb.finish_and_clear();
+    if !json_mode {
+        println!("     ✓  Saved to {}", dest.display());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -528,5 +669,152 @@ mod tests {
         let paths = expected_asset_paths(&cache_path);
         assert_eq!(paths.len(), ASSETS.len());
         assert!(paths[0].ends_with("flame2023.tar.gz"));
+    }
+
+    #[test]
+    fn setup_cache_fails_fast_for_unpublished_assets() {
+        // Every entry in ASSETS currently has an empty sha256, so setup_cache
+        // must fail immediately (no network attempt) with an actionable
+        // message rather than trying — and failing on — a doomed download.
+        let cache_path = std::env::temp_dir().join("oxigaf_test_setup_unpublished");
+        let _ = std::fs::remove_dir_all(&cache_path);
+
+        let result = setup_cache(&cache_path, Verbosity::Quiet, false);
+        assert!(result.is_err());
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            msg.contains("--from-hub") || msg.contains("not yet published"),
+            "unexpected message: {msg}"
+        );
+
+        let _ = std::fs::remove_dir_all(&cache_path);
+    }
+
+    #[test]
+    fn is_cached_missing_file_is_false() {
+        let path = std::env::temp_dir().join("oxigaf_test_is_cached_missing.bin");
+        let _ = std::fs::remove_file(&path);
+        assert!(!is_cached(&path, 100, ""));
+    }
+
+    #[test]
+    fn is_cached_size_floor_without_checksum() {
+        let path = std::env::temp_dir().join("oxigaf_test_is_cached_size.bin");
+        std::fs::write(&path, vec![0u8; 100]).expect("write test file");
+
+        assert!(
+            is_cached(&path, 100, ""),
+            "exact size should pass the floor"
+        );
+        assert!(is_cached(&path, 50, ""), "larger-than-required should pass");
+        assert!(
+            is_cached(&path, 105, ""),
+            "within-90%-tolerance should still pass (100 >= 105*9/10=94)"
+        );
+        assert!(
+            !is_cached(&path, 200, ""),
+            "well below the floor should fail"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn is_cached_checksum_exact_match_required() {
+        let path = std::env::temp_dir().join("oxigaf_test_is_cached_checksum.bin");
+        std::fs::write(&path, b"hello world").expect("write test file");
+        let digest = sha256_hex(&path).expect("compute checksum");
+
+        assert!(is_cached(&path, 0, &digest));
+        assert!(
+            is_cached(&path, 0, &digest.to_uppercase()),
+            "match should be case-insensitive"
+        );
+        assert!(!is_cached(
+            &path,
+            0,
+            "0000000000000000000000000000000000000000000000000000000000000000"
+        ));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn finalize_download_renames_on_success() {
+        let part = std::env::temp_dir().join("oxigaf_test_finalize_ok.part");
+        let dest = std::env::temp_dir().join("oxigaf_test_finalize_ok.bin");
+        let _ = std::fs::remove_file(&part);
+        let _ = std::fs::remove_file(&dest);
+        std::fs::write(&part, vec![1u8; 10]).expect("write part file");
+
+        finalize_download(&part, &dest, 10, "").expect("finalize should succeed");
+        assert!(dest.exists());
+        assert!(!part.exists());
+
+        let _ = std::fs::remove_file(&dest);
+    }
+
+    #[test]
+    fn finalize_download_rejects_truncated_file_without_checksum() {
+        let part = std::env::temp_dir().join("oxigaf_test_finalize_short.part");
+        let dest = std::env::temp_dir().join("oxigaf_test_finalize_short.bin");
+        let _ = std::fs::remove_file(&part);
+        let _ = std::fs::remove_file(&dest);
+        std::fs::write(&part, vec![1u8; 5]).expect("write part file");
+
+        let result = finalize_download(&part, &dest, 10, "");
+        assert!(result.is_err());
+        assert!(
+            !dest.exists(),
+            "truncated file must not be promoted to dest"
+        );
+        assert!(!part.exists(), "part file should be cleaned up on failure");
+    }
+
+    #[test]
+    fn finalize_download_rejects_checksum_mismatch() {
+        let part = std::env::temp_dir().join("oxigaf_test_finalize_badsum.part");
+        let dest = std::env::temp_dir().join("oxigaf_test_finalize_badsum.bin");
+        let _ = std::fs::remove_file(&part);
+        let _ = std::fs::remove_file(&dest);
+        std::fs::write(&part, b"hello world").expect("write part file");
+
+        let result = finalize_download(
+            &part,
+            &dest,
+            0,
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        );
+        assert!(result.is_err());
+        assert!(!dest.exists());
+        assert!(!part.exists());
+    }
+
+    #[test]
+    fn finalize_download_accepts_valid_checksum() {
+        let part = std::env::temp_dir().join("oxigaf_test_finalize_goodsum.part");
+        let dest = std::env::temp_dir().join("oxigaf_test_finalize_goodsum.bin");
+        let _ = std::fs::remove_file(&part);
+        let _ = std::fs::remove_file(&dest);
+        std::fs::write(&part, b"hello world").expect("write part file");
+        let digest = sha256_hex(&part).expect("compute checksum");
+
+        finalize_download(&part, &dest, 0, &digest).expect("finalize should succeed");
+        assert!(dest.exists());
+
+        let _ = std::fs::remove_file(&dest);
+    }
+
+    #[test]
+    fn sha256_hex_is_deterministic_and_matches_known_vector() {
+        let path = std::env::temp_dir().join("oxigaf_test_sha256_known.bin");
+        std::fs::write(&path, b"hello world").expect("write test file");
+        let digest = sha256_hex(&path).expect("compute checksum");
+        // Known SHA-256("hello world")
+        assert_eq!(
+            digest,
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }

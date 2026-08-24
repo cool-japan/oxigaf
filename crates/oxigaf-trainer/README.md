@@ -24,93 +24,142 @@ oxigaf-trainer = "0.1"
 
 ## Usage
 
+The examples below use `oxigaf-render` (for `RasterConfig`), `oxigaf-flame`
+(for FLAME mesh loading), `wgpu`, `rand`, and `pollster = "1"` directly —
+add them to your own `[dependencies]` to run the snippets as-is (any async
+executor works in place of `pollster`).
+
 ### Basic Training Loop
 
 ```rust
-use oxigaf_trainer::{Trainer, TrainingConfig, OptimizerConfig, LossConfig};
-use oxigaf::prelude::*;
+use oxigaf_render::RasterConfig;
+use oxigaf_trainer::init::GaussianInitializer;
+use oxigaf_trainer::{LossConfig, OptimizerConfig, Trainer, TrainingConfig};
+use rand::SeedableRng;
 
 fn main() -> Result<(), oxigaf_trainer::TrainerError> {
-    // Configure training
+    pollster::block_on(run())
+}
+
+async fn run() -> Result<(), oxigaf_trainer::TrainerError> {
+    // Configure training. `TrainingConfig` embeds sub-configs for the
+    // optimizer, loss, density control, and Gaussian initialization.
     let config = TrainingConfig {
-        max_iterations: 1000,
-        batch_size: 4,
+        total_iterations: 1000,
         checkpoint_interval: 100,
+        optimizer: OptimizerConfig::default(),
+        loss: LossConfig::default(),
         ..Default::default()
     };
+    config.validate()?;
 
-    // Create trainer
-    let mut trainer = Trainer::new(config)?;
+    // Load a FLAME model and generate the neutral-expression mesh.
+    let flame_model = oxigaf_flame::FlameModel::load("path/to/flame/model")?;
+    let mesh = flame_model.forward(&oxigaf_flame::FlameParams::neutral());
 
-    // Load FLAME model and generate initial Gaussians
-    let flame_model = FlameModel::load("path/to/flame/model")
-        .map_err(|e| oxigaf_trainer::TrainerError::Init(format!("FLAME load failed: {}", e)))?;
-    let params = FlameParams::neutral();
-    let mesh = flame_model.forward(&params);
+    // Sample initial Gaussians on the mesh surface (rigid/flexible split,
+    // counts and SH degree come from `config.init`).
+    let mut init_rng = rand::rngs::StdRng::seed_from_u64(42);
+    let model = GaussianInitializer::initialize(&mesh, &config.init, &mut init_rng);
 
-    // Initialize Gaussians on mesh surface
-    trainer.initialize_from_mesh(&mesh)?;
+    // `Trainer::new` needs an already-created wgpu device/queue (device
+    // creation is async); request one from the default adapter.
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::all(),
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
+    });
+    let adapter = instance
+        .request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+            apply_limit_buckets: false,
+        })
+        .await
+        .map_err(|e| oxigaf_trainer::TrainerError::Init(format!("No suitable GPU adapter: {e}")))?;
+    let (device, queue) = adapter
+        .request_device(&wgpu::DeviceDescriptor {
+            label: Some("oxigaf_trainer"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::default(),
+            memory_hints: wgpu::MemoryHints::Performance,
+            experimental_features: wgpu::ExperimentalFeatures::default(),
+            trace: wgpu::Trace::Off,
+        })
+        .await
+        .map_err(|e| oxigaf_trainer::TrainerError::Init(e.to_string()))?;
 
-    // Training loop
-    for iteration in 0..config.max_iterations {
-        // Get target images (from diffusion or dataset)
-        let target_images = load_target_images(iteration)?;
+    let raster_config = RasterConfig::new()
+        .with_sh_degree(config.init.sh_degree)
+        .with_resolution(512, 512);
 
-        // Training step
-        let metrics = trainer.step(&target_images)?;
+    // `config` is cloned so the local binding below (`config.total_iterations`
+    // etc.) stays usable after `Trainer::new` takes ownership of its copy.
+    let seed = 42u64;
+    let mut trainer = Trainer::new(config.clone(), model, raster_config, device, queue, seed)?;
 
-        // Log progress
-        if iteration % 10 == 0 {
+    // Training loop. Each `train_step()` samples camera views, renders the
+    // current model, generates targets (diffusion once loaded, or a
+    // self-supervised fallback during warmup), and runs the full
+    // forward/backward/optimizer/density-control pipeline — there is no
+    // separate "supply your own target images" step.
+    for _ in 0..config.total_iterations {
+        let output = trainer.train_step()?;
+
+        if output.iteration % config.log_interval == 0 {
             println!(
-                "Iteration {}: Loss={:.4}, PSNR={:.2} dB",
-                iteration, metrics.total_loss, metrics.psnr
+                "Iteration {}: Loss={:.4}, {} Gaussians",
+                output.iteration, output.loss.total, output.num_gaussians
             );
         }
 
-        // Save checkpoint
-        if iteration % config.checkpoint_interval == 0 {
-            trainer.save_checkpoint(&format!("checkpoint_{}.json", iteration))?;
+        if output.iteration % config.checkpoint_interval == 0 {
+            let path = format!("checkpoint_{}.json", output.iteration);
+            trainer.save_checkpoint(std::path::Path::new(&path))?;
         }
     }
 
-    // Save final model
-    trainer.save_checkpoint("final_model.json")?;
+    // Save final model.
+    trainer.save_checkpoint(std::path::Path::new("final_model.json"))?;
 
     Ok(())
-}
-
-fn load_target_images(iteration: usize) -> Result<Vec<image::RgbaImage>, oxigaf_trainer::TrainerError> {
-    // Load or generate target images for this iteration
-    unimplemented!()
 }
 ```
 
 ### Custom Optimizer Configuration
 
 ```rust
-use oxigaf_trainer::{Trainer, TrainingConfig, OptimizerConfig};
+use oxigaf_trainer::{OptimizerConfig, TrainingConfig};
 
 fn main() -> Result<(), oxigaf_trainer::TrainerError> {
-    // Configure per-parameter learning rates
+    // Configure per-parameter learning rates.
     let optimizer_config = OptimizerConfig {
-        lr_positions: 0.00016,    // Low for stability
-        lr_rotations: 0.001,      // Moderate for rotations
-        lr_scales: 0.005,         // Higher for scales
-        lr_opacities: 0.05,       // Highest for opacities
-        lr_sh: 0.0025,            // Moderate for colors
-        beta1: 0.9,               // Adam momentum
-        beta2: 0.999,             // Adam RMS decay
-        epsilon: 1e-8,            // Numerical stability
+        lr_position: 1.6e-4,       // Low for stability
+        lr_position_final: 1.6e-6, // Target after exponential decay
+        lr_rotation: 1e-3,         // Moderate for rotations
+        lr_scale: 5e-3,            // Higher for scales
+        lr_opacity: 5e-2,          // Highest for opacities
+        lr_sh: 2.5e-3,             // Moderate for colors
+        lr_offset: 1e-4,           // FLAME mesh-surface local offsets
+        beta1: 0.9,                // Adam momentum
+        beta2: 0.999,              // Adam RMS decay
+        epsilon: 1e-15,            // Numerical stability
+        position_lr_decay_steps: 30_000,
     };
 
     let config = TrainingConfig {
         optimizer: optimizer_config,
         ..Default::default()
     };
+    config.validate()?;
 
-    let mut trainer = Trainer::new(config)?;
+    println!(
+        "Trainer configured with custom learning rates: lr_position={}, lr_opacity={}",
+        config.optimizer.lr_position, config.optimizer.lr_opacity
+    );
 
-    println!("Trainer initialized with custom learning rates");
+    // Pass `config` (plus a model, raster config, GPU device/queue, and a
+    // seed) to `Trainer::new` — see "Basic Training Loop" above.
 
     Ok(())
 }
@@ -119,29 +168,32 @@ fn main() -> Result<(), oxigaf_trainer::TrainerError> {
 ### Loss Function Configuration
 
 ```rust
-use oxigaf_trainer::{Trainer, TrainingConfig, LossConfig};
+use oxigaf_trainer::{LossConfig, TrainingConfig};
 
 fn main() -> Result<(), oxigaf_trainer::TrainerError> {
-    // Configure loss function weights
+    // Configure loss function weights.
     let loss_config = LossConfig {
-        l1_weight: 0.8,           // Photometric L1 loss
-        ssim_weight: 0.2,         // Structural similarity
-        lpips_weight: 0.05,       // Perceptual loss (optional)
-        depth_weight: 0.0,        // Depth consistency (optional)
-        normal_weight: 0.0,       // Normal consistency (optional)
+        w_l1: 0.8,             // Photometric L1 loss
+        w_ssim: 0.2,           // Structural similarity (used as 1 - SSIM)
+        w_ms_ssim: 0.0,        // Multi-scale SSIM (optional)
+        w_lpips: 0.05,         // Perceptual loss — see "LPIPS Perceptual Loss" below
+        w_position_reg: 0.01,  // Penalize offset from the mesh surface
+        w_scale_reg: 0.01,     // Penalize extreme scales
+        w_opacity_reg: 0.001,  // Encourage binary opacity
+        w_normal: 0.05,        // Normal consistency (needs a FLAME mesh)
+        w_gradient_penalty: 0.0,
+        gradient_penalty_threshold: 100.0,
     };
 
     let config = TrainingConfig {
         loss: loss_config,
         ..Default::default()
     };
+    config.validate()?;
 
-    let mut trainer = Trainer::new(config)?;
-
-    println!("Using L1={}, SSIM={}, LPIPS={}",
-        loss_config.l1_weight,
-        loss_config.ssim_weight,
-        loss_config.lpips_weight
+    println!(
+        "Using L1={}, SSIM={}, LPIPS={}",
+        config.loss.w_l1, config.loss.w_ssim, config.loss.w_lpips
     );
 
     Ok(())
@@ -151,82 +203,109 @@ fn main() -> Result<(), oxigaf_trainer::TrainerError> {
 ### Adaptive Density Control
 
 ```rust
-use oxigaf_trainer::{Trainer, TrainingConfig, DensityConfig};
+use oxigaf_trainer::{DensityConfig, Trainer, TrainingConfig};
 
 fn main() -> Result<(), oxigaf_trainer::TrainerError> {
-    // Configure adaptive density control
+    // Configure adaptive density control.
     let density_config = DensityConfig {
-        densify_from_iter: 100,       // Start densification at iteration 100
-        densify_until_iter: 500,      // Stop densification at iteration 500
-        densify_grad_threshold: 0.0002, // Split/clone if gradient > threshold
-        densify_interval: 100,        // Densify every 100 iterations
-        opacity_reset_interval: 300,  // Reset opacities every 300 iterations
-        prune_threshold: 0.005,       // Prune if opacity < threshold
-        max_screen_size: 20,          // Prune if screen size > threshold
+        grad_threshold: 0.0002,       // Split/clone if mean gradient exceeds this
+        min_opacity: 0.005,           // Prune Gaussians below this opacity
+        max_screen_size: 20.0,        // Prune Gaussians above this screen extent (px)
+        split_scale_threshold: 0.01,  // Above -> split, below -> clone
+        max_gaussians: 500_000,       // Hard cap on total Gaussian count
     };
 
     let config = TrainingConfig {
         density: density_config,
+        density_control_start: 100,    // Start densification at iteration 100
+        density_control_end: 500,      // Stop densification at iteration 500
+        density_control_interval: 100, // Run every 100 iterations
+        opacity_reset_interval: 300,   // Reset opacities every 300 iterations
         ..Default::default()
     };
+    config.validate()?;
 
-    let mut trainer = Trainer::new(config)?;
+    let mut trainer = build_trainer(config.clone()); // see "Basic Training Loop"
+    run_training(&mut trainer, &config)
+}
 
-    // Training loop with automatic densification
-    for iteration in 0..1000 {
-        let target_images = load_target_images(iteration)?;
-        let metrics = trainer.step(&target_images)?;
+/// Training loop with automatic densification — `train_step()` runs split /
+/// clone / prune internally according to `config.density*`; no separate
+/// call is needed.
+fn run_training(
+    trainer: &mut Trainer,
+    config: &TrainingConfig,
+) -> Result<(), oxigaf_trainer::TrainerError> {
+    for _ in 0..config.total_iterations {
+        trainer.train_step()?;
 
-        // Density control is handled automatically inside step()
-        if iteration % 100 == 0 {
-            let num_gaussians = trainer.num_gaussians();
-            println!("Iteration {}: {} Gaussians", iteration, num_gaussians);
+        if trainer.iteration % 100 == 0 {
+            println!(
+                "Iteration {}: {} Gaussians",
+                trainer.iteration,
+                trainer.model.len()
+            );
         }
     }
-
     Ok(())
 }
 
-fn load_target_images(iteration: usize) -> Result<Vec<image::RgbaImage>, oxigaf_trainer::TrainerError> {
-    unimplemented!()
+fn build_trainer(config: TrainingConfig) -> Trainer {
+    unimplemented!("construct via Trainer::new(config, model, raster_config, device, queue, seed)")
 }
 ```
 
 ### Checkpoint Management
 
 ```rust
-use oxigaf_trainer::{Trainer, TrainingConfig, checkpoint::Checkpoint};
+use oxigaf_trainer::{Trainer, TrainingConfig};
 use std::path::Path;
 
 fn main() -> Result<(), oxigaf_trainer::TrainerError> {
     let config = TrainingConfig::default();
-    let mut trainer = Trainer::new(config)?;
+    let mut trainer = build_trainer(config.clone()); // see "Basic Training Loop"
 
-    // Training loop
-    for iteration in 0..1000 {
-        let target_images = load_target_images(iteration)?;
-        trainer.step(&target_images)?;
+    // Training loop.
+    for _ in 0..config.total_iterations {
+        let output = trainer.train_step()?;
 
-        // Save checkpoint every 100 iterations
-        if iteration % 100 == 0 {
-            let checkpoint_path = format!("checkpoints/iter_{}.json", iteration);
-            trainer.save_checkpoint(&checkpoint_path)?;
-            println!("Saved checkpoint: {}", checkpoint_path);
+        // Save a checkpoint every 100 iterations.
+        if output.iteration % 100 == 0 {
+            let checkpoint_path = format!("checkpoints/iter_{}.json", output.iteration);
+            trainer.save_checkpoint(Path::new(&checkpoint_path))?;
+            println!("Saved checkpoint: {checkpoint_path}");
         }
-    }
-
-    // Resume from checkpoint
-    let checkpoint_path = "checkpoints/iter_500.json";
-    if Path::new(checkpoint_path).exists() {
-        let mut new_trainer = Trainer::from_checkpoint(checkpoint_path)?;
-        println!("Resumed training from iteration {}", new_trainer.current_iteration());
     }
 
     Ok(())
 }
 
-fn load_target_images(iteration: usize) -> Result<Vec<image::RgbaImage>, oxigaf_trainer::TrainerError> {
-    unimplemented!()
+fn build_trainer(config: TrainingConfig) -> Trainer {
+    unimplemented!("construct via Trainer::new(config, model, raster_config, device, queue, seed)")
+}
+```
+
+Resuming loads a *new* trainer, which needs its own GPU device/queue (see
+["Resuming from Checkpoint"](#resuming-from-checkpoint) below for the full
+setup):
+
+```rust
+use oxigaf_render::RasterConfig;
+use oxigaf_trainer::{Trainer, TrainingConfig};
+use std::path::Path;
+
+fn resume_example(
+    config: TrainingConfig,
+    checkpoint_path: &Path,
+    raster_config: RasterConfig,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+) -> Result<(), oxigaf_trainer::TrainerError> {
+    let seed = 42u64;
+    let trainer =
+        Trainer::from_checkpoint(config, checkpoint_path, raster_config, device, queue, seed)?;
+    println!("Resumed training from iteration {}", trainer.iteration);
+    Ok(())
 }
 ```
 
@@ -257,18 +336,19 @@ fn save_checkpoint_example(trainer: &Trainer, iteration: u32) -> Result<(), oxig
 To resume training from a saved checkpoint:
 
 ```rust
-use oxigaf_trainer::{Trainer, TrainingConfig};
 use oxigaf_render::RasterConfig;
+use oxigaf_trainer::{Trainer, TrainerError, TrainingConfig};
 use std::path::Path;
 
-async fn resume_training_example() -> Result<(), oxigaf_trainer::TrainerError> {
+async fn resume_training_example() -> Result<(), TrainerError> {
     let checkpoint_path = Path::new("checkpoints/training_001000.json");
 
     // Check if checkpoint exists
     if !checkpoint_path.exists() {
-        return Err(oxigaf_trainer::TrainerError::CheckpointCorrupted(
-            format!("Checkpoint not found: {}", checkpoint_path.display())
-        ));
+        return Err(TrainerError::CheckpointCorrupted(format!(
+            "Checkpoint not found: {}",
+            checkpoint_path.display()
+        )));
     }
 
     // Load checkpoint first to inspect state
@@ -276,26 +356,39 @@ async fn resume_training_example() -> Result<(), oxigaf_trainer::TrainerError> {
     println!("Resuming from iteration {}", checkpoint.iteration);
     println!("Model has {} Gaussians", checkpoint.positions.len());
 
-    // Setup GPU
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
-    let adapter = instance.request_adapter(&wgpu::RequestAdapterOptions::default())
-        .await.ok_or_else(|| oxigaf_trainer::TrainerError::GpuInit("No adapter".into()))?;
-    let (device, queue) = adapter.request_device(&wgpu::DeviceDescriptor::default(), None)
-        .await.map_err(|e| oxigaf_trainer::TrainerError::GpuInit(e.to_string()))?;
+    // Set up the GPU (wgpu device creation is async).
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::all(),
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
+    });
+    let adapter = instance
+        .request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+            apply_limit_buckets: false,
+        })
+        .await
+        .map_err(|e| TrainerError::Init(format!("No suitable GPU adapter: {e}")))?;
+    let (device, queue) = adapter
+        .request_device(&wgpu::DeviceDescriptor {
+            label: Some("oxigaf_trainer"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::default(),
+            memory_hints: wgpu::MemoryHints::Performance,
+            experimental_features: wgpu::ExperimentalFeatures::default(),
+            trace: wgpu::Trace::Off,
+        })
+        .await
+        .map_err(|e| TrainerError::Init(e.to_string()))?;
 
     // Create trainer from checkpoint
     let config = TrainingConfig::default();
     let raster_config = RasterConfig::default();
     let seed = 42u64;
 
-    let mut trainer = Trainer::from_checkpoint(
-        config,
-        checkpoint_path,
-        raster_config,
-        device,
-        queue,
-        seed,
-    )?;
+    let mut trainer =
+        Trainer::from_checkpoint(config, checkpoint_path, raster_config, device, queue, seed)?;
 
     // Continue training
     println!("Continuing from iteration {}", trainer.iteration);
@@ -477,84 +570,67 @@ This example demonstrates:
 
 ### Metric Tracking
 
+`Trainer::train_step()` automatically records PSNR / SSIM / loss into
+`trainer.metric_tracker` (a `metrics::MetricTracker`) after every step — no
+manual bookkeeping is required:
+
 ```rust
-use oxigaf_trainer::{Trainer, TrainingConfig, metrics::TrainingMetrics};
+use oxigaf_trainer::{Trainer, TrainingConfig};
 
 fn main() -> Result<(), oxigaf_trainer::TrainerError> {
     let config = TrainingConfig::default();
-    let mut trainer = Trainer::new(config)?;
+    let mut trainer = build_trainer(config.clone()); // see "Basic Training Loop"
 
-    // Training loop with metric tracking
-    let mut metric_history = Vec::new();
+    for _ in 0..config.total_iterations {
+        let output = trainer.train_step()?;
 
-    for iteration in 0..1000 {
-        let target_images = load_target_images(iteration)?;
-        let metrics = trainer.step(&target_images)?;
-
-        // Track metrics
-        metric_history.push(metrics.clone());
-
-        // Log every 10 iterations
-        if iteration % 10 == 0 {
-            println!("Iteration {}:", iteration);
-            println!("  Total Loss: {:.4}", metrics.total_loss);
-            println!("  L1 Loss: {:.4}", metrics.l1_loss);
-            println!("  SSIM Loss: {:.4}", metrics.ssim_loss);
-            println!("  PSNR: {:.2} dB", metrics.psnr);
-            println!("  SSIM: {:.4}", metrics.ssim);
-            println!("  Num Gaussians: {}", metrics.num_gaussians);
+        if output.iteration % 10 == 0 {
+            if let Some(latest) = trainer.metric_tracker.latest() {
+                println!(
+                    "Iteration {}: loss={:.4} PSNR={:.2} dB SSIM={:.4} ({} Gaussians)",
+                    latest.iteration, latest.loss, latest.psnr, latest.ssim, output.num_gaussians,
+                );
+            }
         }
     }
 
-    // Compute statistics over last 100 iterations
-    let recent_metrics = &metric_history[metric_history.len().saturating_sub(100)..];
-    let avg_psnr: f32 = recent_metrics.iter().map(|m| m.psnr).sum::<f32>()
-        / recent_metrics.len() as f32;
-    let avg_ssim: f32 = recent_metrics.iter().map(|m| m.ssim).sum::<f32>()
-        / recent_metrics.len() as f32;
-
-    println!("\nFinal statistics (last 100 iterations):");
-    println!("  Average PSNR: {:.2} dB", avg_psnr);
-    println!("  Average SSIM: {:.4}", avg_ssim);
+    // Rolling statistics over the most recent window.
+    println!(
+        "\nFinal statistics (last 100 iterations):\n  Average PSNR: {:.2} dB\n  Average SSIM: {:.4}",
+        trainer.metric_tracker.mean_psnr(100),
+        trainer.metric_tracker.mean_ssim(100),
+    );
 
     Ok(())
 }
 
-fn load_target_images(iteration: usize) -> Result<Vec<image::RgbaImage>, oxigaf_trainer::TrainerError> {
-    unimplemented!()
+fn build_trainer(config: TrainingConfig) -> Trainer {
+    unimplemented!("construct via Trainer::new(config, model, raster_config, device, queue, seed)")
 }
 ```
 
 ### TensorBoard Logging
 
+TensorBoard logging is configured through `TrainingConfig.tensorboard`
+(`TensorBoardConfig`), not through a separate logger object. Once enabled,
+`Trainer::train_step()` writes scalars every step and images/histograms at
+the configured intervals automatically — no manual `log_scalar` calls are
+needed:
+
 ```rust
-use oxigaf_trainer::{Trainer, TrainingConfig, tensorboard::TensorBoardLogger};
+use oxigaf_trainer::{TensorBoardConfig, Trainer, TrainingConfig};
 
 fn main() -> Result<(), oxigaf_trainer::TrainerError> {
-    let config = TrainingConfig::default();
-    let mut trainer = Trainer::new(config)?;
+    let config = TrainingConfig {
+        tensorboard: TensorBoardConfig::new("runs/experiment_1").with_run_name("run1"),
+        ..Default::default()
+    };
+    config.validate()?;
 
-    // Initialize TensorBoard logger
-    let logger = TensorBoardLogger::new("runs/experiment_1")?;
+    let mut trainer = build_trainer(config.clone()); // see "Basic Training Loop"
 
-    // Training loop with TensorBoard logging
-    for iteration in 0..1000 {
-        let target_images = load_target_images(iteration)?;
-        let metrics = trainer.step(&target_images)?;
-
-        // Log scalars
-        logger.log_scalar("loss/total", metrics.total_loss, iteration)?;
-        logger.log_scalar("loss/l1", metrics.l1_loss, iteration)?;
-        logger.log_scalar("loss/ssim", metrics.ssim_loss, iteration)?;
-        logger.log_scalar("metrics/psnr", metrics.psnr, iteration)?;
-        logger.log_scalar("metrics/ssim", metrics.ssim, iteration)?;
-        logger.log_scalar("model/num_gaussians", metrics.num_gaussians as f32, iteration)?;
-
-        // Log images every 100 iterations
-        if iteration % 100 == 0 {
-            let rendered = trainer.render_current_view()?;
-            logger.log_image("render/output", &rendered, iteration)?;
-        }
+    for _ in 0..config.total_iterations {
+        trainer.train_step()?;
     }
 
     println!("View training progress with: tensorboard --logdir runs/");
@@ -562,61 +638,60 @@ fn main() -> Result<(), oxigaf_trainer::TrainerError> {
     Ok(())
 }
 
-fn load_target_images(iteration: usize) -> Result<Vec<image::RgbaImage>, oxigaf_trainer::TrainerError> {
-    unimplemented!()
+fn build_trainer(config: TrainingConfig) -> Trainer {
+    unimplemented!("construct via Trainer::new(config, model, raster_config, device, queue, seed)")
 }
 ```
 
 ### LPIPS Perceptual Loss
 
+**Caveat**: `LossConfig.w_lpips` alone does not enable LPIPS during
+`Trainer::train_step()`. The trainer's built-in loss path
+(`LossComputer::compute`) always evaluates the LPIPS term as `0.0`, because
+LPIPS needs a loaded VGG network that the trainer does not manage
+automatically. To use LPIPS you drive your own render/loss loop with
+`LossComputer::compute_with_lpips` instead of calling `train_step()`:
+
 ```rust
-use oxigaf_trainer::{
-    Trainer,
-    TrainingConfig,
-    LossConfig,
-    lpips::LpipsVgg
-};
+use oxigaf_trainer::loss::LossComputer;
+use oxigaf_trainer::{LossConfig, LpipsLossComputer, TrainingConfig};
+use std::path::Path;
 
 fn main() -> Result<(), oxigaf_trainer::TrainerError> {
-    // Enable LPIPS for perceptual loss
     let loss_config = LossConfig {
-        l1_weight: 0.75,
-        ssim_weight: 0.2,
-        lpips_weight: 0.05,    // Small weight for perceptual loss
+        w_l1: 0.75,
+        w_ssim: 0.2,
+        w_lpips: 0.05, // Small weight for perceptual loss
         ..Default::default()
     };
-
     let config = TrainingConfig {
         loss: loss_config,
         ..Default::default()
     };
+    config.validate()?;
 
-    let mut trainer = Trainer::new(config)?;
+    // Load pre-trained LPIPS VGG + linear weights (safetensors format).
+    let mut lpips = LpipsLossComputer::new();
+    lpips.init(
+        Path::new("path/to/vgg_weights.safetensors"),
+        Path::new("path/to/lpips_weights.safetensors"),
+    )?;
+    let loss_computer = LossComputer::new(config.loss.clone());
 
-    // Load pre-trained LPIPS VGG network
-    let lpips = LpipsVgg::from_pretrained("path/to/lpips_weights")?;
-    trainer.set_lpips_model(lpips);
+    println!(
+        "LPIPS ready: {} (weight={})",
+        lpips.is_initialized(),
+        config.loss.w_lpips
+    );
 
-    println!("Training with LPIPS perceptual loss");
-
-    // Training loop as usual - LPIPS is computed automatically
-    for iteration in 0..1000 {
-        let target_images = load_target_images(iteration)?;
-        let metrics = trainer.step(&target_images)?;
-
-        if iteration % 10 == 0 {
-            println!(
-                "Iteration {}: L1={:.4}, SSIM={:.4}, LPIPS={:.4}",
-                iteration, metrics.l1_loss, metrics.ssim_loss, metrics.lpips_loss
-            );
-        }
-    }
+    // Inside your own render loop, per batch of rendered/target view pairs:
+    //   let lpips_value = lpips.compute_multi(&rendered, &targets, width, height)?;
+    //   let loss_output = loss_computer.compute_with_lpips(
+    //       &rendered, &targets, width, height, &model, mesh, lpips_value,
+    //   );
+    //   println!("L1={:.4} SSIM={:.4} LPIPS={:.4}", loss_output.l1, loss_output.ssim, loss_output.lpips);
 
     Ok(())
-}
-
-fn load_target_images(iteration: usize) -> Result<Vec<image::RgbaImage>, oxigaf_trainer::TrainerError> {
-    unimplemented!()
 }
 ```
 
@@ -625,50 +700,71 @@ fn load_target_images(iteration: usize) -> Result<Vec<image::RgbaImage>, oxigaf_
 ### Default Hyperparameters
 
 ```rust
+// The literal `Default::default()` values (see `src/config.rs`).
 TrainingConfig {
-    max_iterations: 1000,
-    batch_size: 4,
-    checkpoint_interval: 100,
+    total_iterations: 15_000,
+    views_per_step: 4,
+    density_control_interval: 500,
+    density_control_start: 1_000,
+    density_control_end: 12_000,
+    opacity_reset_interval: 3_000,
+    checkpoint_interval: 1_000,
+    log_interval: 50,
+    guidance_scale_start: 7.5,
+    guidance_scale_end: 3.0,
+    guidance_anneal_steps: 10_000,
 
     // Optimizer
     optimizer: OptimizerConfig {
-        lr_positions: 0.00016,
-        lr_rotations: 0.001,
-        lr_scales: 0.005,
-        lr_opacities: 0.05,
-        lr_sh: 0.0025,
+        lr_position: 1.6e-4,
+        lr_position_final: 1.6e-6,
+        lr_rotation: 1e-3,
+        lr_scale: 5e-3,
+        lr_opacity: 5e-2,
+        lr_sh: 2.5e-3,
+        lr_offset: 1e-4,
         beta1: 0.9,
         beta2: 0.999,
-        epsilon: 1e-8,
+        epsilon: 1e-15,
+        position_lr_decay_steps: 30_000,
     },
 
     // Loss
     loss: LossConfig {
-        l1_weight: 0.8,
-        ssim_weight: 0.2,
-        lpips_weight: 0.0,
-        depth_weight: 0.0,
-        normal_weight: 0.0,
+        w_l1: 0.8,
+        w_ssim: 0.2,
+        w_ms_ssim: 0.0,
+        w_lpips: 0.0,
+        w_position_reg: 0.01,
+        w_scale_reg: 0.01,
+        w_opacity_reg: 0.001,
+        w_normal: 0.05,
+        w_gradient_penalty: 0.0,
+        gradient_penalty_threshold: 100.0,
     },
 
     // Density control
     density: DensityConfig {
-        densify_from_iter: 100,
-        densify_until_iter: 500,
-        densify_grad_threshold: 0.0002,
-        densify_interval: 100,
-        opacity_reset_interval: 300,
-        prune_threshold: 0.005,
-        max_screen_size: 20,
+        grad_threshold: 0.0002,
+        min_opacity: 0.005,
+        max_screen_size: 20.0,
+        split_scale_threshold: 0.01,
+        max_gaussians: 500_000,
     },
 
     // Initialization
     init: InitConfig {
-        num_gaussians: 10000,
-        initial_scale: 0.01,
-        initial_opacity: 0.1,
-        sample_method: SampleMethod::Uniform,
+        num_rigid: 50_000,
+        num_flexible: 50_000,
+        initial_scale: -5.0,
+        initial_opacity: -2.0,
+        sh_degree: 3,
     },
+
+    // TensorBoard disabled, Float32 precision, profiling off by default.
+    tensorboard: TensorBoardConfig::default(),
+    precision: TrainingPrecision::Float32,
+    enable_profiling: false,
 }
 ```
 

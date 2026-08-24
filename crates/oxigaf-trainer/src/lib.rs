@@ -2,14 +2,36 @@
 //!
 //! GAF optimization pipeline — iterative denoising distillation.
 //!
-//! Provides:
-//! - Gaussian initialization on FLAME mesh surfaces
-//! - Per-parameter Adam optimizer with group-wise learning rates
-//! - Photometric + structural loss computation (L1, SSIM)
-//! - Adaptive density control (split / clone / prune)
-//! - Checkpoint save / load (JSON + flat f32 arrays)
-//! - Metric tracking (PSNR, SSIM history)
-//! - Main training loop orchestrating render ↔ diffusion distillation
+//! ## The shipped training pipeline
+//!
+//! [`Trainer`] is the only optimisation loop in this crate.  It drives — directly
+//! or transitively — exactly the modules below, plus [`init`], which builds the
+//! Gaussian model handed to [`Trainer::new`]:
+//!
+//! - [`init`] — Gaussian initialization on FLAME mesh surfaces
+//! - [`optimizer`] — per-parameter Adam with group-wise learning rates
+//! - [`loss`] / [`lpips`] — photometric + structural loss (L1, SSIM, LPIPS)
+//! - [`density`] — adaptive density control (split / clone / prune)
+//! - [`diffusion_target`] — render ↔ diffusion distillation targets (SDS)
+//! - [`mixed_precision`] — loss scaling and precision mode
+//! - [`checkpoint`] — checkpoint save / load (JSON + flat f32 arrays)
+//! - [`metrics`] — metric tracking (PSNR, SSIM history)
+//! - [`tensorboard`] / [`profiler_integration`] — logging and phase profiling
+//! - [`config`] — the [`TrainingConfig`] tree parameterising all of the above
+//!
+//! ## Opt-in components (not driven by `Trainer`)
+//!
+//! Every *other* module in this crate is a standalone, independently tested
+//! building block that [`Trainer`] does **not** invoke: learning-rate schedules
+//! ([`lr_scheduler`]), gradient clipping ([`gradient_clipping`]), gradient
+//! accumulation ([`gradient_accumulation`]), EMA shadow weights ([`ema`]),
+//! layer freezing ([`layer_freezing`]), curriculum sampling, diagnostics,
+//! calibration, landscape analysis, and so on.
+//!
+//! They are exported so callers can compose their own loops, but importing one
+//! has **no** effect on [`Trainer::train_step`] — using it means driving it from
+//! your own loop.  The `pub mod` block below is split into the two groups so the
+//! distinction is visible at a glance.
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 #![cfg_attr(not(test), deny(clippy::expect_used))]
@@ -21,6 +43,36 @@
 // A named struct would require a public type for a purely internal function.
 #![allow(clippy::type_complexity)]
 
+// ---------------------------------------------------------------------------
+// Pipeline modules — the shipped training path.
+//
+// These are the modules `trainer::Trainer` actually reaches during
+// `train_step` / `run` (plus `init`, which produces the model it is handed).
+// Changing one changes what the shipped training loop does.
+// ---------------------------------------------------------------------------
+
+pub mod checkpoint;
+pub mod config;
+pub mod density;
+pub mod diffusion_target;
+pub mod init;
+pub mod loss;
+pub mod lpips;
+pub mod metrics;
+pub mod mixed_precision;
+pub mod optimizer;
+pub mod profiler_integration;
+pub mod tensorboard;
+pub mod trainer;
+
+// ---------------------------------------------------------------------------
+// Opt-in components — NOT driven by `Trainer`.
+//
+// Independently tested building blocks for callers composing their own
+// training / analysis loops.  Nothing here is reachable from
+// `Trainer::train_step`; enabling one means calling it yourself.
+// ---------------------------------------------------------------------------
+
 pub mod activation_maps;
 pub mod adaptive_loss;
 pub mod adaptive_loss_weighting;
@@ -28,10 +80,8 @@ pub mod anomaly_detection;
 pub mod augmentation;
 pub mod callback;
 pub mod camera_sampling;
-pub mod checkpoint;
 pub mod checkpoint_interpolation;
 pub mod checkpoint_manager;
-pub mod config;
 pub mod continual_learning;
 pub mod contrastive_learning;
 pub mod contrastive_loss;
@@ -40,9 +90,7 @@ pub mod curriculum;
 pub mod curriculum_learning;
 pub mod data_augmentation;
 pub mod data_parallel;
-pub mod density;
 pub mod diagnostics;
-pub mod diffusion_target;
 pub mod domain_adaptation;
 pub mod ema;
 pub mod feature_bank;
@@ -52,33 +100,25 @@ pub mod gradient_clipping;
 pub mod gradient_flow;
 pub mod gradient_surgery;
 pub mod hparam_search;
-pub mod init;
 pub mod knowledge_distillation;
 pub mod layer_freezing;
-pub mod loss;
 pub mod loss_landscape;
 pub mod loss_reweighting;
-pub mod lpips;
 pub mod lr_scheduler;
 pub mod meta_learning;
-pub mod metrics;
-pub mod mixed_precision;
 pub mod multi_resolution_loss;
 pub mod noise_injection;
 pub mod ohem;
 pub mod online_hard_example_mining;
 pub mod online_learning;
-pub mod optimizer;
 pub mod pose_conditioning;
-pub mod profiler_integration;
 pub mod progressive_training;
 pub mod pruning;
 pub mod regularization;
 pub mod session_recorder;
 pub mod spectral_norm;
 pub mod synthetic_data;
-pub mod tensorboard;
-pub mod trainer;
+pub mod temperature_scaling;
 pub mod training_config;
 pub mod uncertainty_estimation;
 pub mod validation_split;
@@ -223,6 +263,12 @@ pub use adaptive_loss::{
     AdaptiveLossController, AdaptiveLossWeights, GradNormEntry, GradNormTracker, LossComponent,
     LossHistory, WeightingStrategy,
 };
+pub use adaptive_loss_weighting::{
+    alw_clip_weights, alw_format_history_summary, alw_format_weights, alw_imbalance_ratio,
+    alw_normalize_weights, alw_relative_training_rate, alw_weighted_sum, GradNormWeighter,
+    HomoscedasticWeighter, LossStatTracker, LossTask, LossWeightError, ScheduledWeighter,
+    TaskWeightSchedule, WeightHistory, WeightScheduleKind,
+};
 pub use anomaly_detection::{
     anom_check_convergence, anom_check_gradient_norm, anom_check_gradient_numerical,
     anom_check_loss_divergence, anom_check_loss_spike, anom_check_mode_collapse,
@@ -261,6 +307,38 @@ pub use continual_learning::{
     forgetting_measure, replay_loss, simulate_task_gradients, update_online_fisher,
     ContinualLearningError, ContinualLearningStats, EwcConfig, EwcRegularizer, FisherInformation,
     ReplayBuffer, TaskMask,
+};
+pub use contrastive_learning::{
+    cl_alignment,
+    cl_cosine_sim,
+    cl_dot,
+    cl_format_config,
+    cl_format_stats,
+    // InfoNCE loss
+    cl_info_nce_loss,
+    cl_l2_distance,
+    // Hard negative mining
+    cl_mine_hard_negatives,
+    cl_mine_semi_hard_negatives,
+    // Primitive utilities
+    cl_normalize,
+    // NT-Xent (SimCLR) loss
+    cl_nt_xent_loss,
+    cl_similarity_matrix,
+    // Supervised contrastive loss
+    cl_supcon_loss,
+    // Triplet loss
+    cl_triplet_loss,
+    cl_uniformity,
+    cl_update_stats,
+    // Error type
+    ContrastiveError,
+    // Config (renamed to avoid conflict with contrastive_loss::ContrastiveConfig)
+    ContrastiveLearningConfig,
+    // Statistics and tracking
+    ContrastiveStats,
+    // Memory queue
+    EmbeddingQueue,
 };
 pub use contrastive_loss::{
     contrastive_loss_batch,
@@ -316,10 +394,25 @@ pub use diffusion_target::{
     DiffusionTargetConfig, DiffusionTargetGenerator, SdsLoss, SdsWeighting, TemporalConsistency,
     ViewConsistencyLoss,
 };
+pub use domain_adaptation::{
+    da_center_features, da_combined_loss, da_compute_stats, da_confidence_threshold_mask,
+    da_coral_loss, da_covariance, da_dann_loss, da_domain_accuracy, da_entropy, da_entropy_loss,
+    da_feature_mean, da_format_config, da_format_stats, da_frobenius_sq, da_gaussian_kernel,
+    da_median_bandwidth, da_mmd_biased, da_mmd_multiscale, da_mmd_unbiased, da_pseudo_label_loss,
+    da_reversal_loss_scale, AdaptationStats, DannConfig, DomainAdaptConfig, DomainAdaptMethod,
+    DomainAdaptationError, DomainBatch, DomainDiscriminator, MmdConfig,
+};
 pub use ema::GaussianEma;
 pub use feature_bank::{
     compute_bank_stats, sample_negatives, sample_positive, BankConfig, BankStatistics, FeatureBank,
     FeatureBankError, FeatureEntry, MomentumEncoder,
+};
+pub use few_shot_adaptation::{
+    fsa_class_indices, fsa_compute_stats, fsa_episode_accuracy, fsa_format_config,
+    fsa_format_result, fsa_format_stats, fsa_inner_gradient, fsa_inner_loss, fsa_lora_apply,
+    fsa_maml_adapt, fsa_maml_query_loss, fsa_proto_accuracy, fsa_proto_loss, fsa_sample_episode,
+    AdaptationResult, Episode, FewShotConfig, FewShotError, FewShotStats, LoraAdapter, MamlState,
+    PrototypicalNet, QuerySet, SupportSet,
 };
 pub use gradient_accumulation::{
     gradients_have_inf, gradients_have_nan, scale_loss, unscale_gradients, AccumulationConfig,
@@ -379,11 +472,13 @@ pub use lr_scheduler::{
     WarmupCosineSchedule, WarmupLinearSchedule,
 };
 pub use meta_learning::{
-    aggregate_meta_stats, apply_gradient_update, clip_gradient, compute_meta_gradient,
-    evaluate_query_loss, grad_norm, inner_loop_adapt, meta_update_step, mse_loss_and_grad,
-    run_meta_training, FewShotTask, LinearModel, MamlConfig, MetaLearningError, MetaTrainingStats,
-    TaskSampler,
+    adapt_on_support, aggregate_meta_stats, apply_gradient_update, clip_gradient,
+    compute_meta_gradient, evaluate_query_loss, grad_norm, inner_loop_adapt, meta_gradient,
+    meta_step, meta_update_step, mse_loss_and_grad, query_loss_with_params, run_meta_training,
+    FewShotTask, LinearModel, MamlConfig, MetaLearningError, MetaModel, MetaTask,
+    MetaTrainingStats, RegressionBatch, TaskSampler,
 };
+pub use metrics::{psnr, psnr_from_mse, ssim, MetricEntry, MetricTracker};
 pub use mixed_precision::{LossScaler, LossScalerStats, MixedPrecisionTrainer, TrainingPrecision};
 pub use noise_injection::{
     analyze_noise, inject_additive_noise, inject_multiplicative_noise, perturb_rotations,
@@ -477,6 +572,30 @@ pub use synthetic_data::{
     DifficultyLevel, FlameParamSampler, FlameParamSamplerConfig, GaussianCloudConfig,
     SyntheticBatch, SyntheticDataError, SyntheticFlameParams, SyntheticGaussianCloud,
 };
+pub use temperature_scaling::{
+    ts_binary_nll,
+    ts_brier_score,
+    ts_compute_stats,
+    ts_ece,
+    ts_format_reliability_diagram,
+    ts_format_result,
+    ts_format_stats,
+    ts_golden_section_search,
+    ts_log_loss,
+    ts_mce,
+    ts_overconfidence_error,
+    ts_pav_isotonic,
+    ts_reliability_diagram,
+    CalibrationConfig,
+    CalibrationError,
+    // CalibrationResult aliased to avoid collision with uncertainty_estimation::CalibrationResult
+    CalibrationResult as TsCalibrationResult,
+    CalibrationStats,
+    IsotonicCalibrator,
+    PlattScaler,
+    ReliabilityDiagram,
+    TemperatureScaler,
+};
 pub use tensorboard::{LearningRates, TensorBoardConfig, TensorBoardWriter, TrainingMetricsLogger};
 pub use trainer::{StepOutput, Trainer};
 pub use training_config::{TrainingProfile, TrainingProfileConfig};
@@ -513,82 +632,4 @@ pub use weight_averaging::{
     compute_weight_stats, count_params, weights_cosine_similarity, weights_l2_distance, ModelSoup,
     ModelWeights, PolyakAverager, StochasticWeightAverager, SwaConfig, WeightAveragingError,
     WeightStats,
-};
-pub mod temperature_scaling;
-pub use adaptive_loss_weighting::{
-    alw_clip_weights, alw_format_history_summary, alw_format_weights, alw_imbalance_ratio,
-    alw_normalize_weights, alw_relative_training_rate, alw_weighted_sum, GradNormWeighter,
-    HomoscedasticWeighter, LossStatTracker, LossTask, LossWeightError, ScheduledWeighter,
-    TaskWeightSchedule, WeightHistory, WeightScheduleKind,
-};
-pub use contrastive_learning::{
-    cl_alignment,
-    cl_cosine_sim,
-    cl_dot,
-    cl_format_config,
-    cl_format_stats,
-    // InfoNCE loss
-    cl_info_nce_loss,
-    cl_l2_distance,
-    // Hard negative mining
-    cl_mine_hard_negatives,
-    cl_mine_semi_hard_negatives,
-    // Primitive utilities
-    cl_normalize,
-    // NT-Xent (SimCLR) loss
-    cl_nt_xent_loss,
-    cl_similarity_matrix,
-    // Supervised contrastive loss
-    cl_supcon_loss,
-    // Triplet loss
-    cl_triplet_loss,
-    cl_uniformity,
-    cl_update_stats,
-    // Error type
-    ContrastiveError,
-    // Config (renamed to avoid conflict with contrastive_loss::ContrastiveConfig)
-    ContrastiveLearningConfig,
-    // Statistics and tracking
-    ContrastiveStats,
-    // Memory queue
-    EmbeddingQueue,
-};
-pub use domain_adaptation::{
-    da_center_features, da_combined_loss, da_compute_stats, da_confidence_threshold_mask,
-    da_coral_loss, da_covariance, da_dann_loss, da_domain_accuracy, da_entropy, da_entropy_loss,
-    da_feature_mean, da_format_config, da_format_stats, da_frobenius_sq, da_gaussian_kernel,
-    da_median_bandwidth, da_mmd_biased, da_mmd_multiscale, da_mmd_unbiased, da_pseudo_label_loss,
-    da_reversal_loss_scale, AdaptationStats, DannConfig, DomainAdaptConfig, DomainAdaptMethod,
-    DomainAdaptationError, DomainBatch, DomainDiscriminator, MmdConfig,
-};
-pub use few_shot_adaptation::{
-    fsa_class_indices, fsa_compute_stats, fsa_episode_accuracy, fsa_format_config,
-    fsa_format_result, fsa_format_stats, fsa_inner_gradient, fsa_inner_loss, fsa_lora_apply,
-    fsa_maml_adapt, fsa_maml_query_loss, fsa_proto_accuracy, fsa_proto_loss, fsa_sample_episode,
-    AdaptationResult, Episode, FewShotConfig, FewShotError, FewShotStats, LoraAdapter, MamlState,
-    PrototypicalNet, QuerySet, SupportSet,
-};
-pub use temperature_scaling::{
-    ts_binary_nll,
-    ts_brier_score,
-    ts_compute_stats,
-    ts_ece,
-    ts_format_reliability_diagram,
-    ts_format_result,
-    ts_format_stats,
-    ts_golden_section_search,
-    ts_log_loss,
-    ts_mce,
-    ts_overconfidence_error,
-    ts_pav_isotonic,
-    ts_reliability_diagram,
-    CalibrationConfig,
-    CalibrationError,
-    // CalibrationResult aliased to avoid collision with uncertainty_estimation::CalibrationResult
-    CalibrationResult as TsCalibrationResult,
-    CalibrationStats,
-    IsotonicCalibrator,
-    PlattScaler,
-    ReliabilityDiagram,
-    TemperatureScaler,
 };

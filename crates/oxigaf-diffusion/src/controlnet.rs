@@ -1,9 +1,43 @@
 //! ControlNet-style conditioning for the diffusion pipeline.
 //!
-//! Injects conditioning signals (edge maps, depth maps, normal maps) into the
-//! U-Net at multiple resolution levels, following the ControlNet paper.
+//! Conditioning signals (edge maps, depth maps, normal maps, pose heatmaps) are
+//! resampled to each U-Net feature resolution and projected into the feature
+//! space through zero-initialised 1×1 convolutions ([`ZeroConv`]) — the output
+//! projections described by the ControlNet paper.
+//!
+//! # What this module does and does not provide
+//!
+//! * **Provided**: condition management ([`ControlNetProcessor`]), cached
+//!   per-resolution resampling, layer selection
+//!   ([`ControlNetConfig::injects_at`]) and the zero-convolution output
+//!   projection ([`ZeroConv`], [`ControlNetProcessor::set_zero_conv`]).
+//! * **Not provided**: the trainable copy of the U-Net encoder that produces
+//!   ControlNet's control features. That requires trained weights which this
+//!   crate does not ship. Until a [`ZeroConv`] is registered for a layer,
+//!   [`ControlNetProcessor::apply_to_features`] uses a documented fallback that
+//!   adds a channel-constant spatial bias — useful for smoke-testing the
+//!   plumbing, but *not* learned control features.
+//! * **Not wired**: [`crate::unet::MultiViewUNet::forward`] does not call
+//!   [`ControlNetProcessor::apply_to_features`] itself; callers that want
+//!   conditioning must invoke it on the feature buffers between U-Net stages.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use crate::DiffusionError;
+
+// ---------------------------------------------------------------------------
+// Limits
+// ---------------------------------------------------------------------------
+
+/// Maximum number of U-Net stages that can receive ControlNet conditioning.
+///
+/// [`ControlNetConfig::injection_layers`] entries must be strictly below this
+/// value; [`ControlNetConfig::validate`] rejects anything larger. The injection
+/// routines additionally clamp to `MAX_INJECTION_LAYERS - 1` so a hand-built
+/// configuration that skipped validation can never overflow the `1 << layer`
+/// resolution divisor.
+pub const MAX_INJECTION_LAYERS: usize = 8;
 
 // ---------------------------------------------------------------------------
 // ControlSignalType
@@ -56,7 +90,12 @@ impl ControlSignalType {
 pub struct ControlNetCondition {
     /// Type of the conditioning signal.
     pub signal_type: ControlSignalType,
-    /// Flattened pixel data: `[channels * height * width]` f32, values in [0, 1].
+    /// Flattened pixel data: `[channels * height * width]` f32.
+    ///
+    /// Conditioning maps are conventionally in `[0, 1]`, but nothing enforces
+    /// that: signed data (surface normals encoded in `[-1, 1]`, for instance) is
+    /// accepted as-is. Call [`ControlNetCondition::normalize`] to rescale an
+    /// arbitrary range into `[0, 1]`.
     pub data: Vec<f32>,
     /// Number of channels (derived from `signal_type`).
     pub channels: usize,
@@ -180,16 +219,37 @@ impl ControlNetCondition {
         }
     }
 
-    /// Normalizes pixel data in-place to [0, 1] by dividing by the maximum value.
+    /// Rescales pixel data in-place to `[0, 1]` using min-max normalization.
     ///
-    /// Does nothing if all values are zero.
+    /// Every value becomes `(v - min) / (max - min)`, so the smallest sample
+    /// maps to `0.0` and the largest to `1.0` — including for data that spans
+    /// negative values (e.g. `[-5.0, 10.0]` becomes `[0.0, 1.0]`).
+    ///
+    /// The data is left **unchanged** when a meaningful range cannot be
+    /// determined, namely when it is empty, when every value is equal (which
+    /// covers the all-zero case), or when `min`/`max` are not finite.
     pub fn normalize(&mut self) {
-        let max_val = self.data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-
-        if max_val > 0.0 && max_val.is_finite() {
-            for v in &mut self.data {
-                *v /= max_val;
+        let mut min_val = f32::INFINITY;
+        let mut max_val = f32::NEG_INFINITY;
+        for &v in &self.data {
+            if v < min_val {
+                min_val = v;
             }
+            if v > max_val {
+                max_val = v;
+            }
+        }
+
+        if !min_val.is_finite() || !max_val.is_finite() {
+            return;
+        }
+        let range = max_val - min_val;
+        if !range.is_finite() || range <= 0.0 {
+            return;
+        }
+
+        for v in &mut self.data {
+            *v = (*v - min_val) / range;
         }
     }
 }
@@ -206,10 +266,23 @@ pub struct ControlNetConfig {
     /// Maximum number of simultaneous conditions.
     pub max_conditions: usize,
     /// U-Net layer indices at which features will be injected.
+    ///
+    /// Every entry must be `< `[`MAX_INJECTION_LAYERS`]; larger indices are
+    /// rejected by [`ControlNetConfig::validate`] and clamped by the injection
+    /// routines.
     pub injection_layers: Vec<usize>,
-    /// Default conditioning scale applied when no per-condition scale is set.
+    /// Global conditioning scale multiplied into every injected contribution.
+    ///
+    /// This stacks with each condition's own
+    /// [`ControlNetCondition::conditioning_scale`]: the value added to a feature
+    /// is `default_scale * conditioning_scale * <condition value>`. Set it to
+    /// `1.0` to let per-condition scales act alone.
     pub default_scale: f32,
     /// If `true`, inject only at later (coarser) layers; if `false` inject at all listed layers.
+    ///
+    /// "Later" means the upper half of the distinct entries of
+    /// [`ControlNetConfig::injection_layers`] once sorted — see
+    /// [`ControlNetConfig::injects_at`].
     pub late_injection: bool,
 }
 
@@ -239,20 +312,64 @@ impl ControlNetConfig {
     /// Validates configuration parameters.
     ///
     /// # Errors
-    /// - `DiffusionError::InvalidConfig` if `max_conditions == 0` or `default_scale <= 0.0`.
+    /// - `DiffusionError::InvalidConfig` if `max_conditions == 0`.
+    /// - `DiffusionError::InvalidConfig` if `default_scale` is not a finite value `> 0.0`.
+    /// - `DiffusionError::InvalidConfig` if any [`ControlNetConfig::injection_layers`]
+    ///   entry is `>= `[`MAX_INJECTION_LAYERS`].
     pub fn validate(&self) -> Result<(), DiffusionError> {
         if self.max_conditions == 0 {
             return Err(DiffusionError::InvalidConfig(
                 "max_conditions must be > 0".to_string(),
             ));
         }
-        if self.default_scale <= 0.0 {
+        if !self.default_scale.is_finite() || self.default_scale <= 0.0 {
             return Err(DiffusionError::InvalidConfig(format!(
-                "default_scale must be > 0.0, got {}",
+                "default_scale must be a finite value > 0.0, got {}",
                 self.default_scale
             )));
         }
+        if let Some(&bad) = self
+            .injection_layers
+            .iter()
+            .find(|&&layer| layer >= MAX_INJECTION_LAYERS)
+        {
+            return Err(DiffusionError::InvalidConfig(format!(
+                "injection_layers entry {bad} is out of range: must be < {MAX_INJECTION_LAYERS}"
+            )));
+        }
         Ok(())
+    }
+
+    /// Returns `true` when `layer_idx` should receive conditioning.
+    ///
+    /// A layer qualifies when it appears in
+    /// [`ControlNetConfig::injection_layers`]. When
+    /// [`ControlNetConfig::late_injection`] is set, only the coarser half of the
+    /// distinct listed layers qualifies — for `[0, 1, 2, 3]` that is `{2, 3}`,
+    /// for `[0, 1, 2]` it is `{1, 2}` (with an odd count the middle layer is
+    /// kept).
+    pub fn injects_at(&self, layer_idx: usize) -> bool {
+        if !self.injection_layers.contains(&layer_idx) {
+            return false;
+        }
+        if !self.late_injection {
+            return true;
+        }
+
+        // Count distinct entries, and how many of them are strictly coarser-side
+        // (smaller index) than `layer_idx`, without allocating.
+        let mut total_distinct = 0usize;
+        let mut smaller_distinct = 0usize;
+        for (i, &layer) in self.injection_layers.iter().enumerate() {
+            if self.injection_layers[..i].contains(&layer) {
+                continue;
+            }
+            total_distinct += 1;
+            if layer < layer_idx {
+                smaller_distinct += 1;
+            }
+        }
+        smaller_distinct >= total_distinct / 2
     }
 }
 
@@ -284,24 +401,233 @@ pub struct ControlFeature {
 }
 
 // ---------------------------------------------------------------------------
+// ZeroConv
+// ---------------------------------------------------------------------------
+
+/// Zero-initialised 1×1 output projection, as used by ControlNet.
+///
+/// ControlNet feeds its control features through 1×1 convolutions whose weights
+/// and biases start at exactly zero, so an untrained branch contributes nothing
+/// and training can grow the contribution smoothly from the base model. This
+/// struct is one such projection for one injection layer.
+///
+/// `weight` is row-major `[out_channels][in_channels]` (`out_channels *
+/// in_channels` entries) and `bias` holds `out_channels` entries. `in_channels`
+/// is the number of stacked condition channels registered on the processor
+/// (the sum of [`ControlNetCondition::channels`] over all conditions) and
+/// `out_channels` is the number of U-Net feature channels at that layer.
+#[derive(Debug, Clone)]
+pub struct ZeroConv {
+    in_channels: usize,
+    out_channels: usize,
+    weight: Vec<f32>,
+    bias: Vec<f32>,
+}
+
+impl ZeroConv {
+    /// Creates an all-zero projection — the ControlNet initialisation.
+    ///
+    /// Applying it adds exactly `0.0` to every feature.
+    pub fn zeros(in_channels: usize, out_channels: usize) -> Self {
+        Self {
+            in_channels,
+            out_channels,
+            weight: vec![0.0; out_channels.saturating_mul(in_channels)],
+            bias: vec![0.0; out_channels],
+        }
+    }
+
+    /// Creates a projection from trained weights.
+    ///
+    /// # Errors
+    /// - `DiffusionError::ShapeMismatch` if `weight.len() != out_channels * in_channels`
+    ///   or `bias.len() != out_channels`.
+    pub fn from_weights(
+        in_channels: usize,
+        out_channels: usize,
+        weight: Vec<f32>,
+        bias: Vec<f32>,
+    ) -> Result<Self, DiffusionError> {
+        let expected = out_channels.saturating_mul(in_channels);
+        if weight.len() != expected {
+            return Err(DiffusionError::ShapeMismatch {
+                op: "ZeroConv::from_weights (weight)".to_string(),
+                expected: vec![out_channels, in_channels],
+                got: vec![weight.len()],
+            });
+        }
+        if bias.len() != out_channels {
+            return Err(DiffusionError::ShapeMismatch {
+                op: "ZeroConv::from_weights (bias)".to_string(),
+                expected: vec![out_channels],
+                got: vec![bias.len()],
+            });
+        }
+        Ok(Self {
+            in_channels,
+            out_channels,
+            weight,
+            bias,
+        })
+    }
+
+    /// Number of condition channels this projection consumes.
+    pub fn in_channels(&self) -> usize {
+        self.in_channels
+    }
+
+    /// Number of feature channels this projection produces.
+    pub fn out_channels(&self) -> usize {
+        self.out_channels
+    }
+
+    /// Row-major `[out_channels][in_channels]` weights.
+    pub fn weight(&self) -> &[f32] {
+        &self.weight
+    }
+
+    /// Per-output-channel bias.
+    pub fn bias(&self) -> &[f32] {
+        &self.bias
+    }
+
+    /// Returns `true` while every weight and bias is exactly zero, i.e. the
+    /// projection is still at its ControlNet initialisation and contributes
+    /// nothing.
+    pub fn is_zero(&self) -> bool {
+        self.weight.iter().all(|&w| w == 0.0) && self.bias.iter().all(|&b| b == 0.0)
+    }
+
+    /// Projects one spatial position: `out[oc] = bias[oc] + Σ_ic weight[oc][ic] * input[ic]`.
+    ///
+    /// Values missing from `input` are treated as `0.0`, so a short slice is
+    /// projected as if zero-padded rather than panicking.
+    pub fn project(&self, input: &[f32]) -> Vec<f32> {
+        (0..self.out_channels)
+            .map(|oc| {
+                let base = oc * self.in_channels;
+                let mut sum = self.bias.get(oc).copied().unwrap_or(0.0);
+                for ic in 0..self.in_channels {
+                    let w = self.weight.get(base + ic).copied().unwrap_or(0.0);
+                    sum += w * input.get(ic).copied().unwrap_or(0.0);
+                }
+                sum
+            })
+            .collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DownsampledConditions (internal cache entry)
+// ---------------------------------------------------------------------------
+
+/// All registered conditions resampled to one feature resolution.
+///
+/// Cached per `(height, width)` because the result is a pure function of the
+/// conditions and the target resolution — it does not change between denoising
+/// steps, layers with the same resolution, or repeated calls.
+#[derive(Debug)]
+struct DownsampledConditions {
+    /// Stacked condition channels at the cached resolution, layout
+    /// `[channel][spatial]`, with each condition's `conditioning_scale` already
+    /// applied.
+    channels: Vec<f32>,
+    /// Number of stacked condition channels (`Σ cond.channels`).
+    num_channels: usize,
+    /// Fallback aggregation: per-condition channel mean × that condition's
+    /// scale, summed over conditions. Length `spatial`.
+    aggregate: Vec<f32>,
+}
+
+impl DownsampledConditions {
+    fn build(conditions: &[ControlNetCondition], target_h: usize, target_w: usize) -> Self {
+        let spatial = target_h.saturating_mul(target_w);
+        let num_channels: usize = conditions.iter().map(|c| c.channels).sum();
+
+        let mut channels = vec![0.0f32; num_channels.saturating_mul(spatial)];
+        let mut aggregate = vec![0.0f32; spatial];
+
+        let mut offset = 0usize;
+        for cond in conditions {
+            let downsampled = cond.downsample_to(target_h, target_w);
+            let scale = downsampled.conditioning_scale;
+            let cond_channels = downsampled.channels;
+            let inv_channels = if cond_channels > 0 {
+                1.0 / cond_channels as f32
+            } else {
+                0.0
+            };
+
+            for cc in 0..cond_channels {
+                let src = match downsampled.data.get(cc * spatial..(cc + 1) * spatial) {
+                    Some(src) => src,
+                    // Defensive: a hand-built condition may carry a `data`
+                    // vector shorter than `channels * height * width`.
+                    None => continue,
+                };
+                let dst_start = (offset + cc) * spatial;
+                if let Some(dst) = channels.get_mut(dst_start..dst_start + spatial) {
+                    for (d, &s) in dst.iter_mut().zip(src.iter()) {
+                        *d = s * scale;
+                    }
+                }
+                let weight = scale * inv_channels;
+                for (a, &s) in aggregate.iter_mut().zip(src.iter()) {
+                    *a += s * weight;
+                }
+            }
+
+            offset += cond_channels;
+        }
+
+        Self {
+            channels,
+            num_channels,
+            aggregate,
+        }
+    }
+}
+
+/// Maximum number of distinct resolutions kept in the downsample cache.
+///
+/// A U-Net only visits a handful of feature resolutions, so this only ever
+/// trips if a caller sweeps resolutions; the cache is then dropped wholesale
+/// rather than growing without bound.
+const DOWNSAMPLE_CACHE_CAPACITY: usize = 16;
+
+// ---------------------------------------------------------------------------
 // ControlNetProcessor
 // ---------------------------------------------------------------------------
 
 /// Manages multiple ControlNet conditions and orchestrates feature injection.
+///
+/// Conditions are resampled lazily and cached per feature resolution, so a
+/// denoising loop pays the resampling cost once rather than once per step.
 #[derive(Debug)]
 pub struct ControlNetProcessor {
     /// Active configuration.
     pub config: ControlNetConfig,
     /// Registered conditioning signals.
     conditions: Vec<ControlNetCondition>,
+    /// Zero-convolution output projections, keyed by U-Net layer index.
+    zero_convs: HashMap<usize, ZeroConv>,
+    /// Conditions resampled to a given `(height, width)`, computed on demand.
+    downsample_cache: Mutex<HashMap<(usize, usize), Arc<DownsampledConditions>>>,
 }
 
 impl ControlNetProcessor {
     /// Creates a new `ControlNetProcessor` with the given configuration.
+    ///
+    /// The configuration is *not* validated here (that would change this
+    /// constructor's signature); call [`ControlNetConfig::validate`] yourself if
+    /// the configuration came from user input. The injection routines clamp
+    /// out-of-range layer indices defensively either way.
     pub fn new(config: ControlNetConfig) -> Self {
         Self {
             config,
             conditions: Vec::new(),
+            zero_convs: HashMap::new(),
+            downsample_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -310,6 +636,9 @@ impl ControlNetProcessor {
     /// # Errors
     /// - `DiffusionError::InvalidConfig` if ControlNet is disabled.
     /// - `DiffusionError::InvalidConfig` if `max_conditions` would be exceeded.
+    /// - `DiffusionError::ShapeMismatch` if the condition's `data` length does
+    ///   not match `channels * height * width` (possible for conditions built
+    ///   through the struct literal rather than [`ControlNetCondition::new`]).
     pub fn add_condition(&mut self, cond: ControlNetCondition) -> Result<(), DiffusionError> {
         if !self.config.enabled {
             return Err(DiffusionError::InvalidConfig(
@@ -322,8 +651,27 @@ impl ControlNetProcessor {
                 self.config.max_conditions
             )));
         }
+        let expected_len = cond
+            .channels
+            .saturating_mul(cond.height)
+            .saturating_mul(cond.width);
+        if cond.data.len() != expected_len {
+            return Err(DiffusionError::ShapeMismatch {
+                op: "ControlNetProcessor::add_condition".to_string(),
+                expected: vec![cond.channels, cond.height, cond.width],
+                got: vec![cond.data.len()],
+            });
+        }
+
         self.conditions.push(cond);
+        self.invalidate_cache();
         Ok(())
+    }
+
+    /// Removes every registered condition.
+    pub fn clear_conditions(&mut self) {
+        self.conditions.clear();
+        self.invalidate_cache();
     }
 
     /// Returns a slice of all registered conditions.
@@ -331,15 +679,91 @@ impl ControlNetProcessor {
         &self.conditions
     }
 
-    /// Injects conditioning features into a mutable feature buffer for a given U-Net layer.
+    /// Total number of stacked condition channels (`Σ cond.channels`).
     ///
-    /// If `layer_idx` is not in `config.injection_layers`, the buffer is left unchanged.
-    /// Each condition is downsampled to `(feature_h, feature_w)` and its values are added
-    /// element-wise, broadcast across all channels. After injection, features are clamped
-    /// to `[-10.0, 10.0]` to prevent explosion.
+    /// This is the `in_channels` a [`ZeroConv`] must declare to be used.
+    pub fn condition_channels(&self) -> usize {
+        self.conditions.iter().map(|c| c.channels).sum()
+    }
+
+    /// Registers the zero-convolution output projection for one U-Net layer.
     ///
-    /// `features` is expected to have length `channels * feature_h * feature_w` where
-    /// `channels` is implied by the total length divided by `feature_h * feature_w`.
+    /// Once registered (and shape-compatible with the conditions and the
+    /// feature buffer), [`ControlNetProcessor::apply_to_features`] uses the real
+    /// ControlNet projection path instead of the broadcast fallback. Returns the
+    /// previously registered projection, if any.
+    pub fn set_zero_conv(&mut self, layer_idx: usize, conv: ZeroConv) -> Option<ZeroConv> {
+        self.zero_convs.insert(layer_idx, conv)
+    }
+
+    /// Returns the zero-convolution registered for `layer_idx`, if any.
+    pub fn zero_conv(&self, layer_idx: usize) -> Option<&ZeroConv> {
+        self.zero_convs.get(&layer_idx)
+    }
+
+    /// Drops the resampled-condition cache (called whenever conditions change).
+    fn invalidate_cache(&mut self) {
+        let mut cache = self
+            .downsample_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        cache.clear();
+    }
+
+    /// Returns all conditions resampled to `(height, width)`, computing and
+    /// caching the result on first use.
+    fn downsampled(&self, height: usize, width: usize) -> Arc<DownsampledConditions> {
+        let key = (height, width);
+        let mut cache = self
+            .downsample_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = cache.get(&key) {
+            return Arc::clone(entry);
+        }
+        if cache.len() >= DOWNSAMPLE_CACHE_CAPACITY {
+            cache.clear();
+        }
+        let entry = Arc::new(DownsampledConditions::build(
+            &self.conditions,
+            height,
+            width,
+        ));
+        cache.insert(key, Arc::clone(&entry));
+        entry
+    }
+
+    /// Injects conditioning into a mutable U-Net feature buffer for one layer.
+    ///
+    /// The buffer is left completely unchanged unless ControlNet is enabled,
+    /// at least one condition is registered, and
+    /// [`ControlNetConfig::injects_at`] accepts `layer_idx` (which honours both
+    /// [`ControlNetConfig::injection_layers`] and
+    /// [`ControlNetConfig::late_injection`]).
+    ///
+    /// `features` is `[channels][feature_h * feature_w]` row-major, where
+    /// `channels` is implied by `features.len() / (feature_h * feature_w)`; a
+    /// trailing partial channel is ignored.
+    ///
+    /// # Injection paths
+    ///
+    /// * **ControlNet projection** — used when a [`ZeroConv`] is registered for
+    ///   `layer_idx` whose `in_channels` equals
+    ///   [`ControlNetProcessor::condition_channels`] and whose `out_channels`
+    ///   equals the implied feature-channel count. Each spatial position's
+    ///   stacked condition channels are projected through the 1×1 convolution
+    ///   and added to the corresponding feature channels. With the default
+    ///   all-zero weights this adds nothing, exactly as in ControlNet before
+    ///   training.
+    /// * **Broadcast fallback** — used when no compatible projection is
+    ///   registered. Each condition is reduced to its channel mean, scaled, and
+    ///   the resulting scalar is added to *every* feature channel at that
+    ///   position. This is a channel-constant spatial bias, not learned control
+    ///   features; it exists so the plumbing can be exercised without trained
+    ///   ControlNet weights.
+    ///
+    /// Both paths multiply by [`ControlNetConfig::default_scale`] and clamp the
+    /// whole buffer to `[-10.0, 10.0]` afterwards to prevent explosion.
     pub fn apply_to_features(
         &self,
         features: &mut [f32],
@@ -347,106 +771,109 @@ impl ControlNetProcessor {
         feature_h: usize,
         feature_w: usize,
     ) {
-        if !self.config.enabled {
+        if !self.config.enabled || !self.config.injects_at(layer_idx) {
             return;
         }
 
-        // Only inject at specified layers
-        if !self.config.injection_layers.contains(&layer_idx) {
+        let spatial = feature_h.saturating_mul(feature_w);
+        if spatial == 0 || features.is_empty() || self.conditions.is_empty() {
             return;
         }
 
-        let spatial = feature_h * feature_w;
-        if spatial == 0 || features.is_empty() {
-            return;
-        }
-
-        // Number of channels implied by feature buffer size
-        let feature_channels = features.len().checked_div(spatial).unwrap_or(0);
+        // Number of channels implied by feature buffer size.
+        let feature_channels = features.len() / spatial;
         if feature_channels == 0 {
             return;
         }
 
-        // Accumulate contributions from all conditions
-        for cond in &self.conditions {
-            let downsampled = cond.downsample_to(feature_h, feature_w);
-            let scale = downsampled.conditioning_scale;
+        let global_scale = self.config.default_scale;
+        let cached = self.downsampled(feature_h, feature_w);
 
-            // For each condition channel, add scaled values to all feature channels
-            for fy in 0..feature_h {
-                for fx in 0..feature_w {
-                    // Sum across condition channels to produce a scalar per spatial position
-                    let mut cond_val = 0.0f32;
-                    for cc in 0..downsampled.channels {
-                        cond_val += downsampled.pixel_at(cc, fy, fx);
-                    }
-                    // Normalize by condition channel count to keep magnitude stable
-                    if downsampled.channels > 0 {
-                        cond_val /= downsampled.channels as f32;
-                    }
-                    cond_val *= scale;
+        let projection = self.zero_convs.get(&layer_idx).filter(|conv| {
+            conv.in_channels == cached.num_channels && conv.out_channels == feature_channels
+        });
 
-                    // Broadcast this scalar to all feature channels at this spatial position
-                    for fc in 0..feature_channels {
-                        let idx = fc * spatial + fy * feature_w + fx;
-                        if let Some(v) = features.get_mut(idx) {
-                            *v += cond_val;
+        match projection {
+            Some(conv) => {
+                // Real ControlNet output projection. The inner loop walks one
+                // output channel's contiguous spatial slice; the condition
+                // channels form a handful of parallel streams.
+                for (oc, chunk) in features
+                    .chunks_mut(spatial)
+                    .take(feature_channels)
+                    .enumerate()
+                {
+                    let base = oc * conv.in_channels;
+                    let bias = conv.bias.get(oc).copied().unwrap_or(0.0);
+                    for (s, v) in chunk.iter_mut().enumerate() {
+                        let mut sum = bias;
+                        for ic in 0..conv.in_channels {
+                            let w = conv.weight.get(base + ic).copied().unwrap_or(0.0);
+                            let c = cached
+                                .channels
+                                .get(ic * spatial + s)
+                                .copied()
+                                .unwrap_or(0.0);
+                            sum += w * c;
                         }
+                        *v += sum * global_scale;
+                    }
+                }
+            }
+            None => {
+                // Broadcast fallback: one contiguous pass per feature channel.
+                for chunk in features.chunks_mut(spatial).take(feature_channels) {
+                    for (v, &a) in chunk.iter_mut().zip(cached.aggregate.iter()) {
+                        *v += a * global_scale;
                     }
                 }
             }
         }
 
-        // Clamp to prevent gradient explosion
+        // Clamp to prevent gradient explosion.
         for v in features.iter_mut() {
             *v = v.clamp(-10.0, 10.0);
         }
     }
 
-    /// Generates `ControlFeature` objects for every injection layer by summing downsampled conditions.
+    /// Generates a [`ControlFeature`] for every layer that
+    /// [`ControlNetConfig::injects_at`] accepts, by aggregating the downsampled
+    /// conditions.
     ///
-    /// Output features have `channels = 1` (scalar aggregation).
+    /// Layer `n` is evaluated at `image_h / 2^n × image_w / 2^n` (floored, at
+    /// least `1 × 1`), matching the U-Net's per-stage halving. The exponent is
+    /// clamped to `MAX_INJECTION_LAYERS - 1` so an unvalidated
+    /// [`ControlNetConfig::injection_layers`] entry can never overflow the
+    /// shift.
+    ///
+    /// Output features have `channels = 1` (scalar aggregation), scaled by
+    /// [`ControlNetConfig::default_scale`] and clamped to `[-10.0, 10.0]`.
     pub fn process_conditions(&self, image_h: usize, image_w: usize) -> Vec<ControlFeature> {
         if !self.config.enabled || self.conditions.is_empty() {
             return Vec::new();
         }
 
+        let global_scale = self.config.default_scale;
+
         self.config
             .injection_layers
             .iter()
-            .map(|&layer_idx| {
-                // Halve resolution at each deeper layer (approximate U-Net scale)
-                let scale_factor = 1usize << layer_idx;
+            .copied()
+            .filter(|&layer_idx| self.config.injects_at(layer_idx))
+            .map(|layer_idx| {
+                // Halve resolution at each deeper layer (approximate U-Net
+                // scale). Clamping keeps `1 << stage` well inside `usize`.
+                let stage = layer_idx.min(MAX_INJECTION_LAYERS - 1);
+                let scale_factor = 1usize.checked_shl(stage as u32).unwrap_or(1);
                 let feat_h = (image_h / scale_factor).max(1);
                 let feat_w = (image_w / scale_factor).max(1);
-                let spatial = feat_h * feat_w;
 
-                // Sum all condition contributions at this resolution
-                let mut data = vec![0.0f32; spatial];
-
-                for cond in &self.conditions {
-                    let downsampled = cond.downsample_to(feat_h, feat_w);
-                    let scale = downsampled.conditioning_scale;
-
-                    for y in 0..feat_h {
-                        for x in 0..feat_w {
-                            let mut cond_val = 0.0f32;
-                            for cc in 0..downsampled.channels {
-                                cond_val += downsampled.pixel_at(cc, y, x);
-                            }
-                            if downsampled.channels > 0 {
-                                cond_val /= downsampled.channels as f32;
-                            }
-                            let idx = y * feat_w + x;
-                            data[idx] += cond_val * scale;
-                        }
-                    }
-                }
-
-                // Clamp to prevent explosion
-                for v in &mut data {
-                    *v = v.clamp(-10.0, 10.0);
-                }
+                let cached = self.downsampled(feat_h, feat_w);
+                let data: Vec<f32> = cached
+                    .aggregate
+                    .iter()
+                    .map(|&v| (v * global_scale).clamp(-10.0, 10.0))
+                    .collect();
 
                 ControlFeature {
                     layer_idx,
@@ -682,10 +1109,64 @@ mod tests {
         let data = vec![0.0f32, 2.0, 4.0, 8.0];
         let mut cond = ControlNetCondition::depth_map(data, 2, 2).unwrap();
         cond.normalize();
-        // max was 8.0 → all values divided by 8
+        // min was 0.0 and max 8.0 → (v - 0) / 8
         assert!((cond.data[3] - 1.0).abs() < 1e-6);
         assert!((cond.data[2] - 0.5).abs() < 1e-6);
         assert!(cond.data[0].abs() < 1e-6);
+    }
+
+    // Regression: `normalize` used to divide by the maximum only, so signed data
+    // such as [-5.0, 10.0] came back as [-0.5, 1.0] — outside the documented
+    // [0, 1] range — and all-negative data was left untouched entirely.
+    #[test]
+    fn test_condition_normalize_signed_data_lands_in_unit_range() {
+        let mut cond = ControlNetCondition::depth_map(vec![-5.0f32, 0.0, 2.5, 10.0], 2, 2).unwrap();
+        cond.normalize();
+        for v in &cond.data {
+            assert!(
+                (0.0..=1.0).contains(v),
+                "normalize must produce [0, 1], got {v}"
+            );
+        }
+        assert!(cond.data[0].abs() < 1e-6, "min must map to 0.0");
+        assert!((cond.data[3] - 1.0).abs() < 1e-6, "max must map to 1.0");
+        // (0 - (-5)) / 15 = 1/3
+        assert!((cond.data[1] - 1.0 / 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_condition_normalize_all_negative_lands_in_unit_range() {
+        let mut cond =
+            ControlNetCondition::depth_map(vec![-8.0f32, -6.0, -4.0, -2.0], 2, 2).unwrap();
+        cond.normalize();
+        for v in &cond.data {
+            assert!(
+                (0.0..=1.0).contains(v),
+                "normalize must produce [0, 1], got {v}"
+            );
+        }
+        assert!(cond.data[0].abs() < 1e-6);
+        assert!((cond.data[3] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_condition_normalize_constant_data_is_left_unchanged() {
+        let mut cond = ControlNetCondition::depth_map(vec![0.0f32; 4], 2, 2).unwrap();
+        cond.normalize();
+        assert!(cond.data.iter().all(|v| v.abs() < 1e-6));
+
+        let mut uniform = ControlNetCondition::depth_map(vec![3.0f32; 4], 2, 2).unwrap();
+        uniform.normalize();
+        assert!(uniform.data.iter().all(|v| (v - 3.0).abs() < 1e-6));
+    }
+
+    #[test]
+    fn test_condition_normalize_non_finite_data_is_left_unchanged() {
+        let mut cond =
+            ControlNetCondition::depth_map(vec![0.0f32, 1.0, f32::INFINITY, 2.0], 2, 2).unwrap();
+        cond.normalize();
+        assert!((cond.data[1] - 1.0).abs() < 1e-6);
+        assert!(cond.data[2].is_infinite());
     }
 
     // -----------------------------------------------------------------------
@@ -865,5 +1346,429 @@ mod tests {
         ];
         let conds2 = condition_images_from_multi_view(&mixed, 4, 4);
         assert_eq!(conds2.len(), 1, "invalid map should be silently skipped");
+    }
+
+    // -----------------------------------------------------------------------
+    // injection_layers range checking (regression: shift-left overflow)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_config_validate_rejects_out_of_range_injection_layer() {
+        let cfg = ControlNetConfig {
+            injection_layers: vec![0, MAX_INJECTION_LAYERS],
+            ..ControlNetConfig::default()
+        };
+        let result = cfg.validate();
+        assert!(
+            result.is_err(),
+            "layer >= MAX_INJECTION_LAYERS must be rejected"
+        );
+        match result {
+            Err(DiffusionError::InvalidConfig(msg)) => {
+                assert!(
+                    msg.contains("injection_layers"),
+                    "unexpected message: {msg}"
+                );
+            }
+            other => panic!("Expected InvalidConfig, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_config_validate_rejects_non_finite_default_scale() {
+        let cfg = ControlNetConfig {
+            default_scale: f32::NAN,
+            ..ControlNetConfig::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    // Regression: `process_conditions` used `1usize << layer_idx` on an
+    // unvalidated, publicly settable index — 64 and above panicked in debug
+    // builds ("attempt to shift left with overflow") and silently wrapped in
+    // release builds.
+    #[test]
+    fn test_process_conditions_huge_layer_index_does_not_overflow() {
+        let mut proc = ControlNetProcessor::new(ControlNetConfig {
+            injection_layers: vec![64, 200, usize::MAX],
+            ..ControlNetConfig::default()
+        });
+        proc.add_condition(ControlNetCondition::depth_map(vec![1.0f32; 64], 8, 8).unwrap())
+            .unwrap();
+
+        let features = proc.process_conditions(64, 64);
+        assert_eq!(features.len(), 3);
+        for feature in &features {
+            assert!(feature.height >= 1 && feature.width >= 1);
+            assert_eq!(feature.features.len(), feature.height * feature.width);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // default_scale / late_injection are honoured
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_apply_to_features_honours_default_scale() {
+        let mut proc = ControlNetProcessor::new(ControlNetConfig {
+            default_scale: 2.5,
+            ..ControlNetConfig::default()
+        });
+        proc.add_condition(ControlNetCondition::depth_map(vec![1.0f32; 16], 4, 4).unwrap())
+            .unwrap();
+
+        let mut features = vec![0.0f32; 16];
+        proc.apply_to_features(&mut features, 0, 4, 4);
+        for v in &features {
+            assert!((*v - 2.5).abs() < 1e-5, "expected 2.5, got {v}");
+        }
+    }
+
+    #[test]
+    fn test_process_conditions_honours_default_scale() {
+        let mut proc = ControlNetProcessor::new(ControlNetConfig {
+            injection_layers: vec![0],
+            default_scale: 3.0,
+            ..ControlNetConfig::default()
+        });
+        proc.add_condition(ControlNetCondition::depth_map(vec![1.0f32; 16], 4, 4).unwrap())
+            .unwrap();
+
+        let features = proc.process_conditions(4, 4);
+        assert_eq!(features.len(), 1);
+        for v in &features[0].features {
+            assert!((*v - 3.0).abs() < 1e-5, "expected 3.0, got {v}");
+        }
+    }
+
+    #[test]
+    fn test_injects_at_late_injection_keeps_coarser_half() {
+        let cfg = ControlNetConfig {
+            injection_layers: vec![0, 1, 2, 3],
+            late_injection: true,
+            ..ControlNetConfig::default()
+        };
+        assert!(!cfg.injects_at(0));
+        assert!(!cfg.injects_at(1));
+        assert!(cfg.injects_at(2));
+        assert!(cfg.injects_at(3));
+        assert!(!cfg.injects_at(7), "unlisted layer never injects");
+    }
+
+    #[test]
+    fn test_injects_at_odd_count_keeps_middle_layer() {
+        let cfg = ControlNetConfig {
+            injection_layers: vec![2, 0, 1],
+            late_injection: true,
+            ..ControlNetConfig::default()
+        };
+        assert!(!cfg.injects_at(0));
+        assert!(cfg.injects_at(1));
+        assert!(cfg.injects_at(2));
+    }
+
+    #[test]
+    fn test_injects_at_all_layers_when_late_injection_off() {
+        let cfg = ControlNetConfig::default();
+        for layer in 0..4 {
+            assert!(cfg.injects_at(layer));
+        }
+    }
+
+    #[test]
+    fn test_apply_to_features_late_injection_skips_early_layers() {
+        let mut proc = ControlNetProcessor::new(ControlNetConfig {
+            late_injection: true,
+            ..ControlNetConfig::default()
+        });
+        proc.add_condition(ControlNetCondition::depth_map(vec![1.0f32; 16], 4, 4).unwrap())
+            .unwrap();
+
+        let mut early = vec![0.0f32; 16];
+        proc.apply_to_features(&mut early, 0, 4, 4);
+        assert!(
+            early.iter().all(|v| v.abs() < 1e-10),
+            "layer 0 must be skipped when late_injection is set"
+        );
+
+        let mut late = vec![0.0f32; 16];
+        proc.apply_to_features(&mut late, 3, 4, 4);
+        assert!(late.iter().all(|v| (*v - 1.0).abs() < 1e-5));
+    }
+
+    #[test]
+    fn test_process_conditions_late_injection_filters_layers() {
+        let mut proc = ControlNetProcessor::new(ControlNetConfig {
+            injection_layers: vec![0, 1, 2, 3],
+            late_injection: true,
+            ..ControlNetConfig::default()
+        });
+        proc.add_condition(ControlNetCondition::depth_map(vec![0.5f32; 256], 16, 16).unwrap())
+            .unwrap();
+
+        let features = proc.process_conditions(16, 16);
+        let layers: Vec<usize> = features.iter().map(|f| f.layer_idx).collect();
+        assert_eq!(layers, vec![2, 3]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Multi-channel / multi-condition aggregation semantics
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_apply_to_features_broadcasts_across_all_feature_channels() {
+        let mut proc = ControlNetProcessor::new(ControlNetConfig::default());
+        proc.add_condition(ControlNetCondition::depth_map(vec![1.0f32; 4], 2, 2).unwrap())
+            .unwrap();
+
+        // 3 feature channels over a 2×2 map.
+        let mut features = vec![0.0f32; 3 * 4];
+        proc.apply_to_features(&mut features, 0, 2, 2);
+        assert_eq!(features.len(), 12);
+        for v in &features {
+            assert!((*v - 1.0).abs() < 1e-5, "expected 1.0, got {v}");
+        }
+    }
+
+    #[test]
+    fn test_apply_to_features_sums_conditions_with_per_condition_scale() {
+        let mut proc = ControlNetProcessor::new(ControlNetConfig::default());
+        proc.add_condition(
+            ControlNetCondition::new(ControlSignalType::DepthMap, vec![1.0f32; 4], 2, 2, 0.5)
+                .unwrap(),
+        )
+        .unwrap();
+        // A 3-channel normal map of all 2.0 has channel mean 2.0.
+        proc.add_condition(
+            ControlNetCondition::new(ControlSignalType::NormalMap, vec![2.0f32; 3 * 4], 2, 2, 1.0)
+                .unwrap(),
+        )
+        .unwrap();
+
+        let mut features = vec![0.0f32; 4];
+        proc.apply_to_features(&mut features, 0, 2, 2);
+        // 1.0 * 0.5 + 2.0 * 1.0 = 2.5
+        for v in &features {
+            assert!((*v - 2.5).abs() < 1e-5, "expected 2.5, got {v}");
+        }
+    }
+
+    #[test]
+    fn test_apply_to_features_repeated_calls_accumulate_identically() {
+        // Guards the per-resolution downsample cache: the second call must see
+        // exactly the same conditioning as the first.
+        let mut proc = ControlNetProcessor::new(ControlNetConfig::default());
+        proc.add_condition(ControlNetCondition::depth_map(vec![1.0f32; 16], 4, 4).unwrap())
+            .unwrap();
+
+        let mut features = vec![0.0f32; 16];
+        proc.apply_to_features(&mut features, 0, 4, 4);
+        proc.apply_to_features(&mut features, 0, 4, 4);
+        for v in &features {
+            assert!((*v - 2.0).abs() < 1e-5, "expected 2.0, got {v}");
+        }
+    }
+
+    #[test]
+    fn test_apply_to_features_cache_invalidated_by_new_condition() {
+        let mut proc = ControlNetProcessor::new(ControlNetConfig::default());
+        proc.add_condition(ControlNetCondition::depth_map(vec![1.0f32; 16], 4, 4).unwrap())
+            .unwrap();
+
+        let mut first = vec![0.0f32; 16];
+        proc.apply_to_features(&mut first, 0, 4, 4);
+        assert!(first.iter().all(|v| (*v - 1.0).abs() < 1e-5));
+
+        proc.add_condition(ControlNetCondition::depth_map(vec![1.0f32; 16], 4, 4).unwrap())
+            .unwrap();
+
+        let mut second = vec![0.0f32; 16];
+        proc.apply_to_features(&mut second, 0, 4, 4);
+        assert!(
+            second.iter().all(|v| (*v - 2.0).abs() < 1e-5),
+            "cache must be invalidated when a condition is added"
+        );
+    }
+
+    #[test]
+    fn test_apply_to_features_clamps_to_plus_minus_ten() {
+        let mut proc = ControlNetProcessor::new(ControlNetConfig::default());
+        proc.add_condition(
+            ControlNetCondition::new(ControlSignalType::DepthMap, vec![1.0f32; 4], 2, 2, 100.0)
+                .unwrap(),
+        )
+        .unwrap();
+
+        let mut features = vec![0.0f32; 4];
+        proc.apply_to_features(&mut features, 0, 2, 2);
+        for v in &features {
+            assert!((*v - 10.0).abs() < 1e-5, "expected clamp to 10.0, got {v}");
+        }
+    }
+
+    #[test]
+    fn test_add_condition_rejects_inconsistent_data_length() {
+        let mut proc = ControlNetProcessor::new(ControlNetConfig::default());
+        // Built via struct literal so it bypasses `ControlNetCondition::new`.
+        let malformed = ControlNetCondition {
+            signal_type: ControlSignalType::DepthMap,
+            data: vec![1.0f32; 3],
+            channels: 1,
+            height: 4,
+            width: 4,
+            conditioning_scale: 1.0,
+        };
+        let result = proc.add_condition(malformed);
+        assert!(result.is_err());
+        match result {
+            Err(DiffusionError::ShapeMismatch { op, .. }) => {
+                assert!(op.contains("add_condition"), "unexpected op: {op}");
+            }
+            other => panic!("Expected ShapeMismatch, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // ZeroConv / ControlNet output projection
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_zero_conv_zeros_is_zero() {
+        let conv = ZeroConv::zeros(3, 8);
+        assert_eq!(conv.in_channels(), 3);
+        assert_eq!(conv.out_channels(), 8);
+        assert_eq!(conv.weight().len(), 24);
+        assert_eq!(conv.bias().len(), 8);
+        assert!(conv.is_zero());
+        assert_eq!(conv.project(&[1.0, 2.0, 3.0]), vec![0.0; 8]);
+    }
+
+    #[test]
+    fn test_zero_conv_from_weights_shape_checked() {
+        assert!(ZeroConv::from_weights(2, 3, vec![0.0; 6], vec![0.0; 3]).is_ok());
+        assert!(ZeroConv::from_weights(2, 3, vec![0.0; 5], vec![0.0; 3]).is_err());
+        assert!(ZeroConv::from_weights(2, 3, vec![0.0; 6], vec![0.0; 2]).is_err());
+    }
+
+    #[test]
+    fn test_zero_conv_project() {
+        // out0 = 1*a + 0*b + 1, out1 = 0*a + 2*b + 0
+        let conv = ZeroConv::from_weights(2, 2, vec![1.0, 0.0, 0.0, 2.0], vec![1.0, 0.0])
+            .expect("valid shapes");
+        assert!(!conv.is_zero());
+        let out = conv.project(&[3.0, 5.0]);
+        assert!((out[0] - 4.0).abs() < 1e-6);
+        assert!((out[1] - 10.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_apply_to_features_zero_conv_contributes_nothing_until_trained() {
+        let mut proc = ControlNetProcessor::new(ControlNetConfig::default());
+        proc.add_condition(ControlNetCondition::depth_map(vec![1.0f32; 4], 2, 2).unwrap())
+            .unwrap();
+        // 1 condition channel in, 2 feature channels out.
+        proc.set_zero_conv(0, ZeroConv::zeros(1, 2));
+
+        let mut features = vec![0.0f32; 2 * 4];
+        proc.apply_to_features(&mut features, 0, 2, 2);
+        assert!(
+            features.iter().all(|v| v.abs() < 1e-10),
+            "an untrained zero-conv must add exactly nothing"
+        );
+    }
+
+    #[test]
+    fn test_apply_to_features_uses_zero_conv_projection_when_trained() {
+        let mut proc = ControlNetProcessor::new(ControlNetConfig::default());
+        // Two 1-channel conditions → in_channels = 2.
+        proc.add_condition(ControlNetCondition::depth_map(vec![1.0f32; 4], 2, 2).unwrap())
+            .unwrap();
+        proc.add_condition(ControlNetCondition::edge_map(vec![3.0f32; 4], 2, 2).unwrap())
+            .unwrap();
+        assert_eq!(proc.condition_channels(), 2);
+
+        // out0 = 1*c0 + 0*c1, out1 = 0*c0 + 2*c1
+        let conv = ZeroConv::from_weights(2, 2, vec![1.0, 0.0, 0.0, 2.0], vec![0.0, 0.0])
+            .expect("valid shapes");
+        proc.set_zero_conv(0, conv);
+
+        let mut features = vec![0.0f32; 2 * 4];
+        proc.apply_to_features(&mut features, 0, 2, 2);
+        // Channel 0 gets c0 = 1.0, channel 1 gets 2 * c1 = 6.0.
+        for v in &features[..4] {
+            assert!((*v - 1.0).abs() < 1e-5, "channel 0: expected 1.0, got {v}");
+        }
+        for v in &features[4..] {
+            assert!((*v - 6.0).abs() < 1e-5, "channel 1: expected 6.0, got {v}");
+        }
+    }
+
+    #[test]
+    fn test_apply_to_features_incompatible_zero_conv_falls_back_to_broadcast() {
+        let mut proc = ControlNetProcessor::new(ControlNetConfig::default());
+        proc.add_condition(ControlNetCondition::depth_map(vec![1.0f32; 4], 2, 2).unwrap())
+            .unwrap();
+        // Declares 5 input channels but only 1 condition channel exists.
+        proc.set_zero_conv(0, ZeroConv::zeros(5, 2));
+
+        let mut features = vec![0.0f32; 2 * 4];
+        proc.apply_to_features(&mut features, 0, 2, 2);
+        for v in &features {
+            assert!(
+                (*v - 1.0).abs() < 1e-5,
+                "expected broadcast fallback, got {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_zero_conv_accessor_round_trip() {
+        let mut proc = ControlNetProcessor::new(ControlNetConfig::default());
+        assert!(proc.zero_conv(1).is_none());
+        assert!(proc.set_zero_conv(1, ZeroConv::zeros(3, 4)).is_none());
+        let stored = proc.zero_conv(1).expect("just registered");
+        assert_eq!(stored.in_channels(), 3);
+        assert_eq!(stored.out_channels(), 4);
+        let previous = proc.set_zero_conv(1, ZeroConv::zeros(3, 8));
+        assert_eq!(previous.map(|c| c.out_channels()), Some(4));
+    }
+
+    #[test]
+    fn test_clear_conditions_resets_injection() {
+        let mut proc = ControlNetProcessor::new(ControlNetConfig::default());
+        proc.add_condition(ControlNetCondition::depth_map(vec![1.0f32; 16], 4, 4).unwrap())
+            .unwrap();
+        let mut features = vec![0.0f32; 16];
+        proc.apply_to_features(&mut features, 0, 4, 4);
+        assert!(features.iter().all(|v| (*v - 1.0).abs() < 1e-5));
+
+        proc.clear_conditions();
+        assert_eq!(proc.conditions().len(), 0);
+        let mut after = vec![7.0f32; 16];
+        proc.apply_to_features(&mut after, 0, 4, 4);
+        assert!(
+            after.iter().all(|v| (*v - 7.0).abs() < 1e-5),
+            "no conditions means no change at all"
+        );
+    }
+
+    #[test]
+    fn test_apply_to_features_partial_trailing_channel_is_ignored() {
+        let mut proc = ControlNetProcessor::new(ControlNetConfig::default());
+        proc.add_condition(ControlNetCondition::depth_map(vec![1.0f32; 4], 2, 2).unwrap())
+            .unwrap();
+
+        // 4 spatial + 2 trailing floats: one whole channel plus a remainder.
+        let mut features = vec![0.0f32; 6];
+        proc.apply_to_features(&mut features, 0, 2, 2);
+        for v in &features[..4] {
+            assert!((*v - 1.0).abs() < 1e-5);
+        }
+        for v in &features[4..] {
+            assert!(
+                v.abs() < 1e-10,
+                "trailing partial channel must be untouched"
+            );
+        }
     }
 }

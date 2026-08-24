@@ -8,7 +8,8 @@
 
 #![allow(clippy::doc_markdown)]
 
-use std::collections::{HashMap, HashSet};
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashSet};
 
 use crate::error::FlameError;
 
@@ -197,7 +198,10 @@ impl MultiResMesh {
         self.levels.get(level).map_or(0, |l| l.vertices.len())
     }
 
-    /// Ratio of the coarsest level's vertex count to the finest level.
+    /// Ratio of the finest level's vertex count to the coarsest level's.
+    ///
+    /// For example `10.0` means the coarsest level has one tenth of the
+    /// vertices of the finest level.  The value is always `>= 1.0`.
     ///
     /// Returns `1.0` if there is only one level.
     #[must_use]
@@ -218,6 +222,11 @@ impl MultiResMesh {
 #[derive(Debug, Clone)]
 pub struct DecimationConfig {
     /// Stop once the mesh reaches at most this many vertices.
+    ///
+    /// The default is [`usize::MAX`], meaning "no decimation": the stop
+    /// condition holds for any input mesh, so [`MeshDecimator::decimate`]
+    /// returns the input unchanged.  Set an explicit target to decimate.
+    /// A value of `0` is rejected by [`MeshDecimator::decimate`].
     pub target_vertex_count: usize,
     /// Stop early if the minimum edge error exceeds this value.
     ///
@@ -234,7 +243,7 @@ pub struct DecimationConfig {
 impl Default for DecimationConfig {
     fn default() -> Self {
         Self {
-            target_vertex_count: 0,
+            target_vertex_count: usize::MAX,
             max_error_threshold: f64::MAX,
             preserve_boundary: true,
             min_triangle_quality: 0.0,
@@ -289,9 +298,18 @@ pub fn compute_vertex_normals(vertices: &[[f32; 3]], faces: &[[u32; 3]]) -> Vec<
         let ny = e1[2] * e2[0] - e1[0] * e2[2];
         let nz = e1[0] * e2[1] - e1[1] * e2[0];
 
-        // Skip zero-area faces
+        // Skip zero-area faces.
+        //
+        // `len_sq` is the SQUARED cross-product magnitude (i.e. `(2 * area)²`),
+        // so the threshold must be the square of the desired magnitude cutoff.
+        // Every other normal routine in the crate rejects `|cross| < 1e-10`,
+        // hence `1e-20` here.  Comparing a squared quantity against
+        // `f32::EPSILON` (1.19e-7) would instead discard every triangle with an
+        // area below ~1.7e-4 — which at metric FLAME scale (head ≈ 0.2 m,
+        // per-face area ≈ 1e-5 m²) is *every* face, leaving all normals at the
+        // `[0, 0, 1]` fallback.
         let len_sq = nx * nx + ny * ny + nz * nz;
-        if len_sq < f32::EPSILON {
+        if len_sq < 1e-20 {
             continue;
         }
 
@@ -323,16 +341,71 @@ pub fn compute_vertex_normals(vertices: &[[f32; 3]], faces: &[[u32; 3]]) -> Vec<
 // MeshDecimator
 // ---------------------------------------------------------------------------
 
+/// A candidate edge collapse held in the decimation priority queue.
+///
+/// `ver1`/`ver2` snapshot the endpoint versions at the time the cost was
+/// computed; a mismatch when the entry is popped means the endpoint's quadric
+/// or position has changed since, so the entry is stale and is discarded
+/// (lazy invalidation).
+#[derive(Debug, Clone, Copy)]
+struct EdgeCandidate {
+    cost: f64,
+    pos: [f64; 3],
+    v1: u32,
+    v2: u32,
+    ver1: u32,
+    ver2: u32,
+}
+
+impl Ord for EdgeCandidate {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Reversed: `BinaryHeap` is a max-heap and we want the cheapest
+        // collapse first.  `total_cmp` gives a total order over all f64
+        // (including NaN), which `Ord` requires.
+        other.cost.total_cmp(&self.cost)
+    }
+}
+
+impl PartialOrd for EdgeCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for EdgeCandidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for EdgeCandidate {}
+
 /// Internal mesh decimation engine using Quadric Error Metrics.
 ///
 /// Implements the Garland-Heckbert edge-collapse strategy: at each step the
 /// edge with the smallest QEM cost is collapsed.
+///
+/// # Complexity
+///
+/// Edge costs live in a binary heap with lazy invalidation and every vertex
+/// keeps its incident-face list, so a collapse touches only the 1-ring of the
+/// merged vertex: `O(E log E)` for the initial build plus `O(deg · log E)` per
+/// collapse.  Nothing in the loop scans the whole face or edge array.
 pub struct MeshDecimator {
     vertices: Vec<[f64; 3]>,
     faces: Vec<[u32; 3]>,
     quadrics: Vec<Quadric>,
     valid_vertices: Vec<bool>,
     valid_faces: Vec<bool>,
+    /// Indices of the faces incident to each vertex.
+    ///
+    /// Invariant: every *valid* face appears in the list of each of its three
+    /// (canonical) vertices.  Lists may additionally contain now-invalid faces,
+    /// which every reader skips.
+    vertex_faces: Vec<Vec<u32>>,
+    /// Bumped whenever a vertex's quadric or position changes, invalidating any
+    /// queued edge cost that referenced the old state.
+    version: Vec<u32>,
     /// Collapse chain: `vertex_map[v]` gives the index that vertex `v` was
     /// merged into (initially the identity `v → v`).
     vertex_map: Vec<u32>,
@@ -371,17 +444,29 @@ impl MeshDecimator {
             .map(|v| [f64::from(v[0]), f64::from(v[1]), f64::from(v[2])])
             .collect();
 
-        // Build per-vertex quadrics by accumulating face plane quadrics
+        // Build per-vertex quadrics by accumulating face plane quadrics, and
+        // the incident-face adjacency used by the collapse loop.
         let mut quadrics = vec![Quadric::zero(); n_verts];
+        let mut valid_faces: Vec<bool> = vec![true; faces.len()];
+        let mut vertex_faces: Vec<Vec<u32>> = vec![Vec::new(); n_verts];
 
-        for face in faces {
+        for (fi, face) in faces.iter().enumerate() {
             let i0 = face[0] as usize;
             let i1 = face[1] as usize;
             let i2 = face[2] as usize;
 
-            if i0 >= n_verts || i1 >= n_verts || i2 >= n_verts {
-                continue; // skip degenerate indices
+            // Faces referencing a missing vertex, or repeating one, carry no
+            // surface information; drop them up front so no later step can
+            // index out of bounds or corrupt the collapse bookkeeping.
+            if i0 >= n_verts || i1 >= n_verts || i2 >= n_verts || i0 == i1 || i1 == i2 || i0 == i2 {
+                valid_faces[fi] = false;
+                continue;
             }
+
+            let fi_u32 = fi as u32;
+            vertex_faces[i0].push(fi_u32);
+            vertex_faces[i1].push(fi_u32);
+            vertex_faces[i2].push(fi_u32);
 
             let v0 = verts_f64[i0];
             let v1 = verts_f64[i1];
@@ -398,7 +483,9 @@ impl MeshDecimator {
 
             let len = (nx * nx + ny * ny + nz * nz).sqrt();
             if len < 1e-12 {
-                continue; // degenerate face
+                // Zero-area face: no usable plane constraint, but the face is
+                // topologically real, so it stays valid and adjacent.
+                continue;
             }
 
             // Normalise the plane equation: plane_a*x + plane_b*y + plane_c*z + plane_d = 0
@@ -413,7 +500,6 @@ impl MeshDecimator {
             quadrics[i2] = quadrics[i2].add(&fq);
         }
 
-        let valid_faces: Vec<bool> = vec![true; faces.len()];
         let valid_vertices: Vec<bool> = vec![true; n_verts];
         let vertex_map: Vec<u32> = (0..n_verts as u32).collect();
 
@@ -423,6 +509,8 @@ impl MeshDecimator {
             quadrics,
             valid_vertices,
             valid_faces,
+            vertex_faces,
+            version: vec![0; n_verts],
             vertex_map,
             live_vertex_count: n_verts,
             original_vertex_count,
@@ -469,35 +557,114 @@ impl MeshDecimator {
         edge_set.into_iter().collect()
     }
 
-    /// Build a set of boundary edges (edges belonging to exactly one face).
+    /// Number of valid, non-degenerate faces incident to *both* canonical
+    /// vertices `a` and `b` — i.e. the number of faces sharing edge `(a, b)`.
     ///
-    /// Returns a `HashSet`-equivalent via a `HashMap<edge, count>`.
-    fn boundary_edges(&self) -> HashMap<(u32, u32), usize> {
-        let mut counts: HashMap<(u32, u32), usize> = HashMap::new();
-
-        for (fi, face) in self.faces.iter().enumerate() {
-            if !self.valid_faces[fi] {
+    /// Only the incident-face list of `a` is scanned, so this costs `O(deg(a))`
+    /// rather than a pass over the whole face array.
+    fn shared_face_count(&self, a: u32, b: u32) -> usize {
+        let mut count = 0;
+        for &fi in &self.vertex_faces[a as usize] {
+            let idx = fi as usize;
+            if !self.valid_faces[idx] {
                 continue;
             }
-            let a = self.canonical(face[0]);
-            let b = self.canonical(face[1]);
-            let c = self.canonical(face[2]);
-
-            if a == b || b == c || a == c {
+            let face = self.faces[idx];
+            let ca = self.canonical(face[0]);
+            let cb = self.canonical(face[1]);
+            let cc = self.canonical(face[2]);
+            if ca == cb || cb == cc || ca == cc {
                 continue;
             }
-
-            for (u, v) in [(a, b), (b, c), (a, c)] {
-                let key = if u < v { (u, v) } else { (v, u) };
-                *counts.entry(key).or_insert(0) += 1;
+            if (ca == a || cb == a || cc == a) && (ca == b || cb == b || cc == b) {
+                count += 1;
             }
         }
+        count
+    }
 
-        counts
+    /// Does any valid face still contain both canonical vertices?
+    fn edge_exists(&self, a: u32, b: u32) -> bool {
+        self.shared_face_count(a, b) > 0
+    }
+
+    /// An edge lies on the mesh boundary when exactly one face contains it.
+    fn is_boundary_edge(&self, a: u32, b: u32) -> bool {
+        self.shared_face_count(a, b) == 1
+    }
+
+    /// Canonical vertices sharing a valid face with `v` (its 1-ring).
+    fn neighbors(&self, v: u32) -> Vec<u32> {
+        let mut out: Vec<u32> = Vec::new();
+        for &fi in &self.vertex_faces[v as usize] {
+            let idx = fi as usize;
+            if !self.valid_faces[idx] {
+                continue;
+            }
+            for &slot in &self.faces[idx] {
+                let c = self.canonical(slot);
+                if c != v && !out.contains(&c) {
+                    out.push(c);
+                }
+            }
+        }
+        out
+    }
+
+    /// Build a priced collapse candidate for edge `(a, b)`.
+    ///
+    /// The endpoints are normalised to `(min, max)` so that the lower index
+    /// always survives the collapse, keeping the collapse chains short and the
+    /// result independent of the order edges were discovered in.
+    fn make_candidate(&self, a: u32, b: u32) -> Option<EdgeCandidate> {
+        if a == b {
+            return None;
+        }
+        let (v1, v2) = if a < b { (a, b) } else { (b, a) };
+        if !self.valid_vertices[v1 as usize] || !self.valid_vertices[v2 as usize] {
+            return None;
+        }
+
+        let q_combined = self.quadrics[v1 as usize].add(&self.quadrics[v2 as usize]);
+
+        // Try to find optimal collapse position; fall back to midpoint
+        let pos = q_combined.minimize_position().unwrap_or_else(|| {
+            let p1 = self.vertices[v1 as usize];
+            let p2 = self.vertices[v2 as usize];
+            [
+                (p1[0] + p2[0]) * 0.5,
+                (p1[1] + p2[1]) * 0.5,
+                (p1[2] + p2[2]) * 0.5,
+            ]
+        });
+
+        Some(EdgeCandidate {
+            cost: q_combined.error(pos),
+            pos,
+            v1,
+            v2,
+            ver1: self.version[v1 as usize],
+            ver2: self.version[v2 as usize],
+        })
+    }
+
+    /// Is a queued candidate still an accurate description of a live edge?
+    fn is_current(&self, candidate: &EdgeCandidate) -> bool {
+        let v1 = candidate.v1 as usize;
+        let v2 = candidate.v2 as usize;
+        self.valid_vertices[v1]
+            && self.valid_vertices[v2]
+            && self.version[v1] == candidate.ver1
+            && self.version[v2] == candidate.ver2
+            && self.edge_exists(candidate.v1, candidate.v2)
     }
 
     /// Check whether collapsing edge `(v1, v2)` to position `pos` would produce
     /// a degenerate triangle (sin of smallest angle < `min_quality`).
+    ///
+    /// Only the faces incident to `v1` or `v2` can change shape, so only those
+    /// are visited — the same set the previous full-array scan selected, at
+    /// `O(deg)` instead of `O(F)`.
     ///
     /// Returns `true` if the quality check passes (collapse is acceptable).
     fn check_triangle_quality(&self, v1: u32, v2: u32, pos: [f64; 3], min_quality: f32) -> bool {
@@ -509,10 +676,16 @@ impl MeshDecimator {
         // after collapse and check quality
         let min_q = f64::from(min_quality);
 
-        for (fi, face) in self.faces.iter().enumerate() {
+        let incident = self.vertex_faces[v1 as usize]
+            .iter()
+            .chain(self.vertex_faces[v2 as usize].iter());
+
+        for &fi in incident {
+            let fi = fi as usize;
             if !self.valid_faces[fi] {
                 continue;
             }
+            let face = self.faces[fi];
             let a = self.canonical(face[0]);
             let b = self.canonical(face[1]);
             let c = self.canonical(face[2]);
@@ -580,6 +753,17 @@ impl MeshDecimator {
     /// The decimator's internal state is mutated in place; call again on a fresh
     /// instance to decimate to a different target.
     ///
+    /// # Algorithm
+    ///
+    /// Edge costs are held in a min-heap that is built once.  A popped entry is
+    /// discarded when either endpoint has been merged away or re-priced since
+    /// the entry was queued (lazy invalidation), so after a collapse only the
+    /// edges of the merged vertex's 1-ring have to be re-costed.  Edges blocked
+    /// by the triangle-quality gate are parked and re-queued after the next
+    /// successful collapse, because a nearby collapse can change their
+    /// geometry — boundary-blocked edges are dropped outright, since faces are
+    /// only ever removed and an edge that lost a face never regains one.
+    ///
     /// # Errors
     ///
     /// Returns [`FlameError::InvalidParams`] if the config target is 0.
@@ -590,85 +774,63 @@ impl MeshDecimator {
             ));
         }
 
-        // Iteratively collapse lowest-cost edges until target is reached
-        loop {
-            if self.live_vertex_count <= config.target_vertex_count {
-                break;
+        // Price every edge once up front.
+        let edges = self.collect_edges();
+        let mut heap: BinaryHeap<EdgeCandidate> = BinaryHeap::with_capacity(edges.len());
+        for (v1, v2) in edges {
+            if let Some(candidate) = self.make_candidate(v1, v2) {
+                heap.push(candidate);
             }
+        }
 
-            let edges = self.collect_edges();
-            if edges.is_empty() {
-                break;
-            }
+        // Edges rejected by the quality gate, retried after the next collapse.
+        let mut deferred: Vec<EdgeCandidate> = Vec::new();
 
-            // Build boundary edge map if we need to preserve boundaries
-            let boundary = if config.preserve_boundary {
-                self.boundary_edges()
-            } else {
-                HashMap::new()
+        while self.live_vertex_count > config.target_vertex_count {
+            let Some(candidate) = heap.pop() else {
+                break; // no collapsible edge left
             };
 
-            // Find the best (lowest-cost) valid edge to collapse
-            let mut best_cost = f64::MAX;
-            let mut best_edge: Option<(u32, u32)> = None;
-            let mut best_pos = [0.0f64; 3];
-
-            for (v1, v2) in &edges {
-                let v1 = *v1;
-                let v2 = *v2;
-
-                // Skip boundary edges when preserve_boundary is set
-                if config.preserve_boundary {
-                    let key = if v1 < v2 { (v1, v2) } else { (v2, v1) };
-                    if boundary.get(&key).copied().unwrap_or(0) == 1 {
-                        continue;
-                    }
-                }
-
-                let q_combined = self.quadrics[v1 as usize].add(&self.quadrics[v2 as usize]);
-
-                // Try to find optimal collapse position; fall back to midpoint
-                let candidate_pos = q_combined.minimize_position().unwrap_or_else(|| {
-                    let p1 = self.vertices[v1 as usize];
-                    let p2 = self.vertices[v2 as usize];
-                    [
-                        (p1[0] + p2[0]) * 0.5,
-                        (p1[1] + p2[1]) * 0.5,
-                        (p1[2] + p2[2]) * 0.5,
-                    ]
-                });
-
-                let cost = q_combined.error(candidate_pos);
-
-                if cost < best_cost {
-                    // Quality gate
-                    if config.min_triangle_quality > 0.0
-                        && !self.check_triangle_quality(
-                            v1,
-                            v2,
-                            candidate_pos,
-                            config.min_triangle_quality,
-                        )
-                    {
-                        continue;
-                    }
-                    best_cost = cost;
-                    best_edge = Some((v1, v2));
-                    best_pos = candidate_pos;
-                }
+            // Lazy invalidation: drop entries that no longer describe a live edge
+            if !self.is_current(&candidate) {
+                continue;
             }
 
-            // Check error threshold
-            if best_cost > config.max_error_threshold {
+            // The heap yields the globally cheapest collapse, so once it is too
+            // expensive no remaining edge can be cheap enough.
+            if candidate.cost > config.max_error_threshold {
                 break;
             }
 
-            let Some((v1, v2)) = best_edge else {
-                break; // no collapsible edge found (all blocked by boundary / quality)
-            };
+            let (v1, v2) = (candidate.v1, candidate.v2);
+
+            if config.preserve_boundary && self.is_boundary_edge(v1, v2) {
+                continue;
+            }
+
+            if config.min_triangle_quality > 0.0
+                && !self.check_triangle_quality(v1, v2, candidate.pos, config.min_triangle_quality)
+            {
+                deferred.push(candidate);
+                continue;
+            }
 
             // Perform the collapse: merge v2 into v1
-            self.collapse_edge(v1, v2, best_pos);
+            self.collapse_edge(v1, v2, candidate.pos);
+
+            // Re-price every edge of the merged vertex's new 1-ring …
+            for neighbor in self.neighbors(v1) {
+                if let Some(new_candidate) = self.make_candidate(v1, neighbor) {
+                    heap.push(new_candidate);
+                }
+            }
+            // … and give quality-blocked edges another chance now that the
+            // surrounding geometry has moved.
+            for parked in deferred.drain(..) {
+                if self.is_current(&parked) {
+                    heap.push(parked);
+                }
+            }
         }
 
         Ok(self.build_mesh_level())
@@ -676,40 +838,50 @@ impl MeshDecimator {
 
     /// Collapse edge `(v1, v2)`: move v1 to `new_pos`, redirect all references
     /// to v2 to v1, and remove now-degenerate faces.
+    ///
+    /// Only the faces incident to `v2` can change, so only those are rewritten;
+    /// they are stored back with canonical indices, which keeps the invariant
+    /// that every valid face holds canonical vertex indices.
     fn collapse_edge(&mut self, v1: u32, v2: u32, new_pos: [f64; 3]) {
         // Merge quadrics
         let q_new = self.quadrics[v1 as usize].add(&self.quadrics[v2 as usize]);
         self.quadrics[v1 as usize] = q_new;
 
-        // Move v1 to the optimal position
+        // Move v1 to the optimal position and invalidate its queued costs
         self.vertices[v1 as usize] = new_pos;
+        self.version[v1 as usize] = self.version[v1 as usize].wrapping_add(1);
 
         // Mark v2 as invalid and point it to v1
         self.valid_vertices[v2 as usize] = false;
         self.vertex_map[v2 as usize] = v1;
         self.live_vertex_count -= 1;
 
-        // Update faces: replace v2 with v1, invalidate degenerate faces
-        for fi in 0..self.faces.len() {
-            if !self.valid_faces[fi] {
+        // Update the faces around v2: they now reference v1, and the ones that
+        // contained both endpoints have collapsed to a sliver and are removed.
+        let v2_faces = std::mem::take(&mut self.vertex_faces[v2 as usize]);
+        let mut inherited: Vec<u32> = Vec::with_capacity(v2_faces.len());
+        for fi in v2_faces {
+            let idx = fi as usize;
+            if !self.valid_faces[idx] {
                 continue;
             }
-
-            let face = &mut self.faces[fi];
-
-            // Remap each vertex through the canonical chain
-            for slot in face.iter_mut() {
-                if *slot == v2 {
-                    *slot = v1;
-                }
-            }
-
-            // After remapping, check for degenerate face (two identical vertices)
-            let (a, b, c) = (face[0], face[1], face[2]);
+            let a = self.canonical(self.faces[idx][0]);
+            let b = self.canonical(self.faces[idx][1]);
+            let c = self.canonical(self.faces[idx][2]);
             if a == b || b == c || a == c {
-                self.valid_faces[fi] = false;
+                self.valid_faces[idx] = false;
+                continue;
             }
+            self.faces[idx] = [a, b, c];
+            inherited.push(fi);
         }
+
+        // v1 adopts v2's surviving faces; drop the ones it lost along the way
+        // so the adjacency lists cannot grow without bound.
+        let mut v1_faces = std::mem::take(&mut self.vertex_faces[v1 as usize]);
+        v1_faces.retain(|&fi| self.valid_faces[fi as usize]);
+        v1_faces.extend(inherited);
+        self.vertex_faces[v1 as usize] = v1_faces;
     }
 
     /// Extract the current mesh state into a [`MeshLevel`].
@@ -753,15 +925,35 @@ impl MeshDecimator {
             }
         }
 
-        // Build vertex_map for the original level-0 vertex count
+        // Build vertex_map for the original level-0 vertex count.
+        //
+        // Every collapse chain terminates at a surviving (valid) vertex, so the
+        // lookup below always resolves.  Should an internal inconsistency ever
+        // break that invariant we fall back to vertex 0 and report it once,
+        // rather than silently mis-mapping or panicking.
+        let mut unresolved = 0_usize;
         let vertex_map: Vec<u32> = (0..self.original_vertex_count as u32)
             .map(|orig_idx| {
                 // Follow the collapse chain until we reach a valid surviving vertex
                 let canonical = self.canonical(orig_idx);
                 // Map the canonical vertex to its compact index
-                old_to_new[canonical as usize].unwrap_or(0)
+                old_to_new
+                    .get(canonical as usize)
+                    .copied()
+                    .flatten()
+                    .unwrap_or_else(|| {
+                        unresolved += 1;
+                        0
+                    })
             })
             .collect();
+        if unresolved > 0 {
+            tracing::warn!(
+                "MeshDecimator: {} original vertices did not resolve to a surviving \
+                 vertex and were mapped to vertex 0",
+                unresolved
+            );
+        }
 
         let normals = compute_vertex_normals(&new_vertices, &new_faces);
 
@@ -926,6 +1118,28 @@ mod tests {
         (verts, faces)
     }
 
+    /// An `n × n` grid of gently curved quads (2·(n-1)² triangles).
+    fn grid_mesh(n: u32) -> (Vec<[f32; 3]>, Vec<[u32; 3]>) {
+        let mut verts = Vec::with_capacity((n * n) as usize);
+        for row in 0..n {
+            for col in 0..n {
+                let x = col as f32 * 0.05;
+                let y = row as f32 * 0.05;
+                // A little curvature keeps the quadrics non-singular.
+                verts.push([x, y, 0.01 * (x * y).sin()]);
+            }
+        }
+        let mut faces = Vec::with_capacity((2 * (n - 1) * (n - 1)) as usize);
+        for row in 0..n - 1 {
+            for col in 0..n - 1 {
+                let i = row * n + col;
+                faces.push([i, i + 1, i + n]);
+                faces.push([i + 1, i + n + 1, i + n]);
+            }
+        }
+        (verts, faces)
+    }
+
     // -----------------------------------------------------------------------
     // Quadric tests
     // -----------------------------------------------------------------------
@@ -1045,6 +1259,35 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_compute_vertex_normals_metric_scale_faces_survive() {
+        // Two triangles forming a 2 mm quad in the YZ plane, so the correct
+        // normal is ±X and cannot be confused with the `[0, 0, 1]` fallback.
+        // |cross| ≈ 4e-6 → len_sq ≈ 1.6e-11, which the old `f32::EPSILON`
+        // (1.19e-7) threshold discarded as "zero area", turning every normal
+        // of a metric-scale FLAME mesh into the fallback.
+        let verts = vec![
+            [0.0f32, 0.0, 0.0],
+            [0.0, 2e-3, 0.0],
+            [0.0, 2e-3, 2e-3],
+            [0.0, 0.0, 2e-3],
+        ];
+        let faces = vec![[0u32, 1, 2], [0, 2, 3]];
+        let normals = compute_vertex_normals(&verts, &faces);
+
+        assert_eq!(normals.len(), 4);
+        for (i, n) in normals.iter().enumerate() {
+            assert!(
+                n[0].abs() > 0.99,
+                "vertex {i}: expected a ±X normal, got {n:?}"
+            );
+            assert!(
+                n[2].abs() < 1e-3,
+                "vertex {i}: got the [0,0,1] fallback: {n:?}"
+            );
+        }
+    }
+
     // -----------------------------------------------------------------------
     // MeshDecimator tests
     // -----------------------------------------------------------------------
@@ -1145,6 +1388,88 @@ mod tests {
             assert_ne!(face[0], face[1], "degenerate face: equal vertex indices");
             assert_ne!(face[1], face[2], "degenerate face: equal vertex indices");
             assert_ne!(face[0], face[2], "degenerate face: equal vertex indices");
+        }
+    }
+
+    #[test]
+    fn test_decimator_scales_with_quality_gate_enabled() {
+        // 576 vertices / 1058 faces.  The previous implementation rebuilt the
+        // whole edge set and boundary map per collapse and called the O(F)
+        // quality gate from inside the O(E) inner loop — O(N·E·F) ≈ 8e8 float
+        // operations for this mesh.  The incremental priority queue only ever
+        // touches the 1-ring of the merged vertex, so this finishes instantly.
+        let (verts, faces) = grid_mesh(24);
+        assert_eq!(verts.len(), 576);
+
+        let config = DecimationConfig {
+            target_vertex_count: 100,
+            preserve_boundary: false,
+            min_triangle_quality: 0.1,
+            ..DecimationConfig::default()
+        };
+
+        let mut dec = MeshDecimator::new(&verts, &faces).expect("valid mesh");
+        let level = dec.decimate(&config).expect("decimation ok");
+
+        assert!(
+            level.vertices.len() < verts.len(),
+            "decimation made no progress: {} vertices",
+            level.vertices.len()
+        );
+        assert_eq!(level.vertex_map.len(), verts.len());
+        for face in &level.faces {
+            for &vi in face {
+                assert!(
+                    (vi as usize) < level.vertices.len(),
+                    "face index {vi} out of bounds ({})",
+                    level.vertices.len()
+                );
+            }
+            assert!(
+                face[0] != face[1] && face[1] != face[2] && face[0] != face[2],
+                "degenerate face {face:?} survived decimation"
+            );
+        }
+    }
+
+    #[test]
+    fn test_decimator_default_config_is_a_no_op() {
+        // `DecimationConfig::default()` used to carry `target_vertex_count: 0`,
+        // which `decimate` rejected outright — the Default value was unusable.
+        let (verts, faces) = tetrahedron();
+        let mut dec = MeshDecimator::new(&verts, &faces).expect("valid mesh");
+        let level = dec
+            .decimate(&DecimationConfig::default())
+            .expect("default config must be usable");
+        assert_eq!(level.vertices.len(), verts.len());
+    }
+
+    #[test]
+    fn test_decimator_rejects_zero_target() {
+        let (verts, faces) = tetrahedron();
+        let mut dec = MeshDecimator::new(&verts, &faces).expect("valid mesh");
+        let config = DecimationConfig {
+            target_vertex_count: 0,
+            ..DecimationConfig::default()
+        };
+        assert!(dec.decimate(&config).is_err());
+    }
+
+    #[test]
+    fn test_decimator_ignores_out_of_range_face_indices() {
+        let (verts, mut faces) = tetrahedron();
+        faces.push([0, 1, 99]); // references a vertex that does not exist
+        let config = DecimationConfig {
+            target_vertex_count: 3,
+            preserve_boundary: false,
+            ..DecimationConfig::default()
+        };
+        let mut dec = MeshDecimator::new(&verts, &faces).expect("valid mesh");
+        let level = dec.decimate(&config).expect("decimation ok");
+        for face in &level.faces {
+            for &vi in face {
+                assert!((vi as usize) < level.vertices.len());
+            }
         }
     }
 

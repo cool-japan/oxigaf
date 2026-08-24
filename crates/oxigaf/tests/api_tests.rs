@@ -84,7 +84,7 @@ fn test_pipeline_builder_zero_iterations_rejected() {
 fn test_validate_config_catches_nonexistent_paths() {
     let config = PipelineConfig {
         flame_model_path: std::path::PathBuf::from("/nonexistent/flame/path/that/cannot/exist"),
-        output_dir: std::path::PathBuf::from("/tmp/out"),
+        output_dir: std::env::temp_dir().join("oxigaf_validate_nonexistent_out"),
         num_views: 8,
         iterations: 1000,
     };
@@ -238,8 +238,13 @@ fn test_export_format_equality() {
 
 #[test]
 fn test_render_from_file_missing_path_returns_err() {
-    let err = render_from_file("/nonexistent/model.ply", "/tmp/out.png", 512, 512)
-        .expect_err("missing model path should fail");
+    let err = render_from_file(
+        "/nonexistent/model.ply",
+        std::env::temp_dir().join("oxigaf_render_missing_out.png"),
+        512,
+        512,
+    )
+    .expect_err("missing model path should fail");
     assert!(matches!(err, OxigafError::PathNotFound(_)));
 }
 
@@ -248,8 +253,9 @@ fn test_render_from_file_zero_dimensions_returns_err() {
     let tmp = std::env::temp_dir().join("oxigaf_render_test.ply");
     fs::write(&tmp, b"ply").expect("write dummy ply");
 
-    let err = render_from_file(tmp.as_path(), std::path::Path::new("/tmp/out.png"), 0, 512)
-        .expect_err("zero width should fail");
+    let out = std::env::temp_dir().join("oxigaf_render_zero_dim_out.png");
+    let err =
+        render_from_file(tmp.as_path(), out.as_path(), 0, 512).expect_err("zero width should fail");
     assert!(matches!(err, OxigafError::InvalidConfig(_)));
 
     fs::remove_file(&tmp).ok();
@@ -259,7 +265,7 @@ fn test_render_from_file_zero_dimensions_returns_err() {
 fn test_export_missing_path_returns_err() {
     let err = export(
         "/nonexistent/model.ply",
-        "/tmp/out.gltf",
+        std::env::temp_dir().join("oxigaf_export_missing_out.gltf"),
         ExportFormat::Gltf,
     )
     .expect_err("missing model path should fail");

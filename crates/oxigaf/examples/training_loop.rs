@@ -46,7 +46,12 @@ fn create_demo_model(num_gaussians: usize, sh_degree: u32) -> GaussianModel {
     let mut seed = 42u64;
     let mut random_f32 = || -> f32 {
         seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-        ((seed >> 33) as f32) / (u32::MAX as f32 / 2.0) - 1.0
+        // Use the top 32 bits (more random than the low bits of an LCG) as a
+        // full-range u32, then map to [-1, 1]. A `>> 33` shift here only
+        // yields 31 bits (range [0, 2^31)), which after the same divisor
+        // collapses to [-1, 0) instead of [-1, 1) — every "random" value
+        // would be non-positive.
+        ((seed >> 32) as f32) / (u32::MAX as f32 / 2.0) - 1.0
     };
 
     for _ in 0..num_gaussians {

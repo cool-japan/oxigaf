@@ -40,7 +40,7 @@ Implements the methods from [GAF: Gaussian Avatar Reconstruction from Monocular 
 ### Quality & Performance
 - **100% Pure Rust**: Zero C/Fortran dependencies (COOLJAPAN compliant)
 - **12537 Tests Passing**: Comprehensive validation across all crates
-- **Production Ready**: Zero unwrap(), all files <2000 lines, feature-gated dependencies
+- **Production Ready**: Zero unwrap(), feature-gated dependencies, files kept under a 2000-line limit (one outlier, `oxigaf-cli/src/diff_tool.rs`, is pending a `splitrs` split)
 
 ## Workspace Structure
 
@@ -50,7 +50,7 @@ Implements the methods from [GAF: Gaussian Avatar Reconstruction from Monocular 
 | `oxigaf-diffusion` | lib | Multi-view diffusion with IP-Adapter, upsampling, and CFG (candle) |
 | `oxigaf-render` | lib | Differentiable 3D Gaussian Splatting rasterizer with CPU reference (wgpu) |
 | `oxigaf-trainer` | lib | Optimization pipeline with gradient verification and FLAME binding backward |
-| `oxigaf-bridge` | lib | PyTorch ↔ OxiGAF weight conversion and layer mapping utilities |
+| `oxigaf-bridge` | lib | PyTorch ↔ OxiGAF weight conversion and layer mapping utilities. Standalone library — add it as a dependency in your own project; it is not currently wired into the `oxigaf` CLI binary (the CLI's `convert` subcommand only handles FLAME `.pkl`/`.npz`). |
 | `oxigaf` | lib | Meta crate — unified re-export of all sub-crates |
 | `oxigaf-cli` | bin | CLI binary (`oxigaf` command) |
 
@@ -78,47 +78,45 @@ OxiGAF supports various feature flags for platform-specific optimizations:
 | `simd` | SIMD optimizations for FLAME model (requires nightly Rust) |
 | `parallel` | Parallel processing with rayon |
 | `flash_attention` | Memory-efficient attention mechanism |
-| `mixed_precision` | FP16/BF16 inference (placeholder) |
+| `mixed_precision` | FP16/BF16 inference |
 | `gpu_debug` | GPU validation layers and debug markers |
 
-### Platform-Specific Features
+### GPU / BLAS Backends
 
-| Feature | Platforms | Requirements |
-|---------|-----------|--------------|
-| `cuda` | Linux, Windows | NVIDIA GPU + CUDA Toolkit (nvcc, nvidia-smi) |
-| `metal` | macOS | Apple Silicon or Intel Mac with Metal |
-| `accelerate` | macOS | Apple Accelerate framework (enabled by default) |
+OxiGAF does not define its own `cuda` / `metal` / `accelerate` feature flags —
+no crate in this workspace declares them. GPU/BLAS acceleration for the
+`candle`-based crates (`oxigaf-diffusion`, `oxigaf-trainer`) is configured by
+depending on the `oxicandle-core` fork directly with its own features, e.g. in
+a downstream `Cargo.toml`:
+
+```toml
+candle-core = { package = "oxicandle-core", version = "0.11.0", features = ["metal"] }      # macOS GPU
+candle-core = { package = "oxicandle-core", version = "0.11.0", features = ["accelerate"] } # macOS BLAS
+candle-core = { package = "oxicandle-core", version = "0.11.0", features = ["cuda"] }        # NVIDIA GPU
+```
+
+The 3D Gaussian Splatting rasterizer (`oxigaf-render`) always uses `wgpu`,
+which auto-selects Metal / Vulkan / DirectX / GL at runtime — no feature flag
+needed there.
 
 ### Building Documentation
 
-**Important:** Do NOT use `--all-features` on macOS as it will attempt to enable CUDA support which requires Linux/Windows.
-
 ```bash
-# macOS (Metal supported, CUDA not available)
 cargo doc --no-deps --features "simd,parallel,flash_attention,mixed_precision,gpu_debug"
 
-# Linux with NVIDIA GPU
-cargo doc --no-deps --features "cuda,simd,parallel,flash_attention,mixed_precision,gpu_debug"
-
-# Linux without GPU (CPU only)
-cargo doc --no-deps --features "simd,parallel,flash_attention,mixed_precision"
-
-# Enforce warnings as errors (for CI)
-RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --features "simd,parallel,flash_attention"
+# Enforce warnings as errors
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --features "simd,parallel,flash_attention,mixed_precision,gpu_debug"
 ```
 
 ### Building with Features
 
 ```bash
-# macOS optimized build
-cargo build --release --features "metal,simd,parallel,flash_attention"
-
-# Linux with CUDA
-cargo build --release --features "cuda,simd,parallel,flash_attention"
-
 # CPU-only build (all platforms)
 cargo build --release --features "simd,parallel,flash_attention"
 ```
+
+See "GPU / BLAS Backends" above to additionally enable `oxicandle-core`'s
+`metal` / `accelerate` / `cuda` features for `oxigaf-diffusion`/`oxigaf-trainer`.
 
 ## FLAME Model Setup
 
@@ -126,10 +124,14 @@ OxiGAF supports both legacy NPY and modern Safetensors formats for FLAME models.
 
 ### Option 1: Safetensors (Recommended, v0.1.1)
 
-Safetensors format is supported for runtime loading/saving. PyTorch conversion script coming soon.
+Safetensors format is supported for runtime loading/saving.
 
 1. Download the FLAME 2023 model from <https://flame.is.tue.mpg.de/>
-2. Convert using PyTorch and save as safetensors (script in development)
+2. Convert the PyTorch checkpoint to safetensors (casts to fp16, partitions
+   into `unet`/`vae`/`clip`/`other`):
+   ```bash
+   python scripts/convert_weights.py path/to/checkpoint.pt output_dir/
+   ```
 
 ### Option 2: NPY (Legacy)
 
@@ -198,6 +200,10 @@ save_flame_model_safetensors(&model, Path::new("output.safetensors"))?;
 ```
 
 ### PyTorch Weight Conversion (v0.1.1)
+
+`oxigaf-bridge` is a standalone library crate — add `oxigaf-bridge` to your
+own `Cargo.toml` to use it (`cargo add oxigaf-bridge`); it is not exposed
+through the `oxigaf` CLI binary.
 
 ```rust
 use oxigaf_bridge::LayerMapping;

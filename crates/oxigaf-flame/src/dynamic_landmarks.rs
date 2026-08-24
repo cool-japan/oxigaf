@@ -1,11 +1,25 @@
 //! Pose-dependent dynamic face contour landmark extraction.
 //!
 //! Dynamic landmarks are the **face contour** points (chin/jaw outline) that
-//! shift based on head pose.  As the head rotates, different vertex chains
-//! become the visible silhouette:
+//! shift based on head pose.  As the head rotates, one side of the jaw recedes
+//! behind the cheek and its contour has to slide inward, so a different vertex
+//! chain traces the silhouette.
 //!
-//! - Left turn  (positive yaw): left-side jaw vertices become the visible outline
-//! - Right turn (negative yaw): right-side jaw vertices become the visible outline
+//! ## Yaw sign convention
+//!
+//! This crate uses a right-handed frame with `+X` = the subject's right,
+//! `+Y` = up and `+Z` = out of the face (see the crate-level docs), so a
+//! positive rotation about `+Y` swings the face toward `+X`: **positive yaw is
+//! a turn to the subject's right**.  That matches
+//! [`crate::canonical::HeadOrientation::yaw`], the `head_turn` rig control
+//! (`+1 = turn right`) and [`crate::pose_estimation::estimate_yaw_from_symmetry`].
+//!
+//! Under a right turn the subject's right ear rotates away from a camera on
+//! `+Z`, so the right side is the one that recedes and needs the pose-dependent
+//! contour:
+//!
+//! - Right turn (positive yaw): the right-side chain traces the contour
+//! - Left turn  (negative yaw): the left-side chain traces the contour
 //! - Near-frontal (|yaw| < threshold): both sides used symmetrically
 //!
 //! ## Quick Start
@@ -75,45 +89,202 @@ impl Default for DynamicLandmarkConfig {
 /// Each chain lists vertex indices in order from the chin outward to the
 /// respective ear.  The vertex indices correspond to the FLAME 2020 canonical
 /// mesh topology (~5023 vertices).
+///
+/// The two chains are **disjoint**: the chin vertex belongs to `left_chain`
+/// only, so `left_chain` followed by `right_chain` walks the whole jaw contour
+/// without repeating a point.  [`DynamicLandmarkExtractor::extract`] relies on
+/// that when it builds a symmetric frontal contour from both chains.
+#[derive(Debug, Clone)]
 pub struct ContourVertexChains {
     /// Left side contour vertices (chin → left ear), ordered.
     pub left_chain: Vec<u32>,
-    /// Right side contour vertices (chin → right ear), ordered.
+    /// Right side contour vertices (just past the chin → right ear), ordered.
     pub right_chain: Vec<u32>,
 }
 
 impl ContourVertexChains {
-    /// Default FLAME 2020 contour vertex chains.
+    /// Contour chains derived from the canonical FLAME 68-point jaw line.
     ///
-    /// These approximate the jaw/chin silhouette for a 5023-vertex FLAME mesh.
-    /// When `flame_dynamic_embedding.npy` is available the chains should be
-    /// replaced with the embedding's `dynamic_lmk_faces_idx` and
-    /// `dynamic_lmk_b_coords` values projected to vertex indices.
+    /// The two chains are the two halves of the jaw contour that
+    /// [`LandmarkExtractor`] already models — real jaw vertices, split at the
+    /// chin — rather than runs of consecutive vertex indices, which are
+    /// unrelated to one another in the FLAME topology.
     ///
-    /// **Left chain** covers approximately vertex indices 1–17 (chin to left
-    /// jaw), using small indices that are guaranteed to exist in any standard
-    /// FLAME mesh.
+    /// # This is a pose-*independent* fallback
     ///
-    /// **Right chain** covers approximately vertex indices 4984–5000 (chin to
-    /// right jaw), near the end of the FLAME vertex array.
+    /// A genuinely pose-dependent contour needs FLAME's dynamic landmark
+    /// embedding (`flame_dynamic_embedding.npy`), which is a licensed model
+    /// asset this crate does not ship.  Without it the contour vertex *set*
+    /// cannot change with head pose, so an extractor built on these chains
+    /// reports [`DynamicLandmarkExtractor::is_pose_dependent`] `== false` and
+    /// [`DynamicLandmarkExtractor::extract_all`] deliberately leaves the static
+    /// 68-point set alone instead of overwriting its jaw slots with a contour
+    /// that carries no extra information.  Load the real embedding with
+    /// [`ContourVertexChains::from_dynamic_embedding`] to get pose-dependent
+    /// behaviour.
+    ///
+    /// # Side assignment
+    ///
+    /// Which end of the jaw table is the subject's left is inherited from
+    /// [`landmarks`](crate::landmarks): that module labels the low-numbered
+    /// iBUG ranges (17–21, 36–41) as the *left* eyebrow and eye, so the
+    /// low-numbered end of the jaw line (slot 0) is taken to be the subject's
+    /// left and slot 16 the subject's right.  Correcting the landmark table
+    /// therefore corrects this too, in one place.
     #[must_use]
     pub fn default_flame() -> Self {
-        // Left side: chin → left ear (approximate FLAME 2020 jaw contour).
-        // Uses indices 1-17 which are valid for the 5023-vertex FLAME mesh.
-        let left_chain = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17];
+        // Bind the extractor: `group_indices` borrows from it.
+        let extractor = LandmarkExtractor::new();
+        Self::from_jaw_contour(extractor.group_indices(LandmarkGroup::JawLine))
+    }
 
-        // Right side: chin → right ear (approximate FLAME 2020 jaw contour).
-        // Uses indices near the end of the vertex array, valid for 5023-vertex FLAME.
-        let right_chain = vec![
-            5000, 4999, 4998, 4997, 4996, 4995, 4994, 4993, 4992, 4991, 4990, 4989, 4988, 4987,
-            4986, 4985, 4984,
-        ];
-
+    /// Split an ordered jaw contour into a left and a right chain.
+    ///
+    /// `jaw` is expected in iBUG jaw order, walking continuously from one ear
+    /// to the other; the midpoint entry is the chin.  The chin is assigned to
+    /// `left_chain`, keeping the two chains disjoint.
+    ///
+    /// An empty `jaw` yields two empty chains rather than an error — the
+    /// extraction functions surface that as an empty landmark list.
+    #[must_use]
+    pub fn from_jaw_contour(jaw: &[u32]) -> Self {
+        if jaw.is_empty() {
+            return Self {
+                left_chain: Vec::new(),
+                right_chain: Vec::new(),
+            };
+        }
+        // `chin <= jaw.len() - 1` for every non-empty slice, so both slices below
+        // are in range.
+        let chin = jaw.len() / 2;
+        // Left chain runs chin-outward, so the first half is walked in reverse.
+        let left_chain: Vec<u32> = jaw[..=chin].iter().rev().copied().collect();
+        let right_chain: Vec<u32> = jaw[chin + 1..].to_vec();
         Self {
             left_chain,
             right_chain,
         }
     }
+
+    /// Build contour chains from FLAME's dynamic landmark embedding.
+    ///
+    /// `flame_dynamic_embedding.npy` stores, for each of `n_bins` quantised head
+    /// yaw angles, `n_contour` contour landmarks as a triangle index
+    /// (`dynamic_lmk_faces_idx`, shape `[n_bins, n_contour]`) plus barycentric
+    /// weights within that triangle (`dynamic_lmk_b_coords`, shape
+    /// `[n_bins, n_contour, 3]`).  Both are passed here flattened in row-major
+    /// order; `n_bins` is inferred from `lmk_faces_idx.len() / n_contour`.
+    ///
+    /// A barycentric point generally lies *inside* a triangle, while a chain can
+    /// only name vertices, so each contour point is collapsed to the triangle
+    /// corner carrying the largest barycentric weight — the nearest true vertex.
+    ///
+    /// `left_bin` and `right_bin` select the two yaw rows to keep.  They are
+    /// explicit parameters because the row ordering (which end of the table is
+    /// maximum left yaw) is a property of the file being loaded and cannot be
+    /// inferred from the data.
+    ///
+    /// # Errors
+    ///
+    /// - [`FlameError::InvalidParams`] if `n_contour` is zero, if
+    ///   `lmk_faces_idx` is empty or not a whole number of bins, or if
+    ///   `lmk_b_coords` does not hold `n_bins * n_contour * 3` weights.
+    /// - [`FlameError::IndexOutOfBounds`] if a bin index is beyond `n_bins`, or
+    ///   if a stored triangle index is beyond `faces`.
+    pub fn from_dynamic_embedding(
+        lmk_faces_idx: &[u32],
+        lmk_b_coords: &[f32],
+        faces: &[[u32; 3]],
+        n_contour: usize,
+        left_bin: usize,
+        right_bin: usize,
+    ) -> Result<Self, FlameError> {
+        if n_contour == 0 {
+            return Err(FlameError::InvalidParams(
+                "dynamic landmark embedding: n_contour must be > 0".to_string(),
+            ));
+        }
+        if lmk_faces_idx.is_empty() || lmk_faces_idx.len() % n_contour != 0 {
+            return Err(FlameError::InvalidParams(format!(
+                "dynamic landmark embedding: dynamic_lmk_faces_idx has {} entries, which is not a positive multiple of n_contour {n_contour}",
+                lmk_faces_idx.len()
+            )));
+        }
+        let n_bins = lmk_faces_idx.len() / n_contour;
+        let expected_coords = n_bins * n_contour * 3;
+        if lmk_b_coords.len() != expected_coords {
+            return Err(FlameError::InvalidParams(format!(
+                "dynamic landmark embedding: dynamic_lmk_b_coords has {} entries, expected {expected_coords}",
+                lmk_b_coords.len()
+            )));
+        }
+        for bin in [left_bin, right_bin] {
+            if bin >= n_bins {
+                return Err(FlameError::index_out_of_bounds(
+                    "dynamic landmark yaw bin",
+                    bin,
+                    n_bins,
+                ));
+            }
+        }
+        Ok(Self {
+            left_chain: chain_from_yaw_bin(
+                lmk_faces_idx,
+                lmk_b_coords,
+                faces,
+                n_contour,
+                left_bin,
+            )?,
+            right_chain: chain_from_yaw_bin(
+                lmk_faces_idx,
+                lmk_b_coords,
+                faces,
+                n_contour,
+                right_bin,
+            )?,
+        })
+    }
+}
+
+/// Collapse one yaw row of a dynamic landmark embedding to a vertex chain.
+///
+/// Callers must have validated `n_contour`, the array lengths and `bin`; every
+/// index computed here is then in range except the stored triangle index, which
+/// is checked against `faces`.
+fn chain_from_yaw_bin(
+    lmk_faces_idx: &[u32],
+    lmk_b_coords: &[f32],
+    faces: &[[u32; 3]],
+    n_contour: usize,
+    bin: usize,
+) -> Result<Vec<u32>, FlameError> {
+    let mut chain = Vec::with_capacity(n_contour);
+    for point in 0..n_contour {
+        let flat = bin * n_contour + point;
+        let face_index = lmk_faces_idx[flat] as usize;
+        let face = faces.get(face_index).ok_or_else(|| {
+            FlameError::index_out_of_bounds(
+                format!("dynamic landmark triangle for contour point {point}"),
+                face_index,
+                faces.len(),
+            )
+        })?;
+        let base = flat * 3;
+        let weights = [
+            lmk_b_coords[base],
+            lmk_b_coords[base + 1],
+            lmk_b_coords[base + 2],
+        ];
+        // Nearest true vertex = the corner with the largest barycentric weight.
+        let mut best = 0_usize;
+        for (corner, &weight) in weights.iter().enumerate().skip(1) {
+            if weight > weights[best] {
+                best = corner;
+            }
+        }
+        chain.push(face[best]);
+    }
+    Ok(chain)
 }
 
 // ---------------------------------------------------------------------------
@@ -136,28 +307,49 @@ impl ContourVertexChains {
 pub struct DynamicLandmarkExtractor {
     contour_chains: ContourVertexChains,
     config: DynamicLandmarkConfig,
+    /// Whether `contour_chains` genuinely varies with head pose.
+    ///
+    /// `false` for the [`ContourVertexChains::default_flame`] fallback, which is
+    /// the static jaw contour split in two; `true` for caller-supplied chains.
+    pose_dependent: bool,
 }
 
 impl DynamicLandmarkExtractor {
-    /// Create a new extractor with default contour chains and configuration.
+    /// Create a new extractor with the fallback contour chains and default
+    /// configuration.
+    ///
+    /// The chains come from [`ContourVertexChains::default_flame`], so the
+    /// extractor is **not** pose-dependent — see
+    /// [`DynamicLandmarkExtractor::is_pose_dependent`].
     #[must_use]
     pub fn new() -> Self {
         Self {
             contour_chains: ContourVertexChains::default_flame(),
             config: DynamicLandmarkConfig::default(),
+            pose_dependent: false,
         }
     }
 
-    /// Create a new extractor with custom configuration and default contour chains.
+    /// Create a new extractor with custom configuration and the fallback
+    /// contour chains (not pose-dependent).
     #[must_use]
     pub fn with_config(config: DynamicLandmarkConfig) -> Self {
         Self {
             contour_chains: ContourVertexChains::default_flame(),
             config,
+            pose_dependent: false,
         }
     }
 
     /// Create a new extractor with both custom config and custom contour chains.
+    ///
+    /// Chains supplied here are treated as **authoritative pose-dependent
+    /// contours** — typically the output of
+    /// [`ContourVertexChains::from_dynamic_embedding`] — so
+    /// [`DynamicLandmarkExtractor::extract_all`] will use them to replace the
+    /// static jaw landmarks.  Passing [`ContourVertexChains::default_flame`]
+    /// here therefore opts back into that overwrite, which
+    /// [`DynamicLandmarkExtractor::new`] deliberately avoids.
     #[must_use]
     pub fn with_chains_and_config(
         contour_chains: ContourVertexChains,
@@ -166,7 +358,23 @@ impl DynamicLandmarkExtractor {
         Self {
             contour_chains,
             config,
+            pose_dependent: true,
         }
+    }
+
+    /// Whether this extractor carries a contour that really does vary with head
+    /// pose.
+    ///
+    /// `false` means the extractor is running on the
+    /// [`ContourVertexChains::default_flame`] fallback: `extract` still returns
+    /// jaw contour points, but they come from the static jaw line and the
+    /// selected side only changes which half is walked.
+    /// [`DynamicLandmarkExtractor::extract_all`] uses this to decide whether
+    /// replacing the static jaw landmarks would add information or destroy it.
+    #[inline]
+    #[must_use]
+    pub fn is_pose_dependent(&self) -> bool {
+        self.pose_dependent
     }
 
     // -----------------------------------------------------------------------
@@ -199,18 +407,23 @@ impl DynamicLandmarkExtractor {
 
     /// Select which contour side to use based on the head yaw angle.
     ///
+    /// Follows the crate-wide convention (positive yaw = turn to the subject's
+    /// right) and picks the side that *recedes* under that turn, because that
+    /// is the side whose contour moves:
+    ///
     /// - `|yaw| < threshold` → [`ContourSide::Both`]
-    /// - `yaw > 0`           → [`ContourSide::Left`]  (left-turn)
-    /// - `yaw < 0`           → [`ContourSide::Right`] (right-turn)
+    /// - `yaw > 0`           → [`ContourSide::Right`] (right turn — the right
+    ///   side of the jaw rotates away from the camera)
+    /// - `yaw < 0`           → [`ContourSide::Left`]  (left turn)
     #[must_use]
     pub fn select_contour_side(&self, params: &FlameParams) -> ContourSide {
         let yaw = Self::extract_yaw(params);
         if yaw.abs() < self.config.side_threshold_rad {
             ContourSide::Both
         } else if yaw > 0.0 {
-            ContourSide::Left
-        } else {
             ContourSide::Right
+        } else {
+            ContourSide::Left
         }
     }
 
@@ -220,13 +433,15 @@ impl DynamicLandmarkExtractor {
 
     /// Look up positions for a slice of vertex indices from `mesh`.
     ///
-    /// Samples at most `count` indices from `chain`.  Returns an error when
-    /// any requested index is ≥ `mesh.vertices.len()`.
+    /// Samples at most `count` indices from `chain`; `label` names the chain in
+    /// any error message.  Returns an error when any requested index is
+    /// ≥ `mesh.vertices.len()`.
     fn sample_chain(
         mesh: &Mesh,
         chain: &[u32],
         count: usize,
         start_index: usize,
+        label: &str,
         group: LandmarkGroup,
     ) -> Result<Vec<Landmark>, FlameError> {
         let num_verts = mesh.vertices.len();
@@ -237,7 +452,7 @@ impl DynamicLandmarkExtractor {
             let vi = vi_u32 as usize;
             if vi >= num_verts {
                 return Err(FlameError::index_out_of_bounds(
-                    format!("dynamic contour chain vertex at chain-offset {offset}"),
+                    format!("dynamic contour {label}-chain vertex at chain-offset {offset}"),
                     vi,
                     num_verts,
                 ));
@@ -259,12 +474,23 @@ impl DynamicLandmarkExtractor {
 
     /// Compute dynamic contour landmarks from a posed mesh.
     ///
-    /// Returns exactly [`DynamicLandmarkConfig::num_contour_landmarks`] landmarks
-    /// with [`LandmarkGroup::JawLine`] group labels.  Landmark `index` values
-    /// start at `0` and are sequential.
+    /// Returns **at most** [`DynamicLandmarkConfig::num_contour_landmarks`]
+    /// landmarks with [`LandmarkGroup::JawLine`] group labels; landmark `index`
+    /// values start at `0` and are sequential.
     ///
-    /// When both sides are selected (frontal pose) the left and right chains
-    /// are interleaved to produce a symmetric contour covering both sides.
+    /// The count is capped by the chains actually available:
+    ///
+    /// - [`ContourSide::Left`] / [`ContourSide::Right`] yield at most
+    ///   `left_chain.len()` / `right_chain.len()` landmarks — with the default
+    ///   chains that is one half of the jaw contour, not all 17 points.
+    /// - [`ContourSide::Both`] (frontal pose) concatenates `ceil(n / 2)` points
+    ///   from the left chain and `floor(n / 2)` from the right chain, producing
+    ///   the full contour when both chains are long enough.  The chains are
+    ///   disjoint, so no vertex is emitted twice.
+    ///
+    /// Callers that need a fixed-length result must check `len()`;
+    /// [`DynamicLandmarkExtractor::extract_all`] logs a warning when the
+    /// contour is shorter than the iBUG jaw line.
     ///
     /// # Errors
     ///
@@ -280,6 +506,7 @@ impl DynamicLandmarkExtractor {
                 &self.contour_chains.left_chain,
                 n,
                 0,
+                "left",
                 LandmarkGroup::JawLine,
             ),
             ContourSide::Right => Self::sample_chain(
@@ -287,75 +514,59 @@ impl DynamicLandmarkExtractor {
                 &self.contour_chains.right_chain,
                 n,
                 0,
+                "right",
                 LandmarkGroup::JawLine,
             ),
             ContourSide::Both => {
-                // Interleave left and right chains.
-                // Take ceil(n/2) from left and floor(n/2) from right.
+                // Concatenate the two disjoint chains: ceil(n/2) points from the
+                // left chain (chin outward) then floor(n/2) from the right.
                 let left_n = n.div_ceil(2);
                 let right_n = n / 2;
-                let num_verts = mesh.vertices.len();
-                let mut landmarks = Vec::with_capacity(n);
 
-                // Left side first
-                for (offset, &vi_u32) in self
-                    .contour_chains
-                    .left_chain
-                    .iter()
-                    .take(left_n)
-                    .enumerate()
-                {
-                    let vi = vi_u32 as usize;
-                    if vi >= num_verts {
-                        return Err(FlameError::index_out_of_bounds(
-                            format!("dynamic contour left-chain vertex at offset {offset}"),
-                            vi,
-                            num_verts,
-                        ));
-                    }
-                    let v = &mesh.vertices[vi];
-                    landmarks.push(Landmark {
-                        position: [v.x, v.y, v.z],
-                        index: offset,
-                        group: LandmarkGroup::JawLine,
-                    });
-                }
-
-                // Right side fills the remainder
-                for (offset, &vi_u32) in self
-                    .contour_chains
-                    .right_chain
-                    .iter()
-                    .take(right_n)
-                    .enumerate()
-                {
-                    let vi = vi_u32 as usize;
-                    if vi >= num_verts {
-                        return Err(FlameError::index_out_of_bounds(
-                            format!("dynamic contour right-chain vertex at offset {offset}"),
-                            vi,
-                            num_verts,
-                        ));
-                    }
-                    let v = &mesh.vertices[vi];
-                    landmarks.push(Landmark {
-                        position: [v.x, v.y, v.z],
-                        index: left_n + offset,
-                        group: LandmarkGroup::JawLine,
-                    });
-                }
+                let mut landmarks = Self::sample_chain(
+                    mesh,
+                    &self.contour_chains.left_chain,
+                    left_n,
+                    0,
+                    "left",
+                    LandmarkGroup::JawLine,
+                )?;
+                // Continue numbering from the points actually emitted, so a
+                // short left chain leaves no gap in the landmark indices.
+                let right_start = landmarks.len();
+                let right = Self::sample_chain(
+                    mesh,
+                    &self.contour_chains.right_chain,
+                    right_n,
+                    right_start,
+                    "right",
+                    LandmarkGroup::JawLine,
+                )?;
+                landmarks.extend(right);
 
                 Ok(landmarks)
             }
         }
     }
 
-    /// Compute all 68 landmarks: static set with the jaw line (indices 0–16)
-    /// replaced by the pose-dependent dynamic contour.
+    /// Compute all 68 landmarks: the static set with the jaw line
+    /// (indices 0–16) replaced by the pose-dependent dynamic contour.
     ///
     /// The returned `Vec` always has exactly 68 entries.  Landmark `index`
     /// values match the iBUG 68-point convention so that downstream code does
     /// not need to know whether static or dynamic jaw points were used.
+    ///
+    /// # Without a pose-dependent contour
+    ///
+    /// When [`DynamicLandmarkExtractor::is_pose_dependent`] is `false` the jaw
+    /// slots are **left untouched** and the static 68-point set is returned
+    /// verbatim.  The fallback chains are two halves of the very jaw contour
+    /// those static landmarks already carry, so overwriting slot *i* with
+    /// contour point *i* would only scramble which vertex lands in which iBUG
+    /// slot — corrupting an otherwise correct landmark set while advertising a
+    /// pose dependence that is not there.  Build the extractor with
+    /// [`DynamicLandmarkExtractor::with_chains_and_config`] from a real
+    /// embedding to enable the replacement.
     ///
     /// # Errors
     ///
@@ -369,18 +580,38 @@ impl DynamicLandmarkExtractor {
         // Extract full static 68-point set.
         let mut static_landmarks = LandmarkExtractor::new().extract(mesh)?;
 
-        // Compute dynamic jaw contour (17 points).
+        if !self.pose_dependent {
+            tracing::debug!(
+                "dynamic_landmarks: no pose-dependent contour loaded (default chains); \
+                 keeping the static iBUG jaw line untouched"
+            );
+            return Ok(static_landmarks);
+        }
+
+        // Compute the dynamic jaw contour.
         let dynamic_jaw = self.extract(mesh, params)?;
+        let jaw_slots = LandmarkGroup::JawLine.count();
 
         // Overwrite jaw-line entries (indices 0-16) with dynamic landmarks.
         // Preserve the original iBUG index values and group labels.
+        let mut replaced = 0_usize;
         for (jaw_slot, dyn_lm) in static_landmarks
             .iter_mut()
-            .take(17) // jaw line is always slots 0-16 in iBUG ordering
+            .take(jaw_slots)
             .zip(dynamic_jaw.iter())
         {
             // Keep jaw_slot.index unchanged (it's 0..16) — just update position.
             jaw_slot.position = dyn_lm.position;
+            replaced += 1;
+        }
+
+        if replaced < jaw_slots {
+            tracing::warn!(
+                replaced,
+                expected = jaw_slots,
+                "dynamic_landmarks: contour is shorter than the iBUG jaw line; \
+                 the remaining jaw slots keep their static positions"
+            );
         }
 
         Ok(static_landmarks)
@@ -400,8 +631,11 @@ impl Default for DynamicLandmarkExtractor {
 impl Mesh {
     /// Extract pose-dependent dynamic face contour landmarks.
     ///
-    /// Convenience wrapper around `DynamicLandmarkExtractor::new().extract()`.
-    /// Returns 17 contour landmarks using the jaw-line chain selected by head pose.
+    /// Convenience wrapper around `DynamicLandmarkExtractor::new().extract()`,
+    /// which uses the pose-independent fallback chains — see
+    /// [`ContourVertexChains::default_flame`].  Returns the jaw contour points
+    /// for the side selected by head pose: the full 17-point contour for a
+    /// near-frontal pose, one half of it otherwise.
     ///
     /// # Errors
     ///
@@ -428,8 +662,8 @@ mod tests {
     // Helpers
     // -----------------------------------------------------------------------
 
-    /// Minimum vertex count to satisfy all canonical FLAME landmark indices
-    /// AND the right-chain indices (max 5000).
+    /// Minimum vertex count to satisfy all canonical FLAME landmark indices,
+    /// which the contour chains are now derived from (max index 2450).
     const MIN_VERTS: usize = 5023;
 
     /// Build a synthetic mesh with `n` vertices placed on a unit-circle
@@ -499,15 +733,161 @@ mod tests {
     }
 
     #[test]
-    fn test_default_chains_left_length_17() {
+    fn test_default_chains_split_the_jaw_line_at_the_chin() {
+        // 17 jaw points split at the chin: 9 on the left (chin included), 8 on
+        // the right, disjoint and together covering the whole contour.
         let chains = ContourVertexChains::default_flame();
-        assert_eq!(chains.left_chain.len(), 17);
+        assert_eq!(chains.left_chain.len(), 9);
+        assert_eq!(chains.right_chain.len(), 8);
+        assert_eq!(chains.left_chain.len() + chains.right_chain.len(), 17);
     }
 
     #[test]
-    fn test_default_chains_right_length_17() {
+    fn test_default_chains_are_the_canonical_jaw_vertices() {
+        // Regression: the chains used to be fabricated runs (1..17 and
+        // 4984..5000) picked for existing, not for tracing the jaw.
+        let extractor = LandmarkExtractor::new();
+        let jaw = extractor.group_indices(LandmarkGroup::JawLine);
         let chains = ContourVertexChains::default_flame();
-        assert_eq!(chains.right_chain.len(), 17);
+        let mut covered: Vec<u32> = chains
+            .left_chain
+            .iter()
+            .chain(chains.right_chain.iter())
+            .copied()
+            .collect();
+        covered.sort_unstable();
+        let mut expected = jaw.to_vec();
+        expected.sort_unstable();
+        assert_eq!(
+            covered, expected,
+            "the two chains must partition the canonical jaw contour"
+        );
+    }
+
+    #[test]
+    fn test_default_chains_are_disjoint() {
+        let chains = ContourVertexChains::default_flame();
+        for vertex in &chains.left_chain {
+            assert!(
+                !chains.right_chain.contains(vertex),
+                "vertex {vertex} appears in both chains"
+            );
+        }
+    }
+
+    #[test]
+    fn test_default_chains_start_at_the_chin() {
+        // The chin is the midpoint of the jaw contour and belongs to the left
+        // chain, which walks chin-outward.
+        let extractor = LandmarkExtractor::new();
+        let jaw = extractor.group_indices(LandmarkGroup::JawLine);
+        let chains = ContourVertexChains::default_flame();
+        assert_eq!(chains.left_chain[0], jaw[jaw.len() / 2]);
+        assert_eq!(chains.right_chain[0], jaw[jaw.len() / 2 + 1]);
+    }
+
+    #[test]
+    fn test_from_jaw_contour_empty_is_empty() {
+        let chains = ContourVertexChains::from_jaw_contour(&[]);
+        assert!(chains.left_chain.is_empty());
+        assert!(chains.right_chain.is_empty());
+    }
+
+    #[test]
+    fn test_from_jaw_contour_single_point() {
+        let chains = ContourVertexChains::from_jaw_contour(&[42]);
+        assert_eq!(chains.left_chain, vec![42]);
+        assert!(chains.right_chain.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // ContourVertexChains::from_dynamic_embedding
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_from_dynamic_embedding_collapses_to_the_dominant_corner() {
+        // Two yaw bins × two contour points, over three triangles.
+        let faces = vec![[10_u32, 11, 12], [20, 21, 22], [30, 31, 32]];
+        let lmk_faces_idx = vec![0_u32, 1, 2, 0];
+        let lmk_b_coords = vec![
+            // bin 0, point 0 → corner 2 of face 0 → vertex 12
+            0.1_f32, 0.2, 0.7, // bin 0, point 1 → corner 0 of face 1 → vertex 20
+            0.8, 0.1, 0.1, // bin 1, point 0 → corner 1 of face 2 → vertex 31
+            0.2, 0.6, 0.2, // bin 1, point 1 → corner 1 of face 0 → vertex 11
+            0.3, 0.5, 0.2,
+        ];
+        let chains = ContourVertexChains::from_dynamic_embedding(
+            &lmk_faces_idx,
+            &lmk_b_coords,
+            &faces,
+            2,
+            0,
+            1,
+        )
+        .expect("well-formed embedding");
+        assert_eq!(chains.left_chain, vec![12, 20]);
+        assert_eq!(chains.right_chain, vec![31, 11]);
+    }
+
+    #[test]
+    fn test_from_dynamic_embedding_rejects_ragged_face_table() {
+        let faces = vec![[0_u32, 1, 2]];
+        // 3 entries cannot be split into whole bins of 2 contour points.
+        assert!(ContourVertexChains::from_dynamic_embedding(
+            &[0_u32, 0, 0],
+            &[1.0_f32; 9],
+            &faces,
+            2,
+            0,
+            0
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn test_from_dynamic_embedding_rejects_bad_bary_length() {
+        let faces = vec![[0_u32, 1, 2]];
+        assert!(ContourVertexChains::from_dynamic_embedding(
+            &[0_u32, 0],
+            &[1.0_f32; 5],
+            &faces,
+            2,
+            0,
+            0
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn test_from_dynamic_embedding_rejects_out_of_range_bin() {
+        let faces = vec![[0_u32, 1, 2]];
+        assert!(matches!(
+            ContourVertexChains::from_dynamic_embedding(
+                &[0_u32, 0],
+                &[1.0_f32; 6],
+                &faces,
+                2,
+                0,
+                7
+            ),
+            Err(FlameError::IndexOutOfBounds { .. })
+        ));
+    }
+
+    #[test]
+    fn test_from_dynamic_embedding_rejects_out_of_range_face() {
+        let faces = vec![[0_u32, 1, 2]];
+        assert!(matches!(
+            ContourVertexChains::from_dynamic_embedding(
+                &[0_u32, 9],
+                &[1.0_f32; 6],
+                &faces,
+                2,
+                0,
+                0
+            ),
+            Err(FlameError::IndexOutOfBounds { .. })
+        ));
     }
 
     // -----------------------------------------------------------------------
@@ -566,17 +946,35 @@ mod tests {
     }
 
     #[test]
-    fn test_select_side_large_positive_yaw_is_left() {
+    fn test_select_side_positive_yaw_is_the_receding_right_side() {
+        // Regression: this module used to read positive yaw as a LEFT turn,
+        // inverting the convention the rest of the crate documents
+        // (canonical::HeadOrientation::yaw, the `head_turn` rig control which
+        // drives root pose index 1, pose_estimation::estimate_yaw_from_symmetry
+        // — all "positive = turn right").  A right turn swings the subject's
+        // right side away from the camera, so the right chain is the one that
+        // traces the pose-dependent contour.
         let extractor = DynamicLandmarkExtractor::new();
         let params = params_with_yaw(0.5); // well above threshold 0.1
+        assert_eq!(extractor.select_contour_side(&params), ContourSide::Right);
+    }
+
+    #[test]
+    fn test_select_side_negative_yaw_is_the_receding_left_side() {
+        let extractor = DynamicLandmarkExtractor::new();
+        let params = params_with_yaw(-0.5);
         assert_eq!(extractor.select_contour_side(&params), ContourSide::Left);
     }
 
     #[test]
-    fn test_select_side_large_negative_yaw_is_right() {
+    fn test_select_side_is_antisymmetric_in_yaw() {
+        // Whatever the labelling, mirroring the yaw must mirror the side.
         let extractor = DynamicLandmarkExtractor::new();
-        let params = params_with_yaw(-0.5);
-        assert_eq!(extractor.select_contour_side(&params), ContourSide::Right);
+        let positive = extractor.select_contour_side(&params_with_yaw(0.4));
+        let negative = extractor.select_contour_side(&params_with_yaw(-0.4));
+        assert_ne!(positive, negative);
+        assert_ne!(positive, ContourSide::Both);
+        assert_ne!(negative, ContourSide::Both);
     }
 
     #[test]
@@ -588,11 +986,11 @@ mod tests {
             extractor.select_contour_side(&params_below),
             ContourSide::Both
         );
-        // Just above threshold → Left
+        // Just above threshold → Right (positive yaw = turn right)
         let params_above = params_with_yaw(0.15);
         assert_eq!(
             extractor.select_contour_side(&params_above),
-            ContourSide::Left
+            ContourSide::Right
         );
     }
 
@@ -612,25 +1010,64 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_left_returns_17() {
+    fn test_extract_right_side_returns_the_right_half_chain() {
         let mesh = synthetic_mesh(MIN_VERTS);
         let extractor = DynamicLandmarkExtractor::new();
-        let params = params_with_yaw(0.5);
-        let landmarks = extractor
-            .extract(&mesh, &params)
-            .expect("extract left should succeed");
-        assert_eq!(landmarks.len(), 17);
-    }
-
-    #[test]
-    fn test_extract_right_returns_17() {
-        let mesh = synthetic_mesh(MIN_VERTS);
-        let extractor = DynamicLandmarkExtractor::new();
-        let params = params_with_yaw(-0.5);
+        let params = params_with_yaw(0.5); // right turn
         let landmarks = extractor
             .extract(&mesh, &params)
             .expect("extract right should succeed");
-        assert_eq!(landmarks.len(), 17);
+        // Documented as "at most num_contour_landmarks": the right half of the
+        // jaw contour is 8 points, fewer than the 17 requested.
+        assert_eq!(landmarks.len(), 8);
+    }
+
+    #[test]
+    fn test_extract_left_side_returns_the_left_half_chain() {
+        let mesh = synthetic_mesh(MIN_VERTS);
+        let extractor = DynamicLandmarkExtractor::new();
+        let params = params_with_yaw(-0.5); // left turn
+        let landmarks = extractor
+            .extract(&mesh, &params)
+            .expect("extract left should succeed");
+        assert_eq!(landmarks.len(), 9);
+    }
+
+    #[test]
+    fn test_extract_frontal_contour_has_no_duplicate_vertices() {
+        // The chains are disjoint, so the frontal contour must not repeat the
+        // chin (or any other point).
+        let mesh = synthetic_mesh(MIN_VERTS);
+        let extractor = DynamicLandmarkExtractor::new();
+        let landmarks = extractor
+            .extract(&mesh, &FlameParams::neutral())
+            .expect("frontal extraction");
+        for (i, lm) in landmarks.iter().enumerate() {
+            for other in landmarks.iter().skip(i + 1) {
+                assert!(
+                    (lm.position[0] - other.position[0]).abs() > 1e-9
+                        || (lm.position[1] - other.position[1]).abs() > 1e-9
+                        || (lm.position[2] - other.position[2]).abs() > 1e-9,
+                    "contour point {i} is duplicated"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_extract_shorter_chain_is_capped_not_padded() {
+        // A caller asking for more landmarks than the chain holds gets the
+        // chain length back, never a panic and never fabricated points.
+        let mesh = synthetic_mesh(MIN_VERTS);
+        let config = DynamicLandmarkConfig {
+            num_contour_landmarks: 100,
+            ..DynamicLandmarkConfig::default()
+        };
+        let extractor = DynamicLandmarkExtractor::with_config(config);
+        let landmarks = extractor
+            .extract(&mesh, &params_with_yaw(-0.5))
+            .expect("extraction");
+        assert_eq!(landmarks.len(), 9);
     }
 
     #[test]
@@ -688,17 +1125,19 @@ mod tests {
 
     #[test]
     fn test_extract_small_mesh_returns_error() {
-        // Right chain has indices up to 5000 — a small mesh can't satisfy them.
+        // The chains are canonical jaw vertices (indices ~1900-2450), so a
+        // 100-vertex mesh cannot satisfy either side.
         let mesh = synthetic_mesh(100);
         let extractor = DynamicLandmarkExtractor::new();
-        // For left-only (small indices 1-17), a 100-vertex mesh works.
-        // For right-only (indices 4984-5000), it should fail.
-        let params = params_with_yaw(-0.5); // force ContourSide::Right
-        let result = extractor.extract(&mesh, &params);
-        assert!(
-            result.is_err(),
-            "extract with right chain on tiny mesh should return Err"
-        );
+        for params in [params_with_yaw(-0.5), params_with_yaw(0.5)] {
+            assert!(
+                matches!(
+                    extractor.extract(&mesh, &params),
+                    Err(FlameError::IndexOutOfBounds { .. })
+                ),
+                "extract on a tiny mesh must return IndexOutOfBounds, never index out of range"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -763,13 +1202,121 @@ mod tests {
     }
 
     #[test]
-    fn test_mesh_method_small_mesh_left_chain_ok() {
-        // Left chain uses indices 1-17, so a 50-vertex mesh is sufficient.
+    fn test_mesh_method_small_mesh_reports_the_missing_vertex() {
+        // Canonical jaw vertices live around index 1900-2450, so a 50-vertex
+        // mesh is reported as out of bounds rather than silently truncated.
         let mesh = synthetic_mesh(50);
-        let params = params_with_yaw(0.5); // force left chain
-        let landmarks = mesh
-            .extract_dynamic_landmarks(&params)
-            .expect("left chain on 50-vertex mesh should succeed");
-        assert_eq!(landmarks.len(), 17);
+        let params = params_with_yaw(0.5);
+        assert!(matches!(
+            mesh.extract_dynamic_landmarks(&params),
+            Err(FlameError::IndexOutOfBounds { .. })
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Pose dependence: extract_all must not corrupt the static jaw line
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_default_extractor_is_not_pose_dependent() {
+        assert!(!DynamicLandmarkExtractor::new().is_pose_dependent());
+        assert!(
+            !DynamicLandmarkExtractor::with_config(DynamicLandmarkConfig::default())
+                .is_pose_dependent()
+        );
+    }
+
+    #[test]
+    fn test_supplied_chains_are_pose_dependent() {
+        let extractor = DynamicLandmarkExtractor::with_chains_and_config(
+            ContourVertexChains {
+                left_chain: vec![100, 101],
+                right_chain: vec![200, 201],
+            },
+            DynamicLandmarkConfig::default(),
+        );
+        assert!(extractor.is_pose_dependent());
+    }
+
+    #[test]
+    fn test_extract_all_keeps_the_static_jaw_without_a_real_embedding() {
+        // Regression: extract_all used to overwrite iBUG slots 0-16 with the
+        // fallback contour, scrambling an otherwise correct landmark set with
+        // no error signal.  With no pose-dependent contour loaded the static
+        // 68-point set must come back untouched.
+        let mesh = synthetic_mesh(MIN_VERTS);
+        let extractor = DynamicLandmarkExtractor::new();
+        let params = params_with_yaw(0.5);
+        let dynamic = extractor
+            .extract_all(&mesh, &params)
+            .expect("extract_all should succeed");
+        let static_only = LandmarkExtractor::new()
+            .extract(&mesh)
+            .expect("static extraction");
+        assert_eq!(dynamic.len(), static_only.len());
+        for (got, expected) in dynamic.iter().zip(static_only.iter()) {
+            assert_eq!(
+                got.position, expected.position,
+                "landmark {} must keep its static position",
+                got.index
+            );
+        }
+    }
+
+    #[test]
+    fn test_extract_all_uses_supplied_pose_dependent_chains() {
+        let mesh = synthetic_mesh(MIN_VERTS);
+        // 9 + 8 disjoint vertices so a frontal pose fills all 17 jaw slots.
+        let left_chain: Vec<u32> = (100..109).collect();
+        let right_chain: Vec<u32> = (200..208).collect();
+        let extractor = DynamicLandmarkExtractor::with_chains_and_config(
+            ContourVertexChains {
+                left_chain: left_chain.clone(),
+                right_chain: right_chain.clone(),
+            },
+            DynamicLandmarkConfig::default(),
+        );
+        let landmarks = extractor
+            .extract_all(&mesh, &FlameParams::neutral())
+            .expect("extract_all with custom chains");
+        assert_eq!(landmarks.len(), 68);
+
+        let expected: Vec<u32> = left_chain.into_iter().chain(right_chain).collect();
+        for (slot, &vertex) in expected.iter().enumerate() {
+            let v = &mesh.vertices[vertex as usize];
+            assert_eq!(
+                landmarks[slot].position,
+                [v.x, v.y, v.z],
+                "jaw slot {slot} should carry the supplied contour vertex {vertex}"
+            );
+            assert_eq!(
+                landmarks[slot].index, slot,
+                "iBUG indices must be preserved"
+            );
+        }
+    }
+
+    #[test]
+    fn test_extract_all_short_contour_leaves_remaining_slots_static() {
+        let mesh = synthetic_mesh(MIN_VERTS);
+        let extractor = DynamicLandmarkExtractor::with_chains_and_config(
+            ContourVertexChains {
+                left_chain: vec![100, 101],
+                right_chain: vec![200],
+            },
+            DynamicLandmarkConfig::default(),
+        );
+        let landmarks = extractor
+            .extract_all(&mesh, &FlameParams::neutral())
+            .expect("extract_all with a short contour");
+        assert_eq!(landmarks.len(), 68);
+        let static_only = LandmarkExtractor::new()
+            .extract(&mesh)
+            .expect("static extraction");
+        // Slots beyond the supplied contour keep their static positions rather
+        // than being dropped or zeroed.
+        for slot in 3..LandmarkGroup::JawLine.count() {
+            assert_eq!(landmarks[slot].position, static_only[slot].position);
+        }
     }
 }

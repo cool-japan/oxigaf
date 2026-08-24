@@ -1,11 +1,16 @@
-//! Latent upsampler for 32×32 → 64×64 latent upsampling.
+//! Latent upsampler that doubles latent resolution (e.g. 32×32 → 64×64).
 //!
-//! This module implements the sd-x2-latent-upscaler pipeline for upsampling
-//! latents from 32×32 to 64×64, enabling 512×512 output resolution (vs 256×256).
+//! This module implements the sd-x2-latent-upscaler pipeline, enabling 512×512
+//! output resolution (vs 256×256).
 //!
 //! The upsampler uses a separate U-Net model with 10-step DDIM denoising in
-//! latent space. A fallback `BilinearVae` mode is also provided for cases
-//! where the upsampler weights are not available.
+//! latent space. Following diffusers' `StableDiffusionLatentUpscalePipeline`,
+//! the denoising runs **at the target resolution**: the conditioning latents
+//! are nearest-upsampled 2× and concatenated channel-wise onto the noisy
+//! target-resolution latents, so the U-Net sees `2 × latent_channels` inputs.
+//!
+//! A fallback `BilinearVae` mode is also provided for cases where the
+//! upsampler weights are not available.
 
 use candle_core::{DType, Device, Result, Tensor};
 use candle_nn as nn;
@@ -13,6 +18,13 @@ use candle_nn::Module;
 
 use crate::scheduler::{DdimScheduler, PredictionType};
 use crate::DiffusionError;
+
+/// Latent channel count produced by the SD VAE.
+const UPSAMPLER_LATENT_CHANNELS: usize = 4;
+
+/// U-Net input channels: noisy target-resolution latents concatenated with the
+/// nearest-upsampled conditioning latents.
+const UPSAMPLER_UNET_IN_CHANNELS: usize = UPSAMPLER_LATENT_CHANNELS * 2;
 
 // ---------------------------------------------------------------------------
 // Upsampler mode
@@ -256,13 +268,118 @@ impl TimeEmbedding {
 }
 
 // ---------------------------------------------------------------------------
+// Bilinear resampling
+// ---------------------------------------------------------------------------
+
+/// Gather indices and interpolation weights for one output axis.
+struct AxisTaps {
+    /// Lower source index per output position.
+    lo: Vec<u32>,
+    /// Upper source index per output position (clamped at the last row/column).
+    hi: Vec<u32>,
+    /// Fractional distance from `lo` towards `hi`, in `[0, 1)`.
+    frac: Vec<f32>,
+}
+
+/// Build `align_corners = false` bilinear taps for one axis.
+///
+/// `src = (out_idx + 0.5) * in_len / out_len - 0.5`, clamped to
+/// `[0, in_len - 1]` — the same mapping `resolution::resize_image_bilinear`
+/// uses, and what PIL, OpenCV and `torch.nn.functional.interpolate` produce.
+fn axis_taps(in_len: usize, out_len: usize) -> AxisTaps {
+    let scale = in_len as f32 / out_len as f32;
+    let max_idx = in_len - 1;
+    let mut lo = Vec::with_capacity(out_len);
+    let mut hi = Vec::with_capacity(out_len);
+    let mut frac = Vec::with_capacity(out_len);
+
+    for out_idx in 0..out_len {
+        let src = ((out_idx as f32 + 0.5) * scale - 0.5).clamp(0.0, max_idx as f32);
+        let floor = src.floor();
+        let lo_idx = floor as usize;
+        lo.push(lo_idx as u32);
+        hi.push((lo_idx + 1).min(max_idx) as u32);
+        frac.push(src - floor);
+    }
+
+    AxisTaps { lo, hi, frac }
+}
+
+/// True bilinear resampling of an `(N, C, H, W)` tensor to `(N, C, out_h, out_w)`.
+///
+/// candle only ships nearest-neighbour `upsample_nearest2d`, so the four corner
+/// taps are gathered with `index_select` and blended with precomputed weights.
+/// Everything stays on the tensor's own device.
+fn bilinear_upsample2d(xs: &Tensor, out_h: usize, out_w: usize) -> Result<Tensor> {
+    let (_, _, in_h, in_w) = xs.dims4()?;
+    if in_h == 0 || in_w == 0 || out_h == 0 || out_w == 0 {
+        return Err(candle_core::Error::Msg(format!(
+            "bilinear_upsample2d: zero-sized resample {in_h}x{in_w} -> {out_h}x{out_w}"
+        )));
+    }
+
+    let device = xs.device();
+    let dtype = xs.dtype();
+    // `index_select` needs contiguous storage.
+    let src = xs.contiguous()?;
+
+    let rows = axis_taps(in_h, out_h);
+    let cols = axis_taps(in_w, out_w);
+
+    let y_lo = Tensor::from_vec(rows.lo, out_h, device)?;
+    let y_hi = Tensor::from_vec(rows.hi, out_h, device)?;
+    let x_lo = Tensor::from_vec(cols.lo, out_w, device)?;
+    let x_hi = Tensor::from_vec(cols.hi, out_w, device)?;
+
+    // Gather the two source rows once, then the two source columns from each.
+    let top = src.index_select(&y_lo, 2)?;
+    let bottom = src.index_select(&y_hi, 2)?;
+    let p00 = top.index_select(&x_lo, 3)?;
+    let p10 = top.index_select(&x_hi, 3)?;
+    let p01 = bottom.index_select(&x_lo, 3)?;
+    let p11 = bottom.index_select(&x_hi, 3)?;
+
+    // Blend weights, shaped (1, 1, out_h, out_w) so they broadcast over batch
+    // and channels.
+    let count = out_h * out_w;
+    let mut w00 = Vec::with_capacity(count);
+    let mut w10 = Vec::with_capacity(count);
+    let mut w01 = Vec::with_capacity(count);
+    let mut w11 = Vec::with_capacity(count);
+    for &ty in &rows.frac {
+        let ty_inv = 1.0 - ty;
+        for &tx in &cols.frac {
+            let tx_inv = 1.0 - tx;
+            w00.push(tx_inv * ty_inv);
+            w10.push(tx * ty_inv);
+            w01.push(tx_inv * ty);
+            w11.push(tx * ty);
+        }
+    }
+
+    let shape = (1usize, 1usize, out_h, out_w);
+    let w00 = Tensor::from_vec(w00, shape, device)?.to_dtype(dtype)?;
+    let w10 = Tensor::from_vec(w10, shape, device)?.to_dtype(dtype)?;
+    let w01 = Tensor::from_vec(w01, shape, device)?.to_dtype(dtype)?;
+    let w11 = Tensor::from_vec(w11, shape, device)?.to_dtype(dtype)?;
+
+    let out = p00.broadcast_mul(&w00)?;
+    let out = (out + p10.broadcast_mul(&w10)?)?;
+    let out = (out + p01.broadcast_mul(&w01)?)?;
+    (out + p11.broadcast_mul(&w11)?)
+}
+
+// ---------------------------------------------------------------------------
 // Upsampler U-Net
 // ---------------------------------------------------------------------------
 
-/// Simplified U-Net for latent upsampling (32×32 → 64×64).
+/// Simplified U-Net for latent upsampling.
 ///
 /// This is a lighter architecture than the main multi-view U-Net,
 /// designed specifically for the upsampling task.
+///
+/// The network is spatially size-preserving: the 2× upscale comes from running
+/// it on target-resolution latents, not from the network itself.
 #[derive(Debug)]
 struct UpsamplerUNet {
     conv_in: nn::Conv2d,
@@ -290,13 +407,14 @@ impl UpsamplerUNet {
     /// Build the upsampler U-Net from weights.
     ///
     /// Architecture:
-    /// - Input: (B, 4, 32, 32)
-    /// - Output: (B, 4, 64, 64)
+    /// - Input: `(B, in_channels, H, W)` — noisy latents concatenated with the
+    ///   nearest-upsampled conditioning latents, so `in_channels` is
+    ///   `UPSAMPLER_UNET_IN_CHANNELS` (8), not 4.
+    /// - Output: `(B, 4, H, W)`
     /// - Base channels: 128
     /// - Time embedding dimension: 512
-    fn new(vs: nn::VarBuilder) -> Result<Self> {
-        let in_channels = 4;
-        let out_channels = 4;
+    fn new(vs: nn::VarBuilder, in_channels: usize) -> Result<Self> {
+        let out_channels = UPSAMPLER_LATENT_CHANNELS;
         let base_channels = 128;
         let time_dim = 512;
 
@@ -447,7 +565,7 @@ impl UpsamplerUNet {
 // Latent Upsampler public API
 // ---------------------------------------------------------------------------
 
-/// Latent upsampler for 32×32 → 64×64 latent upsampling.
+/// Latent upsampler that doubles latent resolution (32×32 → 64×64 by default).
 ///
 /// This enables 512×512 output resolution (vs 256×256) by upsampling the
 /// latent representation before VAE decoding. The upsampler uses a separate
@@ -455,8 +573,11 @@ impl UpsamplerUNet {
 ///
 /// # Modes
 ///
-/// - **SdX2**: Uses the sd-x2-latent-upscaler U-Net with DDIM denoising.
-/// - **BilinearVae**: Fallback mode that uses simple bilinear upsampling.
+/// - **SdX2**: Uses the sd-x2-latent-upscaler U-Net with DDIM denoising, run
+///   at the target resolution with the source latents concatenated on as
+///   conditioning.
+/// - **BilinearVae**: Fallback mode using true bilinear interpolation
+///   (`align_corners = false`), no U-Net required.
 ///
 /// # Example
 ///
@@ -508,9 +629,11 @@ impl LatentUpsampler {
                 })?;
                 let vb = nn::VarBuilder::from_buffered_safetensors(data, dtype, device)
                     .map_err(|e| DiffusionError::ModelLoad(format!("Upsampler VarBuilder: {e}")))?;
-                Some(UpsamplerUNet::new(vb).map_err(|e| {
-                    DiffusionError::ModelLoad(format!("Upsampler U-Net build: {e}"))
-                })?)
+                Some(
+                    UpsamplerUNet::new(vb, UPSAMPLER_UNET_IN_CHANNELS).map_err(|e| {
+                        DiffusionError::ModelLoad(format!("Upsampler U-Net build: {e}"))
+                    })?,
+                )
             }
             UpsamplerMode::BilinearVae => None,
         };
@@ -525,20 +648,23 @@ impl LatentUpsampler {
         })
     }
 
-    /// Upsample latents from 32×32 to 64×64.
+    /// Upsample latents by 2× (e.g. 32×32 → 64×64).
     ///
     /// # Arguments
     ///
-    /// * `latents` - Input latents `(B, 4, 32, 32)`
-    /// * `num_steps` - Number of DDIM denoising steps (typically 10)
+    /// * `latents` - Input latents `(B, 4, H, W)`
+    /// * `num_steps` - Number of DDIM denoising steps (typically 10); ignored
+    ///   in `BilinearVae` mode
     ///
     /// # Returns
     ///
-    /// Upsampled latents `(B, 4, 64, 64)`
+    /// Upsampled latents `(B, 4, 2H, 2W)`
     ///
     /// # Errors
     ///
-    /// Returns `DiffusionError::Inference` if upsampling fails.
+    /// Returns `DiffusionError::InvalidLatentShape` when `latents` is not a
+    /// 4-channel 4-D tensor, and `DiffusionError::Inference` if upsampling
+    /// fails.
     pub fn upsample(
         &mut self,
         latents: &Tensor,
@@ -550,30 +676,68 @@ impl LatentUpsampler {
         }
     }
 
+    /// Validate `(B, 4, H, W)` and return the doubled target size `(2H, 2W)`.
+    fn target_size(latents: &Tensor) -> std::result::Result<(usize, usize), DiffusionError> {
+        let (batch, ch, h, w) = latents
+            .dims4()
+            .map_err(|e| DiffusionError::Inference(format!("Invalid latent shape: {e}")))?;
+        if h == 0 || w == 0 {
+            return Err(DiffusionError::InvalidLatentShape {
+                expected: vec![batch, UPSAMPLER_LATENT_CHANNELS, 1, 1],
+                got: vec![batch, ch, h, w],
+            });
+        }
+        if ch != UPSAMPLER_LATENT_CHANNELS {
+            return Err(DiffusionError::InvalidLatentShape {
+                expected: vec![batch, UPSAMPLER_LATENT_CHANNELS, h, w],
+                got: vec![batch, ch, h, w],
+            });
+        }
+        Ok((h * 2, w * 2))
+    }
+
     /// Upsample using sd-x2-latent-upscaler with DDIM denoising.
+    ///
+    /// Mirrors diffusers' `StableDiffusionLatentUpscalePipeline`: denoising
+    /// happens at the **target** resolution, and the low-resolution latents are
+    /// nearest-upsampled once and concatenated onto every model input as
+    /// conditioning. The U-Net therefore receives
+    /// `UPSAMPLER_UNET_IN_CHANNELS` channels at `2H × 2W`, and its prediction
+    /// is shape-compatible with the sample handed to the scheduler.
     fn upsample_sdx2(
         &mut self,
         latents: &Tensor,
         num_steps: usize,
     ) -> std::result::Result<Tensor, DiffusionError> {
+        let (out_h, out_w) = Self::target_size(latents)?;
+        let batch = latents
+            .dim(0)
+            .map_err(|e| DiffusionError::Inference(format!("Invalid latent shape: {e}")))?;
+
+        if num_steps == 0 {
+            return Err(DiffusionError::Inference(
+                "Latent upsampling requires at least one denoising step".to_string(),
+            ));
+        }
+
         let unet = self.unet.as_ref().ok_or_else(|| {
             DiffusionError::Inference("SdX2 mode requires U-Net, but it's not loaded".to_string())
         })?;
 
-        // Validate input shape
-        let (batch, ch, h, w) = latents
-            .dims4()
-            .map_err(|e| DiffusionError::Inference(format!("Invalid latent shape: {e}")))?;
-        if ch != 4 || h != 32 || w != 32 {
-            return Err(DiffusionError::InvalidLatentShape {
-                expected: vec![batch, 4, 32, 32],
-                got: vec![batch, ch, h, w],
-            });
-        }
+        // Conditioning: the low-resolution latents lifted to the target grid.
+        // Computed once — it does not change between denoising steps.
+        let condition = latents
+            .upsample_nearest2d(out_h, out_w)
+            .map_err(|e| DiffusionError::Inference(format!("Condition upsample: {e}")))?;
 
-        // Initialize noise at 64×64
-        let mut current = Tensor::randn(0f32, 1f32, (batch, 4, 64, 64), &self.device)
-            .map_err(|e| DiffusionError::Inference(format!("Noise init: {e}")))?;
+        // Initialize noise at the target resolution.
+        let mut current = Tensor::randn(
+            0f32,
+            1f32,
+            (batch, UPSAMPLER_LATENT_CHANNELS, out_h, out_w),
+            &self.device,
+        )
+        .map_err(|e| DiffusionError::Inference(format!("Noise init: {e}")))?;
 
         // Set scheduler timesteps
         self.scheduler.set_timesteps(num_steps);
@@ -581,13 +745,8 @@ impl LatentUpsampler {
 
         // DDIM denoising loop
         for &t in &timesteps {
-            // Downsample current to 32×32 for conditioning
-            let current_downsampled = current
-                .upsample_nearest2d(32, 32)
-                .map_err(|e| DiffusionError::Inference(format!("Downsample for condition: {e}")))?;
-
-            // Concatenate with input latents for conditioning
-            let model_input = Tensor::cat(&[&current_downsampled, latents], 1)
+            // (B, 4, 2H, 2W) ⧺ (B, 4, 2H, 2W) -> (B, 8, 2H, 2W)
+            let model_input = Tensor::cat(&[&current, &condition], 1)
                 .map_err(|e| DiffusionError::Inference(format!("Concat condition: {e}")))?;
 
             // U-Net prediction
@@ -608,10 +767,15 @@ impl LatentUpsampler {
         Ok(current)
     }
 
-    /// Upsample using simple bilinear interpolation (fallback mode).
+    /// Upsample using true bilinear interpolation (fallback mode).
+    ///
+    /// Doubles the spatial resolution with the same `align_corners = false`
+    /// coordinate mapping PIL/OpenCV use, so decoded output does not show the
+    /// blocky 8×8-pixel artefacts that nearest-neighbour latent upscaling
+    /// produces after the VAE.
     fn upsample_bilinear(&self, latents: &Tensor) -> std::result::Result<Tensor, DiffusionError> {
-        latents
-            .upsample_nearest2d(64, 64)
+        let (out_h, out_w) = Self::target_size(latents)?;
+        bilinear_upsample2d(latents, out_h, out_w)
             .map_err(|e| DiffusionError::Inference(format!("Bilinear upsample: {e}")))
     }
 }
@@ -694,5 +858,164 @@ mod tests {
         let result = upsampler.upsample(&latents, 10);
         assert!(result.is_err());
         Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Bilinear fallback: must really interpolate, at a derived output size.
+    // ------------------------------------------------------------------
+
+    fn bilinear_upsampler(device: &Device) -> LatentUpsampler {
+        LatentUpsampler {
+            mode: UpsamplerMode::BilinearVae,
+            unet: None,
+            scheduler: DdimScheduler::new(1000, PredictionType::Epsilon),
+            device: device.clone(),
+        }
+    }
+
+    #[test]
+    fn test_bilinear_upsample2d_interpolates_between_rows() -> Result<()> {
+        let device = Device::Cpu;
+        // Row 0 = 0, row 1 = 1. align_corners=false taps for 2 -> 4 give
+        // fractional offsets 0, 0.25, 0.75, 0 (the last clamped to row 1).
+        let xs = Tensor::from_vec(vec![0f32, 0.0, 1.0, 1.0], (1, 1, 2, 2), &device)?;
+        let out = bilinear_upsample2d(&xs, 4, 4)?;
+        assert_eq!(out.dims(), &[1, 1, 4, 4]);
+
+        let values = out.flatten_all()?.to_vec1::<f32>()?;
+        let expected = [0.0f32, 0.25, 0.75, 1.0];
+        for (row, &want) in expected.iter().enumerate() {
+            for col in 0..4 {
+                let got = values[row * 4 + col];
+                assert!(
+                    (got - want).abs() < 1e-5,
+                    "row {row} col {col}: {got} vs {want}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_bilinear_is_not_nearest_neighbour() -> Result<()> {
+        // Regression: `upsample_bilinear` used to call `upsample_nearest2d`.
+        let device = Device::Cpu;
+        let mut upsampler = bilinear_upsampler(&device);
+
+        let latents = Tensor::randn(0f32, 1f32, (1, 4, 8, 8), &device)?;
+        let bilinear = upsampler
+            .upsample(&latents, 0)
+            .map_err(|e| candle_core::Error::Msg(format!("{e}")))?;
+        let nearest = latents.upsample_nearest2d(16, 16)?;
+
+        assert_eq!(bilinear.dims(), &[1, 4, 16, 16]);
+        let diff = (bilinear - nearest)?.abs()?.sum_all()?.to_scalar::<f32>()?;
+        assert!(
+            diff > 1e-3,
+            "bilinear upsampling must not degenerate to nearest (total diff {diff})"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_bilinear_output_size_derived_from_input() -> Result<()> {
+        // Regression: the target size used to be hardcoded to 64×64.
+        let device = Device::Cpu;
+        let mut upsampler = bilinear_upsampler(&device);
+
+        for (h, w) in [(8usize, 8usize), (16, 16), (12, 20)] {
+            let latents = Tensor::randn(0f32, 1f32, (1, 4, h, w), &device)?;
+            let out = upsampler
+                .upsample(&latents, 0)
+                .map_err(|e| candle_core::Error::Msg(format!("{e}")))?;
+            assert_eq!(out.dims(), &[1, 4, h * 2, w * 2]);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_bilinear_rejects_wrong_channel_count() -> Result<()> {
+        // Regression: the fallback path never validated its input.
+        let device = Device::Cpu;
+        let mut upsampler = bilinear_upsampler(&device);
+        let latents = Tensor::randn(0f32, 1f32, (1, 3, 8, 8), &device)?;
+        assert!(upsampler.upsample(&latents, 0).is_err());
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // SdX2: the denoising loop must actually run.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_sdx2_denoising_step_runs_with_synthetic_weights() -> Result<()> {
+        // Regression: the U-Net was built for 4 input channels while the loop
+        // fed it 8, and the model input was built at half the resolution of
+        // the sample handed to the scheduler. Both made this path unusable.
+        let device = Device::Cpu;
+        let varmap = nn::VarMap::new();
+        let vb = nn::VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let unet = UpsamplerUNet::new(vb, UPSAMPLER_UNET_IN_CHANNELS)?;
+
+        let mut upsampler = LatentUpsampler {
+            mode: UpsamplerMode::SdX2,
+            unet: Some(unet),
+            scheduler: DdimScheduler::new(1000, PredictionType::Epsilon),
+            device: device.clone(),
+        };
+
+        let latents = Tensor::randn(0f32, 1f32, (1, 4, 8, 8), &device)?;
+        let out = upsampler
+            .upsample(&latents, 1)
+            .map_err(|e| candle_core::Error::Msg(format!("{e}")))?;
+
+        assert_eq!(out.dims(), &[1, 4, 16, 16]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_upsampler_unet_declares_eight_input_channels() {
+        // The conditioning latents are concatenated onto the noisy latents.
+        assert_eq!(UPSAMPLER_UNET_IN_CHANNELS, 2 * UPSAMPLER_LATENT_CHANNELS);
+        assert_eq!(UPSAMPLER_UNET_IN_CHANNELS, 8);
+    }
+
+    #[test]
+    fn test_sdx2_zero_steps_errors() -> Result<()> {
+        let device = Device::Cpu;
+        let mut upsampler = LatentUpsampler {
+            mode: UpsamplerMode::SdX2,
+            unet: None,
+            scheduler: DdimScheduler::new(1000, PredictionType::Epsilon),
+            device: device.clone(),
+        };
+        let latents = Tensor::randn(0f32, 1f32, (1, 4, 8, 8), &device)?;
+        assert!(upsampler.upsample(&latents, 0).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_sdx2_without_unet_errors() -> Result<()> {
+        let device = Device::Cpu;
+        let mut upsampler = LatentUpsampler {
+            mode: UpsamplerMode::SdX2,
+            unet: None,
+            scheduler: DdimScheduler::new(1000, PredictionType::Epsilon),
+            device: device.clone(),
+        };
+        let latents = Tensor::randn(0f32, 1f32, (1, 4, 8, 8), &device)?;
+        assert!(upsampler.upsample(&latents, 10).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_axis_taps_clamp_at_edges() {
+        let taps = axis_taps(2, 4);
+        assert_eq!(taps.lo, vec![0, 0, 0, 1]);
+        assert_eq!(taps.hi, vec![1, 1, 1, 1]);
+        assert!((taps.frac[0] - 0.0).abs() < 1e-6);
+        assert!((taps.frac[1] - 0.25).abs() < 1e-6);
+        assert!((taps.frac[2] - 0.75).abs() < 1e-6);
+        assert!((taps.frac[3] - 0.0).abs() < 1e-6);
     }
 }

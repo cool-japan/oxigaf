@@ -1,9 +1,10 @@
 //! Per-vertex and per-face visibility culling for FLAME meshes.
 //!
-//! Computes which vertices and faces are visible (front-facing, inside the
-//! camera frustum, not occluded) from a given camera viewpoint. Useful for
-//! the training pipeline to determine which parts of a head avatar are
-//! observable from each training view.
+//! Computes which vertices and faces are visible from a given camera viewpoint:
+//! front-facing, inside the camera frustum and — when
+//! [`VisibilityCullerConfig::use_depth_test`] is enabled — not self-occluded.
+//! Useful for the training pipeline to determine which parts of a head avatar
+//! are observable from each training view.
 //!
 //! # Example
 //!
@@ -78,14 +79,22 @@ pub struct VisibilityCullerConfig {
     /// `0.0` (strict image boundary).
     pub frustum_margin: f32,
 
-    /// Whether to perform an approximate depth-occlusion test.
+    /// Whether to perform a depth-occlusion test.
     ///
-    /// Currently reserved; set to `false` (the default). When `true`, a
-    /// future implementation will use a per-pixel depth buffer to detect
-    /// self-occluded vertices.
+    /// When `true`, the mesh is rasterized into a per-pixel depth buffer at the
+    /// camera resolution and every front-facing, in-frustum vertex (and, for
+    /// [`compute_face_visibility`], every face centroid) is tested against it,
+    /// so self-occluded geometry — the far side of the nose, an ear behind the
+    /// cheek — is reported as not visible. Off by default: it costs one full
+    /// rasterization pass per camera.
     pub use_depth_test: bool,
 
-    /// Depth bias used to break z-fighting ties in the depth test.
+    /// Minimum depth tolerance (camera-space units) for the depth test.
+    ///
+    /// The effective tolerance is `max(depth_bias, largest depth step to the four
+    /// neighbouring pixels)`: a slope-scaled bias, so a vertex on a steeply
+    /// slanted surface is never reported as occluding itself while one genuinely
+    /// behind another surface still is. Only read when `use_depth_test` is set.
     pub depth_bias: f32,
 }
 
@@ -191,18 +200,23 @@ fn compute_face_normal(v0: [f32; 3], v1: [f32; 3], v2: [f32; 3]) -> [f32; 3] {
     }
 }
 
-/// Compute the world-space direction from a mesh vertex toward the camera origin.
+/// World-space position of the camera centre: `p = −Rᵀ·t`.
 ///
-/// The camera world position satisfies `p_cam_world = −R^T t` (where `R` and
-/// `t` are the world-to-camera rotation and translation).  The returned vector
-/// is normalized.  Returns `[0, 0, 0]` if the vertex coincides with the camera.
+/// Constant for a given camera, so callers compute it **once** and pass it to
+/// [`camera_direction`] rather than rebuilding it per vertex/face.
 #[inline]
-fn camera_direction(vertex: [f32; 3], camera: &Camera) -> [f32; 3] {
-    // Camera world position: p = -R^T * t
-    let rt = camera.rotation.transpose();
-    let neg_t = -camera.translation;
-    let cam_world = rt * neg_t;
+fn camera_world_position(camera: &Camera) -> [f32; 3] {
+    let p = camera.rotation.transpose() * (-camera.translation);
+    [p[0], p[1], p[2]]
+}
 
+/// Compute the world-space direction from a mesh vertex toward the camera
+/// origin `cam_world` (see [`camera_world_position`]).
+///
+/// The returned vector is normalized; returns `[0, 0, 0]` if the vertex
+/// coincides with the camera.
+#[inline]
+fn camera_direction(vertex: [f32; 3], cam_world: [f32; 3]) -> [f32; 3] {
     let dx = cam_world[0] - vertex[0];
     let dy = cam_world[1] - vertex[1];
     let dz = cam_world[2] - vertex[2];
@@ -263,6 +277,162 @@ fn compute_face_screen_area(s0: [f32; 2], s1: [f32; 2], s2: [f32; 2]) -> f32 {
     (area * 0.5).abs()
 }
 
+/// Clamp a floating-point pixel coordinate into `[0, max_index]`.
+#[inline]
+fn clamp_pixel(value: f32, max_index: usize) -> usize {
+    if !value.is_finite() {
+        return 0;
+    }
+    value.max(0.0).min(max_index as f32) as usize
+}
+
+/// Rasterize the mesh into a screen-space depth buffer of camera-space `z`.
+///
+/// One `f32` per pixel, `f32::INFINITY` where no triangle covers the pixel
+/// centre.  Depth is interpolated screen-linearly (`w0·z0 + w1·z1 + w2·z2`) like
+/// the tile rasterizer in `normal_map` — not perspective correct, but far below
+/// the depth gaps this test resolves.  Triangles with any vertex at or behind
+/// the near plane are skipped.
+fn rasterize_depth_buffer(mesh: &Mesh, camera: &Camera) -> Vec<f32> {
+    let width = camera.width as usize;
+    let height = camera.height as usize;
+    let mut depth = vec![f32::INFINITY; width * height];
+    if width == 0 || height == 0 {
+        return depth;
+    }
+
+    let n_verts = mesh.vertices.len();
+    for face in &mesh.faces {
+        let idx = [face[0] as usize, face[1] as usize, face[2] as usize];
+        if idx.iter().any(|&i| i >= n_verts) {
+            continue;
+        }
+
+        let cam_pts: [na::Point3<f32>; 3] = [
+            camera.world_to_cam(&mesh.vertices[idx[0]]),
+            camera.world_to_cam(&mesh.vertices[idx[1]]),
+            camera.world_to_cam(&mesh.vertices[idx[2]]),
+        ];
+        if cam_pts.iter().any(|p| p.z <= camera.near) {
+            continue;
+        }
+
+        let mut screen = [[0.0f32; 2]; 3];
+        for (dst, p) in screen.iter_mut().zip(cam_pts.iter()) {
+            *dst = [
+                camera.focal_x * p.x / p.z + camera.cx,
+                camera.focal_y * p.y / p.z + camera.cy,
+            ];
+        }
+
+        let area = (screen[1][0] - screen[0][0]) * (screen[2][1] - screen[0][1])
+            - (screen[2][0] - screen[0][0]) * (screen[1][1] - screen[0][1]);
+        if area.abs() < 1e-12 || !area.is_finite() {
+            continue;
+        }
+        let inv_area = 1.0 / area;
+
+        let min_x = screen[0][0].min(screen[1][0]).min(screen[2][0]);
+        let max_x = screen[0][0].max(screen[1][0]).max(screen[2][0]);
+        let min_y = screen[0][1].min(screen[1][1]).min(screen[2][1]);
+        let max_y = screen[0][1].max(screen[1][1]).max(screen[2][1]);
+
+        let x_start = clamp_pixel(min_x.floor(), width - 1);
+        let x_end = clamp_pixel(max_x.ceil(), width - 1);
+        let y_start = clamp_pixel(min_y.floor(), height - 1);
+        let y_end = clamp_pixel(max_y.ceil(), height - 1);
+
+        for py in y_start..=y_end {
+            let sample_y = py as f32 + 0.5;
+            for px in x_start..=x_end {
+                let sample_x = px as f32 + 0.5;
+
+                let w0 = ((screen[1][0] - sample_x) * (screen[2][1] - sample_y)
+                    - (screen[2][0] - sample_x) * (screen[1][1] - sample_y))
+                    * inv_area;
+                let w1 = ((screen[2][0] - sample_x) * (screen[0][1] - sample_y)
+                    - (screen[0][0] - sample_x) * (screen[2][1] - sample_y))
+                    * inv_area;
+                let w2 = 1.0 - w0 - w1;
+                if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 {
+                    continue;
+                }
+
+                let z = w0 * cam_pts[0].z + w1 * cam_pts[1].z + w2 * cam_pts[2].z;
+                let pixel = py * width + px;
+                if z < depth[pixel] {
+                    depth[pixel] = z;
+                }
+            }
+        }
+    }
+
+    depth
+}
+
+/// Test one world-space vertex against a rasterized depth buffer.
+///
+/// Returns `true` when the vertex lies behind the recorded surface by more than
+/// the effective tolerance `max(depth_bias, largest depth step to the four
+/// neighbouring pixels)`.  Vertices outside the image, behind the near plane, or
+/// on pixels no triangle covered are never reported as occluded.
+fn is_occluded(vertex: [f32; 3], camera: &Camera, depth: &[f32], depth_bias: f32) -> bool {
+    let width = camera.width as usize;
+    let height = camera.height as usize;
+    if width == 0 || height == 0 {
+        return false;
+    }
+
+    let p = na::Point3::new(vertex[0], vertex[1], vertex[2]);
+    let p_cam = camera.world_to_cam(&p);
+    if p_cam.z <= camera.near {
+        return false;
+    }
+
+    let screen_x = camera.focal_x * p_cam.x / p_cam.z + camera.cx;
+    let screen_y = camera.focal_y * p_cam.y / p_cam.z + camera.cy;
+    if !screen_x.is_finite() || !screen_y.is_finite() || screen_x < 0.0 || screen_y < 0.0 {
+        return false;
+    }
+    let px = screen_x as usize;
+    let py = screen_y as usize;
+    if px >= width || py >= height {
+        return false;
+    }
+
+    let Some(&stored) = depth.get(py * width + px) else {
+        return false;
+    };
+    if !stored.is_finite() {
+        return false;
+    }
+
+    // Slope-scaled bias: how fast the surface recedes across one pixel.
+    //
+    // The buffer samples pixel *centres*, so a vertex may sit up to half a pixel
+    // away in each axis: the sampling error is bounded by
+    // `½·(|∂z/∂x| + |∂z/∂y|)`, which never exceeds the largest one-pixel step.
+    // Using the full step as the tolerance therefore guarantees that a vertex
+    // lying on the rasterized surface is never reported as occluding itself.
+    let mut step = 0.0f32;
+    for (nx, ny) in [
+        (px.wrapping_sub(1), py),
+        (px + 1, py),
+        (px, py.wrapping_sub(1)),
+        (px, py + 1),
+    ] {
+        if nx >= width || ny >= height {
+            continue;
+        }
+        let neighbour = depth.get(ny * width + nx).copied().unwrap_or(f32::INFINITY);
+        if neighbour.is_finite() {
+            step = step.max((neighbour - stored).abs());
+        }
+    }
+
+    p_cam.z > stored + depth_bias.max(step)
+}
+
 // ---------------------------------------------------------------------------
 // Core Public API
 // ---------------------------------------------------------------------------
@@ -270,7 +440,9 @@ fn compute_face_screen_area(s0: [f32; 2], s1: [f32; 2], s2: [f32; 2]) -> f32 {
 /// Compute per-face visibility from a single camera viewpoint.
 ///
 /// For every face the function computes:
-/// - Whether the face normal points toward the camera (front-facing test).
+/// - Whether the face normal points toward the camera (front-facing test), and
+///   — when `config.use_depth_test` is set — whether the face centroid survives
+///   the depth-occlusion test.
 /// - The projected screen-space area of the triangle.
 ///
 /// # Errors
@@ -291,6 +463,14 @@ pub fn compute_face_visibility(
     let n_verts = mesh.vertices.len();
     let mut visible = vec![false; n_faces];
     let mut screen_area = vec![0.0_f32; n_faces];
+
+    // Constant per camera — computed once instead of once per face.
+    let cam_world = camera_world_position(camera);
+    let depth_buffer = if config.use_depth_test {
+        Some(rasterize_depth_buffer(mesh, camera))
+    } else {
+        None
+    };
 
     for (face_idx, face) in mesh.faces.iter().enumerate() {
         let i0 = face[0] as usize;
@@ -334,9 +514,12 @@ pub fn compute_face_visibility(
             (v0.y + v1.y + v2.y) / 3.0,
             (v0.z + v1.z + v2.z) / 3.0,
         ];
-        let view_dir = camera_direction(centroid, camera);
+        let view_dir = camera_direction(centroid, cam_world);
 
-        visible[face_idx] = is_front_facing(face_normal, view_dir, config.backface_threshold);
+        visible[face_idx] = is_front_facing(face_normal, view_dir, config.backface_threshold)
+            && !depth_buffer
+                .as_deref()
+                .is_some_and(|buf| is_occluded(centroid, camera, buf, config.depth_bias));
 
         // Projected screen-space area
         let s0 = project_vertex(v0a, camera);
@@ -358,8 +541,9 @@ pub fn compute_face_visibility(
 
 /// Compute per-vertex visibility from a single camera viewpoint.
 ///
-/// A vertex is considered **visible** when it is both inside the camera frustum
-/// and has a front-facing per-vertex normal.
+/// A vertex is considered **visible** when it is inside the camera frustum, has
+/// a front-facing per-vertex normal, and — when `config.use_depth_test` is set —
+/// is not hidden behind other geometry in the rasterized depth buffer.
 ///
 /// # Errors
 ///
@@ -386,6 +570,14 @@ pub fn compute_vertex_visibility(
     let mut front_facing_buf = vec![false; n_vertices];
     let mut visible_buf = vec![false; n_vertices];
 
+    // Constant per camera — computed once instead of once per vertex.
+    let cam_world = camera_world_position(camera);
+    let depth_buffer = if config.use_depth_test {
+        Some(rasterize_depth_buffer(mesh, camera))
+    } else {
+        None
+    };
+
     for (i, (vertex, normal)) in mesh.vertices.iter().zip(mesh.normals.iter()).enumerate() {
         let va = [vertex.x, vertex.y, vertex.z];
 
@@ -395,12 +587,17 @@ pub fn compute_vertex_visibility(
         in_frustum_buf[i] = in_f;
 
         // Front-facing test using per-vertex normal
-        let view_dir = camera_direction(va, camera);
+        let view_dir = camera_direction(va, cam_world);
         let na_arr = [normal.x, normal.y, normal.z];
         let ff = is_front_facing(na_arr, view_dir, config.backface_threshold);
         front_facing_buf[i] = ff;
 
-        visible_buf[i] = in_f && ff;
+        // Optional occlusion test against the rasterized depth buffer
+        visible_buf[i] = in_f
+            && ff
+            && !depth_buffer
+                .as_deref()
+                .is_some_and(|buf| is_occluded(va, camera, buf, config.depth_bias));
     }
 
     Ok(VertexVisibility {
@@ -508,44 +705,81 @@ pub fn find_view_dependent_vertices(multi_view: &MultiViewVisibility) -> Vec<usi
 /// Compute per-camera coverage: fraction of mesh vertices visible from each camera.
 ///
 /// Returns a `Vec<f32>` of length `cameras.len()`, where each entry is the
-/// fraction of vertices visible from the corresponding camera.
+/// fraction of vertices visible from the corresponding camera.  The values are
+/// independent per camera — nothing here optimizes the *set* of views; see
+/// [`compute_greedy_view_selection`] for that.
 ///
 /// # Errors
 ///
 /// Returns [`VisibilityError::NoCameras`] when `cameras` is empty, or any
 /// error from [`compute_vertex_visibility`].
+pub fn compute_per_view_coverage(
+    mesh: &Mesh,
+    cameras: &[Camera],
+    config: &VisibilityCullerConfig,
+) -> Result<Vec<f32>, VisibilityError> {
+    Ok(compute_per_view_visibility(mesh, cameras, config)?
+        .iter()
+        .map(coverage_fraction)
+        .collect())
+}
+
+/// Per-camera [`VertexVisibility`], one entry per camera.
+///
+/// # Errors
+///
+/// Returns [`VisibilityError::NoCameras`] when `cameras` is empty, or any
+/// error from [`compute_vertex_visibility`].
+pub fn compute_per_view_visibility(
+    mesh: &Mesh,
+    cameras: &[Camera],
+    config: &VisibilityCullerConfig,
+) -> Result<Vec<VertexVisibility>, VisibilityError> {
+    if cameras.is_empty() {
+        return Err(VisibilityError::NoCameras);
+    }
+    cameras
+        .iter()
+        .map(|camera| compute_vertex_visibility(mesh, camera, config))
+        .collect()
+}
+
+/// Fraction of vertices marked visible in a single-view result.
+#[must_use]
+fn coverage_fraction(visibility: &VertexVisibility) -> f32 {
+    if visibility.n_vertices == 0 {
+        return 0.0;
+    }
+    let visible_count = visibility.visible.iter().filter(|&&v| v).count();
+    visible_count as f32 / visibility.n_vertices as f32
+}
+
+/// Deprecated name for [`compute_per_view_coverage`], kept for API stability.
+///
+/// The function computes no optimum: it returns one coverage fraction per
+/// camera.  Prefer [`compute_per_view_coverage`] or, for actual view selection,
+/// [`compute_greedy_view_selection`].
+///
+/// # Errors
+///
+/// Same as [`compute_per_view_coverage`].
 pub fn compute_optimal_view_coverage(
     mesh: &Mesh,
     cameras: &[Camera],
     config: &VisibilityCullerConfig,
 ) -> Result<Vec<f32>, VisibilityError> {
-    if cameras.is_empty() {
-        return Err(VisibilityError::NoCameras);
-    }
-
-    let n_vertices = mesh.vertices.len();
-    let mut coverage = Vec::with_capacity(cameras.len());
-
-    for camera in cameras {
-        let vis = compute_vertex_visibility(mesh, camera, config)?;
-        let visible_count = vis.visible.iter().filter(|&&v| v).count();
-        let frac = if n_vertices == 0 {
-            0.0
-        } else {
-            visible_count as f32 / n_vertices as f32
-        };
-        coverage.push(frac);
-    }
-
-    Ok(coverage)
+    compute_per_view_coverage(mesh, cameras, config)
 }
 
-/// Greedily select the `k` cameras with the highest coverage fractions.
+/// Select the `k` cameras with the highest **individual** coverage fractions.
 ///
-/// Returns camera indices sorted by coverage descending (highest coverage
-/// first). If `k` exceeds the number of cameras the full list is returned.
+/// Returns camera indices sorted by coverage descending, ties broken by index;
+/// if `k` exceeds the number of cameras the full list is returned.  This ignores
+/// overlap: the top-`k` views of a head cluster around the frontal direction and
+/// see almost the same vertices, so their union can cover far less of the mesh
+/// than a greedy choice — use [`select_greedy_covering_views`] for the union.
 #[must_use]
-pub fn select_maximally_covering_views(coverage: &[f32], k: usize) -> Vec<usize> {
+pub fn select_top_coverage_views(coverage: &[f32], k: usize) -> Vec<usize> {
     let mut indexed: Vec<(usize, f32)> =
         coverage.iter().enumerate().map(|(i, &c)| (i, c)).collect();
 
@@ -558,6 +792,88 @@ pub fn select_maximally_covering_views(coverage: &[f32], k: usize) -> Vec<usize>
 
     indexed.truncate(k);
     indexed.into_iter().map(|(i, _)| i).collect()
+}
+
+/// Deprecated name for [`select_top_coverage_views`], kept for API stability.
+///
+/// Despite the name it performs no maximal-coverage selection — it is a plain
+/// top-`k` by individual coverage.  Prefer [`select_greedy_covering_views`].
+#[must_use]
+pub fn select_maximally_covering_views(coverage: &[f32], k: usize) -> Vec<usize> {
+    select_top_coverage_views(coverage, k)
+}
+
+/// Greedy set-cover selection over per-camera visibility masks.
+///
+/// On each of at most `k` rounds the camera adding the most **newly** covered
+/// vertices is appended and its mask OR-ed into the covered set; ties go to the
+/// lowest camera index, so the result is deterministic.  Selection stops early —
+/// returning fewer than `k` indices — once no remaining camera contributes a new
+/// vertex, rather than padding the result with arbitrary cameras.
+#[must_use]
+pub fn select_greedy_covering_views(visibilities: &[VertexVisibility], k: usize) -> Vec<usize> {
+    let n_vertices = visibilities
+        .iter()
+        .map(|v| v.visible.len())
+        .max()
+        .unwrap_or(0);
+
+    let mut covered = vec![false; n_vertices];
+    let mut used = vec![false; visibilities.len()];
+    let mut selected: Vec<usize> = Vec::new();
+
+    while selected.len() < k {
+        let mut best: Option<(usize, usize)> = None; // (gain, camera index)
+        for (cam_idx, vis) in visibilities.iter().enumerate() {
+            if used[cam_idx] {
+                continue;
+            }
+            let gain = vis
+                .visible
+                .iter()
+                .enumerate()
+                .filter(|&(v_idx, &v)| v && !covered[v_idx])
+                .count();
+            if best.is_none_or(|(best_gain, _)| gain > best_gain) {
+                best = Some((gain, cam_idx));
+            }
+        }
+
+        let Some((gain, cam_idx)) = best else {
+            break; // every camera already used
+        };
+        if gain == 0 {
+            break; // no marginal coverage left
+        }
+
+        for (v_idx, &v) in visibilities[cam_idx].visible.iter().enumerate() {
+            if v {
+                covered[v_idx] = true;
+            }
+        }
+        used[cam_idx] = true;
+        selected.push(cam_idx);
+    }
+
+    selected
+}
+
+/// Compute per-camera visibility and greedily select `k` views maximizing the
+/// union of covered vertices ([`compute_per_view_visibility`] +
+/// [`select_greedy_covering_views`]).
+///
+/// # Errors
+///
+/// Returns [`VisibilityError::NoCameras`] when `cameras` is empty, or any
+/// error from [`compute_vertex_visibility`].
+pub fn compute_greedy_view_selection(
+    mesh: &Mesh,
+    cameras: &[Camera],
+    config: &VisibilityCullerConfig,
+    k: usize,
+) -> Result<Vec<usize>, VisibilityError> {
+    let visibilities = compute_per_view_visibility(mesh, cameras, config)?;
+    Ok(select_greedy_covering_views(&visibilities, k))
 }
 
 // ---------------------------------------------------------------------------
@@ -692,69 +1008,26 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_face_normal_xy_plane_points_z() {
-        // Triangle in XY plane → normal should be +Z
-        let v0 = [0.0_f32, 0.0, 0.0];
-        let v1 = [1.0, 0.0, 0.0];
-        let v2 = [0.0, 1.0, 0.0];
-        let n = compute_face_normal(v0, v1, v2);
-        assert!(
-            (n[2] - 1.0).abs() < 1e-5,
-            "z component should be 1, got {}",
-            n[2]
-        );
-        assert!(n[0].abs() < 1e-5);
-        assert!(n[1].abs() < 1e-5);
+    fn test_face_normal_orientation_and_winding() {
+        let origin = [0.0_f32, 0.0, 0.0];
+        // Triangle in the XY plane → +Z; reversed winding → −Z.
+        let n = compute_face_normal(origin, [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]);
+        assert!((n[2] - 1.0).abs() < 1e-5, "z should be 1, got {}", n[2]);
+        assert!(n[0].abs() < 1e-5 && n[1].abs() < 1e-5, "{n:?}");
+        let r = compute_face_normal(origin, [0.0, 1.0, 0.0], [1.0, 0.0, 0.0]);
+        assert!((r[2] + 1.0).abs() < 1e-5, "z should be -1, got {}", r[2]);
+        // Triangle in the XZ plane → e1×e2 = [1,0,0]×[0,0,1] = [0,-1,0].
+        let y = compute_face_normal(origin, [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]);
+        assert!((y[1] + 1.0).abs() < 1e-5, "y should be -1, got {}", y[1]);
     }
 
     #[test]
-    fn test_face_normal_reversed_winding_points_neg_z() {
-        let v0 = [0.0_f32, 0.0, 0.0];
-        let v1 = [0.0, 1.0, 0.0]; // reversed winding
-        let v2 = [1.0, 0.0, 0.0];
-        let n = compute_face_normal(v0, v1, v2);
-        assert!(
-            (n[2] + 1.0).abs() < 1e-5,
-            "z component should be -1, got {}",
-            n[2]
-        );
-    }
-
-    #[test]
-    fn test_face_normal_degenerate_returns_zero() {
-        let v0 = [0.0_f32, 0.0, 0.0];
-        let v1 = [0.0, 0.0, 0.0]; // same point
-        let v2 = [0.0, 0.0, 0.0];
-        let n = compute_face_normal(v0, v1, v2);
-        assert_eq!(n, [0.0, 0.0, 0.0]);
-    }
-
-    #[test]
-    fn test_face_normal_xz_plane_points_y() {
-        // Triangle in XZ plane → normal should be ±Y
-        let v0 = [0.0_f32, 0.0, 0.0];
-        let v1 = [1.0, 0.0, 0.0];
-        let v2 = [0.0, 0.0, 1.0];
-        let n = compute_face_normal(v0, v1, v2);
-        // e1×e2 = [1,0,0]×[0,0,1] = [0*1-0*0, 0*0-1*1, 1*0-0*0] = [0,-1,0]
-        assert!(
-            (n[1] + 1.0).abs() < 1e-5,
-            "y component should be -1, got {}",
-            n[1]
-        );
-    }
-
-    #[test]
-    fn test_face_normal_unit_length() {
-        let v0 = [0.0_f32, 0.0, 0.0];
-        let v1 = [2.0, 0.0, 0.0];
-        let v2 = [0.0, 3.0, 0.0];
-        let n = compute_face_normal(v0, v1, v2);
+    fn test_face_normal_degenerate_and_unit_length() {
+        let origin = [0.0_f32, 0.0, 0.0];
+        assert_eq!(compute_face_normal(origin, origin, origin), [0.0, 0.0, 0.0]);
+        let n = compute_face_normal(origin, [2.0, 0.0, 0.0], [0.0, 3.0, 0.0]);
         let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
-        assert!(
-            (len - 1.0).abs() < 1e-5,
-            "normal should be unit length, len={len}"
-        );
+        assert!((len - 1.0).abs() < 1e-5, "not unit length, len={len}");
     }
 
     // -----------------------------------------------------------------------
@@ -809,41 +1082,20 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_is_in_frustum_center_is_inside() {
-        let camera = front_camera();
-        assert!(is_in_frustum([128.0, 128.0], &camera, 0.0));
+    fn test_is_in_frustum_image_bounds() {
+        let camera = front_camera(); // 256×256
+        assert!(is_in_frustum([128.0, 128.0], &camera, 0.0), "centre");
+        assert!(is_in_frustum([0.0, 0.0], &camera, 0.0), "corner pixel");
+        assert!(!is_in_frustum([257.0, 128.0], &camera, 0.0), "past right");
+        assert!(!is_in_frustum([-1.0, 128.0], &camera, 0.0), "past left");
     }
 
     #[test]
-    fn test_is_in_frustum_outside_right_edge_false() {
+    fn test_is_in_frustum_margin_extends_bounds() {
         let camera = front_camera();
-        assert!(!is_in_frustum([257.0, 128.0], &camera, 0.0));
-    }
-
-    #[test]
-    fn test_is_in_frustum_outside_but_within_margin_true() {
-        let camera = front_camera();
-        // x=257, width=256 → outside by 1px; margin=2 → inside
+        // 1 px outside on either side, but within a 2 px margin.
         assert!(is_in_frustum([257.0, 128.0], &camera, 2.0));
-    }
-
-    #[test]
-    fn test_is_in_frustum_negative_coords_outside() {
-        let camera = front_camera();
-        assert!(!is_in_frustum([-1.0, 128.0], &camera, 0.0));
-    }
-
-    #[test]
-    fn test_is_in_frustum_negative_with_margin_inside() {
-        let camera = front_camera();
         assert!(is_in_frustum([-1.0, 128.0], &camera, 2.0));
-    }
-
-    #[test]
-    fn test_is_in_frustum_corner_pixel_inside() {
-        let camera = front_camera();
-        // Top-left corner pixel
-        assert!(is_in_frustum([0.0, 0.0], &camera, 0.0));
     }
 
     // -----------------------------------------------------------------------
@@ -1472,6 +1724,275 @@ mod tests {
         assert!(
             result.is_some(),
             "vertex in front of camera should project successfully"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // camera_world_position / camera_direction
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_camera_world_position_and_direction() {
+        // front_camera: R = diag(-1, 1, -1), t = [0, 0, 2] → −Rᵀt = [0, 0, 2]
+        let cam_world = camera_world_position(&front_camera());
+        assert!(
+            cam_world[0].abs() < 1e-5 && cam_world[1].abs() < 1e-5,
+            "{cam_world:?}"
+        );
+        assert!((cam_world[2] - 2.0).abs() < 1e-5, "{cam_world:?}");
+
+        let dir = camera_direction([0.0, 0.0, 0.0], cam_world);
+        assert!(
+            (dir[2] - 1.0).abs() < 1e-5,
+            "should point toward +Z: {dir:?}"
+        );
+        let len = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
+        assert!(
+            (len - 1.0).abs() < 1e-5,
+            "direction must be unit, len={len}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Depth-occlusion test (use_depth_test / depth_bias)
+    // -----------------------------------------------------------------------
+
+    /// Small triangle at world z = 0 hidden behind a large triangle at z = 0.5
+    /// (which is nearer to `front_camera`, located at world [0, 0, 2]).
+    fn occluded_mesh() -> Mesh {
+        let vertices = vec![
+            na::Point3::new(0.0_f32, 0.0, 0.0),
+            na::Point3::new(0.1_f32, 0.0, 0.0),
+            na::Point3::new(0.0_f32, 0.1, 0.0),
+            na::Point3::new(-0.3_f32, -0.3, 0.5),
+            na::Point3::new(0.3_f32, -0.3, 0.5),
+            na::Point3::new(0.0_f32, 0.3, 0.5),
+        ];
+        let normals = vec![na::Vector3::new(0.0_f32, 0.0, 1.0); 6];
+        Mesh {
+            vertices,
+            normals,
+            faces: vec![[0u32, 1, 2], [3u32, 4, 5]],
+            uv_coords: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_depth_test_culls_occluded_vertices_only() {
+        let mesh = occluded_mesh();
+        let plain = VisibilityCullerConfig::default();
+        let baseline =
+            compute_vertex_visibility(&mesh, &front_camera(), &plain).expect("should succeed");
+        assert_eq!(
+            baseline.visible.iter().filter(|&&v| v).count(),
+            6,
+            "without the depth test every front-facing vertex counts as visible"
+        );
+
+        let config = VisibilityCullerConfig {
+            use_depth_test: true,
+            ..plain
+        };
+        let vv =
+            compute_vertex_visibility(&mesh, &front_camera(), &config).expect("should succeed");
+
+        for i in 0..3 {
+            assert!(
+                !vv.visible[i],
+                "vertex {i} sits behind the occluder and must be culled"
+            );
+            // Only the occlusion test changed — it is still front-facing.
+            assert!(vv.front_facing[i] && vv.in_frustum[i]);
+        }
+        // The occluder must not occlude itself (slope-scaled bias / uncovered
+        // pixel rule), otherwise the test would be vacuous.
+        for i in 3..6 {
+            assert!(vv.visible[i], "occluder vertex {i} must stay visible");
+        }
+    }
+
+    /// Steeply slanted surface (`z = −x`, camera-space depth 1.76 → 2.24 across
+    /// ~62 px) tessellated into a strip, plus probe vertices lying exactly on it
+    /// whose own pixels the strip covers.  Returns the probe vertex indices.
+    fn slanted_mesh() -> (Mesh, Vec<usize>) {
+        let mut vertices: Vec<na::Point3<f32>> = Vec::new();
+        let mut faces: Vec<[u32; 3]> = Vec::new();
+        let columns = 8u32;
+        for i in 0..=columns {
+            let x = -0.24 + 0.48 * (i as f32) / (columns as f32);
+            vertices.push(na::Point3::new(x, -0.24, -x));
+            vertices.push(na::Point3::new(x, 0.24, -x));
+        }
+        for i in 0..columns {
+            let base = 2 * i;
+            faces.push([base, base + 2, base + 1]);
+            faces.push([base + 1, base + 2, base + 3]);
+        }
+
+        let first_probe = vertices.len();
+        for k in 0..5 {
+            let x = -0.15 + 0.075 * k as f32;
+            vertices.push(na::Point3::new(x, 0.013 * k as f32, -x));
+        }
+        let normal = na::Vector3::new(1.0_f32, 0.0, 1.0).normalize();
+        let normals = vec![normal; vertices.len()];
+        let probes = (first_probe..vertices.len()).collect();
+
+        (
+            Mesh {
+                vertices,
+                normals,
+                faces,
+                uv_coords: Vec::new(),
+            },
+            probes,
+        )
+    }
+
+    #[test]
+    fn test_depth_test_keeps_slanted_surface_visible() {
+        let (mesh, probes) = slanted_mesh();
+        let camera = front_camera();
+        let config = VisibilityCullerConfig {
+            use_depth_test: true,
+            ..Default::default()
+        };
+        let depth = rasterize_depth_buffer(&mesh, &camera);
+        let width = camera.width as usize;
+
+        for &probe in &probes {
+            let v = mesh.vertices[probe];
+            let screen = project_vertex([v.x, v.y, v.z], &camera).expect("probe must project");
+            let pixel = (screen[1] as usize) * width + (screen[0] as usize);
+            let stored = depth[pixel];
+            // Non-vacuous: the probe's own pixel is covered, so the comparison
+            // really runs instead of taking the "empty pixel" shortcut …
+            assert!(stored.is_finite(), "probe {probe} landed on an empty pixel");
+            // … and the surface recedes far faster per pixel than `depth_bias`,
+            // so a fixed bias alone would report the probe as self-occluded.
+            let step = (depth[pixel + 1] - stored).abs();
+            assert!(
+                step > 10.0 * config.depth_bias,
+                "probe {probe}: one-pixel step {step} is too flat to be a test"
+            );
+        }
+
+        let vv = compute_vertex_visibility(&mesh, &camera, &config).expect("should succeed");
+        for &probe in &probes {
+            assert!(
+                vv.visible[probe],
+                "probe {probe} lies on the surface and must not occlude itself"
+            );
+        }
+    }
+
+    #[test]
+    fn test_depth_test_culls_occluded_face() {
+        let config = VisibilityCullerConfig {
+            use_depth_test: true,
+            ..Default::default()
+        };
+        let mesh = occluded_mesh();
+        let fv = compute_face_visibility(&mesh, &front_camera(), &config).expect("should succeed");
+        assert!(!fv.visible[0], "hidden face must be culled");
+        assert!(fv.visible[1], "occluding face must stay visible");
+    }
+
+    #[test]
+    fn test_rasterize_depth_buffer_records_nearest_surface() {
+        let camera = front_camera();
+        let depth = rasterize_depth_buffer(&occluded_mesh(), &camera);
+        let centre = depth[128 * camera.width as usize + 128];
+        assert!(
+            (centre - 1.5).abs() < 1e-3,
+            "centre pixel should hold the nearer surface (z=1.5), got {centre}"
+        );
+        // A corner pixel is covered by no triangle.
+        assert!(depth[0].is_infinite(), "uncovered pixel must stay infinite");
+    }
+
+    // -----------------------------------------------------------------------
+    // Greedy (set-cover) view selection
+    // -----------------------------------------------------------------------
+
+    fn visibility_from_mask(mask: &[bool]) -> VertexVisibility {
+        VertexVisibility {
+            visible: mask.to_vec(),
+            in_frustum: mask.to_vec(),
+            front_facing: mask.to_vec(),
+            n_vertices: mask.len(),
+        }
+    }
+
+    #[test]
+    fn test_greedy_selection_beats_top_k_on_overlapping_views() {
+        // Views 0 and 1 are identical (coverage 4/6); view 2 covers the rest.
+        let views = [
+            visibility_from_mask(&[true, true, true, true, false, false]),
+            visibility_from_mask(&[true, true, true, true, false, false]),
+            visibility_from_mask(&[false, false, false, false, true, true]),
+        ];
+        let coverage: Vec<f32> = views.iter().map(coverage_fraction).collect();
+
+        let top = select_top_coverage_views(&coverage, 2);
+        assert_eq!(top, vec![0, 1], "top-k picks the two identical views");
+
+        let greedy = select_greedy_covering_views(&views, 2);
+        assert_eq!(greedy, vec![0, 2], "greedy must add marginal coverage");
+
+        let union = |sel: &[usize]| {
+            (0..6)
+                .filter(|&v| sel.iter().any(|&c| views[c].visible[v]))
+                .count()
+        };
+        assert!(
+            union(&greedy) > union(&top),
+            "greedy union {} should beat top-k union {}",
+            union(&greedy),
+            union(&top)
+        );
+    }
+
+    #[test]
+    fn test_greedy_stops_when_no_marginal_coverage() {
+        let views = [
+            visibility_from_mask(&[true, true, false]),
+            visibility_from_mask(&[true, false, false]), // subset of view 0
+        ];
+        let selected = select_greedy_covering_views(&views, 5);
+        assert_eq!(
+            selected,
+            vec![0],
+            "selection must stop instead of padding to k"
+        );
+    }
+
+    #[test]
+    fn test_compute_greedy_view_selection_end_to_end() {
+        let mesh = simple_mesh();
+        let cameras = vec![back_camera(), front_camera()];
+        let config = VisibilityCullerConfig::default();
+        let selected =
+            compute_greedy_view_selection(&mesh, &cameras, &config, 2).expect("should succeed");
+        assert_eq!(selected, vec![1], "only the front camera covers anything");
+        assert!(matches!(
+            compute_greedy_view_selection(&mesh, &[], &config, 2),
+            Err(VisibilityError::NoCameras)
+        ));
+    }
+
+    #[test]
+    fn test_renamed_coverage_helpers_match_legacy_names() {
+        let mesh = simple_mesh();
+        let cameras = vec![front_camera(), back_camera()];
+        let config = VisibilityCullerConfig::default();
+        let renamed = compute_per_view_coverage(&mesh, &cameras, &config).expect("should succeed");
+        let legacy =
+            compute_optimal_view_coverage(&mesh, &cameras, &config).expect("should succeed");
+        assert_eq!(renamed, legacy);
+        assert_eq!(
+            select_top_coverage_views(&renamed, 1),
+            select_maximally_covering_views(&legacy, 1)
         );
     }
 }

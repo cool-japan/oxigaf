@@ -254,14 +254,22 @@ pub fn retar_expression_acceleration(
 }
 /// Gaussian smoothing of an expression sequence.
 ///
-/// `sigma` is the smoothing strength in frames.  Kernel half-width is
-/// `ceil(3 * sigma)`.  Boundary frames are padded by repetition (clamp).
+/// `sigma` is the smoothing strength in frames.  The kernel half-width is
+/// `ceil(3 * sigma)`, **clamped to `len - 1`**.  Boundary frames are padded by
+/// repetition (clamp-to-edge), so a tap further than `len - 1` away from the
+/// current frame can only ever re-read the first or last frame; the clamp keeps
+/// the kernel allocation and the convolution proportional to the sequence
+/// instead of to `sigma`, and keeps `2 * half + 1` far away from `i64`
+/// overflow.  A consequence is that very large `sigma` values all saturate to
+/// the same edge-dominated, near-uniform average rather than growing without
+/// bound.
 ///
-/// Returns [`RetargetError::EmptySequence`] if `sequence` is empty.
+/// `sigma <= 0` returns the sequence unchanged.
 ///
 /// # Errors
 ///
-/// Returns an error if the operation fails.
+/// - [`RetargetError::EmptySequence`] if `sequence` is empty.
+/// - [`RetargetError::InvalidConfig`] if `sigma` is not finite (NaN or ±∞).
 pub fn retar_smooth_sequence(
     sequence: &[ExpressionState],
     sigma: f32,
@@ -269,11 +277,19 @@ pub fn retar_smooth_sequence(
     if sequence.is_empty() {
         return Err(RetargetError::EmptySequence);
     }
+    if !sigma.is_finite() {
+        return Err(RetargetError::InvalidConfig(format!(
+            "smoothing sigma must be finite, got {sigma}"
+        )));
+    }
     if sigma <= 0.0_f32 {
         return Ok(sequence.to_vec());
     }
-    let half = (3.0_f32 * sigma).ceil() as i64;
     let n = i64::try_from(sequence.len()).unwrap_or(i64::MAX);
+    // Widest useful half-width: beyond `n - 1` every extra tap is clamped onto
+    // a frame the kernel already covers.
+    let max_half = n.saturating_sub(1).max(1);
+    let half = ((3.0_f32 * sigma).ceil() as i64).clamp(0, max_half);
     let dim = sequence[0].expr_dim;
     let kernel_len = (2 * half + 1) as usize;
     let mut kernel: Vec<f32> = (0..kernel_len)
@@ -412,23 +428,229 @@ pub fn retar_find_neutral_frame(sequence: &[ExpressionState]) -> Result<usize, R
     }
     Ok(best_idx)
 }
-/// Mirror an expression by negating odd-indexed expression dimensions.
+/// Cholesky factorization `A = L Lᵀ` of a symmetric positive-definite matrix.
 ///
-/// FLAME expression dimensions alternate between bilateral-symmetric components;
-/// negating the odd-indexed ones performs a left-right reflection.
-#[must_use]
-pub fn retar_mirror_expression(state: &ExpressionState) -> ExpressionState {
-    let params: Vec<f32> = state
-        .expression_params
-        .iter()
-        .enumerate()
-        .map(|(i, &v)| if i % 2 == 1 { -v } else { v })
-        .collect();
-    ExpressionState {
-        expression_params: params,
-        jaw_pose: state.jaw_pose,
-        expr_dim: state.expr_dim,
+/// `matrix` is `[dim × dim]` row-major; only the lower triangle is read.  The
+/// returned `L` is `[dim × dim]` row-major with a zero upper triangle.
+fn cholesky_factor(matrix: &[f32], dim: usize) -> Result<Vec<f32>, RetargetError> {
+    let mut chol = vec![0.0_f32; dim * dim];
+    for ii in 0..dim {
+        for jj in 0..=ii {
+            let mut sum_val = matrix[ii * dim + jj];
+            for kk in 0..jj {
+                sum_val -= chol[ii * dim + kk] * chol[jj * dim + kk];
+            }
+            if ii == jj {
+                if sum_val <= 0.0_f32 {
+                    return Err(RetargetError::Singular);
+                }
+                chol[ii * dim + ii] = sum_val.sqrt();
+            } else {
+                chol[ii * dim + jj] = sum_val / chol[jj * dim + jj];
+            }
+        }
     }
+    Ok(chol)
+}
+
+/// Solve `L Lᵀ x = rhs` given the Cholesky factor `L` from [`cholesky_factor`].
+fn cholesky_solve(chol: &[f32], rhs: &[f32], dim: usize) -> Vec<f32> {
+    // Forward substitution: L y = rhs
+    let mut fwd_y = vec![0.0_f32; dim];
+    for ii in 0..dim {
+        let mut sum_val = rhs[ii];
+        for jj in 0..ii {
+            sum_val -= chol[ii * dim + jj] * fwd_y[jj];
+        }
+        fwd_y[ii] = sum_val / chol[ii * dim + ii];
+    }
+    // Back substitution: Lᵀ x = y
+    let mut sol_x = vec![0.0_f32; dim];
+    for ii in (0..dim).rev() {
+        let mut sum_val = fwd_y[ii];
+        for jj in (ii + 1)..dim {
+            sum_val -= chol[jj * dim + ii] * sol_x[jj];
+        }
+        sol_x[ii] = sum_val / chol[ii * dim + ii];
+    }
+    sol_x
+}
+
+/// Build the coefficient-space left-right mirror matrix `M` for a FLAME
+/// expression basis.
+///
+/// Mirroring a FLAME face is a **vertex-space** operation, not a coefficient
+/// relabelling: reflect every vertex displacement across the mid-sagittal plane
+/// (`x → −x`) *and* swap every vertex with its bilateral counterpart.  Written
+/// as matrices that is `P · S · B`, where
+///
+/// - `B` is the expression basis, `[3N × K]`,
+/// - `S` negates the x component of each vertex displacement, and
+/// - `P` is the vertex permutation described by `symmetry_map`.
+///
+/// The mirrored displacement field is projected back onto the basis by least
+/// squares, giving a `K × K` matrix in coefficient space:
+///
+/// `M = (BᵀB + λI)⁻¹ · (Bᵀ P S B)`
+///
+/// with a tiny ridge term `λ` (`1e-6` of the mean Gram diagonal) so that a
+/// rank-deficient basis still factorizes.  Feed the result to
+/// [`retar_mirror_expression`].
+///
+/// # Arguments
+///
+/// - `expression_basis`: FLAME `expressiondirs` flattened exactly as
+///   `ndarray`'s `[N, 3, K]` row-major layout, i.e. element `(vertex, axis, k)`
+///   lives at `((vertex * 3) + axis) * K + k`.  Length must be
+///   `symmetry_map.len() * 3 * expr_dim`.
+/// - `symmetry_map`: for every vertex, the index of its bilateral counterpart
+///   (midline vertices map to themselves) — see
+///   [`crate::symmetry::SymmetryMap`].
+/// - `expr_dim`: number of expression components `K`.
+///
+/// # Performance
+///
+/// Cost is `O(3N · K²)`; for the standard FLAME model (`N = 5023`, `K = 100`)
+/// this is a few hundred million multiply-adds.  Build the matrix once and
+/// reuse it across frames.
+///
+/// # Errors
+///
+/// - [`RetargetError::InvalidConfig`] if `expr_dim` is zero, `symmetry_map` is
+///   empty, or a symmetry-map entry is out of bounds.
+/// - [`RetargetError::DimensionMismatch`] if `expression_basis` does not have
+///   `symmetry_map.len() * 3 * expr_dim` elements.
+/// - [`RetargetError::Singular`] if `BᵀB + λI` is not positive definite.
+pub fn retar_build_expression_mirror_matrix(
+    expression_basis: &[f32],
+    symmetry_map: &[usize],
+    expr_dim: usize,
+) -> Result<Vec<f32>, RetargetError> {
+    if expr_dim == 0 {
+        return Err(RetargetError::InvalidConfig(
+            "expr_dim must be > 0".to_string(),
+        ));
+    }
+    let num_vertices = symmetry_map.len();
+    if num_vertices == 0 {
+        return Err(RetargetError::InvalidConfig(
+            "symmetry map must not be empty".to_string(),
+        ));
+    }
+    let expected = num_vertices * 3 * expr_dim;
+    if expression_basis.len() != expected {
+        return Err(RetargetError::DimensionMismatch {
+            src_dim: expected,
+            got: expression_basis.len(),
+        });
+    }
+    for (vertex, &mapped) in symmetry_map.iter().enumerate() {
+        if mapped >= num_vertices {
+            return Err(RetargetError::InvalidConfig(format!(
+                "symmetry map entry {vertex} points at vertex {mapped}, out of bounds for {num_vertices} vertices"
+            )));
+        }
+    }
+
+    // gram  = BᵀB          cross = Bᵀ (P S B)
+    let mut gram = vec![0.0_f32; expr_dim * expr_dim];
+    let mut cross = vec![0.0_f32; expr_dim * expr_dim];
+    for (vertex, &mirrored) in symmetry_map.iter().enumerate() {
+        for axis in 0..3_usize {
+            // S negates the x component (axis 0) of the displacement.
+            let sign = if axis == 0 { -1.0_f32 } else { 1.0_f32 };
+            let row = (vertex * 3 + axis) * expr_dim;
+            // P reads the displacement of the bilateral counterpart.
+            let mirror_row = (mirrored * 3 + axis) * expr_dim;
+            for i in 0..expr_dim {
+                let b_i = expression_basis[row + i];
+                if b_i == 0.0_f32 {
+                    continue;
+                }
+                let signed_b_i = sign * b_i;
+                for j in 0..expr_dim {
+                    gram[i * expr_dim + j] += b_i * expression_basis[row + j];
+                    cross[i * expr_dim + j] += signed_b_i * expression_basis[mirror_row + j];
+                }
+            }
+        }
+    }
+
+    // Ridge term scaled to the basis energy so it stays negligible but rescues
+    // a rank-deficient (or duplicated-component) basis.
+    let trace: f32 = (0..expr_dim).map(|d| gram[d * expr_dim + d]).sum();
+    let lambda = (trace / expr_dim as f32).abs() * 1e-6_f32 + f32::EPSILON;
+    for d in 0..expr_dim {
+        gram[d * expr_dim + d] += lambda;
+    }
+
+    let chol = cholesky_factor(&gram, expr_dim)?;
+
+    // Solve gram · M[:, j] = cross[:, j] independently for every column j.
+    let mut mirror = vec![0.0_f32; expr_dim * expr_dim];
+    let mut rhs = vec![0.0_f32; expr_dim];
+    for j in 0..expr_dim {
+        for (i, slot) in rhs.iter_mut().enumerate() {
+            *slot = cross[i * expr_dim + j];
+        }
+        let column = cholesky_solve(&chol, &rhs, expr_dim);
+        for (i, &value) in column.iter().enumerate() {
+            mirror[i * expr_dim + j] = value;
+        }
+    }
+    Ok(mirror)
+}
+
+/// Mirror an expression state across the mid-sagittal plane.
+///
+/// The expression coefficients are transformed by the coefficient-space mirror
+/// matrix produced by [`retar_build_expression_mirror_matrix`]:
+/// `ψ' = M · ψ`.  A FLAME expression basis is a PCA basis over vertex
+/// displacements ordered by explained variance — its components carry no
+/// alternating symmetric/antisymmetric structure — so a mirror **cannot** be
+/// expressed as a fixed sign pattern on the coefficients and genuinely requires
+/// the basis geometry that `M` encodes.
+///
+/// The jaw pose is mirrored analytically: reflecting across `x = 0` conjugates
+/// the jaw rotation by `diag(−1, 1, 1)`, which maps the axis-angle vector
+/// `(rx, ry, rz)` to `(rx, −ry, −rz)`.
+///
+/// # Errors
+///
+/// Returns [`RetargetError::DimensionMismatch`] if `state.expression_params`
+/// does not have `state.expr_dim` entries, or if `mirror_matrix` is not
+/// `expr_dim × expr_dim`.
+pub fn retar_mirror_expression(
+    state: &ExpressionState,
+    mirror_matrix: &[f32],
+) -> Result<ExpressionState, RetargetError> {
+    let dim = state.expr_dim;
+    if state.expression_params.len() != dim {
+        return Err(RetargetError::DimensionMismatch {
+            src_dim: dim,
+            got: state.expression_params.len(),
+        });
+    }
+    if mirror_matrix.len() != dim * dim {
+        return Err(RetargetError::DimensionMismatch {
+            src_dim: dim * dim,
+            got: mirror_matrix.len(),
+        });
+    }
+    let mut params = vec![0.0_f32; dim];
+    for (i, out) in params.iter_mut().enumerate() {
+        let row = &mirror_matrix[i * dim..(i + 1) * dim];
+        *out = row
+            .iter()
+            .zip(state.expression_params.iter())
+            .map(|(&m, &v)| m * v)
+            .sum();
+    }
+    Ok(ExpressionState {
+        expression_params: params,
+        jaw_pose: [state.jaw_pose[0], -state.jaw_pose[1], -state.jaw_pose[2]],
+        expr_dim: dim,
+    })
 }
 /// Weighted blend of multiple expression states.
 ///
@@ -479,14 +701,32 @@ pub fn retar_blend_states(
         expr_dim: dim,
     })
 }
-/// Component-wise spherical linear interpolation (SLERP) of two expression states.
+/// Spherical linear interpolation (SLERP) of two expression states.
 ///
-/// Each expression coefficient is interpolated on a 1-D arc. `t = 0` returns
-/// a clone of `a`; `t = 1` returns a clone of `b`.
+/// The expression vector is treated as a single point in `expr_dim`-dimensional
+/// space: its **direction** is interpolated along the great circle joining the
+/// unit vectors of `a` and `b`, while its **magnitude** is interpolated
+/// linearly between `‖a‖` and `‖b‖`.  This is one N-dimensional arc, *not* N
+/// independent per-coefficient arcs — every output coefficient therefore
+/// depends on every input coefficient.
+///
+/// Fallbacks:
+///
+/// - If either expression vector is near zero (`‖·‖ < 1e-8`) the whole vector
+///   is linearly interpolated instead (the direction of a zero vector is
+///   undefined).
+/// - If the angle between the two directions is below `1e-6` rad the directions
+///   are linearly interpolated and renormalized, which avoids dividing by
+///   `sin θ ≈ 0`.
+///
+/// The jaw pose is **always** interpolated linearly, never slerped.
+///
+/// `t` is clamped to `[0, 1]`; `t = 0` reproduces `a` and `t = 1` reproduces `b`.
 ///
 /// # Errors
 ///
-/// Returns an error if the operation fails.
+/// Returns [`RetargetError::DimensionMismatch`] if `a` and `b` have different
+/// expression dimensionality.
 pub fn retar_slerp_states(
     a: &ExpressionState,
     b: &ExpressionState,
@@ -633,4 +873,192 @@ pub fn retar_format_config(config: &RetargetConfig) -> String {
         config.expr_dim, config.regularization, config.scale_by_variance, config
         .include_jaw, config.smoothing_sigma,
     )
+}
+
+// ---------------------------------------------------------------------------
+// Regression tests for the mirror / smoothing / SLERP fixes
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two-vertex, one-component basis whose single component is a pure
+    /// x-displacement of magnitude `x0` on vertex 0 and `x1` on vertex 1.
+    ///
+    /// Layout matches `ndarray`'s `[N, 3, K]` row-major order with `N = 2`,
+    /// `K = 1`: `((vertex * 3) + axis) * 1 + 0`.
+    fn two_vertex_x_basis(x0: f32, x1: f32) -> Vec<f32> {
+        vec![x0, 0.0, 0.0, x1, 0.0, 0.0]
+    }
+
+    #[test]
+    fn mirror_matrix_negates_a_symmetric_x_component() {
+        // Both vertices displace along +x by the same amount.  Reflecting x and
+        // swapping the two vertices maps the field onto its own negative, so the
+        // coefficient-space mirror must be −1.
+        let basis = two_vertex_x_basis(1.0, 1.0);
+        let symmetry_map = vec![1_usize, 0_usize];
+        let mirror = retar_build_expression_mirror_matrix(&basis, &symmetry_map, 1)
+            .expect("mirror matrix for a well-conditioned basis");
+        assert_eq!(mirror.len(), 1);
+        assert!(
+            (mirror[0] + 1.0).abs() < 1e-4,
+            "expected M ≈ -1, got {}",
+            mirror[0]
+        );
+    }
+
+    #[test]
+    fn mirror_matrix_preserves_an_antisymmetric_x_component() {
+        // Vertex 0 displaces +x, vertex 1 displaces −x.  Reflecting x and
+        // swapping the vertices reproduces the field exactly, so M must be +1.
+        let basis = two_vertex_x_basis(1.0, -1.0);
+        let symmetry_map = vec![1_usize, 0_usize];
+        let mirror = retar_build_expression_mirror_matrix(&basis, &symmetry_map, 1)
+            .expect("mirror matrix for a well-conditioned basis");
+        assert!(
+            (mirror[0] - 1.0).abs() < 1e-4,
+            "expected M ≈ +1, got {}",
+            mirror[0]
+        );
+    }
+
+    #[test]
+    fn mirror_matrix_rejects_wrong_basis_length() {
+        let symmetry_map = vec![1_usize, 0_usize];
+        assert!(matches!(
+            retar_build_expression_mirror_matrix(&[1.0, 0.0, 0.0], &symmetry_map, 1),
+            Err(RetargetError::DimensionMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn mirror_matrix_rejects_out_of_bounds_symmetry_map() {
+        let basis = two_vertex_x_basis(1.0, 1.0);
+        assert!(matches!(
+            retar_build_expression_mirror_matrix(&basis, &[9_usize, 0_usize], 1),
+            Err(RetargetError::InvalidConfig(_))
+        ));
+    }
+
+    #[test]
+    fn mirror_expression_applies_the_matrix_and_flips_jaw_yaw_roll() {
+        // Identity-free 2×2 matrix so a wrong (transposed) application is visible.
+        let mirror = vec![0.0_f32, 1.0, 2.0, 0.0];
+        let state = ExpressionState::from_params_and_jaw(vec![3.0, 5.0], [0.1, 0.2, 0.3]);
+        let mirrored =
+            retar_mirror_expression(&state, &mirror).expect("2×2 matrix on a 2-dim state");
+        // row 0 = [0, 1] · [3, 5] = 5 ; row 1 = [2, 0] · [3, 5] = 6
+        assert!((mirrored.expression_params[0] - 5.0).abs() < 1e-6);
+        assert!((mirrored.expression_params[1] - 6.0).abs() < 1e-6);
+        // Reflecting across x = 0 keeps the pitch axis and flips yaw and roll.
+        assert!((mirrored.jaw_pose[0] - 0.1).abs() < 1e-6);
+        assert!((mirrored.jaw_pose[1] + 0.2).abs() < 1e-6);
+        assert!((mirrored.jaw_pose[2] + 0.3).abs() < 1e-6);
+    }
+
+    #[test]
+    fn mirror_expression_twice_is_the_identity_for_a_real_basis() {
+        let basis = two_vertex_x_basis(1.0, 1.0);
+        let symmetry_map = vec![1_usize, 0_usize];
+        let mirror =
+            retar_build_expression_mirror_matrix(&basis, &symmetry_map, 1).expect("mirror matrix");
+        let state = ExpressionState::from_params_and_jaw(vec![0.75], [0.1, 0.2, 0.3]);
+        let once = retar_mirror_expression(&state, &mirror).expect("first mirror");
+        let twice = retar_mirror_expression(&once, &mirror).expect("second mirror");
+        assert!(
+            (twice.expression_params[0] - 0.75).abs() < 1e-4,
+            "double mirror should be the identity, got {}",
+            twice.expression_params[0]
+        );
+        assert_eq!(twice.jaw_pose, [0.1, 0.2, 0.3]);
+    }
+
+    #[test]
+    fn mirror_expression_rejects_wrong_matrix_size() {
+        let state = ExpressionState::from_params(vec![1.0, 2.0]);
+        assert!(matches!(
+            retar_mirror_expression(&state, &[1.0, 0.0, 0.0]),
+            Err(RetargetError::DimensionMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn smooth_sequence_survives_enormous_sigma() {
+        // Before the half-width clamp this overflowed `2 * half + 1` (panic in
+        // debug) or tried to allocate a kernel of astronomic length.
+        let sequence = vec![
+            ExpressionState::from_params(vec![0.0, 1.0]),
+            ExpressionState::from_params(vec![1.0, 0.0]),
+            ExpressionState::from_params(vec![2.0, -1.0]),
+        ];
+        let smoothed =
+            retar_smooth_sequence(&sequence, 1e18_f32).expect("huge sigma must not panic");
+        assert_eq!(smoothed.len(), 3);
+        for frame in &smoothed {
+            for value in &frame.expression_params {
+                assert!(value.is_finite(), "smoothed value {value} is not finite");
+            }
+        }
+    }
+
+    #[test]
+    fn smooth_sequence_rejects_non_finite_sigma() {
+        let sequence = vec![ExpressionState::from_params(vec![0.0])];
+        assert!(matches!(
+            retar_smooth_sequence(&sequence, f32::NAN),
+            Err(RetargetError::InvalidConfig(_))
+        ));
+        assert!(matches!(
+            retar_smooth_sequence(&sequence, f32::INFINITY),
+            Err(RetargetError::InvalidConfig(_))
+        ));
+    }
+
+    #[test]
+    fn smooth_sequence_moderate_sigma_still_smooths() {
+        let sequence = vec![
+            ExpressionState::from_params(vec![0.0]),
+            ExpressionState::from_params(vec![10.0]),
+            ExpressionState::from_params(vec![0.0]),
+        ];
+        let smoothed = retar_smooth_sequence(&sequence, 1.0_f32).expect("finite sigma");
+        assert_eq!(smoothed.len(), 3);
+        assert!(
+            smoothed[1].expression_params[0] < 10.0,
+            "the spike should be attenuated, got {}",
+            smoothed[1].expression_params[0]
+        );
+    }
+
+    #[test]
+    fn slerp_endpoints_reproduce_the_inputs() {
+        let a = ExpressionState::from_params_and_jaw(vec![1.0, 0.0], [0.0, 0.0, 0.0]);
+        let b = ExpressionState::from_params_and_jaw(vec![0.0, 2.0], [1.0, 1.0, 1.0]);
+        let at_zero = retar_slerp_states(&a, &b, 0.0).expect("slerp at t=0");
+        let at_one = retar_slerp_states(&a, &b, 1.0).expect("slerp at t=1");
+        assert!((at_zero.expression_params[0] - 1.0).abs() < 1e-5);
+        assert!(at_zero.expression_params[1].abs() < 1e-5);
+        assert!(at_one.expression_params[0].abs() < 1e-5);
+        assert!((at_one.expression_params[1] - 2.0).abs() < 1e-5);
+        // The jaw pose is linearly interpolated, never slerped.
+        assert!((at_zero.jaw_pose[1]).abs() < 1e-6);
+        assert!((at_one.jaw_pose[1] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn slerp_couples_all_coefficients() {
+        // Documented behaviour: the whole vector shares one arc, so changing a
+        // single coefficient of `a` moves *every* interpolated coefficient.
+        let b = ExpressionState::from_params(vec![0.0, 1.0]);
+        let a1 = ExpressionState::from_params(vec![1.0, 0.0]);
+        let a2 = ExpressionState::from_params(vec![2.0, 0.0]);
+        let mid1 = retar_slerp_states(&a1, &b, 0.5).expect("slerp");
+        let mid2 = retar_slerp_states(&a2, &b, 0.5).expect("slerp");
+        assert!(
+            (mid1.expression_params[1] - mid2.expression_params[1]).abs() > 1e-4,
+            "coefficient 1 should react to a change in coefficient 0"
+        );
+    }
 }

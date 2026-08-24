@@ -40,12 +40,12 @@
 //! # ToRSh Example (requires `torsh` feature)
 //!
 //! ```rust,no_run
+//! # use std::path::Path;
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! # #[cfg(feature = "torsh")]
 //! # {
 //! use oxigaf_bridge::{WeightConverter, Precision};
-//! use std::path::Path;
 //!
-//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! let converter = WeightConverter::new()
 //!     .with_precision(Precision::FP16);
 //!
@@ -60,15 +60,22 @@
 //!     Path::new("oxigaf/unet.safetensors"),
 //!     Path::new("gaf_checkpoint_new.safetensors")
 //! )?;
-//! # Ok(())
 //! # }
+//! # Ok(())
 //! # }
 //! ```
 //!
 //! # Layer Name Conventions
 //!
 //! - **PyTorch**: `unet.down_blocks.0.resnets.0.conv1.weight`
-//! - **OxiGAF**: `down_blocks_0_resnets_0_conv1_weight`
+//! - **OxiGAF (PyTorch bridge)**: `down__blocks_0_resnets_0_conv1_weight` --
+//!   existing underscores are doubled before dots become single underscores,
+//!   so `down_blocks` (one underscore) is distinguishable from a converted
+//!   dot. See [`layer_mapping::LayerMapping`].
+//! - **OxiGAF (ToRSh/GAF bridge)**: `down_blocks.0.resnets.0.conv1.weight` --
+//!   a direct `/` → `.` substitution, matching the dot-separated path
+//!   convention `candle_nn::VarBuilder::pp` expects. See
+//!   [`gaf_layer_mapper::GafLayerMapper`].
 //! - **ToRSh**: `down_blocks/0/resnets/0/conv1/weight`
 
 pub mod error;

@@ -13,8 +13,10 @@ members = [
 [workspace.package]
 version = "0.1.2"
 edition = "2021"
+rust-version = "1.85"
 license = "Apache-2.0"
 repository = "https://github.com/cool-japan/oxigaf"
+homepage = "https://github.com/cool-japan/oxigaf"
 authors = ["COOLJAPAN OU (Team Kitasan)"]
 
 [workspace.dependencies]
@@ -26,7 +28,10 @@ glam = "0.33"
 # oxicandle-* is the COOLJAPAN fork of huggingface/candle 0.11.0: it selects
 # fancy-regex instead of the C Oniguruma (onig/onig_sys) that upstream pulls
 # in through tokenizers. Dependency keys stay `candle-core`/`candle-nn`, so
-# source code is unchanged. default-features = false avoids CUDA on macOS.
+# source code is unchanged. default-features = false is a no-op today
+# (oxicandle-core's own `default = []` already excludes cuda/metal/mkl/
+# accelerate) but is kept explicit so this workspace stays CPU-only by
+# default even if that upstream default ever changes.
 candle-core = { package = "oxicandle-core", version = "0.11.0", default-features = false }
 candle-nn = { package = "oxicandle-nn", version = "0.11.0", default-features = false }
 safetensors = "0.8"
@@ -59,7 +64,7 @@ rand = "0.10"
 
 # Parallelism & Async
 rayon = "1.12"
-pollster = "0.4"
+pollster = "1"
 
 # Testing
 approx = "0.5"
@@ -96,13 +101,20 @@ kiddo = "5"
 # Half-precision floating point
 half = "2.7"
 
-# Internal crates
-oxigaf-flame = { path = "crates/oxigaf-flame" }
-oxigaf-diffusion = { path = "crates/oxigaf-diffusion" }
-oxigaf-render = { path = "crates/oxigaf-render" }
-oxigaf-trainer = { path = "crates/oxigaf-trainer" }
-oxigaf = { path = "crates/oxigaf" }
-oxigaf-bridge = { path = "crates/oxigaf-bridge" }
+# LRU caching (oxigaf-flame video sequences)
+lru = "0.18"
+
+# ToRSh interop (Pure Rust, feature-gated; oxigaf-bridge only)
+torsh-tensor = "0.2.0"
+torsh-nn = "0.2.0"
+
+# Internal crates (version required so member crates stay publishable)
+oxigaf-flame = { path = "crates/oxigaf-flame", version = "0.1.2" }
+oxigaf-diffusion = { path = "crates/oxigaf-diffusion", version = "0.1.2" }
+oxigaf-render = { path = "crates/oxigaf-render", version = "0.1.2" }
+oxigaf-trainer = { path = "crates/oxigaf-trainer", version = "0.1.2" }
+oxigaf = { path = "crates/oxigaf", version = "0.1.2" }
+oxigaf-bridge = { path = "crates/oxigaf-bridge", version = "0.1.2" }
 
 # Performance optimization profiles
 [profile.release]
@@ -115,7 +127,9 @@ panic = "abort"            # Smaller binary size and faster panics (no unwinding
 [profile.release-with-debug]
 inherits = "release"
 debug = true               # Include debug info for profiling while keeping release optimizations
+strip = false              # Override release's strip=true, otherwise debug info above is discarded
 
 [profile.bench]
 inherits = "release"
 debug = true               # Include debug info for Criterion benchmarks
+strip = false              # Override release's strip=true, otherwise Criterion loses symbols
