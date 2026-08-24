@@ -3,7 +3,8 @@
 //! This module provides:
 //! - [`ExperimentMetrics`] — per-experiment recorded training metrics
 //! - [`ExperimentComparison`] — multi-experiment comparison with rankings
-//! - [`generate_svg_line_chart`] — SVG chart generation without external dependencies
+//! - [`generate_svg_line_chart_with_steps`] — SVG chart generation against real x-axis step values
+//! - [`generate_svg_line_chart`] — index-based SVG chart generation (no external dependencies)
 //! - [`HtmlReportGenerator`] — self-contained HTML report (no JS frameworks, no templating crates)
 
 use std::collections::HashMap;
@@ -240,8 +241,9 @@ pub struct ExperimentComparison {
     pub experiments: Vec<ExperimentMetrics>,
     /// Index into `experiments` of the experiment with the best final PSNR.
     pub best_psnr_idx: usize,
-    /// Index into `experiments` of the experiment that converged earliest.
-    pub fastest_converge_idx: usize,
+    /// Index into `experiments` of the experiment that converged earliest,
+    /// or `None` if no experiment ever reached 95% of its own peak PSNR.
+    pub fastest_converge_idx: Option<usize>,
     /// Index into `experiments` of the experiment with the highest stability score.
     pub most_stable_idx: usize,
 }
@@ -249,12 +251,21 @@ pub struct ExperimentComparison {
 impl ExperimentComparison {
     /// Build a comparison from a non-empty list of experiments.
     ///
+    /// Calls [`ExperimentMetrics::finalize`] on every experiment (it is
+    /// idempotent — safe even if the caller already finalized) so
+    /// `best_psnr_idx` reflects real data instead of an arbitrary index
+    /// into experiments whose `best_psnr` a caller forgot to compute.
+    ///
     /// # Errors
     ///
     /// Returns [`ReportError::EmptyExperiments`] if `experiments` is empty.
-    pub fn new(experiments: Vec<ExperimentMetrics>) -> Result<Self, ReportError> {
+    pub fn new(mut experiments: Vec<ExperimentMetrics>) -> Result<Self, ReportError> {
         if experiments.is_empty() {
             return Err(ReportError::EmptyExperiments);
+        }
+
+        for exp in &mut experiments {
+            exp.finalize();
         }
 
         // Best PSNR index
@@ -269,20 +280,15 @@ impl ExperimentComparison {
             .map(|(i, _)| i)
             .unwrap_or(0);
 
-        // Fastest convergence: smallest step value; experiments that never converge are ranked last.
-        let fastest_converge_idx = {
-            let mut best_idx = 0;
-            let mut best_step = usize::MAX;
-            for (i, exp) in experiments.iter().enumerate() {
-                if let Some(step) = exp.convergence_step() {
-                    if step < best_step {
-                        best_step = step;
-                        best_idx = i;
-                    }
-                }
-            }
-            best_idx
-        };
+        // Fastest convergence: smallest step value among experiments that
+        // converged at all; `None` (rather than a misleading index 0) when
+        // none of them ever reached the threshold.
+        let fastest_converge_idx = experiments
+            .iter()
+            .enumerate()
+            .filter_map(|(i, exp)| exp.convergence_step().map(|step| (i, step)))
+            .min_by_key(|&(_, step)| step)
+            .map(|(i, _)| i);
 
         // Most stable: highest stability score
         let most_stable_idx = experiments
@@ -361,10 +367,16 @@ impl ExperimentComparison {
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| "N/A".to_string());
             let stab = format!("{:.4}", exp.stability_score());
+            // Truncate by chars, not bytes: a byte slice can land inside a
+            // multibyte character and panic on a non-ASCII experiment name.
+            let display_name: String = if exp.name.chars().count() > col_name {
+                exp.name.chars().take(col_name).collect()
+            } else {
+                exp.name.clone()
+            };
             let row = format!(
                 "| {:<col_name$} | {:<col_psnr$} | {:<col_loss$} | {:<col_time$} | {:<col_conv$} | {:<col_stab$} |",
-                // Truncate name if longer than column
-                if exp.name.len() > col_name { &exp.name[..col_name] } else { &exp.name },
+                display_name,
                 format!("{:.4}", exp.best_psnr),
                 format!("{:.6}", exp.final_loss),
                 format!("{:.2}", exp.training_time_secs),
@@ -397,18 +409,28 @@ const PAD_BOTTOM: f64 = 40.0;
 /// Legend item height (pixels).
 const LEGEND_LINE_HEIGHT: f64 = 18.0;
 
-/// Generate a simple SVG line chart from multiple named data series.
+/// Generate a simple SVG line chart from multiple named data series, each
+/// plotted against its own real x-axis step values rather than array index.
 ///
 /// # Parameters
-/// - `series`: slice of `(name, color_hex, data_points)` tuples
+/// - `series`: slice of `(name, color_hex, steps, data_points)` tuples,
+///   where `steps[i]` is the x-axis value (e.g. training step) at which
+///   `data_points[i]` was recorded. `steps` and `data_points` must be the
+///   same length within a series.
 /// - `title`: chart title rendered at the top
 /// - `y_label`: label for the y-axis
 /// - `width` / `height`: SVG viewport dimensions in pixels
 ///
 /// # Returns
 /// Complete `<svg>` element as a UTF-8 string.
-pub fn generate_svg_line_chart(
-    series: &[(&str, &str, &[f32])],
+///
+/// All series share one x-axis spanning the global minimum to maximum step
+/// across every series, so a run logged at irregular intervals is not drawn
+/// as if the intervals were uniform, and two series with a different number
+/// of recorded points are not stretched to the same width and thereby
+/// compared at different training steps on the same x-position.
+pub fn generate_svg_line_chart_with_steps(
+    series: &[(&str, &str, &[usize], &[f32])],
     title: &str,
     y_label: &str,
     width: usize,
@@ -425,13 +447,17 @@ pub fn generate_svg_line_chart(
     let plot_w = plot_right - plot_left;
     let plot_h = plot_bottom - plot_top;
 
-    // Compute global data bounds across all series
+    // Compute global data bounds (both axes) across all series
     let mut y_min = f64::INFINITY;
     let mut y_max = f64::NEG_INFINITY;
-    let mut x_count: usize = 0;
-    for (_, _, pts) in series {
-        x_count = x_count.max(pts.len());
-        for &v in *pts {
+    let mut x_min = usize::MAX;
+    let mut x_max = 0usize;
+    let mut any_points = false;
+    for (_, _, steps, pts) in series {
+        for (&step, &v) in steps.iter().zip(pts.iter()) {
+            any_points = true;
+            x_min = x_min.min(step);
+            x_max = x_max.max(step);
             let fv = v as f64;
             if fv < y_min {
                 y_min = fv;
@@ -441,22 +467,25 @@ pub fn generate_svg_line_chart(
             }
         }
     }
-    if x_count == 0 {
+    if !any_points {
         y_min = 0.0;
         y_max = 1.0;
+        x_min = 0;
+        x_max = 0;
     }
     if (y_max - y_min).abs() < 1e-9 {
         // All values equal — center vertically
         y_min -= 1.0;
         y_max += 1.0;
     }
+    let x_range = (x_max - x_min) as f64;
 
     // Helper: map data coordinates → SVG coordinates
-    let to_svg_x = |xi: usize, total: usize| -> f64 {
-        if total <= 1 {
+    let to_svg_x = |step: usize| -> f64 {
+        if x_range <= 0.0 {
             return plot_left + plot_w * 0.5;
         }
-        plot_left + (xi as f64 / (total as f64 - 1.0)) * plot_w
+        plot_left + ((step - x_min) as f64 / x_range) * plot_w
     };
 
     let to_svg_y = |v: f64| -> f64 { plot_bottom - ((v - y_min) / (y_max - y_min)) * plot_h };
@@ -530,13 +559,14 @@ pub fn generate_svg_line_chart(
     ));
     svg.push('\n');
 
-    // X-axis labels (first and last step index)
-    if x_count > 0 {
+    // X-axis labels (real first/last step values, not array indices)
+    if any_points {
         svg.push_str(&format!(
             "  <text x=\"{x:.2}\" y=\"{y:.2}\" fill=\"#aaa\" font-size=\"10\" \
-             text-anchor=\"middle\">0</text>",
+             text-anchor=\"middle\">{val}</text>",
             x = plot_left,
             y = plot_bottom + 14.0,
+            val = x_min,
         ));
         svg.push('\n');
         svg.push_str(&format!(
@@ -544,21 +574,20 @@ pub fn generate_svg_line_chart(
              text-anchor=\"middle\">{val}</text>",
             x = plot_right,
             y = plot_bottom + 14.0,
-            val = x_count - 1,
+            val = x_max,
         ));
         svg.push('\n');
     }
 
     // Polylines for each series
-    for (name, color, pts) in series.iter() {
+    for (name, color, steps, pts) in series.iter() {
         if pts.is_empty() {
             continue;
         }
-        let total = pts.len();
-        let points: String = pts
+        let points: String = steps
             .iter()
-            .enumerate()
-            .map(|(xi, &v)| format!("{:.2},{:.2}", to_svg_x(xi, total), to_svg_y(v as f64)))
+            .zip(pts.iter())
+            .map(|(&step, &v)| format!("{:.2},{:.2}", to_svg_x(step), to_svg_y(v as f64)))
             .collect::<Vec<_>>()
             .join(" ");
         svg.push_str(&format!(
@@ -574,7 +603,7 @@ pub fn generate_svg_line_chart(
     // Legend
     let legend_x = plot_right - 160.0;
     let legend_y_start = plot_top + 10.0;
-    for (i, (name, color, _)) in series.iter().enumerate() {
+    for (i, (name, color, _, _)) in series.iter().enumerate() {
         let ly = legend_y_start + i as f64 * LEGEND_LINE_HEIGHT;
         svg.push_str(&format!(
             "  <line x1=\"{x1:.2}\" y1=\"{y:.2}\" x2=\"{x2:.2}\" y2=\"{y:.2}\" \
@@ -596,6 +625,43 @@ pub fn generate_svg_line_chart(
 
     svg.push_str("</svg>");
     svg
+}
+
+/// Generate a simple SVG line chart from multiple named data series,
+/// plotted against array index (0, 1, 2, …) rather than any real x-axis
+/// unit.
+///
+/// Prefer [`generate_svg_line_chart_with_steps`] whenever the series have
+/// meaningful x-axis values (e.g. training steps) — it renders the true
+/// x-axis and keeps series of different lengths comparable at the same
+/// x-position. This index-based variant is kept for callers that only have
+/// a bare value sequence with no associated step numbers.
+///
+/// # Parameters
+/// - `series`: slice of `(name, color_hex, data_points)` tuples
+/// - `title`: chart title rendered at the top
+/// - `y_label`: label for the y-axis
+/// - `width` / `height`: SVG viewport dimensions in pixels
+///
+/// # Returns
+/// Complete `<svg>` element as a UTF-8 string.
+pub fn generate_svg_line_chart(
+    series: &[(&str, &str, &[f32])],
+    title: &str,
+    y_label: &str,
+    width: usize,
+    height: usize,
+) -> String {
+    let index_steps: Vec<Vec<usize>> = series
+        .iter()
+        .map(|(_, _, pts)| (0..pts.len()).collect())
+        .collect();
+    let indexed: Vec<(&str, &str, &[usize], &[f32])> = series
+        .iter()
+        .zip(index_steps.iter())
+        .map(|((name, color, pts), steps)| (*name, *color, steps.as_slice(), *pts))
+        .collect();
+    generate_svg_line_chart_with_steps(&indexed, title, y_label, width, height)
 }
 
 // ---------------------------------------------------------------------------
@@ -645,20 +711,38 @@ impl HtmlReportGenerator {
     pub fn generate(&self) -> String {
         let exps = &self.comparison.experiments;
 
-        // Build per-experiment color lists
-        let series_psnr: Vec<(&str, &str, &[f32])> = exps
+        // Build per-experiment color lists. Each series carries its own
+        // `steps` alongside the values so the chart's x-axis reflects real
+        // training steps instead of the array index — `ExperimentMetrics`
+        // records `steps`/`psnr_curve`/`loss_curve`/`num_gaussians_curve` in
+        // lockstep via `add_step`, so indexing them together is always valid.
+        let series_psnr: Vec<(&str, &str, &[usize], &[f32])> = exps
             .iter()
             .enumerate()
-            .map(|(i, e)| (e.name.as_str(), color_for(i), e.psnr_curve.as_slice()))
+            .map(|(i, e)| {
+                (
+                    e.name.as_str(),
+                    color_for(i),
+                    e.steps.as_slice(),
+                    e.psnr_curve.as_slice(),
+                )
+            })
             .collect();
 
-        let series_loss: Vec<(&str, &str, &[f32])> = exps
+        let series_loss: Vec<(&str, &str, &[usize], &[f32])> = exps
             .iter()
             .enumerate()
-            .map(|(i, e)| (e.name.as_str(), color_for(i), e.loss_curve.as_slice()))
+            .map(|(i, e)| {
+                (
+                    e.name.as_str(),
+                    color_for(i),
+                    e.steps.as_slice(),
+                    e.loss_curve.as_slice(),
+                )
+            })
             .collect();
 
-        let psnr_svg = generate_svg_line_chart(
+        let psnr_svg = generate_svg_line_chart_with_steps(
             &series_psnr,
             "PSNR over Training Steps",
             "PSNR (dB)",
@@ -666,7 +750,7 @@ impl HtmlReportGenerator {
             self.config.chart_height,
         );
 
-        let loss_svg = generate_svg_line_chart(
+        let loss_svg = generate_svg_line_chart_with_steps(
             &series_loss,
             "Loss over Training Steps",
             "Loss",
@@ -679,19 +763,21 @@ impl HtmlReportGenerator {
 
         // Gaussians chart (optional)
         let gaussians_section = if self.config.include_gaussians_chart {
-            let series_gauss: Vec<(String, &str, Vec<f32>)> = exps
+            let series_gauss: Vec<(String, &str, Vec<usize>, Vec<f32>)> = exps
                 .iter()
                 .enumerate()
                 .map(|(i, e)| {
                     let pts: Vec<f32> = e.num_gaussians_curve.iter().map(|&n| n as f32).collect();
-                    (e.name.clone(), color_for(i), pts)
+                    (e.name.clone(), color_for(i), e.steps.clone(), pts)
                 })
                 .collect();
-            let series_refs: Vec<(&str, &str, &[f32])> = series_gauss
+            let series_refs: Vec<(&str, &str, &[usize], &[f32])> = series_gauss
                 .iter()
-                .map(|(name, color, pts)| (name.as_str(), *color, pts.as_slice()))
+                .map(|(name, color, steps, pts)| {
+                    (name.as_str(), *color, steps.as_slice(), pts.as_slice())
+                })
                 .collect();
-            let gauss_svg = generate_svg_line_chart(
+            let gauss_svg = generate_svg_line_chart_with_steps(
                 &series_refs,
                 "Gaussian Count over Training Steps",
                 "# Gaussians",
@@ -1197,5 +1283,143 @@ mod tests {
         // Raw unescaped < or > from the experiment name must not appear inside SVG tags
         // The SVG legend text should be escaped
         assert!(html.contains("run&lt;1&gt;&amp;&quot;test&quot;"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_format_text_table_truncates_multibyte_name_by_char_not_byte() {
+        // 30 non-ASCII (3-byte UTF-8) chars: byte-slicing at the 24-byte
+        // column width would land mid-character and panic.
+        let name: String = std::iter::repeat_n('あ', 30).collect();
+        let mut exp = ExperimentMetrics::new(name.clone());
+        exp.add_step(0, 20.0, 1.0, 100);
+        exp.finalize();
+        let cmp = ExperimentComparison::new(vec![exp]).expect("ok");
+        // Must not panic, and must contain a 24-char (not 24-byte) prefix.
+        let table = cmp.format_text_table();
+        let expected_prefix: String = name.chars().take(24).collect();
+        assert!(
+            table.contains(&expected_prefix),
+            "table should contain the char-truncated name prefix"
+        );
+    }
+
+    #[test]
+    fn test_fastest_converge_idx_none_when_nothing_converges() {
+        // `ExperimentMetrics::convergence_step` returns `None` whenever the
+        // curve's peak PSNR is <= 0.0 (see its own doc/impl: a non-positive
+        // peak makes the 95%-of-peak threshold meaningless) — construct two
+        // such experiments so `fastest_converge_idx` must be `None` rather
+        // than defaulting to a fabricated index 0.
+        let mut exp_a = ExperimentMetrics::new("neg_a");
+        exp_a.add_step(0, -10.0, 1.0, 100);
+        exp_a.add_step(1, -5.0, 0.5, 100);
+        exp_a.finalize();
+
+        let mut exp_b = ExperimentMetrics::new("neg_b");
+        exp_b.add_step(0, -20.0, 1.0, 100);
+        exp_b.add_step(1, -1.0, 0.5, 100);
+        exp_b.finalize();
+
+        let cmp = ExperimentComparison::new(vec![exp_a, exp_b]).expect("ok");
+        assert_eq!(
+            cmp.fastest_converge_idx, None,
+            "neither experiment has a positive peak PSNR, so neither can \
+             converge and the field must be None, not a fabricated index 0"
+        );
+    }
+
+    #[test]
+    fn test_fastest_converge_idx_some_when_one_converges() {
+        let mut exp_a = ExperimentMetrics::new("converges");
+        exp_a.add_step(0, 10.0, 1.0, 100);
+        exp_a.add_step(1, 39.0, 0.5, 100); // >= 95% of its peak (40.0)
+        exp_a.add_step(2, 40.0, 0.1, 100);
+        exp_a.finalize();
+
+        let mut exp_b = ExperimentMetrics::new("never_converges");
+        exp_b.add_step(0, -5.0, 1.0, 100);
+        exp_b.add_step(1, -2.0, 0.5, 100);
+        exp_b.finalize(); // peak = -2.0 <= 0.0, so convergence_step() is always None
+
+        let cmp = ExperimentComparison::new(vec![exp_a, exp_b]).expect("ok");
+        assert_eq!(cmp.fastest_converge_idx, Some(0));
+    }
+
+    #[test]
+    fn test_comparison_new_finalizes_experiments_defensively() {
+        // A caller who forgets to call `finalize()` still gets a real
+        // best_psnr_idx, since `ExperimentComparison::new` finalizes every
+        // experiment itself (idempotently) before ranking them.
+        let mut exp_a = ExperimentMetrics::new("a");
+        exp_a.add_step(0, 10.0, 1.0, 100);
+        // exp_a.finalize() intentionally NOT called — best_psnr starts 0.0
+
+        let mut exp_b = ExperimentMetrics::new("b");
+        exp_b.add_step(0, 25.0, 1.0, 100);
+        // exp_b.finalize() intentionally NOT called either
+
+        let cmp = ExperimentComparison::new(vec![exp_a, exp_b]).expect("ok");
+        assert_eq!(
+            cmp.best_psnr_idx, 1,
+            "b has the higher real PSNR and must win even though neither \
+             experiment was finalized by the caller"
+        );
+        assert!((cmp.experiments[0].best_psnr - 10.0).abs() < 1e-5);
+        assert!((cmp.experiments[1].best_psnr - 25.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_svg_chart_with_steps_plots_real_step_values() {
+        // Two series recorded at very different step scales: a naive
+        // index-based plot would place their k-th points at the same
+        // x-position regardless of the real step gap between them. With
+        // real steps, the x-axis labels must reflect the true global
+        // min/max step, not `0` and `len - 1`.
+        let steps_a = vec![0usize, 1000, 2000];
+        let vals_a = vec![10.0_f32, 20.0, 30.0];
+        let steps_b = vec![0usize, 5000];
+        let vals_b = vec![15.0_f32, 25.0];
+        let svg = generate_svg_line_chart_with_steps(
+            &[
+                ("a", "#ff0000", &steps_a, &vals_a),
+                ("b", "#00ff00", &steps_b, &vals_b),
+            ],
+            "Steps Test",
+            "Value",
+            600,
+            300,
+        );
+        assert!(svg.starts_with("<svg"));
+        assert!(svg.ends_with("</svg>"));
+        // The global max step (5000, from series b) must appear as an axis
+        // label — a bug that plotted array index instead would show "2"
+        // (series a's last index) or "1" (series b's last index) instead.
+        assert!(
+            svg.contains(">5000<"),
+            "x-axis label should show the real max step 5000"
+        );
+        assert_eq!(svg.matches("<polyline").count(), 2);
+    }
+
+    #[test]
+    fn test_svg_chart_with_steps_empty_series_does_not_panic() {
+        let svg = generate_svg_line_chart_with_steps(&[], "Empty", "Y", 400, 200);
+        assert!(svg.starts_with("<svg"));
+        assert!(svg.ends_with("</svg>"));
+    }
+
+    #[test]
+    fn test_svg_chart_index_delegation_matches_previous_shape() {
+        // The index-based `generate_svg_line_chart` must still behave like
+        // a chart whose x-axis runs 0..len-1 for a single series (its only
+        // previously-tested shape), now implemented via the step-aware core.
+        let data = vec![1.0_f32, 2.0, 3.0, 4.0];
+        let svg = generate_svg_line_chart(&[("s", "#123456", &data)], "T", "Y", 500, 250);
+        assert!(svg.contains(">0<"), "first index label should be 0");
+        assert!(svg.contains(">3<"), "last index label should be len-1=3");
     }
 }

@@ -29,6 +29,16 @@ pub enum DeduplicatorError {
     /// Cell size must be strictly positive.
     #[error("Grid cell size must be positive, got {size}")]
     InvalidCellSize { size: f32 },
+    /// A flat per-Gaussian attribute array's length doesn't match `count * stride`.
+    #[error(
+        "Attribute length mismatch: expected {expected} ({count} x stride {stride}), got {got}"
+    )]
+    AttributeLengthMismatch {
+        expected: usize,
+        got: usize,
+        count: usize,
+        stride: usize,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -326,6 +336,59 @@ fn uf_to_groups(parent: &mut [usize], n: usize) -> Vec<Vec<usize>> {
 }
 
 // ---------------------------------------------------------------------------
+// Shared attribute-length validation
+// ---------------------------------------------------------------------------
+
+/// Validate that `opacities`/`scales`/`sh_coeffs` are long enough for `n`
+/// Gaussians before any indexed access into them. Single choke point for
+/// both duplicate-detection entry points, protecting `gd_are_duplicates`'s
+/// unchecked indexing from every caller (direct, or via
+/// [`gd_deduplicate`]/[`gd_analyze_duplicates`]) — previously only
+/// `positions` was validated here.
+fn validate_dedup_attributes(
+    positions: &[f32],
+    opacities: &[f32],
+    scales: &[f32],
+    sh_coeffs: &[f32],
+    sh_channels: usize,
+    n: usize,
+) -> Result<(), DeduplicatorError> {
+    if positions.len() < n * 3 {
+        return Err(DeduplicatorError::PositionLengthMismatch {
+            pos: positions.len(),
+            n,
+        });
+    }
+    if opacities.len() < n {
+        return Err(DeduplicatorError::AttributeLengthMismatch {
+            expected: n,
+            got: opacities.len(),
+            count: n,
+            stride: 1,
+        });
+    }
+    if scales.len() < n * 3 {
+        return Err(DeduplicatorError::AttributeLengthMismatch {
+            expected: n * 3,
+            got: scales.len(),
+            count: n,
+            stride: 3,
+        });
+    }
+    // `gd_are_duplicates` only indexes `sh_coeffs` when `sh_channels >= 3`
+    // (and non-empty, which a length check subsumes).
+    if sh_channels >= 3 && sh_coeffs.len() < n * sh_channels {
+        return Err(DeduplicatorError::AttributeLengthMismatch {
+            expected: n * sh_channels,
+            got: sh_coeffs.len(),
+            count: n,
+            stride: sh_channels,
+        });
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Duplicate detection: spatial hash
 // ---------------------------------------------------------------------------
 
@@ -345,12 +408,7 @@ pub fn gd_find_duplicates_spatial(
     if n == 0 {
         return Ok(Vec::new());
     }
-    if positions.len() < n * 3 {
-        return Err(DeduplicatorError::PositionLengthMismatch {
-            pos: positions.len(),
-            n,
-        });
-    }
+    validate_dedup_attributes(positions, opacities, scales, sh_coeffs, sh_channels, n)?;
 
     let map = SpatialHashMap::new(
         n.next_power_of_two().max(16),
@@ -408,12 +466,7 @@ pub fn gd_find_duplicates_brute(
     if n == 0 {
         return Ok(Vec::new());
     }
-    if positions.len() < n * 3 {
-        return Err(DeduplicatorError::PositionLengthMismatch {
-            pos: positions.len(),
-            n,
-        });
-    }
+    validate_dedup_attributes(positions, opacities, scales, sh_coeffs, sh_channels, n)?;
 
     let mut parent: Vec<usize> = (0..n).collect();
     let mut rank: Vec<u8> = vec![0u8; n];
@@ -445,15 +498,21 @@ pub fn gd_find_duplicates_brute(
 // ---------------------------------------------------------------------------
 
 /// Select the index to keep from a duplicate group according to `policy`.
+///
+/// Returns `None` if `group` is empty (there is nothing to keep). The
+/// original implementation evaluated `group[0]` as `unwrap_or`'s eager
+/// fallback argument even for `KeepFirst`/`KeepLast`, which panics on an
+/// empty group regardless of whether the fallback was actually needed.
 pub fn gd_pick_representative(
     group: &[usize],
     opacities: &[f32],
     scales: &[f32],
     policy: &DedupKeepPolicy,
-) -> usize {
-    match policy {
+) -> Option<usize> {
+    let &first = group.first()?;
+    let best = match policy {
         DedupKeepPolicy::KeepHighestOpacity => {
-            let mut best = group[0];
+            let mut best = first;
             let mut best_val = opacities[best];
             for &idx in &group[1..] {
                 if opacities[idx] > best_val {
@@ -464,7 +523,7 @@ pub fn gd_pick_representative(
             best
         }
         DedupKeepPolicy::KeepLargestScale => {
-            let mut best = group[0];
+            let mut best = first;
             let mut best_val = max_scale(scales, best);
             for &idx in &group[1..] {
                 let v = max_scale(scales, idx);
@@ -476,7 +535,7 @@ pub fn gd_pick_representative(
             best
         }
         DedupKeepPolicy::KeepSmallestScale => {
-            let mut best = group[0];
+            let mut best = first;
             let mut best_val = max_scale(scales, best);
             for &idx in &group[1..] {
                 let v = max_scale(scales, idx);
@@ -487,9 +546,10 @@ pub fn gd_pick_representative(
             }
             best
         }
-        DedupKeepPolicy::KeepFirst => *group.iter().min().unwrap_or(&group[0]),
-        DedupKeepPolicy::KeepLast => *group.iter().max().unwrap_or(&group[0]),
-    }
+        DedupKeepPolicy::KeepFirst => *group.iter().min()?,
+        DedupKeepPolicy::KeepLast => *group.iter().max()?,
+    };
+    Some(best)
 }
 
 // ---------------------------------------------------------------------------
@@ -509,7 +569,12 @@ pub fn gd_build_remove_mask(
 ) -> Vec<bool> {
     let mut mask = vec![false; n];
     for group in duplicate_groups {
-        let keep = gd_pick_representative(group, opacities, scales, policy);
+        // `None` only for an empty group, which `uf_to_groups` never
+        // produces (it filters to len >= 2); skip defensively rather than
+        // panicking if some other caller constructs one directly.
+        let Some(keep) = gd_pick_representative(group, opacities, scales, policy) else {
+            continue;
+        };
         for &idx in group {
             if idx != keep {
                 mask[idx] = true;
@@ -525,19 +590,40 @@ pub fn gd_build_remove_mask(
 
 /// Filter a flat array with `stride` values per Gaussian, removing entries
 /// where `mask[i] == true`.
-pub fn gd_apply_mask(data: &[f32], mask: &[bool], stride: usize) -> Vec<f32> {
+///
+/// # Errors
+/// Returns [`DeduplicatorError::AttributeLengthMismatch`] if
+/// `data.len() != mask.len() * stride`, rather than panicking on an
+/// out-of-bounds slice or silently emitting a truncated, misaligned row.
+pub fn gd_apply_mask(
+    data: &[f32],
+    mask: &[bool],
+    stride: usize,
+) -> Result<Vec<f32>, DeduplicatorError> {
     let n = mask.len();
-    let mut out = Vec::with_capacity(n * stride);
+    let expected = n * stride;
+    if data.len() != expected {
+        return Err(DeduplicatorError::AttributeLengthMismatch {
+            expected,
+            got: data.len(),
+            count: n,
+            stride,
+        });
+    }
+    let mut out = Vec::with_capacity(expected);
     for i in 0..n {
         if !mask[i] {
-            out.extend_from_slice(&data[i * stride..(i * stride + stride).min(data.len())]);
+            out.extend_from_slice(&data[i * stride..i * stride + stride]);
         }
     }
-    out
+    Ok(out)
 }
 
 /// Filter a flat scalar array (stride=1), removing entries where `mask[i] == true`.
-pub fn gd_apply_scalar_mask(data: &[f32], mask: &[bool]) -> Vec<f32> {
+///
+/// # Errors
+/// See [`gd_apply_mask`].
+pub fn gd_apply_scalar_mask(data: &[f32], mask: &[bool]) -> Result<Vec<f32>, DeduplicatorError> {
     gd_apply_mask(data, mask, 1)
 }
 
@@ -565,6 +651,8 @@ pub struct DedupResult {
     pub n_removed: usize,
     /// Number of duplicate groups found.
     pub n_groups: usize,
+    /// Size (Gaussian count) of each duplicate group found, in detection order.
+    pub group_sizes: Vec<usize>,
 }
 
 /// Input scene data for [`gd_deduplicate`].
@@ -635,18 +723,19 @@ pub fn gd_deduplicate(
     };
 
     let n_groups = groups.len();
+    let group_sizes: Vec<usize> = groups.iter().map(Vec::len).collect();
     let mask = gd_build_remove_mask(&groups, n_gaussians, opacities, scales, &config.keep_policy);
     let n_removed = mask.iter().filter(|&&r| r).count();
     let n_after = n_gaussians - n_removed;
 
-    let new_positions = gd_apply_mask(positions, &mask, 3);
-    let new_rotations = gd_apply_mask(rotations, &mask, 4);
-    let new_scales = gd_apply_mask(scales, &mask, 3);
-    let new_opacities = gd_apply_scalar_mask(opacities, &mask);
+    let new_positions = gd_apply_mask(positions, &mask, 3)?;
+    let new_rotations = gd_apply_mask(rotations, &mask, 4)?;
+    let new_scales = gd_apply_mask(scales, &mask, 3)?;
+    let new_opacities = gd_apply_scalar_mask(opacities, &mask)?;
     let new_sh = if sh_channels == 0 {
         Vec::new()
     } else {
-        gd_apply_mask(sh_coefficients, &mask, sh_channels)
+        gd_apply_mask(sh_coefficients, &mask, sh_channels)?
     };
 
     Ok(DedupResult {
@@ -659,6 +748,7 @@ pub fn gd_deduplicate(
         n_after,
         n_removed,
         n_groups,
+        group_sizes,
     })
 }
 
@@ -800,14 +890,15 @@ pub fn gd_compute_stats(result: &DedupResult, sh_channels: usize) -> DedupStats 
         result.n_removed as f32 / result.n_before as f32 * 100.0
     };
 
-    // Placeholder group stats — actual group sizes aren't stored in DedupResult.
-    // We store n_groups and can compute mean only if we have group data.
-    // Here we compute conservative estimates from n_removed / n_groups.
-    let (mean_group_size, max_group_size) = if result.n_groups == 0 {
+    // Real per-group sizes (was a placeholder formula reporting total member
+    // count across every group as the "max", not the largest group's size).
+    let (mean_group_size, max_group_size) = if result.group_sizes.is_empty() {
         (0.0f32, 0usize)
     } else {
-        let mean = (result.n_removed + result.n_groups) as f32 / result.n_groups as f32;
-        (mean, (result.n_removed + result.n_groups).max(2))
+        let total: usize = result.group_sizes.iter().sum();
+        let mean = total as f32 / result.group_sizes.len() as f32;
+        let max = result.group_sizes.iter().copied().max().unwrap_or(0);
+        (mean, max)
     };
 
     let bytes_per_gaussian = (3 + 4 + 3 + 1 + sh_channels) * 4;
@@ -1344,7 +1435,8 @@ mod tests {
             &opacities,
             &scales,
             &DedupKeepPolicy::KeepHighestOpacity,
-        );
+        )
+        .expect("group is non-empty");
         assert_eq!(rep, 1);
     }
 
@@ -1353,7 +1445,8 @@ mod tests {
         let opacities = vec![0.5f32; 3];
         let scales = vec![1.0f32; 9];
         let group = vec![2usize, 0, 1];
-        let rep = gd_pick_representative(&group, &opacities, &scales, &DedupKeepPolicy::KeepFirst);
+        let rep = gd_pick_representative(&group, &opacities, &scales, &DedupKeepPolicy::KeepFirst)
+            .expect("group is non-empty");
         assert_eq!(rep, 0);
     }
 
@@ -1362,7 +1455,8 @@ mod tests {
         let opacities = vec![0.5f32; 3];
         let scales = vec![1.0f32; 9];
         let group = vec![0usize, 1, 2];
-        let rep = gd_pick_representative(&group, &opacities, &scales, &DedupKeepPolicy::KeepLast);
+        let rep = gd_pick_representative(&group, &opacities, &scales, &DedupKeepPolicy::KeepLast)
+            .expect("group is non-empty");
         assert_eq!(rep, 2);
     }
 
@@ -1377,7 +1471,8 @@ mod tests {
             &opacities,
             &scales,
             &DedupKeepPolicy::KeepLargestScale,
-        );
+        )
+        .expect("group is non-empty");
         assert_eq!(rep, 1);
     }
 
@@ -1391,8 +1486,31 @@ mod tests {
             &opacities,
             &scales,
             &DedupKeepPolicy::KeepSmallestScale,
-        );
+        )
+        .expect("group is non-empty");
         assert_eq!(rep, 0);
+    }
+
+    #[test]
+    fn pick_representative_empty_group_returns_none_not_panic() {
+        // KeepFirst/KeepLast used to evaluate group[0] as an eager
+        // unwrap_or fallback, panicking on an empty group.
+        let opacities: Vec<f32> = vec![];
+        let scales: Vec<f32> = vec![];
+        let group: Vec<usize> = vec![];
+        for policy in [
+            DedupKeepPolicy::KeepHighestOpacity,
+            DedupKeepPolicy::KeepLargestScale,
+            DedupKeepPolicy::KeepSmallestScale,
+            DedupKeepPolicy::KeepFirst,
+            DedupKeepPolicy::KeepLast,
+        ] {
+            assert_eq!(
+                gd_pick_representative(&group, &opacities, &scales, &policy),
+                None,
+                "empty group must return None for {policy:?}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1428,7 +1546,7 @@ mod tests {
     fn apply_mask_stride3_removes_correct_rows() {
         let data = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
         let mask = vec![false, true, false]; // remove middle row
-        let result = gd_apply_mask(&data, &mask, 3);
+        let result = gd_apply_mask(&data, &mask, 3).expect("lengths match");
         assert_eq!(result, vec![1.0, 2.0, 3.0, 7.0, 8.0, 9.0]);
     }
 
@@ -1436,7 +1554,7 @@ mod tests {
     fn apply_mask_keeps_all_when_no_removal() {
         let data = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
         let mask = vec![false, false];
-        let result = gd_apply_mask(&data, &mask, 3);
+        let result = gd_apply_mask(&data, &mask, 3).expect("lengths match");
         assert_eq!(result, data);
     }
 
@@ -1444,7 +1562,7 @@ mod tests {
     fn apply_scalar_mask_removes_elements() {
         let data = vec![0.1f32, 0.5, 0.9];
         let mask = vec![true, false, false];
-        let result = gd_apply_scalar_mask(&data, &mask);
+        let result = gd_apply_scalar_mask(&data, &mask).expect("lengths match");
         assert_eq!(result, vec![0.5, 0.9]);
     }
 
@@ -1452,8 +1570,25 @@ mod tests {
     fn apply_scalar_mask_removes_all() {
         let data = vec![1.0f32, 2.0, 3.0];
         let mask = vec![true, true, true];
-        let result = gd_apply_scalar_mask(&data, &mask);
+        let result = gd_apply_scalar_mask(&data, &mask).expect("lengths match");
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn apply_mask_length_mismatch_is_error_not_panic() {
+        // A short `data` used to panic ("slice index starts at ... but ends
+        // at ..."); a length between row boundaries silently emitted a
+        // truncated, misaligned row. Both must now error up front.
+        let short = gd_apply_mask(&[1.0f32, 2.0, 3.0], &[false, false], 3);
+        assert!(matches!(
+            short,
+            Err(DeduplicatorError::AttributeLengthMismatch { .. })
+        ));
+        let partial_row = gd_apply_mask(&[1.0f32, 2.0, 3.0, 4.0, 5.0], &[false, false], 3);
+        assert!(matches!(
+            partial_row,
+            Err(DeduplicatorError::AttributeLengthMismatch { .. })
+        ));
     }
 
     // -----------------------------------------------------------------------
@@ -1606,6 +1741,9 @@ mod tests {
         .unwrap();
         assert_eq!(result.n_removed, 3, "3 duplicates of index 0 removed");
         assert_eq!(result.n_after, 7);
+        // group_sizes must reflect the real group (0,7,8,9), size 4.
+        assert_eq!(result.group_sizes.len(), result.n_groups);
+        assert_eq!(result.group_sizes.iter().copied().max(), Some(4));
         let _ = (rot, sc, op, sh); // suppress unused warnings
     }
 
@@ -1667,6 +1805,47 @@ mod tests {
     }
 
     #[test]
+    fn analyze_duplicates_mismatched_opacities_is_error_not_panic() {
+        // Never validated anything beyond n_gaussians == 0 (not even
+        // positions); relied on gd_are_duplicates' unchecked indexing.
+        let positions = vec![0.0f32; 3 * 3];
+        let scales = vec![1.0f32; 3 * 3];
+        let opacities = vec![0.5f32]; // too short
+        let sh = vec![0.0f32; 3 * 3];
+        let cfg = make_config();
+        let err = gd_analyze_duplicates(&positions, &opacities, &scales, &sh, 3, 3, &cfg);
+        assert!(
+            matches!(err, Err(DeduplicatorError::AttributeLengthMismatch { .. })),
+            "expected AttributeLengthMismatch, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn deduplicate_short_sh_coeffs_with_3_channels_is_error_not_panic() {
+        // The sh_channels >= 3 guard only checks !sh_coeffs.is_empty(),
+        // which a short-but-nonempty array passes and then indexes past.
+        let (pos, rot, sc, op, _) = make_identical(100);
+        let sh = vec![0.0f32; 3]; // far too short for n=100, sh_channels=3
+        let cfg = make_config();
+        let err = gd_deduplicate(
+            GdDeduplicateInput {
+                positions: &pos,
+                rotations: &rot,
+                scales: &sc,
+                opacities: &op,
+                sh_coefficients: &sh,
+                sh_channels: 3,
+                n_gaussians: 100,
+            },
+            &cfg,
+        );
+        assert!(
+            matches!(err, Err(DeduplicatorError::AttributeLengthMismatch { .. })),
+            "expected AttributeLengthMismatch, got {err:?}"
+        );
+    }
+
+    #[test]
     fn analyze_duplicates_mean_opacity_correct() {
         // All 4 Gaussians at same position with very similar opacities → one group.
         // Opacities differ by <= 0.02 < threshold 0.1.
@@ -1703,6 +1882,7 @@ mod tests {
             n_after: 75,
             n_removed: 25,
             n_groups: 5,
+            group_sizes: vec![6, 6, 6, 6, 6], // 5 groups of 6 => removes 5 each = 25
         };
         let stats = gd_compute_stats(&result, 3);
         assert!((stats.reduction_percent - 25.0).abs() < 1e-3);
@@ -1720,6 +1900,7 @@ mod tests {
             n_after: 8,
             n_removed: 2,
             n_groups: 1,
+            group_sizes: vec![3], // 1 group of 3 => removes 2, keeps 1
         };
         // bytes_per_gaussian = (3+4+3+1+3)*4 = 56
         let stats = gd_compute_stats(&result, 3);
@@ -1738,10 +1919,36 @@ mod tests {
             n_after: 10,
             n_removed: 0,
             n_groups: 0,
+            group_sizes: vec![],
         };
         let stats = gd_compute_stats(&result, 3);
         assert_eq!(stats.mean_group_size, 0.0);
         assert_eq!(stats.max_group_size, 0);
+    }
+
+    #[test]
+    fn compute_stats_max_group_size_is_actual_max_not_total_members() {
+        // Groups of 2 and 5: old formula (n_removed+n_groups).max(2)=7 — no
+        // group has 7 members; true max is 5.
+        let result = DedupResult {
+            positions: vec![],
+            rotations: vec![],
+            scales: vec![],
+            opacities: vec![],
+            sh_coefficients: vec![],
+            n_before: 7,
+            n_after: 2,
+            n_removed: 5,
+            n_groups: 2,
+            group_sizes: vec![2, 5],
+        };
+        let stats = gd_compute_stats(&result, 3);
+        assert_eq!(
+            stats.max_group_size, 5,
+            "max group size must be the largest actual group, not total members"
+        );
+        let expected_mean = (2 + 5) as f32 / 2.0;
+        assert!((stats.mean_group_size - expected_mean).abs() < 1e-5);
     }
 
     // -----------------------------------------------------------------------
@@ -1760,6 +1967,7 @@ mod tests {
             n_after: 40,
             n_removed: 10,
             n_groups: 2,
+            group_sizes: vec![6, 6], // 2 groups of 6 => removes 5 each = 10
         };
         let stats = gd_compute_stats(&result, 3);
         let s = gd_format_stats(&stats);
@@ -1779,6 +1987,7 @@ mod tests {
             n_after: 8,
             n_removed: 2,
             n_groups: 1,
+            group_sizes: vec![3],
         };
         let groups: Vec<DuplicateGroup> = vec![DuplicateGroup {
             indices: vec![0, 1],
@@ -1909,7 +2118,8 @@ mod tests {
         let op = vec![0.2f32, 0.8, 0.5];
         let sc = vec![1.0f32; 9];
         let group = vec![0usize, 1, 2];
-        let rep = gd_pick_representative(&group, &op, &sc, &DedupKeepPolicy::KeepHighestOpacity);
+        let rep = gd_pick_representative(&group, &op, &sc, &DedupKeepPolicy::KeepHighestOpacity)
+            .expect("group is non-empty");
         assert_eq!(rep, 1);
     }
 

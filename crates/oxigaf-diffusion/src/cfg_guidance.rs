@@ -17,7 +17,7 @@
 //! - **Dynamic thresholding**: [`DynamicThresholdCfg`] implements Imagen-style thresholding
 //!   to reduce oversaturation at high CFG scales.
 //! - **Noise rescaling**: [`rescale_cfg_result`] prevents oversaturation by matching
-//!   unconditional prediction standard deviation.
+//!   conditional prediction standard deviation.
 //! - **Multi-view CFG**: [`apply_cfg_multi_view`] applies guidance per-view in a stacked
 //!   multi-view latent tensor.
 //! - **Negative prompt blending**: [`blend_unconditional`] interpolates between null and
@@ -127,6 +127,9 @@ pub fn apply_cfg_multi_guidance(
     unconditional: &[f32],
     scales: &[f32],
 ) -> Result<Vec<f32>, CfgError> {
+    if conditionals.is_empty() {
+        return Err(CfgError::EmptyInput);
+    }
     if conditionals.len() != scales.len() {
         return Err(CfgError::LengthMismatch {
             expected: conditionals.len(),
@@ -489,7 +492,7 @@ pub struct CfgGuidance {
     pub schedule: CfgScheduleKind,
     /// Optional dynamic thresholding (Imagen-style).
     pub dynamic_threshold: Option<DynamicThresholdCfg>,
-    /// If `true`, rescale the CFG output to match the unconditional prediction's
+    /// If `true`, rescale the CFG output to match the conditional prediction's
     /// standard deviation before returning.
     pub rescale_noise: bool,
     /// Blend factor for noise rescaling: `rescaled * factor + output * (1 - factor)`.
@@ -573,7 +576,7 @@ impl CfgGuidance {
         }
 
         if self.rescale_noise {
-            output = rescale_cfg_result(&output, unconditional, self.rescale_factor);
+            output = rescale_cfg_result(&output, conditional, self.rescale_factor);
         }
 
         Ok(output)
@@ -584,21 +587,33 @@ impl CfgGuidance {
 // Noise rescaling
 // ---------------------------------------------------------------------------
 
-/// Rescale CFG noise prediction to match unconditional standard deviation.
+/// Rescale CFG noise prediction to match the conditional prediction's standard
+/// deviation.
 ///
-/// Prevents oversaturation at high guidance scales by anchoring the output
-/// magnitude to the unconditional prediction scale.
+/// This is the rescaling from Lin et al. 2024 ("Common Diffusion Noise Schedules
+/// and Sample Steps are Flawed"), matching diffusers' `rescale_noise_cfg`.
+/// High guidance scales inflate the CFG output's magnitude relative to the
+/// conditional prediction, causing oversaturation; anchoring back to the
+/// *conditional* signal's statistics (not the unconditional branch's) is what
+/// restores it.
 ///
 /// ```text
-/// std_uncond = std(unconditional)
-/// std_cfg    = std(cfg_output)
-/// rescaled   = cfg_output * (std_uncond / max(std_cfg, 1e-8))
-/// final      = rescaled * factor + cfg_output * (1 - factor)
+/// std_cond = std(conditional)
+/// std_cfg  = std(cfg_output)
+/// rescaled = cfg_output * (std_cond / max(std_cfg, 1e-8))
+/// final    = rescaled * factor + cfg_output * (1 - factor)
 /// ```
-pub fn rescale_cfg_result(cfg_output: &[f32], unconditional: &[f32], factor: f32) -> Vec<f32> {
-    let std_uncond = compute_std(unconditional);
+///
+/// Returns `cfg_output` unchanged (no rescaling) when either slice has fewer
+/// than 2 elements, since [`compute_std`] is undefined (returns `0.0`) below
+/// that length and would otherwise silently shrink the output toward zero.
+pub fn rescale_cfg_result(cfg_output: &[f32], conditional: &[f32], factor: f32) -> Vec<f32> {
+    if cfg_output.len() < 2 || conditional.len() < 2 {
+        return cfg_output.to_vec();
+    }
+    let std_cond = compute_std(conditional);
     let std_cfg = compute_std(cfg_output);
-    let ratio = std_uncond / std_cfg.max(1e-8);
+    let ratio = std_cond / std_cfg.max(1e-8);
     cfg_output
         .iter()
         .map(|&x| {
@@ -917,18 +932,52 @@ mod tests {
     // ---- rescale_cfg_result --------------------------------------------------
 
     #[test]
-    fn test_rescale_cfg_result_std_closer_to_uncond() {
-        // unconditional with std ~1; cfg output with std ~10
-        let uncond: Vec<f32> = (0..100).map(|i| (i as f32 - 50.0) / 50.0).collect();
-        let cfg_output: Vec<f32> = uncond.iter().map(|&x| x * 10.0).collect();
-        let rescaled = rescale_cfg_result(&cfg_output, &uncond, 0.7);
+    fn test_rescale_cfg_result_std_closer_to_anchor() {
+        // conditional signal with std ~1; cfg output with std ~10
+        let cond_signal: Vec<f32> = (0..100).map(|i| (i as f32 - 50.0) / 50.0).collect();
+        let cfg_output: Vec<f32> = cond_signal.iter().map(|&x| x * 10.0).collect();
+        let rescaled = rescale_cfg_result(&cfg_output, &cond_signal, 0.7);
         let std_orig = compute_std(&cfg_output);
         let std_rescaled = compute_std(&rescaled);
-        let std_uncond = compute_std(&uncond);
-        // The rescaled std should be closer to std_uncond than the original was.
-        let dist_before = (std_orig - std_uncond).abs();
-        let dist_after = (std_rescaled - std_uncond).abs();
-        assert!(dist_after < dist_before, "rescaled std {std_rescaled} should be closer to uncond std {std_uncond} than original {std_orig}");
+        let std_anchor = compute_std(&cond_signal);
+        // The rescaled std should be closer to the anchor's std than the original was.
+        let dist_before = (std_orig - std_anchor).abs();
+        let dist_after = (std_rescaled - std_anchor).abs();
+        assert!(dist_after < dist_before, "rescaled std {std_rescaled} should be closer to anchor std {std_anchor} than original {std_orig}");
+    }
+
+    #[test]
+    fn test_rescale_cfg_result_short_slice_unchanged() {
+        // len < 2: compute_std is undefined (0.0); must not corrupt the output.
+        let cfg_output = vec![3.0f32];
+        let conditional = vec![1.0f32];
+        let rescaled = rescale_cfg_result(&cfg_output, &conditional, 0.7);
+        assert_eq!(rescaled, cfg_output);
+    }
+
+    #[test]
+    fn test_cfg_guidance_rescale_anchors_to_conditional_not_unconditional() {
+        // Conditional has std ~1; unconditional has std ~0.1; cfg output (scale=7.5)
+        // is inflated far beyond both. Rescaling must pull the output's std toward
+        // the *conditional* std, not the unconditional one.
+        let conditional: Vec<f32> = (0..50).map(|i| (i as f32 - 25.0) / 25.0).collect();
+        let unconditional: Vec<f32> = conditional.iter().map(|&x| x * 0.1).collect();
+
+        let mut guidance = CfgGuidance::constant(7.5).expect("valid scale");
+        guidance.rescale_noise = true;
+        guidance.rescale_factor = 1.0; // fully anchor, no blending, for a crisp check
+
+        let out = guidance
+            .apply(&conditional, &unconditional, 0, 50)
+            .expect("apply ok");
+        let std_out = compute_std(&out);
+        let std_cond = compute_std(&conditional);
+        let std_uncond = compute_std(&unconditional);
+
+        assert!(
+            (std_out - std_cond).abs() < (std_out - std_uncond).abs(),
+            "rescaled std {std_out} should be closer to conditional std {std_cond} than to unconditional std {std_uncond}"
+        );
     }
 
     // ---- apply_cfg_multi_view ------------------------------------------------

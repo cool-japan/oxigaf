@@ -110,7 +110,11 @@ impl Module for ClipEncoderLayer {
 
         let residual = &xs;
         let h = self.layer_norm2.forward(&xs)?;
-        let h = self.fc1.forward(&h)?.gelu()?;
+        // HuggingFace `laion/CLIP-ViT-H-14` sets `hidden_act = "gelu"`, which is
+        // the exact erf-based GELU. candle's `.gelu()` is the tanh approximation;
+        // `.gelu_erf()` matches the reference implementation (the ~1e-3 relative
+        // per-activation gap compounds across 32 encoder layers otherwise).
+        let h = self.fc1.forward(&h)?.gelu_erf()?;
         let h = self.fc2.forward(&h)?;
         h + residual
     }
@@ -193,7 +197,14 @@ impl ClipImageEncoder {
             vs.pp("embeddings.position_embedding"),
         )?;
 
-        let class_embedding = vs.get((1, 1, embed_dim), "embeddings.class_embedding")?;
+        // HuggingFace `CLIPVisionModel` stores `embeddings.class_embedding` as a
+        // rank-1 parameter of shape `(embed_dim,)`. `VarBuilder::get` requires an
+        // exact shape match (it does not reshape), so requesting `(1, 1, embed_dim)`
+        // directly would fail to load a real checkpoint. Fetch the rank-1 tensor and
+        // reshape it here instead, so `forward`'s `broadcast_as` call is unaffected.
+        let class_embedding = vs
+            .get((embed_dim,), "embeddings.class_embedding")?
+            .reshape((1, 1, embed_dim))?;
 
         let pre_layernorm = nn::layer_norm(embed_dim, 1e-5, vs.pp("pre_layrnorm"))?;
 

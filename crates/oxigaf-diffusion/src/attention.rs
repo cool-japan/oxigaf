@@ -38,12 +38,35 @@
 //! Flash attention provides 2-4× memory reduction for large images without
 //! sacrificing accuracy (< 1e-3 numerical difference from standard attention).
 
-use candle_core::{DType, Result, Tensor, D};
+use candle_core::{DType, Device, Result, Tensor, D};
 use candle_nn as nn;
 use candle_nn::Module;
 
+use crate::attention_masking::AttentionMask;
+
 #[cfg(feature = "flash_attention")]
 use crate::flash_attention::{FlashAttention, FlashAttentionConfig};
+
+// ---------------------------------------------------------------------------
+// Attention-mask bridge: attention_masking::AttentionMask -> Tensor
+// ---------------------------------------------------------------------------
+
+/// Converts an [`AttentionMask`] into an additive `f32` bias tensor of shape
+/// `(1, 1, seq_len, seq_len)`, ready to pass as `attn_mask` to
+/// [`CrossAttention::forward_masked`] (broadcasts against scores of shape
+/// `(batch, heads, seq_len, seq_len)`).
+///
+/// See [`CrossAttention::forward_masked`] and
+/// [`MultiViewTransformerBlock::forward_with_mask`] for the shape each
+/// attention site actually expects — in particular, a mask built by
+/// [`crate::attention_masking::build_layer_mask`] is sized for
+/// `num_views * tokens_per_view` and does **not** fit the cross-view
+/// attention site (which needs a `num_views`-sized mask, i.e. one built with
+/// `tokens_per_view = 1`).
+pub fn mask_to_bias_tensor(mask: &AttentionMask, device: &Device) -> Result<Tensor> {
+    let bias = mask.to_bias();
+    Tensor::from_vec(bias, (1, 1, mask.seq_len, mask.seq_len), device)
+}
 
 // ---------------------------------------------------------------------------
 // GeGLU activation
@@ -192,6 +215,25 @@ impl CrossAttention {
     /// Automatically dispatches to flash attention when enabled and the feature
     /// is available, otherwise uses standard O(N^2) attention.
     pub fn forward(&self, xs: &Tensor, context: Option<&Tensor>) -> Result<Tensor> {
+        self.forward_masked(xs, context, None)
+    }
+
+    /// Scaled-dot-product attention with an optional additive bias mask.
+    ///
+    /// `attn_mask`, when present, must broadcast against the pre-softmax score
+    /// tensor of shape `(batch, heads, seq_len, ctx_len)` — typically shape
+    /// `(1, 1, seq_len, ctx_len)`. Build one from a
+    /// [`crate::attention_masking::AttentionMask`] via [`mask_to_bias_tensor`].
+    ///
+    /// A mask forces the standard (non-flash) attention path even when flash
+    /// attention is enabled, since flash attention here has no additive-bias
+    /// support.
+    pub fn forward_masked(
+        &self,
+        xs: &Tensor,
+        context: Option<&Tensor>,
+        attn_mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
         let context = context.unwrap_or(xs);
         let (b, seq_len, _) = xs.dims3()?;
         let q = self.to_q.forward(xs)?;
@@ -213,16 +255,22 @@ impl CrossAttention {
             .transpose(1, 2)?
             .contiguous()?;
 
-        // Dispatch to flash attention or standard attention
+        // Dispatch to flash attention or standard attention. A mask always
+        // routes through standard_attention, since flash attention has no
+        // additive-bias support here.
         #[cfg(feature = "flash_attention")]
-        let out = if let Some(flash) = &self.flash_attention {
-            flash.forward(&q, &k, &v)?
+        let out = if attn_mask.is_none() {
+            if let Some(flash) = &self.flash_attention {
+                flash.forward(&q, &k, &v)?
+            } else {
+                self.standard_attention(&q, &k, &v, attn_mask)?
+            }
         } else {
-            self.standard_attention(&q, &k, &v)?
+            self.standard_attention(&q, &k, &v, attn_mask)?
         };
 
         #[cfg(not(feature = "flash_attention"))]
-        let out = self.standard_attention(&q, &k, &v)?;
+        let out = self.standard_attention(&q, &k, &v, attn_mask)?;
 
         // Reshape back to (B, seq, inner_dim)
         let out = out
@@ -235,8 +283,14 @@ impl CrossAttention {
     /// Standard O(N^2) scaled-dot-product attention.
     ///
     /// Computes the full attention matrix. Used as fallback when flash
-    /// attention is disabled or unavailable.
-    fn standard_attention(&self, q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
+    /// attention is disabled, unavailable, or an `attn_mask` is present.
+    fn standard_attention(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        attn_mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
         // Compute attention in f32 for numerical stability
         let in_dtype = q.dtype();
         let q = q.to_dtype(DType::F32)?;
@@ -245,6 +299,10 @@ impl CrossAttention {
 
         let k_t = k.transpose(D::Minus2, D::Minus1)?.contiguous()?;
         let attn = (q.matmul(&k_t)? * self.scale)?;
+        let attn = match attn_mask {
+            Some(mask) => attn.broadcast_add(&mask.to_dtype(DType::F32)?)?,
+            None => attn,
+        };
         let attn = nn::ops::softmax_last_dim(&attn)?;
         attn.matmul(&v)?.to_dtype(in_dtype)
     }
@@ -421,6 +479,32 @@ impl MultiViewTransformerBlock {
         context: Option<&Tensor>,
         ip_tokens: Option<&Tensor>,
     ) -> Result<Tensor> {
+        self.forward_with_mask(xs, context, ip_tokens, None)
+    }
+
+    /// Forward pass with an optional cross-view attention mask.
+    ///
+    /// Identical to [`Self::forward`], except `cross_view_mask` — when
+    /// present — additively biases the `attn_cv` (cross-view) attention
+    /// scores, restricting which views may attend to which other views.
+    ///
+    /// `attn_cv` operates on tokens reshaped to `(B*seq_len, num_views, dim)`,
+    /// so its pre-softmax scores have shape
+    /// `(B*seq_len, heads, num_views, num_views)` — **not**
+    /// `(num_views * tokens_per_view)²`. `cross_view_mask` must broadcast
+    /// against that, i.e. it must be built with `tokens_per_view = 1`
+    /// (e.g. `attention_masking::ring_view_mask(num_views, 1)` or
+    /// `attention_masking::angular_proximity_mask(num_views, 1, positions,
+    /// angle)`, converted via [`mask_to_bias_tensor`]). A mask built by
+    /// `attention_masking::build_layer_mask` is sized for
+    /// `num_views * tokens_per_view` and will not broadcast correctly here.
+    pub fn forward_with_mask(
+        &self,
+        xs: &Tensor,
+        context: Option<&Tensor>,
+        ip_tokens: Option<&Tensor>,
+        cross_view_mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
         let (bv, seq_len, dim) = xs.dims3()?;
         let b = bv / self.num_views;
 
@@ -437,7 +521,9 @@ impl MultiViewTransformerBlock {
             .reshape((b, self.num_views, seq_len, dim))?
             .transpose(1, 2)?
             .reshape((b * seq_len, self.num_views, dim))?;
-        let cv_out = self.attn_cv.forward(&cv_input, None)?;
+        let cv_out = self
+            .attn_cv
+            .forward_masked(&cv_input, None, cross_view_mask)?;
         // (B*S, V, D) -> (B, S, V, D) -> (B, V, S, D) -> (B*V, S, D)
         let cv_out = cv_out
             .reshape((b, seq_len, self.num_views, dim))?
@@ -470,15 +556,28 @@ impl MultiViewTransformerBlock {
 // Multi-view spatial transformer (wraps projection + transformer blocks)
 // ---------------------------------------------------------------------------
 
+/// Spatial-to-token projection, matching either SD 2.x's linear projection or
+/// SD 1.5 / Zero123's 1×1-conv projection, selected at construction time via
+/// `use_linear_projection` so the loaded checkpoint's weight layout matches:
+/// `(out, in)` for `Linear`, `(out, in, 1, 1)` for `Conv`.
+#[derive(Debug)]
+enum Projection {
+    Linear(nn::Linear),
+    Conv(nn::Conv2d),
+}
+
 /// A spatial transformer that includes multi-view attention in every block.
 /// Replaces the standard `SpatialTransformer` from SD 2.1.
 #[derive(Debug)]
 pub struct MultiViewSpatialTransformer {
     norm: nn::GroupNorm,
-    proj_in: nn::Linear,
+    proj_in: Projection,
     transformer_blocks: Vec<MultiViewTransformerBlock>,
-    proj_out: nn::Linear,
-    use_linear_projection: bool,
+    proj_out: Projection,
+    /// Transformer hidden dimension (`n_heads * d_head`).
+    inner_dim: usize,
+    /// Input/output feature-map channel count.
+    in_channels: usize,
 }
 
 impl MultiViewSpatialTransformer {
@@ -545,8 +644,35 @@ impl MultiViewSpatialTransformer {
     ) -> Result<Self> {
         let inner_dim = n_heads * d_head;
         let norm = nn::group_norm(num_groups, in_channels, 1e-6, vs.pp("norm"))?;
-        let proj_in = nn::linear(in_channels, inner_dim, vs.pp("proj_in"))?;
-        let proj_out = nn::linear(inner_dim, in_channels, vs.pp("proj_out"))?;
+
+        // SD 2.x checkpoints store proj_in/proj_out as (out, in) Linear
+        // weights; SD 1.5 / Zero123 checkpoints store the *same* keys as
+        // (out, in, 1, 1) 1x1-Conv2d weights. Building the layer type that
+        // matches `use_linear_projection` (rather than always building
+        // Linear) is what makes loading either checkpoint family possible.
+        let (proj_in, proj_out) = if use_linear_projection {
+            (
+                Projection::Linear(nn::linear(in_channels, inner_dim, vs.pp("proj_in"))?),
+                Projection::Linear(nn::linear(inner_dim, in_channels, vs.pp("proj_out"))?),
+            )
+        } else {
+            (
+                Projection::Conv(nn::conv2d(
+                    in_channels,
+                    inner_dim,
+                    1,
+                    Default::default(),
+                    vs.pp("proj_in"),
+                )?),
+                Projection::Conv(nn::conv2d(
+                    inner_dim,
+                    in_channels,
+                    1,
+                    Default::default(),
+                    vs.pp("proj_out"),
+                )?),
+            )
+        };
 
         let vs_tb = vs.pp("transformer_blocks");
         let mut transformer_blocks = Vec::with_capacity(depth);
@@ -569,7 +695,8 @@ impl MultiViewSpatialTransformer {
             proj_in,
             transformer_blocks,
             proj_out,
-            use_linear_projection,
+            inner_dim,
+            in_channels,
         })
     }
 
@@ -584,48 +711,215 @@ impl MultiViewSpatialTransformer {
         context: Option<&Tensor>,
         ip_tokens: Option<&Tensor>,
     ) -> Result<Tensor> {
+        self.forward_with_mask(xs, context, ip_tokens, None)
+    }
+
+    /// Forward pass with an optional cross-view attention mask, threaded
+    /// through to every block's `attn_cv`. See
+    /// [`MultiViewTransformerBlock::forward_with_mask`] for the required
+    /// mask shape (built with `tokens_per_view = 1`).
+    pub fn forward_with_mask(
+        &self,
+        xs: &Tensor,
+        context: Option<&Tensor>,
+        ip_tokens: Option<&Tensor>,
+        cross_view_mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
         let (batch, _channel, height, width) = xs.dims4()?;
         let residual = xs;
 
         let xs = self.norm.forward(xs)?;
-        // Flatten spatial dims and optionally project
-        let inner_dim = if self.use_linear_projection {
-            let inner_dim = xs.dim(1)?;
-            let xs_flat =
-                xs.transpose(1, 2)?
-                    .transpose(2, 3)?
-                    .reshape((batch, height * width, inner_dim))?;
-            let xs_proj = self.proj_in.forward(&xs_flat)?;
-            // Process through transformer blocks
-            let mut h = xs_proj;
-            for block in &self.transformer_blocks {
-                h = block.forward(&h, context, ip_tokens)?;
+
+        // Project into token space. Conv-style (SD 1.5 / Zero123) applies a
+        // 1x1 convolution on the (B,C,H,W) map *before* flattening, matching
+        // how those checkpoints store proj_in as a (out,in,1,1) conv weight;
+        // linear-style (SD 2.x) flattens first, matching a (out,in) linear
+        // weight. Both paths produce the same (B, H*W, inner_dim) token
+        // layout for the transformer blocks.
+        let tokens = match &self.proj_in {
+            Projection::Linear(l) => {
+                let flat = xs.transpose(1, 2)?.transpose(2, 3)?.reshape((
+                    batch,
+                    height * width,
+                    self.in_channels,
+                ))?;
+                l.forward(&flat)?
             }
-            let h = self.proj_out.forward(&h)?;
-            let result = h
-                .reshape((batch, height, width, inner_dim))?
-                .transpose(2, 3)?
-                .transpose(1, 2)?;
-            return result + residual;
-        } else {
-            xs.dim(1)?
+            Projection::Conv(c) => {
+                let projected = c.forward(&xs)?; // (B, inner_dim, H, W)
+                projected.transpose(1, 2)?.transpose(2, 3)?.reshape((
+                    batch,
+                    height * width,
+                    self.inner_dim,
+                ))?
+            }
         };
 
-        // Conv-style projection path (for completeness, though SD 2.1 uses linear)
-        let xs_flat =
-            xs.transpose(1, 2)?
-                .transpose(2, 3)?
-                .reshape((batch, height * width, inner_dim))?;
-        let xs_proj = self.proj_in.forward(&xs_flat)?;
-        let mut h = xs_proj;
+        let mut h = tokens;
         for block in &self.transformer_blocks {
-            h = block.forward(&h, context, ip_tokens)?;
+            h = block.forward_with_mask(&h, context, ip_tokens, cross_view_mask)?;
         }
-        let h = self.proj_out.forward(&h)?;
-        let result = h
-            .reshape((batch, height, width, inner_dim))?
-            .transpose(2, 3)?
-            .transpose(1, 2)?;
+
+        let result = match &self.proj_out {
+            Projection::Linear(l) => {
+                let h = l.forward(&h)?; // (B, HW, in_channels)
+                h.reshape((batch, height, width, self.in_channels))?
+                    .transpose(2, 3)?
+                    .transpose(1, 2)?
+            }
+            Projection::Conv(c) => {
+                let h_nchw = h
+                    .reshape((batch, height, width, self.inner_dim))?
+                    .transpose(2, 3)?
+                    .transpose(1, 2)?
+                    .contiguous()?;
+                c.forward(&h_nchw)? // (B, in_channels, H, W)
+            }
+        };
         result + residual
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+//
+// This file previously had no inline test module (existing coverage lives in
+// tests/attention_tests.rs). These tests are scoped to the fixes made here:
+// the Conv2d projection branch and attention-mask threading. Note: a
+// VarMap-backed VarBuilder *creates* each requested variable fresh at
+// whatever shape is asked for, rather than loading real checkpoint data, so
+// these tests can verify internal shape consistency and that the Conv2d code
+// path is genuinely exercised and distinct from the Linear path — they
+// cannot verify compatibility with a real SD 1.5 / Zero123 safetensors file.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_nn::VarMap;
+
+    fn test_varbuilder() -> nn::VarBuilder<'static> {
+        let varmap = VarMap::new();
+        nn::VarBuilder::from_varmap(&varmap, DType::F32, &Device::Cpu)
+    }
+
+    #[test]
+    fn test_multi_view_spatial_transformer_conv_projection_shape() -> Result<()> {
+        let vs = test_varbuilder();
+        let in_channels = 8;
+        let transformer = MultiViewSpatialTransformer::new(
+            vs.pp("t"),
+            in_channels,
+            2, // n_heads
+            4, // d_head
+            1, // depth
+            16,
+            16,    // context_dim, ip_dim
+            2,     // num_views
+            4,     // num_groups
+            false, // use_linear_projection -> exercises the Conv2d branch
+        )?;
+        let batch_views = 2; // B=1 * V=2
+        let (h, w) = (4, 4);
+        let xs = Tensor::randn(0f32, 1f32, (batch_views, in_channels, h, w), &Device::Cpu)?;
+        let out = transformer.forward(&xs, None, None)?;
+        assert_eq!(out.dims4()?, (batch_views, in_channels, h, w));
+        Ok(())
+    }
+
+    #[test]
+    fn test_multi_view_spatial_transformer_linear_projection_shape() -> Result<()> {
+        let vs = test_varbuilder();
+        let in_channels = 8;
+        let transformer = MultiViewSpatialTransformer::new(
+            vs.pp("t"),
+            in_channels,
+            2,
+            4,
+            1,
+            16,
+            16,
+            2,
+            4,
+            true, // use_linear_projection
+        )?;
+        let batch_views = 2;
+        let (h, w) = (4, 4);
+        let xs = Tensor::randn(0f32, 1f32, (batch_views, in_channels, h, w), &Device::Cpu)?;
+        let out = transformer.forward(&xs, None, None)?;
+        assert_eq!(out.dims4()?, (batch_views, in_channels, h, w));
+        Ok(())
+    }
+
+    #[test]
+    fn test_mask_to_bias_tensor_shape() -> Result<()> {
+        let mut mask = AttentionMask::new(4, true);
+        mask.set(0, 1, false);
+        let bias = mask_to_bias_tensor(&mask, &Device::Cpu)?;
+        assert_eq!(bias.dims4()?, (1, 1, 4, 4));
+        Ok(())
+    }
+
+    #[test]
+    fn test_cross_attention_forward_masked_changes_output() -> Result<()> {
+        let vs = test_varbuilder();
+        let query_dim = 8;
+        let attn = CrossAttention::new(vs.pp("attn"), query_dim, None, 2, 4)?;
+
+        let seq_len = 4;
+        let xs = Tensor::randn(0f32, 1f32, (1, seq_len, query_dim), &Device::Cpu)?;
+        let unmasked = attn.forward_masked(&xs, None, None)?;
+
+        // Block position 0 from attending to anything but itself.
+        let mut mask = AttentionMask::new(seq_len, true);
+        for k in 1..seq_len {
+            mask.set(0, k, false);
+        }
+        let bias = mask_to_bias_tensor(&mask, &Device::Cpu)?;
+        let masked = attn.forward_masked(&xs, None, Some(&bias))?;
+
+        let diff = unmasked
+            .sub(&masked)?
+            .abs()?
+            .sum_all()?
+            .to_scalar::<f32>()?;
+        assert!(
+            diff > 1e-4,
+            "masking should change the attention output, diff={diff}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_multi_view_transformer_block_cross_view_mask_changes_output() -> Result<()> {
+        let vs = test_varbuilder();
+        let dim = 8;
+        let num_views = 3;
+        let block = MultiViewTransformerBlock::new(vs.pp("block"), dim, 2, 4, 8, 8, num_views)?;
+
+        let seq_len = 2; // spatial tokens per view
+        let bv = num_views; // B=1, V=num_views
+        let xs = Tensor::randn(0f32, 1f32, (bv, seq_len, dim), &Device::Cpu)?;
+
+        let unmasked = block.forward(&xs, None, None)?;
+
+        // cross_view_mask is sized (num_views, num_views) -- built with
+        // tokens_per_view = 1 -- not (num_views * tokens_per_view)^2.
+        let mut mask = AttentionMask::new(num_views, true);
+        for k in 1..num_views {
+            mask.set(0, k, false);
+        }
+        let bias = mask_to_bias_tensor(&mask, &Device::Cpu)?;
+        let masked = block.forward_with_mask(&xs, None, None, Some(&bias))?;
+
+        let diff = unmasked
+            .sub(&masked)?
+            .abs()?
+            .sum_all()?
+            .to_scalar::<f32>()?;
+        assert!(
+            diff > 1e-4,
+            "cross_view_mask should change the block output, diff={diff}"
+        );
+        Ok(())
     }
 }

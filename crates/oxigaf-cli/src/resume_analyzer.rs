@@ -278,12 +278,14 @@ impl CheckpointScanner {
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
 
+            let (psnr, loss, num_gaussians) = Self::probe_metadata(&path, file_name);
+
             checkpoints.push(CheckpointMetadata {
                 path,
                 step,
-                psnr: -1.0,
-                loss: -1.0,
-                num_gaussians: 0,
+                psnr,
+                loss,
+                num_gaussians,
                 timestamp_secs,
                 file_size_bytes,
             });
@@ -292,6 +294,59 @@ impl CheckpointScanner {
         // Sort ascending by step
         checkpoints.sort_by_key(|c| c.step);
         Ok(checkpoints)
+    }
+
+    /// Best-effort extraction of `(psnr, loss, num_gaussians)` for one
+    /// checkpoint file, returning the documented "unknown" sentinels
+    /// (`(-1.0, -1.0, 0)`) for anything that cannot be determined.
+    ///
+    /// Real checkpoints written by `Trainer::save_checkpoint`
+    /// (`oxigaf_trainer::checkpoint::CheckpointData`) are JSON with a
+    /// `metrics_history` of `MetricEntry { iteration, psnr, ssim, loss }`
+    /// and a `positions` array whose length is the Gaussian count — the
+    /// most recent entry gives the checkpoint's PSNR/loss directly. When the
+    /// file isn't a parseable `CheckpointData` JSON (a `.bin`/`.safetensors`
+    /// checkpoint, or one predating `metrics_history`), fall back to a PSNR
+    /// value embedded in the filename itself (`checkpoint_browser`'s
+    /// `"..._psnr_28.5..."` convention).
+    ///
+    /// Cost note: `load_checkpoint` fully deserializes the checkpoint —
+    /// positions/rotations/scales/opacities/SH coefficients *and* both Adam
+    /// moment vectors — not just the three facts read here, so on a
+    /// real multi-hundred-thousand-Gaussian run each `.json` checkpoint can
+    /// cost hundreds of MB to parse. This is still the right trade-off for a
+    /// resume-checkpoint scan (typically a handful of files, and the
+    /// alternative is fabricating psnr/loss/num_gaussians), but avoid
+    /// calling this over a directory with many large checkpoints in a hot
+    /// path.
+    fn probe_metadata(path: &Path, file_name: &str) -> (f32, f32, usize) {
+        let is_json = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("json"))
+            .unwrap_or(false);
+
+        if is_json {
+            if let Ok(data) = oxigaf_trainer::checkpoint::load_checkpoint(path) {
+                let num_gaussians = data.positions.len();
+                if let Some(latest) = data.metrics_history.last() {
+                    return (latest.psnr, latest.loss, num_gaussians);
+                }
+                // Parsed fine but carries no metrics history (e.g. a
+                // checkpoint saved before the first evaluation) — the
+                // Gaussian count is still genuine even though psnr/loss
+                // are not recorded anywhere in the file.
+                let psnr =
+                    crate::checkpoint_browser::parse_psnr_from_path(file_name).unwrap_or(-1.0);
+                return (psnr, -1.0, num_gaussians);
+            }
+        }
+
+        // Non-JSON checkpoint formats, or a JSON file that isn't a valid
+        // `CheckpointData` (corrupted, or some other JSON payload entirely):
+        // fall back to a PSNR embedded in the filename, if any.
+        let psnr = crate::checkpoint_browser::parse_psnr_from_path(file_name).unwrap_or(-1.0);
+        (psnr, -1.0, 0)
     }
 }
 
@@ -611,10 +666,11 @@ impl ResumeRecommendation {
         ));
 
         out.push_str("├─────────────────────────────────────────────────────────┤\n");
-        out.push_str(&format!(
-            "│  Reason: {:<49}│\n",
-            &self.reason[..self.reason.len().min(49)]
-        ));
+        // Truncate by character, not by byte offset: `reason` is a public
+        // field that may hold caller-supplied or localized text, and a byte
+        // slice can land inside a multi-byte UTF-8 sequence and panic.
+        let reason_display: String = self.reason.chars().take(49).collect();
+        out.push_str(&format!("│  Reason: {:<49}│\n", reason_display));
 
         // Alternatives
         if !self.alternatives.is_empty() {
@@ -906,6 +962,86 @@ mod tests {
     }
 
     #[test]
+    fn test_scanner_scan_reads_real_checkpoint_json_header() {
+        // Regression test: `scan()` must extract psnr/loss/num_gaussians
+        // from an actual `oxigaf_trainer::checkpoint::CheckpointData` JSON
+        // file instead of always leaving them at the "unknown" sentinels.
+        let dir = std::env::temp_dir().join("oxigaf_resume_test_real_header");
+        fs::create_dir_all(&dir).expect("create test dir");
+
+        let payload = serde_json::json!({
+            "version": 1,
+            "iteration": 250,
+            "positions": [[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]],
+            "rotations": [[0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 0.0, 1.0]],
+            "scales": [[0.01, 0.01, 0.01], [0.02, 0.02, 0.02]],
+            "opacities": [0.5, 0.6],
+            "sh_coeffs": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            "sh_degree": 0,
+            "face_indices": [0, 1],
+            "barycentric": [[0.3, 0.3, 0.4], [0.3, 0.3, 0.4]],
+            "local_offsets": [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+            "is_rigid": [true, false],
+            "optimizer_groups": [],
+            "metrics_history": [
+                {"iteration": 100, "psnr": 22.0, "ssim": 0.8, "loss": 0.2},
+                {"iteration": 250, "psnr": 29.7, "ssim": 0.92, "loss": 0.031}
+            ]
+        });
+
+        let path = dir.join("checkpoint_step_250.json");
+        fs::write(&path, payload.to_string()).expect("write checkpoint");
+
+        let scanner = CheckpointScanner::new();
+        let found = scanner.scan(&dir).expect("scan should succeed");
+        assert_eq!(found.len(), 1);
+        let ckpt = &found[0];
+        assert_eq!(ckpt.step, 250);
+        assert_eq!(
+            ckpt.num_gaussians, 2,
+            "should read positions.len() from the checkpoint header"
+        );
+        assert!(
+            (ckpt.psnr - 29.7).abs() < 1e-4,
+            "should read the latest metrics_history psnr, got {}",
+            ckpt.psnr
+        );
+        assert!(
+            (ckpt.loss - 0.031).abs() < 1e-5,
+            "should read the latest metrics_history loss, got {}",
+            ckpt.loss
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_scanner_scan_falls_back_to_filename_psnr_for_non_json_checkpoints() {
+        // Non-JSON checkpoint formats (.bin/.safetensors/.ckpt) have no
+        // parseable header, so the scanner should fall back to a PSNR value
+        // embedded in the filename rather than reporting -1.0 unnecessarily.
+        let dir = std::env::temp_dir().join("oxigaf_resume_test_filename_psnr");
+        fs::create_dir_all(&dir).expect("create test dir");
+
+        create_checkpoint_file(&dir, "ckpt_1000_psnr_31.2.bin");
+
+        let scanner = CheckpointScanner::new();
+        let found = scanner.scan(&dir).expect("scan should succeed");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].step, 1000);
+        assert!(
+            (found[0].psnr - 31.2).abs() < 1e-4,
+            "should fall back to filename-embedded psnr for non-JSON checkpoints, got {}",
+            found[0].psnr
+        );
+        // loss/num_gaussians remain genuinely unknown for this format.
+        assert_eq!(found[0].loss, -1.0);
+        assert_eq!(found[0].num_gaussians, 0);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_scanner_scan_sorted_by_step() {
         let dir = std::env::temp_dir().join("oxigaf_resume_test_sorted");
         fs::create_dir_all(&dir).expect("create test dir");
@@ -1109,6 +1245,36 @@ mod tests {
         assert!(report.contains("28.3"), "should mention PSNR");
         assert!(report.contains('╭'), "should use box-drawing chars");
         assert!(report.contains('╰'), "should close box");
+    }
+
+    #[test]
+    fn test_recommendation_format_report_multibyte_reason_does_not_panic() {
+        // Regression test: `reason` is a public field, so a caller-supplied
+        // or localized reason whose 49th *byte* falls inside a multi-byte
+        // UTF-8 character must not panic when truncated for display.
+        let best = CheckpointMetadata {
+            path: PathBuf::from("/tmp/step_5000.json"),
+            step: 5000,
+            psnr: 28.3,
+            loss: 0.012,
+            num_gaussians: 50_000,
+            timestamp_secs: 0,
+            file_size_bytes: 12 * 1024 * 1024,
+        };
+
+        let rec = ResumeRecommendation {
+            best_checkpoint: best,
+            best_score: 0.85,
+            confidence: 0.72,
+            reason: "損失関数が最も低いチェックポイントであり訓練が安定しているため推奨されます"
+                .to_string(),
+            alternatives: Vec::new(),
+            total_scanned: 5,
+        };
+
+        // Must not panic.
+        let report = rec.format_report();
+        assert!(report.contains("損失関数"), "reason text should appear");
     }
 
     #[test]

@@ -21,7 +21,7 @@
 //! let shape = vec![2, 3];
 //! let quantizer = AbsmaxQuantizer::per_tensor();
 //! let qt = quantizer.quantize(&data, &shape).expect("quantize");
-//! let recovered = qt.dequantize();
+//! let recovered = qt.dequantize().expect("dequantize");
 //! ```
 
 use crate::DiffusionError;
@@ -118,11 +118,66 @@ impl QuantizedTensor {
         fp32_bytes as f32 / self.memory_bytes() as f32
     }
 
+    /// Validate internal consistency of this tensor's metadata.
+    ///
+    /// Every field of `QuantizedTensor` is `pub`, so one can be hand-built
+    /// (not just produced by [`AbsmaxQuantizer::quantize`] /
+    /// [`MinMaxQuantizer::quantize`], which always produce a tensor that
+    /// passes this check) with a `scales`/`zero_points`/`shape` combination
+    /// that would otherwise make [`Self::dequantize`] panic on an
+    /// out-of-bounds index. [`Self::dequantize`] calls this first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DiffusionError::InvalidConfig`] if:
+    /// * `shape` is empty, or `data.len()` does not equal `product(shape)`.
+    /// * `scope` is `PerTensor` and `scales`/`zero_points` do not each have
+    ///   exactly 1 entry.
+    /// * `scope` is `PerChannel(axis)` and `axis >= shape.len()`, or
+    ///   `scales`/`zero_points` do not each have exactly `shape[axis]`
+    ///   entries.
+    pub fn validate(&self) -> Result<(), DiffusionError> {
+        validate_shape_data(&self.data, &self.shape)?;
+
+        let expected_params = match self.scope {
+            QuantizationScope::PerTensor => 1,
+            QuantizationScope::PerChannel(axis) => {
+                let (_, channel_size, _) = channel_dims(&self.shape, axis)?;
+                channel_size
+            }
+        };
+        if self.scales.len() != expected_params {
+            return Err(DiffusionError::InvalidConfig(format!(
+                "quantization: scales has {} entries, expected {} for scope {:?}",
+                self.scales.len(),
+                expected_params,
+                self.scope,
+            )));
+        }
+        if self.zero_points.len() != expected_params {
+            return Err(DiffusionError::InvalidConfig(format!(
+                "quantization: zero_points has {} entries, expected {} for scope {:?}",
+                self.zero_points.len(),
+                expected_params,
+                self.scope,
+            )));
+        }
+        Ok(())
+    }
+
     /// Dequantize back to `f32`.
     ///
     /// Returns a flat `Vec<f32>` in the same element order as the original
     /// input used during quantization.
-    pub fn dequantize(&self) -> Vec<f32> {
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever [`Self::validate`] returns if this tensor's
+    /// metadata is internally inconsistent. This can only happen for a
+    /// hand-built `QuantizedTensor` — every `AbsmaxQuantizer`/
+    /// `MinMaxQuantizer::quantize` output always validates.
+    pub fn dequantize(&self) -> Result<Vec<f32>, DiffusionError> {
+        self.validate()?;
         let n = self.data.len();
         let mut out = vec![0.0_f32; n];
 
@@ -147,7 +202,7 @@ impl QuantizedTensor {
             }
         }
 
-        out
+        Ok(out)
     }
 }
 
@@ -241,11 +296,21 @@ impl AbsmaxQuantizer {
                 let _ = outer_size; // used implicitly through n
                 let _ = n;
 
-                // Compute scale per channel (zero-points are always 0 for symmetric)
-                let scales: Vec<f32> = (0..channel_size)
-                    .map(|c| {
-                        let max_abs = channel_values(data, c, channel_size, inner_size)
-                            .fold(0.0_f32, |acc, x| acc.max(x.abs()));
+                // Single pass over `data`, accumulating each channel's
+                // max-abs directly instead of rescanning the whole tensor
+                // once per channel (filtering by channel and folding per
+                // channel was O(n * channel_size); this is O(n)).
+                let mut max_abs_per_channel = vec![0.0_f32; channel_size];
+                for (i, &x) in data.iter().enumerate() {
+                    let c = (i / inner_size) % channel_size;
+                    let ax = x.abs();
+                    if ax > max_abs_per_channel[c] {
+                        max_abs_per_channel[c] = ax;
+                    }
+                }
+                let scales: Vec<f32> = max_abs_per_channel
+                    .iter()
+                    .map(|&max_abs| {
                         if max_abs == 0.0 {
                             1.0_f32
                         } else {
@@ -346,13 +411,36 @@ impl MinMaxQuantizer {
             QuantizationScope::PerChannel(axis) => {
                 let (_, channel_size, inner_size) = channel_dims(shape, axis)?;
 
+                // Single pass over `data`, accumulating each channel's
+                // (min, max) directly instead of collecting every channel's
+                // values into a fresh Vec and rescanning the whole tensor
+                // once per channel (was O(n * channel_size) plus per-channel
+                // allocations; this is a single O(n) pass with none).
+                let mut min_per_channel = vec![f32::MAX; channel_size];
+                let mut max_per_channel = vec![f32::MIN; channel_size];
+                for (i, &x) in data.iter().enumerate() {
+                    let c = (i / inner_size) % channel_size;
+                    if x < min_per_channel[c] {
+                        min_per_channel[c] = x;
+                    }
+                    if x > max_per_channel[c] {
+                        max_per_channel[c] = x;
+                    }
+                }
+
                 let mut scales = vec![1.0_f32; channel_size];
                 let mut zero_points = vec![0_i32; channel_size];
-
                 for c in 0..channel_size {
-                    let vals: Vec<f32> =
-                        channel_values(data, c, channel_size, inner_size).collect();
-                    let (s, zp) = minmax_scale_zp(&vals);
+                    // A channel with no elements at all (only possible when
+                    // some other shape dimension is 0, which also forces
+                    // `data` to be empty) keeps the same (1.0, 0) degenerate
+                    // default `minmax_scale_zp`'s own empty-input branch
+                    // would have produced.
+                    if min_per_channel[c] == f32::MAX {
+                        continue;
+                    }
+                    let (s, zp) =
+                        minmax_scale_zp_from_bounds(min_per_channel[c], max_per_channel[c]);
                     scales[c] = s;
                     zero_points[c] = zp;
                 }
@@ -403,11 +491,35 @@ pub struct QuantizationMetrics {
 /// Compute quality metrics for an INT8 quantization round-trip.
 ///
 /// Dequantizes `quantized_tensor` and compares with `original`.
+///
+/// # Errors
+///
+/// Returns [`DiffusionError::InvalidConfig`] if:
+/// * `original` is empty (every metric here is a mean or ratio over
+///   `original.len()` elements, which is otherwise a silent `0.0 / 0.0 =
+///   NaN`).
+/// * `original.len()` does not equal `quantized_tensor.num_elements()`
+///   (otherwise the `zip`s below would silently truncate to the shorter of
+///   the two while the divisor stayed `original.len()`, under-reporting
+///   error for a mismatched pair).
+/// * `quantized_tensor` itself fails [`QuantizedTensor::validate`].
 pub fn compute_quantization_metrics(
     original: &[f32],
     quantized_tensor: &QuantizedTensor,
-) -> QuantizationMetrics {
-    let recovered = quantized_tensor.dequantize();
+) -> Result<QuantizationMetrics, DiffusionError> {
+    if original.is_empty() {
+        return Err(DiffusionError::InvalidConfig(
+            "compute_quantization_metrics: original must not be empty".to_owned(),
+        ));
+    }
+    if original.len() != quantized_tensor.num_elements() {
+        return Err(DiffusionError::InvalidConfig(format!(
+            "compute_quantization_metrics: original has {} elements, quantized_tensor has {}",
+            original.len(),
+            quantized_tensor.num_elements(),
+        )));
+    }
+    let recovered = quantized_tensor.dequantize()?;
     let n = original.len();
 
     let max_abs_error = original
@@ -446,13 +558,13 @@ pub fn compute_quantization_metrics(
 
     let compression_ratio = quantized_tensor.compression_ratio_vs_f32();
 
-    QuantizationMetrics {
+    Ok(QuantizationMetrics {
         max_abs_error,
         mean_abs_error,
         root_mean_sq_error,
         signal_to_noise_ratio_db,
         compression_ratio,
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -596,25 +708,6 @@ fn channel_dims(shape: &[usize], axis: usize) -> Result<(usize, usize, usize), D
     Ok((outer_size, channel_size, inner_size))
 }
 
-/// Iterator over all values belonging to a single channel slice.
-///
-/// Elements are *not* contiguous when `axis != 0`; this iterator handles the
-/// strided access pattern correctly.
-fn channel_values<'a>(
-    data: &'a [f32],
-    channel: usize,
-    channel_size: usize,
-    inner_size: usize,
-) -> impl Iterator<Item = f32> + 'a {
-    data.iter().enumerate().filter_map(move |(i, &x)| {
-        if (i / inner_size) % channel_size == channel {
-            Some(x)
-        } else {
-            None
-        }
-    })
-}
-
 /// Symmetric quantization of a single `f32` value.
 ///
 /// `q = clamp(round(x / scale), -127, 127)`
@@ -643,6 +736,17 @@ fn minmax_scale_zp(data: &[f32]) -> (f32, i32) {
         // empty — degenerate
         return (1.0, 0);
     }
+    minmax_scale_zp_from_bounds(min_val, max_val)
+}
+
+/// Compute `(scale, zero_point)` from already-known `(min, max)` bounds.
+///
+/// Shared by [`minmax_scale_zp`] (which derives the bounds from a slice) and
+/// [`MinMaxQuantizer::quantize`]'s per-channel path (which accumulates the
+/// bounds for every channel in a single pass over the whole tensor, rather
+/// than calling [`minmax_scale_zp`] once per channel on a freshly collected
+/// per-channel `Vec`).
+fn minmax_scale_zp_from_bounds(min_val: f32, max_val: f32) -> (f32, i32) {
     let range = max_val - min_val;
     let scale = if range == 0.0 { 1.0_f32 } else { range / 255.0 };
     let zp_f = (-min_val / scale).round();
@@ -696,7 +800,7 @@ mod tests {
         let qt = AbsmaxQuantizer::per_tensor()
             .quantize(&data, &shape)
             .expect("quantize");
-        let recovered = qt.dequantize();
+        let recovered = qt.dequantize().expect("dequantize");
         assert_eq!(recovered.len(), data.len());
         // Symmetric INT8: max error ≤ scale/2 ≈ max_abs/127/2
         let max_err = data
@@ -722,7 +826,7 @@ mod tests {
         // Scale defaults to 1.0 when max_abs==0
         assert_eq!(qt.scales[0], 1.0);
         assert!(qt.data.iter().all(|&x| x == 0));
-        let recovered = qt.dequantize();
+        let recovered = qt.dequantize().expect("dequantize");
         assert!(recovered.iter().all(|&x| x == 0.0));
     }
 
@@ -763,7 +867,7 @@ mod tests {
         assert!((scale - 1.0 / 255.0).abs() < 1e-7, "scale={scale}");
         assert_eq!(zp, 0);
         // First element should dequantize to ~0
-        let dq = qt.dequantize();
+        let dq = qt.dequantize().expect("dequantize");
         assert!(dq[0].abs() < scale, "dq[0]={}", dq[0]);
     }
 
@@ -790,7 +894,7 @@ mod tests {
         let qt = MinMaxQuantizer::per_tensor()
             .quantize(&data, &shape)
             .expect("quantize");
-        let recovered = qt.dequantize();
+        let recovered = qt.dequantize().expect("dequantize");
         let max_err = data
             .iter()
             .zip(recovered.iter())
@@ -841,13 +945,100 @@ mod tests {
         );
 
         // Roundtrip should be accurate
-        let recovered = qt.dequantize();
+        let recovered = qt.dequantize().expect("dequantize");
         let max_err = data
             .iter()
             .zip(recovered.iter())
             .map(|(&a, &b)| (a - b).abs())
             .fold(0.0_f32, f32::max);
         assert!(max_err < 0.02, "per-channel roundtrip max_err={max_err}");
+    }
+
+    // Regression test for the per-channel O(n * channel_size) -> O(n)
+    // refactor: MinMaxQuantizer's PerChannel path had no prior test
+    // coverage at all. Verify each channel's (scale, zero_point) is
+    // computed from *its own* values only, not the whole tensor.
+    #[test]
+    fn test_minmax_per_channel_scope_2d() {
+        // shape [2, 3], axis 0 -> 2 channels of 3 elements each, with very
+        // different ranges so a cross-channel mix-up would be detectable.
+        let data = vec![0.0_f32, 0.5, 1.0, -10.0, -5.0, 0.0];
+        let shape = vec![2, 3];
+        let qt = MinMaxQuantizer::new(QuantizationScope::PerChannel(0))
+            .quantize(&data, &shape)
+            .expect("quantize");
+        assert_eq!(qt.scales.len(), 2);
+        assert_eq!(qt.zero_points.len(), 2);
+
+        // Channel 0: [0.0, 0.5, 1.0] -> range 1.0 -> scale = 1.0/255.
+        assert!(
+            (qt.scales[0] - 1.0 / 255.0).abs() < 1e-6,
+            "ch0 scale={}",
+            qt.scales[0]
+        );
+        // Channel 1: [-10.0, -5.0, 0.0] -> range 10.0 -> scale = 10.0/255.
+        assert!(
+            (qt.scales[1] - 10.0 / 255.0).abs() < 1e-6,
+            "ch1 scale={}",
+            qt.scales[1]
+        );
+
+        let recovered = qt.dequantize().expect("dequantize");
+        let max_err = data
+            .iter()
+            .zip(recovered.iter())
+            .map(|(&a, &b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(max_err < 0.1, "per-channel roundtrip max_err={max_err}");
+    }
+
+    // Cross-check: per-channel results must be identical to (slow)
+    // per-channel-at-a-time computation, for both quantizers, guarding
+    // against the single-pass refactor silently mixing channels together.
+    #[test]
+    fn test_per_channel_matches_naive_per_channel_computation() {
+        let data: Vec<f32> = (0..24).map(|i| ((i * 37) % 23) as f32 - 11.0).collect();
+        let shape = vec![4, 6]; // axis 0 -> 4 channels of 6 elements each.
+
+        let absmax_qt = AbsmaxQuantizer::per_channel(0)
+            .quantize(&data, &shape)
+            .expect("quantize");
+        let minmax_qt = MinMaxQuantizer::new(QuantizationScope::PerChannel(0))
+            .quantize(&data, &shape)
+            .expect("quantize");
+
+        for c in 0..4 {
+            let channel_slice = &data[c * 6..(c + 1) * 6];
+
+            let naive_max_abs = channel_slice
+                .iter()
+                .map(|x| x.abs())
+                .fold(0.0_f32, f32::max);
+            let naive_absmax_scale = if naive_max_abs == 0.0 {
+                1.0
+            } else {
+                naive_max_abs / 127.0
+            };
+            assert!(
+                (absmax_qt.scales[c] - naive_absmax_scale).abs() < 1e-6,
+                "absmax channel {c}: got {}, expected {naive_absmax_scale}",
+                absmax_qt.scales[c]
+            );
+
+            let naive_min = channel_slice.iter().cloned().fold(f32::MAX, f32::min);
+            let naive_max = channel_slice.iter().cloned().fold(f32::MIN, f32::max);
+            let naive_range = naive_max - naive_min;
+            let naive_minmax_scale = if naive_range == 0.0 {
+                1.0
+            } else {
+                naive_range / 255.0
+            };
+            assert!(
+                (minmax_qt.scales[c] - naive_minmax_scale).abs() < 1e-6,
+                "minmax channel {c}: got {}, expected {naive_minmax_scale}",
+                minmax_qt.scales[c]
+            );
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -895,7 +1086,7 @@ mod tests {
         let qt = AbsmaxQuantizer::per_tensor()
             .quantize(&data, &shape)
             .expect("quantize");
-        let metrics = compute_quantization_metrics(&data, &qt);
+        let metrics = compute_quantization_metrics(&data, &qt).expect("metrics");
         // INT8 should have low MAE
         assert!(
             metrics.mean_abs_error < 0.01,
@@ -920,7 +1111,7 @@ mod tests {
         let qt = AbsmaxQuantizer::per_tensor()
             .quantize(&data, &shape)
             .expect("quantize");
-        let metrics = compute_quantization_metrics(&data, &qt);
+        let metrics = compute_quantization_metrics(&data, &qt).expect("metrics");
         assert!(
             metrics.signal_to_noise_ratio_db > 40.0,
             "snr={}",
@@ -936,7 +1127,7 @@ mod tests {
         let qt = AbsmaxQuantizer::per_tensor()
             .quantize(&data, &shape)
             .expect("quantize");
-        let metrics = compute_quantization_metrics(&data, &qt);
+        let metrics = compute_quantization_metrics(&data, &qt).expect("metrics");
         assert!(
             metrics.signal_to_noise_ratio_db.is_infinite(),
             "expected Inf SNR, got {}",
@@ -1053,10 +1244,10 @@ mod tests {
         assert_eq!(qt.data.len(), 1000);
         assert_eq!(qt.num_elements(), 1000);
 
-        let recovered = qt.dequantize();
+        let recovered = qt.dequantize().expect("dequantize");
         assert_eq!(recovered.len(), 1000);
 
-        let metrics = compute_quantization_metrics(&data, &qt);
+        let metrics = compute_quantization_metrics(&data, &qt).expect("metrics");
         // Large smooth signal: SNR should be well above 40 dB
         assert!(
             metrics.signal_to_noise_ratio_db > 40.0,

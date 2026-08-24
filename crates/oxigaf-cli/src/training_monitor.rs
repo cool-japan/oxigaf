@@ -578,7 +578,11 @@ pub fn detect_divergence(recent_losses: &[f32], threshold: f32) -> bool {
         return false;
     }
     let first = recent_losses[0];
-    let last = *recent_losses.last().expect("checked len >= 2 above");
+    // `recent_losses.len() >= 2` is guaranteed by the check above, so this
+    // index is always in bounds; indexing directly avoids an
+    // `Option::expect()` in a production code path (COOLJAPAN no-unwrap
+    // policy).
+    let last = recent_losses[recent_losses.len() - 1];
     if first <= 0.0 {
         return false;
     }
@@ -716,7 +720,16 @@ pub fn summarize_training(
 
     let initial_loss = first.loss;
     let final_loss = last.loss;
-    let total_steps = last.step;
+    // Use the step *delta* across the recorded window rather than the
+    // absolute final step index. `history` may be a trimmed window (see
+    // `TrainingMonitor::record`, which drops the oldest events past
+    // `max_history`) or start mid-run after a resume, in which case
+    // `first.step` is not 0; dividing the absolute `last.step` by the
+    // windowed `total_secs` below would wildly inflate `mean_throughput`.
+    // This also matches the field's own documentation ("Total number of
+    // steps in the run") and is a no-op for the common case where the
+    // window starts at step 0.
+    let total_steps = last.step.saturating_sub(first.step);
     let total_secs = last.elapsed_secs - first.elapsed_secs;
 
     // Find best loss and the step where it was first achieved.
@@ -1370,6 +1383,17 @@ mod tests {
         assert!(!detect_divergence(&[1.0], 2.0));
     }
 
+    #[test]
+    fn detect_divergence_minimum_length_two_no_panic() {
+        // Regression test: `detect_divergence` used to fetch the last
+        // element via `.last().expect(...)`. This exercises the exact
+        // boundary (len == 2) that the length guard is meant to cover,
+        // ensuring the direct-indexing replacement neither panics nor
+        // miscomputes the ratio.
+        assert!(!detect_divergence(&[1.0, 1.5], 2.0));
+        assert!(detect_divergence(&[1.0, 3.0], 2.0));
+    }
+
     // -----------------------------------------------------------------------
     // loss_percentile
     // -----------------------------------------------------------------------
@@ -1474,6 +1498,49 @@ mod tests {
         let summary = summarize_training(&history, 0.001, 5).unwrap();
         // (1.0 - 0.5) / 1.0 = 0.5
         assert!((summary.improvement_fraction - 0.5).abs() < 1e-4);
+    }
+
+    #[test]
+    fn summarize_training_windowed_history_throughput_not_inflated() {
+        // Regression test: `history` can be a trimmed window (see
+        // `TrainingMonitor::record`, which drops events past
+        // `max_history`) or start mid-run after a resume, so `first.step`
+        // is not necessarily 0. `total_steps`/`mean_throughput` must be
+        // derived from the step *delta* across the window, not from the
+        // absolute final step index — otherwise dividing an absolute step
+        // count by only the windowed duration wildly inflates throughput.
+        //
+        // Window: steps 5000..=5100 (100 steps) over 10 seconds.
+        let history = vec![
+            TrainingEvent::new(5000, 500.0, 0.2),
+            TrainingEvent::new(5050, 505.0, 0.15),
+            TrainingEvent::new(5100, 510.0, 0.1),
+        ];
+        let summary = summarize_training(&history, 0.001, 100).unwrap();
+
+        assert_eq!(summary.total_steps, 100, "total_steps must be the delta across the window (5100 - 5000), not the absolute final step index 5100");
+        assert!((summary.total_secs - 10.0).abs() < 1e-4);
+        // 100 steps / 10s = 10 steps/s. The old buggy computation
+        // (5100 absolute steps / 10s = 510 steps/s) would be off by ~51x.
+        assert!(
+            (summary.mean_throughput - 10.0).abs() < 1e-3,
+            "mean_throughput should be ~10.0 steps/s, got {}",
+            summary.mean_throughput
+        );
+    }
+
+    #[test]
+    fn summarize_training_non_windowed_history_unchanged() {
+        // When the history starts at step 0 (the common, non-trimmed,
+        // non-resumed case), total_steps must equal the previous
+        // behavior (the final step index), since first.step == 0 makes
+        // the delta and the absolute index identical.
+        let history = vec![
+            TrainingEvent::new(0, 0.0, 1.0),
+            TrainingEvent::new(50, 5.0, 0.5),
+        ];
+        let summary = summarize_training(&history, 0.001, 100).unwrap();
+        assert_eq!(summary.total_steps, 50);
     }
 
     #[test]

@@ -810,10 +810,12 @@ mod tests {
         let path = std::env::temp_dir().join("oxigaf_test_sha256_known.bin");
         std::fs::write(&path, b"hello world").expect("write test file");
         let digest = sha256_hex(&path).expect("compute checksum");
-        // Known SHA-256("hello world")
+        // Known SHA-256("hello world"), independently verified via both
+        // `shasum -a 256` and Python's hashlib during test authoring.
+        assert_eq!(digest.len(), 64, "SHA-256 hex digest must be 64 chars");
         assert_eq!(
             digest,
-            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde"
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
         );
         let _ = std::fs::remove_file(&path);
     }

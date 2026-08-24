@@ -59,6 +59,10 @@ pub enum ScoreDistillationError {
     /// A noise schedule is required but has not been provided.
     #[error("No noise schedule")]
     NoNoiseSchedule,
+
+    /// Propagated from the LoRA adapter machinery backing [`VsdState`].
+    #[error("LoRA error: {0}")]
+    Lora(#[from] crate::lora_adapter::LoraError),
 }
 
 // ---------------------------------------------------------------------------
@@ -182,16 +186,28 @@ impl SdsConfig {
 // ---------------------------------------------------------------------------
 
 /// Configuration for Variational Score Distillation (ProlificDreamer).
+///
+/// `num_particles`, `lora_rank` and `vsd_lr` are consumed by [`VsdState`],
+/// not by [`vsd_gradient`] itself: `vsd_gradient` is a stateless function
+/// over an already-computed `lora_noise_pred`, so it has no particle
+/// ensemble or optimiser state of its own to configure. [`VsdState`] is the
+/// companion that actually owns one LoRA adapter per particle and applies
+/// the `vsd_lr` SGD update — construct it from this config when you need
+/// real VSD machinery rather than supplying `lora_noise_pred` from your own
+/// external adaptation.
 #[derive(Debug, Clone)]
 pub struct VsdConfig {
     /// Underlying SDS configuration.
     pub sds_config: SdsConfig,
     /// Number of 3D field particles in the variational distribution (default
-    /// `1`).
+    /// `1`). Consumed by [`VsdState::new`], which allocates one LoRA
+    /// adapter per particle.
     pub num_particles: usize,
-    /// LoRA rank for the score model adaptation (default `4`).
+    /// LoRA rank for the score model adaptation (default `4`). Consumed by
+    /// [`VsdState::new`] when constructing each particle's adapter.
     pub lora_rank: usize,
-    /// Learning rate for LoRA adaptation (default `1e-4`).
+    /// Learning rate for LoRA adaptation (default `1e-4`). Consumed by
+    /// [`VsdState::sgd_update`] as the SGD step size.
     pub vsd_lr: f32,
 }
 
@@ -231,6 +247,131 @@ impl VsdConfig {
 }
 
 // ---------------------------------------------------------------------------
+// VSD particle / LoRA state
+// ---------------------------------------------------------------------------
+
+/// Owns the per-particle LoRA adapters that back [`VsdConfig`]'s
+/// `num_particles`, `lora_rank` and `vsd_lr` fields, making them affect real
+/// behaviour rather than sitting validated-but-unread.
+///
+/// [`vsd_gradient`] is a stateless function over an already-computed
+/// `lora_noise_pred` — the model forward pass, with a particle's LoRA delta
+/// merged in, happens in the caller's U-Net, which this crate-internal
+/// module does not own. `VsdState` is the companion piece: it holds one
+/// [`LoraAdapter`](crate::lora_adapter::LoraAdapter) per particle (rank
+/// `lora_rank`) and applies the SGD update at `vsd_lr` once the caller has
+/// backpropagated the VSD gradient through the LoRA layer it applied.
+///
+/// # Typical usage
+///
+/// 1. [`VsdState::new`] — allocates `num_particles` empty adapters.
+/// 2. For each particle, add the
+///    [`LoraLayer`](crate::lora_adapter::LoraLayer)s it needs (matching
+///    whichever U-Net projections the caller adapts) via [`Self::add_layer`].
+/// 3. Per training step and per particle: apply that particle's adapter
+///    (e.g. via [`LoraLayer::apply`](crate::lora_adapter::LoraLayer::apply)
+///    or by merging it into the base weights), run the frozen and
+///    LoRA-adapted forward passes, call [`vsd_gradient`], backprop the
+///    result through the adapted layer with
+///    [`lora_backward`](crate::lora_adapter::lora_backward), and apply the
+///    resulting gradients with [`Self::sgd_update`].
+#[derive(Debug, Clone)]
+pub struct VsdState {
+    /// One LoRA adapter per particle; `particles.len() == config.num_particles`.
+    pub particles: Vec<crate::lora_adapter::LoraAdapter>,
+    /// The configuration this state was built from. `lora_rank` shaped every
+    /// particle's adapter at construction; `vsd_lr` is read by
+    /// [`Self::sgd_update`].
+    pub config: VsdConfig,
+}
+
+impl VsdState {
+    /// Allocate `config.num_particles` empty LoRA adapters, each at rank
+    /// `config.lora_rank`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`VsdConfig::validate`].
+    pub fn new(config: &VsdConfig) -> Result<Self, ScoreDistillationError> {
+        config.validate()?;
+        let lora_config = crate::lora_adapter::LoraConfig::with_rank(config.lora_rank);
+        let particles = (0..config.num_particles)
+            .map(|_| crate::lora_adapter::LoraAdapter::new(lora_config.clone()))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            particles,
+            config: config.clone(),
+        })
+    }
+
+    /// Number of particles (`== config.num_particles` at construction time).
+    pub fn num_particles(&self) -> usize {
+        self.particles.len()
+    }
+
+    /// Add a named LoRA layer (rank `config.lora_rank`, scaling `alpha =
+    /// lora_rank`) to one particle's adapter.
+    ///
+    /// # Errors
+    ///
+    /// [`ScoreDistillationError::InvalidConfig`] if `particle_idx` is out of
+    /// range.
+    pub fn add_layer(
+        &mut self,
+        particle_idx: usize,
+        name: impl Into<String>,
+        in_dim: usize,
+        out_dim: usize,
+        seed: u64,
+    ) -> Result<(), ScoreDistillationError> {
+        let rank = self.config.lora_rank;
+        let particle = self.particles.get_mut(particle_idx).ok_or_else(|| {
+            ScoreDistillationError::InvalidConfig(format!(
+                "particle_idx {particle_idx} out of range (have {} particles)",
+                self.config.num_particles
+            ))
+        })?;
+        let layer =
+            crate::lora_adapter::LoraLayer::new(name, in_dim, out_dim, rank, rank as f32, seed)?;
+        particle.add_layer(layer);
+        Ok(())
+    }
+
+    /// Apply one SGD update (`param -= config.vsd_lr * grad`) to a named
+    /// layer within one particle, from gradients already computed via
+    /// [`lora_backward`](crate::lora_adapter::lora_backward).
+    ///
+    /// # Errors
+    ///
+    /// [`ScoreDistillationError::InvalidConfig`] if `particle_idx` is out of
+    /// range or the named layer does not exist on that particle;
+    /// [`ScoreDistillationError::Lora`] on a gradient shape mismatch.
+    pub fn sgd_update(
+        &mut self,
+        particle_idx: usize,
+        layer_name: &str,
+        grad_a: &[f32],
+        grad_b: &[f32],
+    ) -> Result<(), ScoreDistillationError> {
+        let lr = self.config.vsd_lr;
+        let num_particles = self.particles.len();
+        let particle = self.particles.get_mut(particle_idx).ok_or_else(|| {
+            ScoreDistillationError::InvalidConfig(format!(
+                "particle_idx {particle_idx} out of range (have {num_particles} particles)"
+            ))
+        })?;
+        let layer = particle.get_layer_mut(layer_name).ok_or_else(|| {
+            ScoreDistillationError::InvalidConfig(format!(
+                "layer '{layer_name}' not found on particle {particle_idx}"
+            ))
+        })?;
+        crate::lora_adapter::lora_sgd_step(layer, grad_a, grad_b, lr)?;
+        particle.step += 1;
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Noise schedule
 // ---------------------------------------------------------------------------
 
@@ -250,20 +391,28 @@ pub struct SdsNoiseSchedule {
 }
 
 impl SdsNoiseSchedule {
-    /// Build a linear beta schedule with SD-style endpoints.
+    /// Build a "scaled linear" beta schedule with SD-style endpoints.
     ///
-    /// Betas are linearly spaced between `β_start = 0.00085` and
-    /// `β_end = 0.012`, matching the Stable Diffusion 1.x convention.
+    /// Betas are `linspace(sqrt(β_start), sqrt(β_end), T)^2` with
+    /// `β_start = 0.00085` and `β_end = 0.012`, matching the Stable Diffusion
+    /// 1.x/2.x convention (this is the same schedule [`crate::scheduler`]
+    /// and [`crate::noise_schedule_analysis::NoiseSchedule::scaled_linear`]
+    /// use; a *plain* linear ramp between the same endpoints is a materially
+    /// different schedule — its mean beta differs by roughly 20%, shifting
+    /// every SNR/weight derived from it).
     pub fn linear(num_timesteps: usize) -> Self {
         let beta_start: f64 = 0.00085;
         let beta_end: f64 = 0.012;
+        let sqrt_beta_start = beta_start.sqrt();
+        let sqrt_beta_end = beta_end.sqrt();
         let t = num_timesteps.max(1);
 
         let mut alphas_cumprod = Vec::with_capacity(t);
         let mut running: f64 = 1.0;
         for i in 0..t {
             let frac = i as f64 / (t - 1).max(1) as f64;
-            let beta = beta_start + frac * (beta_end - beta_start);
+            let sqrt_beta = sqrt_beta_start + frac * (sqrt_beta_end - sqrt_beta_start);
+            let beta = sqrt_beta * sqrt_beta;
             running *= 1.0 - beta;
             alphas_cumprod.push(running.clamp(0.0, 1.0) as f32);
         }
@@ -297,7 +446,12 @@ impl SdsNoiseSchedule {
 
         let mut alphas_cumprod = Vec::with_capacity(t);
         for i in 0..t {
-            // Use the midpoint of the interval as the representative timestep.
+            // Evaluate at the *right* endpoint of step i's interval
+            // (i.e. f(i+1)), not its midpoint: this reaches ᾱ = 0 exactly at
+            // i = T-1, which the left-endpoint form f(i) does not. Note
+            // `noise_schedule_analysis::cosine` uses the f(i) convention
+            // instead — the two are deliberately different conventions, not
+            // a shared implementation.
             let raw = (f(i as f64 + 1.0) / f0).clamp(0.0, 1.0) as f32;
             alphas_cumprod.push(raw);
         }
@@ -603,6 +757,13 @@ pub fn compute_weight(
 ///
 /// This simplified version treats the LoRA noise prediction as the variational
 /// score target, reducing variance compared to raw SDS.
+///
+/// This function only combines two already-computed noise predictions — it
+/// does not run the LoRA-adapted model itself or update its weights. Use
+/// [`VsdState`] to own the per-particle LoRA adapters (`config.num_particles`
+/// of them, at rank `config.lora_rank`) that produce `lora_noise_pred`, and
+/// [`VsdState::sgd_update`] (at `config.vsd_lr`) after backpropagating this
+/// gradient through the adapted layer.
 ///
 /// # Arguments
 /// - `ref_noise_pred`: noise prediction from the frozen (text-conditioned) model.
@@ -929,7 +1090,147 @@ mod tests {
         ));
     }
 
+    // ---- VsdState -------------------------------------------------------
+    //
+    // Regression coverage: `num_particles`, `lora_rank` and `vsd_lr` used to
+    // be validated but never consumed anywhere. `VsdState` is the piece that
+    // now makes them load-bearing.
+
+    #[test]
+    fn test_vsd_state_new_allocates_one_adapter_per_particle() {
+        let cfg = VsdConfig {
+            num_particles: 3,
+            lora_rank: 4,
+            ..VsdConfig::default()
+        };
+        let state = VsdState::new(&cfg).unwrap();
+        assert_eq!(state.num_particles(), 3);
+        assert_eq!(state.particles.len(), 3);
+    }
+
+    #[test]
+    fn test_vsd_state_new_rejects_invalid_config() {
+        let cfg = VsdConfig {
+            num_particles: 0,
+            ..VsdConfig::default()
+        };
+        assert!(VsdState::new(&cfg).is_err());
+    }
+
+    #[test]
+    fn test_vsd_state_add_layer_uses_configured_rank() {
+        let cfg = VsdConfig {
+            num_particles: 1,
+            lora_rank: 8,
+            ..VsdConfig::default()
+        };
+        let mut state = VsdState::new(&cfg).unwrap();
+        state.add_layer(0, "to_q", 16, 16, 42).unwrap();
+        let layer = state.particles[0].get_layer("to_q").unwrap();
+        assert_eq!(
+            layer.rank, 8,
+            "layer rank should come from config.lora_rank"
+        );
+    }
+
+    #[test]
+    fn test_vsd_state_add_layer_out_of_range_particle_err() {
+        let cfg = VsdConfig {
+            num_particles: 1,
+            ..VsdConfig::default()
+        };
+        let mut state = VsdState::new(&cfg).unwrap();
+        let err = state.add_layer(5, "to_q", 16, 16, 1).unwrap_err();
+        assert!(matches!(err, ScoreDistillationError::InvalidConfig(_)));
+    }
+
+    #[test]
+    fn test_vsd_state_sgd_update_moves_params_by_configured_lr() {
+        let cfg = VsdConfig {
+            num_particles: 1,
+            lora_rank: 2,
+            vsd_lr: 0.5,
+            ..VsdConfig::default()
+        };
+        let mut state = VsdState::new(&cfg).unwrap();
+        state.add_layer(0, "to_q", 4, 4, 7).unwrap();
+
+        let a_before = state.particles[0]
+            .get_layer("to_q")
+            .unwrap()
+            .a_matrix
+            .clone();
+        let b_before = state.particles[0]
+            .get_layer("to_q")
+            .unwrap()
+            .b_matrix
+            .clone();
+        let grad_a = vec![1.0_f32; a_before.len()];
+        let grad_b = vec![1.0_f32; b_before.len()];
+
+        state.sgd_update(0, "to_q", &grad_a, &grad_b).unwrap();
+
+        let layer_after = state.particles[0].get_layer("to_q").unwrap();
+        // param -= lr * grad, with grad == 1.0 everywhere and lr == 0.5.
+        for (before, after) in a_before.iter().zip(layer_after.a_matrix.iter()) {
+            assert!((before - 0.5 - after).abs() < 1e-6);
+        }
+        for (before, after) in b_before.iter().zip(layer_after.b_matrix.iter()) {
+            assert!((before - 0.5 - after).abs() < 1e-6);
+        }
+        assert_eq!(state.particles[0].step, 1);
+    }
+
+    #[test]
+    fn test_vsd_state_sgd_update_missing_layer_err() {
+        let cfg = VsdConfig {
+            num_particles: 1,
+            ..VsdConfig::default()
+        };
+        let mut state = VsdState::new(&cfg).unwrap();
+        let err = state.sgd_update(0, "does_not_exist", &[], &[]).unwrap_err();
+        assert!(matches!(err, ScoreDistillationError::InvalidConfig(_)));
+    }
+
     // ---- SdsNoiseSchedule::linear -------------------------------------------
+
+    /// Regression test: `linear()` documents (and its name implies) the
+    /// Stable Diffusion "scaled linear" convention
+    /// (betas = linspace(sqrt(beta_start), sqrt(beta_end), T)^2), not a
+    /// plain linear ramp between the same endpoints. Reconstruct beta_500
+    /// from consecutive alphas_cumprod entries and check it matches the
+    /// scaled formula rather than the plain one (the two disagree by
+    /// roughly 30% at the midpoint, so f32 rounding cannot hide the
+    /// difference).
+    #[test]
+    fn test_linear_schedule_uses_scaled_not_plain_beta() {
+        let schedule = SdsNoiseSchedule::linear(1000);
+
+        let beta_start = 0.00085_f64;
+        let beta_end = 0.012_f64;
+        let frac = 500.0_f64 / 999.0;
+        let sqrt_beta_start = beta_start.sqrt();
+        let sqrt_beta_end = beta_end.sqrt();
+        let scaled_beta_500 = (sqrt_beta_start + frac * (sqrt_beta_end - sqrt_beta_start)).powi(2);
+        let plain_beta_500 = beta_start + frac * (beta_end - beta_start);
+        // Sanity: the two candidate formulas actually disagree here.
+        assert!(
+            (scaled_beta_500 - plain_beta_500).abs() > 1e-3,
+            "scaled={scaled_beta_500} plain={plain_beta_500} should differ materially"
+        );
+
+        // alphas_cumprod[i] = alphas_cumprod[i-1] * (1 - beta_i)
+        // => beta_500 = 1 - alphas_cumprod[500] / alphas_cumprod[499]
+        let alpha_499 = schedule.alphas_cumprod[499] as f64;
+        let alpha_500 = schedule.alphas_cumprod[500] as f64;
+        let observed_beta_500 = 1.0 - alpha_500 / alpha_499;
+
+        assert!(
+            (observed_beta_500 - scaled_beta_500).abs() < 1e-4,
+            "observed beta_500={observed_beta_500}, expected scaled-linear \
+             beta_500={scaled_beta_500} (plain-linear would give {plain_beta_500})"
+        );
+    }
 
     #[test]
     fn test_linear_schedule_alphas_decreasing() {

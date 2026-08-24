@@ -29,8 +29,10 @@
 //! ```
 
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use rayon::prelude::*;
 use thiserror::Error;
 
 // ---------------------------------------------------------------------------
@@ -193,6 +195,14 @@ pub struct JobResult {
     pub duration_ms: u64,
     /// Number of items processed (e.g., number of Gaussians).
     pub items_processed: usize,
+    /// Number of execution attempts made (1 = succeeded or failed on the
+    /// first try; >1 indicates retries occurred; 0 for a job that was never
+    /// executed, e.g. `skipped`).
+    pub attempts: usize,
+    /// `true` when this job was not executed at all — a dry run, an unmet
+    /// dependency, or `fail_fast` having aborted the batch — as opposed to
+    /// `success == false` from a genuine execution failure.
+    pub skipped: bool,
 }
 
 impl JobResult {
@@ -205,10 +215,12 @@ impl JobResult {
             error_message: None,
             duration_ms,
             items_processed: items,
+            attempts: 1,
+            skipped: false,
         }
     }
 
-    /// Construct a failed job result.
+    /// Construct a failed job result (the job ran but did not succeed).
     pub fn failure(
         job_id: usize,
         name: impl Into<String>,
@@ -222,7 +234,33 @@ impl JobResult {
             error_message: Some(reason.into()),
             duration_ms,
             items_processed: 0,
+            attempts: 1,
+            skipped: false,
         }
+    }
+
+    /// Construct a skipped job result: the job was never executed (dry run,
+    /// an unmet dependency, or `fail_fast` aborting the batch). `success` is
+    /// `false` since it did not run, but `skipped` distinguishes this from a
+    /// genuine execution failure.
+    pub fn skipped(job_id: usize, name: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self {
+            job_id,
+            job_name: name.into(),
+            success: false,
+            error_message: Some(reason.into()),
+            duration_ms: 0,
+            items_processed: 0,
+            attempts: 0,
+            skipped: true,
+        }
+    }
+
+    /// Override the number of execution attempts (builder-style).
+    #[must_use]
+    pub fn with_attempts(mut self, attempts: usize) -> Self {
+        self.attempts = attempts;
+        self
     }
 }
 
@@ -240,18 +278,27 @@ impl JobResult {
 /// # Errors
 ///
 /// - Returns `Ok(vec![])` when `jobs` is empty.
+/// - Returns [`BatchError::InvalidJobSpec`] if `jobs` contains duplicate IDs
+///   (this algorithm relies on IDs being unique keys), or if a dependency
+///   references an unknown job ID.
 /// - Returns [`BatchError::DependencyCycle`] if the dependency graph contains
 ///   a cycle.
-/// - Returns [`BatchError::InvalidJobSpec`] if a dependency references an
-///   unknown job ID.
 pub fn compute_execution_waves(jobs: &[BatchJob]) -> Result<Vec<Vec<usize>>, BatchError> {
     if jobs.is_empty() {
         return Ok(vec![]);
     }
 
-    // Build a lookup: id → index in `jobs`
-    let id_to_idx: HashMap<usize, usize> =
-        jobs.iter().enumerate().map(|(i, j)| (j.id, i)).collect();
+    // Build a lookup: id → index in `jobs`, rejecting duplicate ids (the
+    // rest of this algorithm treats ids as unique map keys).
+    let mut id_to_idx: HashMap<usize, usize> = HashMap::with_capacity(jobs.len());
+    for (i, job) in jobs.iter().enumerate() {
+        if id_to_idx.insert(job.id, i).is_some() {
+            return Err(BatchError::InvalidJobSpec(format!(
+                "duplicate job id {}: job ids must be unique",
+                job.id
+            )));
+        }
+    }
 
     // Validate that every depends_on entry references a known job ID.
     for job in jobs {
@@ -273,7 +320,18 @@ pub fn compute_execution_waves(jobs: &[BatchJob]) -> Result<Vec<Vec<usize>>, Bat
 
     for job in jobs {
         for &dep in &job.depends_on {
-            *in_degree.get_mut(&job.id).unwrap_or(&mut 0) += 1;
+            match in_degree.get_mut(&job.id) {
+                Some(d) => *d += 1,
+                None => {
+                    // Unreachable given the duplicate-id check above (every
+                    // job.id was seeded as a key), but handled explicitly
+                    // rather than silently dropping the update.
+                    return Err(BatchError::InvalidJobSpec(format!(
+                        "internal error: job {} missing from in-degree map",
+                        job.id
+                    )));
+                }
+            }
             successors.entry(dep).or_default().push(job.id);
         }
     }
@@ -291,8 +349,14 @@ pub fn compute_execution_waves(jobs: &[BatchJob]) -> Result<Vec<Vec<usize>>, Bat
     while !frontier.is_empty() {
         // Sort descending by priority so higher-priority jobs come first.
         frontier.sort_by(|&a, &b| {
-            let pa = jobs[id_to_idx[&a]].priority;
-            let pb = jobs[id_to_idx[&b]].priority;
+            let pa = id_to_idx
+                .get(&a)
+                .and_then(|&idx| jobs.get(idx))
+                .map_or(0, |j| j.priority);
+            let pb = id_to_idx
+                .get(&b)
+                .and_then(|&idx| jobs.get(idx))
+                .map_or(0, |j| j.priority);
             pb.cmp(&pa).then(a.cmp(&b)) // stable tie-break by id
         });
 
@@ -342,6 +406,12 @@ pub struct BatchConfig {
     ///
     /// Default: `0` (no retries).
     pub max_retries: usize,
+    /// Base delay (ms) before retrying a failed job, doubled per subsequent
+    /// attempt (exponential backoff: `retry_backoff_ms * 2^attempt`). `0`
+    /// disables the delay while still retrying immediately.
+    ///
+    /// Default: `100`.
+    pub retry_backoff_ms: u64,
     /// Log verbosity level: `0` = quiet, `1` = normal, `2` = verbose.
     ///
     /// Default: `1`.
@@ -358,6 +428,7 @@ impl Default for BatchConfig {
             max_parallel: 1,
             fail_fast: false,
             max_retries: 0,
+            retry_backoff_ms: 100,
             verbosity: 1,
             dry_run: false,
         }
@@ -453,12 +524,22 @@ impl BatchProcessor {
     ///
     /// # Errors
     ///
-    /// Returns [`BatchError::InvalidJobSpec`] if any job fails validation, or
-    /// [`BatchError::InvalidConfig`] if the config is invalid.
+    /// Returns [`BatchError::InvalidJobSpec`] if any job fails validation or
+    /// if `jobs` contains duplicate IDs, or [`BatchError::InvalidConfig`] if
+    /// the config is invalid.
     pub fn new(jobs: Vec<BatchJob>, config: BatchConfig) -> Result<Self, BatchError> {
         config.validate()?;
         for job in &jobs {
             job.validate()?;
+        }
+        let mut seen_ids: HashSet<usize> = HashSet::with_capacity(jobs.len());
+        for job in &jobs {
+            if !seen_ids.insert(job.id) {
+                return Err(BatchError::InvalidJobSpec(format!(
+                    "duplicate job id {}: job ids must be unique within a batch",
+                    job.id
+                )));
+            }
         }
         Ok(Self { jobs, config })
     }
@@ -476,9 +557,16 @@ impl BatchProcessor {
     ///
     /// # Errors
     ///
-    /// Returns [`BatchError::InvalidJobSpec`] if the job fails validation.
+    /// Returns [`BatchError::InvalidJobSpec`] if the job fails validation or
+    /// its ID duplicates one already in this batch.
     pub fn add_job(&mut self, job: BatchJob) -> Result<(), BatchError> {
         job.validate()?;
+        if self.jobs.iter().any(|j| j.id == job.id) {
+            return Err(BatchError::InvalidJobSpec(format!(
+                "duplicate job id {}: job ids must be unique within a batch",
+                job.id
+            )));
+        }
         self.jobs.push(job);
         Ok(())
     }
@@ -523,17 +611,31 @@ impl BatchProcessor {
     ///
     /// # Execution model
     ///
-    /// Jobs are run wave-by-wave in topological order. Within each wave,
-    /// jobs are iterated sequentially (`max_parallel` governs chunk size for
-    /// future parallelism but currently executes sequentially per the spec).
+    /// Jobs are run wave-by-wave in topological order. Within each wave —
+    /// all of whose jobs are mutually independent by construction, see
+    /// [`compute_execution_waves`] — eligible jobs are dispatched to a
+    /// dedicated worker pool in chunks of at most `config.max_parallel`
+    /// jobs running concurrently, each with its own `config.max_retries`
+    /// retries (exponential backoff via `config.retry_backoff_ms`). Jobs
+    /// with an unmet dependency are skipped before any dispatch. `abort`
+    /// (from `fail_fast`) is rechecked between chunks, so at most one
+    /// chunk's worth of jobs can start after it triggers — with the
+    /// default `max_parallel == 1`, each chunk is a single job, exactly
+    /// reproducing sequential check-before-every-job `fail_fast` semantics.
+    /// `all_results` therefore groups each chunk's skipped-by-dependency or
+    /// skipped-by-abort entries with its executed ones in wave/chunk order,
+    /// rather than strict original priority order when both occur.
     ///
-    /// When `config.dry_run` is `true`, the method returns the plan without
-    /// invoking the executor (all results will be empty / stats zeroed).
+    /// When `config.dry_run` is `true`, the method returns one
+    /// [`JobResult::skipped`] entry per job (`stats.skipped_jobs` equal to
+    /// the total job count, all other stats zeroed) instead of invoking the
+    /// executor.
     ///
     /// # Errors
     ///
     /// - [`BatchError::EmptyBatch`] when there are no jobs.
     /// - Any planning error from [`plan`](Self::plan).
+    /// - [`BatchError::InvalidConfig`] if the worker pool cannot be built.
     pub fn execute(
         &self,
         executor: &JobExecutor,
@@ -552,7 +654,7 @@ impl BatchProcessor {
             let results: Vec<JobResult> = self
                 .jobs
                 .iter()
-                .map(|j| JobResult::failure(j.id, j.name.clone(), 0, "dry-run: not executed"))
+                .map(|j| JobResult::skipped(j.id, j.name.clone(), "dry-run: not executed"))
                 .collect();
             let stats = BatchStats {
                 total_jobs: self.jobs.len(),
@@ -580,26 +682,35 @@ impl BatchProcessor {
             .map(|j| (j.id, j.depends_on.as_slice()))
             .collect();
 
+        let max_retries = self.config.max_retries;
+        let retry_backoff_ms = self.config.retry_backoff_ms;
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(self.config.max_parallel)
+            .build()
+            .map_err(|e| BatchError::InvalidConfig(format!("failed to build worker pool: {e}")))?;
+
         for wave in &waves {
-            // Process jobs in the wave.  The wave is already sorted by priority
-            // descending (handled in compute_execution_waves).
+            // Resolve skips up front (sequential, cheap): everything left
+            // in `to_run` is independent within this wave and safe to
+            // dispatch to the worker pool below.
+            let mut to_run: Vec<usize> = Vec::with_capacity(wave.len());
+
             for &job_id in wave {
                 let job = match job_map.get(&job_id) {
-                    Some(j) => j,
+                    Some(j) => *j,
                     None => continue,
                 };
 
-                // If abort is set or any dependency failed, skip this job.
                 let unmet_dep = dep_map
                     .get(&job_id)
                     .map(|deps| deps.iter().any(|d| failed_ids.contains(d)))
                     .unwrap_or(false);
 
                 if abort || unmet_dep {
-                    all_results.push(JobResult::failure(
+                    all_results.push(JobResult::skipped(
                         job_id,
                         job.name.clone(),
-                        0,
                         if abort {
                             "skipped: fail_fast triggered"
                         } else {
@@ -607,54 +718,114 @@ impl BatchProcessor {
                         },
                     ));
                     stats.skipped_jobs += 1;
+                } else {
+                    to_run.push(job_id);
+                }
+            }
+
+            // Dispatch `to_run` in chunks of at most `max_parallel` jobs,
+            // rechecking `abort` between chunks. This bounds how much extra
+            // work can start after a fail_fast trigger to at most one
+            // chunk's worth (rather than the whole wave), and — critically
+            // — with the default `max_parallel == 1` each chunk holds
+            // exactly one job, exactly reproducing sequential
+            // check-before-every-job fail_fast semantics.
+            for chunk in to_run.chunks(self.config.max_parallel.max(1)) {
+                if abort {
+                    for &job_id in chunk {
+                        let name = job_map
+                            .get(&job_id)
+                            .map(|j| j.name.clone())
+                            .unwrap_or_else(|| format!("job-{job_id}"));
+                        all_results.push(JobResult::skipped(
+                            job_id,
+                            name,
+                            "skipped: fail_fast triggered",
+                        ));
+                        stats.skipped_jobs += 1;
+                    }
                     continue;
                 }
 
-                // Attempt execution with retries.
-                let mut attempt_result: Result<usize, String> = Err(String::new());
-                let mut elapsed_ms = 0u64;
+                let chunk_results: Vec<(usize, JobResult, bool)> = pool.install(|| {
+                    chunk
+                        .par_iter()
+                        .map(|&job_id| {
+                            let job = match job_map.get(&job_id) {
+                                Some(j) => *j,
+                                None => {
+                                    return (
+                                        job_id,
+                                        JobResult::failure(
+                                            job_id,
+                                            format!("job-{job_id}"),
+                                            0,
+                                            "internal error: job not found in job map",
+                                        ),
+                                        false,
+                                    );
+                                }
+                            };
 
-                for attempt in 0..=(self.config.max_retries) {
-                    let t0 = Instant::now();
-                    attempt_result = executor(job);
-                    elapsed_ms = t0.elapsed().as_millis() as u64;
+                            let mut attempt_result: Result<usize, String> = Err(String::new());
+                            let mut elapsed_ms = 0u64;
+                            let mut attempts_made = 0usize;
 
-                    match &attempt_result {
-                        Ok(_) => break,
-                        Err(_) => {
-                            if attempt < self.config.max_retries {
-                                // Will retry; reset elapsed for last attempt.
+                            for attempt in 0..=max_retries {
+                                let t0 = Instant::now();
+                                attempt_result = executor(job);
+                                elapsed_ms = t0.elapsed().as_millis() as u64;
+                                attempts_made += 1;
+
+                                if attempt_result.is_ok() {
+                                    break;
+                                }
+                                if attempt < max_retries && retry_backoff_ms > 0 {
+                                    let backoff_ms =
+                                        retry_backoff_ms.saturating_mul(1u64 << attempt.min(20));
+                                    std::thread::sleep(std::time::Duration::from_millis(
+                                        backoff_ms,
+                                    ));
+                                }
                             }
-                        }
-                    }
-                }
 
-                match attempt_result {
-                    Ok(items) => {
-                        all_results.push(JobResult::success(
-                            job_id,
-                            job.name.clone(),
-                            elapsed_ms,
-                            items,
-                        ));
+                            match attempt_result {
+                                Ok(items) => (
+                                    job_id,
+                                    JobResult::success(job_id, job.name.clone(), elapsed_ms, items)
+                                        .with_attempts(attempts_made),
+                                    true,
+                                ),
+                                Err(reason) => (
+                                    job_id,
+                                    JobResult::failure(
+                                        job_id,
+                                        job.name.clone(),
+                                        elapsed_ms,
+                                        reason,
+                                    )
+                                    .with_attempts(attempts_made),
+                                    false,
+                                ),
+                            }
+                        })
+                        .collect::<Vec<(usize, JobResult, bool)>>()
+                });
+
+                for (job_id, result, succeeded) in chunk_results {
+                    if succeeded {
                         stats.successful_jobs += 1;
-                        stats.total_duration_ms += elapsed_ms;
-                        stats.total_items_processed += items;
-                    }
-                    Err(reason) => {
-                        all_results.push(JobResult::failure(
-                            job_id,
-                            job.name.clone(),
-                            elapsed_ms,
-                            reason,
-                        ));
+                        stats.total_duration_ms += result.duration_ms;
+                        stats.total_items_processed += result.items_processed;
+                    } else {
                         stats.failed_jobs += 1;
-                        stats.total_duration_ms += elapsed_ms;
+                        stats.total_duration_ms += result.duration_ms;
                         failed_ids.insert(job_id);
                         if self.config.fail_fast {
                             abort = true;
                         }
                     }
+                    all_results.push(result);
                 }
             }
         }
@@ -677,20 +848,23 @@ impl BatchProcessor {
 
 /// Build a batch from a directory scan: one job per file matching an extension.
 ///
-/// This function validates the arguments but does **not** scan the filesystem;
-/// real scanning is the caller's responsibility.  It returns `Ok(vec![])` as
-/// a placeholder.
+/// Scans `dir` (non-recursively) for regular files whose extension matches
+/// `extension` (case-insensitively), sorted by file name for a
+/// deterministic, reproducible job order, and constructs one [`BatchJob`]
+/// per match with sequential IDs starting at `0`.
 ///
 /// # Arguments
 ///
-/// * `dir`        – Source directory path (must be non-empty).
+/// * `dir`        – Source directory path (must be non-empty and exist).
 /// * `extension`  – File extension to match without a leading dot (e.g., `"ply"`).
 /// * `output_dir` – Directory where output files should be written (must be non-empty).
 ///
 /// # Errors
 ///
-/// Returns [`BatchError::InvalidJobSpec`] if `dir`, `extension`, or `output_dir`
-/// is an empty string.
+/// - [`BatchError::InvalidJobSpec`] if `dir`, `extension`, or `output_dir`
+///   is an empty string.
+/// - [`BatchError::FileNotFound`] if `dir` cannot be read (does not exist,
+///   is not a directory, or is inaccessible).
 pub fn jobs_from_directory(
     dir: &str,
     extension: &str,
@@ -711,8 +885,43 @@ pub fn jobs_from_directory(
             "output directory must not be empty".to_string(),
         ));
     }
-    // Real implementation would call std::fs::read_dir(dir) here.
-    Ok(vec![])
+
+    let dir_path = Path::new(dir);
+    let entries =
+        std::fs::read_dir(dir_path).map_err(|_| BatchError::FileNotFound(dir.to_string()))?;
+
+    let mut matches: Vec<(String, PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let ext_matches = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case(extension))
+            .unwrap_or(false);
+        if !ext_matches {
+            continue;
+        }
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            matches.push((name.to_string(), path));
+        }
+    }
+    matches.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let output_root = Path::new(output_dir);
+    let jobs = matches
+        .into_iter()
+        .enumerate()
+        .map(|(idx, (name, path))| {
+            let input_path = path.to_string_lossy().to_string();
+            let output_path = output_root.join(&name).to_string_lossy().to_string();
+            BatchJob::new(idx, name, input_path, output_path)
+        })
+        .collect();
+
+    Ok(jobs)
 }
 
 /// Build a batch from an explicit list of input file paths.
@@ -752,20 +961,24 @@ pub fn jobs_from_file_list(
 
 /// Merge two [`BatchProcessor`] instances into a single one.
 ///
-/// Job IDs from `b` are offset by `a.job_count()` to prevent collisions.
-/// Dependency IDs within `b` are offset by the same amount.  The resulting
-/// processor uses the default [`BatchConfig`].
+/// Job IDs from `b` are offset by `a`'s highest existing ID plus one (not
+/// `a.job_count()`, which collides whenever `a`'s IDs are not contiguous
+/// from `0` — e.g. `a` holding ids `[0, 2]` has `job_count() == 2`, which
+/// would collide with `a`'s own job `2`). Dependency IDs within `b` are
+/// offset by the same amount. The resulting processor uses the default
+/// [`BatchConfig`] and re-validates all IDs are unique (see
+/// [`BatchProcessor::new`]).
 ///
 /// # Errors
 ///
 /// Propagates any validation error from constructing the merged processor.
 pub fn merge_batches(a: BatchProcessor, b: BatchProcessor) -> Result<BatchProcessor, BatchError> {
-    let offset = a.job_count();
+    let offset = a.jobs.iter().map(|j| j.id).max().map_or(0, |m| m + 1);
     let mut merged_jobs: Vec<BatchJob> = a.jobs;
 
     for job in b.jobs {
         let new_deps: Vec<usize> = job.depends_on.iter().map(|&d| d + offset).collect();
-        let mut new_job = BatchJob {
+        let new_job = BatchJob {
             id: job.id + offset,
             name: job.name,
             input_path: job.input_path,
@@ -774,8 +987,6 @@ pub fn merge_batches(a: BatchProcessor, b: BatchProcessor) -> Result<BatchProces
             depends_on: new_deps,
             priority: job.priority,
         };
-        // Ensure depends_on is updated before push.
-        new_job.depends_on = job.depends_on.iter().map(|&d| d + offset).collect();
         merged_jobs.push(new_job);
     }
 
@@ -894,6 +1105,8 @@ mod tests {
         assert!(r.error_message.is_none());
         assert_eq!(r.duration_ms, 250);
         assert_eq!(r.items_processed, 5000);
+        assert_eq!(r.attempts, 1);
+        assert!(!r.skipped);
     }
 
     #[test]
@@ -905,6 +1118,24 @@ mod tests {
         assert_eq!(r.error_message.as_deref(), Some("timeout"));
         assert_eq!(r.duration_ms, 100);
         assert_eq!(r.items_processed, 0);
+        assert_eq!(r.attempts, 1);
+        assert!(!r.skipped);
+    }
+
+    #[test]
+    fn test_job_result_skipped_fields() {
+        let r = JobResult::skipped(2, "skipped-job", "dependency failed");
+        assert_eq!(r.job_id, 2);
+        assert!(!r.success);
+        assert!(r.skipped);
+        assert_eq!(r.attempts, 0);
+        assert_eq!(r.error_message.as_deref(), Some("dependency failed"));
+    }
+
+    #[test]
+    fn test_job_result_with_attempts_builder() {
+        let r = JobResult::success(0, "job", 10, 1).with_attempts(3);
+        assert_eq!(r.attempts, 3);
     }
 
     // -----------------------------------------------------------------------
@@ -979,6 +1210,16 @@ mod tests {
     }
 
     #[test]
+    fn test_waves_duplicate_ids_rejected() {
+        let jobs = vec![
+            BatchJob::new(0, "a", "a.ply", "a_out.ply"),
+            BatchJob::new(0, "b", "b.ply", "b_out.ply"),
+        ];
+        let err = compute_execution_waves(&jobs).unwrap_err();
+        assert!(matches!(err, BatchError::InvalidJobSpec(_)));
+    }
+
+    #[test]
     fn test_waves_priority_ordering_within_wave() {
         // No dependencies: all in one wave, but priority should order them.
         let jobs = vec![
@@ -1002,6 +1243,7 @@ mod tests {
         assert_eq!(cfg.max_parallel, 1);
         assert!(!cfg.fail_fast);
         assert_eq!(cfg.max_retries, 0);
+        assert_eq!(cfg.retry_backoff_ms, 100);
         assert_eq!(cfg.verbosity, 1);
         assert!(!cfg.dry_run);
     }
@@ -1066,6 +1308,26 @@ mod tests {
         let mut proc = BatchProcessor::from_jobs(vec![]).expect("ok");
         let err = proc
             .add_job(BatchJob::new(0, "", "in.ply", "out.ply"))
+            .unwrap_err();
+        assert!(matches!(err, BatchError::InvalidJobSpec(_)));
+    }
+
+    #[test]
+    fn test_batch_processor_new_rejects_duplicate_ids() {
+        let jobs = vec![
+            BatchJob::new(0, "a", "a.ply", "a_out.ply"),
+            BatchJob::new(0, "b", "b.ply", "b_out.ply"),
+        ];
+        let err = BatchProcessor::new(jobs, BatchConfig::default()).unwrap_err();
+        assert!(matches!(err, BatchError::InvalidJobSpec(_)));
+    }
+
+    #[test]
+    fn test_batch_processor_add_job_rejects_duplicate_id() {
+        let mut proc = BatchProcessor::from_jobs(vec![BatchJob::new(0, "a", "a.ply", "a_out.ply")])
+            .expect("ok");
+        let err = proc
+            .add_job(BatchJob::new(0, "dup", "b.ply", "b_out.ply"))
             .unwrap_err();
         assert!(matches!(err, BatchError::InvalidJobSpec(_)));
     }
@@ -1161,6 +1423,97 @@ mod tests {
         assert_eq!(stats.failed_jobs, 1); // only the first job in wave 0 ran and failed
                                           // Remaining jobs should be skipped (not failed)
         assert!(stats.skipped_jobs >= 1);
+    }
+
+    #[test]
+    fn test_execute_dry_run_reports_skipped_not_failed() {
+        let jobs = vec![
+            BatchJob::new(0, "a", "a.ply", "a_out.ply"),
+            BatchJob::new(1, "b", "b.ply", "b_out.ply"),
+        ];
+        let config = BatchConfig {
+            dry_run: true,
+            ..Default::default()
+        };
+        let proc = BatchProcessor::new(jobs, config).expect("ok");
+        let executor: JobExecutor = Box::new(|_| Ok(1));
+        let (results, stats) = proc.execute(&executor).expect("dry run ok");
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|r| r.skipped));
+        assert!(results.iter().all(|r| !r.success));
+        assert_eq!(stats.skipped_jobs, 2);
+        assert_eq!(stats.successful_jobs, 0);
+        assert_eq!(stats.failed_jobs, 0);
+    }
+
+    #[test]
+    fn test_execute_fail_fast_default_max_parallel_matches_sequential_semantics() {
+        // With the default max_parallel == 1, two independent jobs in the
+        // same wave must still be processed one at a time: once the first
+        // fails with fail_fast set, the second must be *skipped*, not also
+        // executed (and failed) — regression guard for intra-wave
+        // parallelism accidentally racing fail_fast checks.
+        let jobs = vec![
+            BatchJob::new(0, "a", "a.ply", "a_out.ply"),
+            BatchJob::new(1, "b", "b.ply", "b_out.ply"),
+        ];
+        let config = BatchConfig {
+            fail_fast: true,
+            ..Default::default()
+        };
+        assert_eq!(config.max_parallel, 1);
+        let proc = BatchProcessor::new(jobs, config).expect("ok");
+        let executor: JobExecutor = Box::new(|_| Err("boom".to_string()));
+        let (_results, stats) = proc.execute(&executor).expect("execute ok");
+        assert_eq!(stats.failed_jobs, 1);
+        assert_eq!(stats.skipped_jobs, 1);
+    }
+
+    #[test]
+    fn test_execute_parallel_two_workers_runs_independent_jobs() {
+        let jobs = vec![
+            BatchJob::new(0, "a", "a.ply", "a_out.ply"),
+            BatchJob::new(1, "b", "b.ply", "b_out.ply"),
+            BatchJob::new(2, "c", "c.ply", "c_out.ply"),
+        ];
+        let config = BatchConfig {
+            max_parallel: 2,
+            ..Default::default()
+        };
+        let proc = BatchProcessor::new(jobs, config).expect("ok");
+        let executor: JobExecutor = Box::new(|_| Ok(1));
+        let (results, stats) = proc.execute(&executor).expect("execute ok");
+        assert_eq!(results.len(), 3);
+        assert_eq!(stats.successful_jobs, 3);
+        assert_eq!(stats.failed_jobs, 0);
+    }
+
+    #[test]
+    fn test_execute_retry_backoff_records_attempt_count() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let jobs = vec![BatchJob::new(0, "retry-job", "a.ply", "a_out.ply")];
+        let config = BatchConfig {
+            max_retries: 2,
+            retry_backoff_ms: 1,
+            ..Default::default()
+        };
+        let proc = BatchProcessor::new(jobs, config).expect("ok");
+        let cc = Arc::clone(&call_count);
+        let executor: JobExecutor = Box::new(move |_| {
+            let n = cc.fetch_add(1, Ordering::SeqCst);
+            if n < 2 {
+                Err("transient".to_string())
+            } else {
+                Ok(10)
+            }
+        });
+        let (results, _stats) = proc.execute(&executor).expect("ok");
+        assert_eq!(call_count.load(Ordering::SeqCst), 3);
+        assert!(results[0].success);
+        assert_eq!(results[0].attempts, 3);
     }
 
     #[test]
@@ -1326,9 +1679,48 @@ mod tests {
     }
 
     #[test]
-    fn test_jobs_from_directory_returns_empty_vec() {
-        let result = jobs_from_directory("/nonexistent", "ply", "/output").expect("ok");
-        assert!(result.is_empty()); // placeholder — no filesystem scan
+    fn test_jobs_from_directory_nonexistent_dir_errors() {
+        let result = jobs_from_directory(
+            "/oxigaf_test_nonexistent_dir_xyz_should_not_exist",
+            "ply",
+            "/output",
+        );
+        assert!(matches!(result, Err(BatchError::FileNotFound(_))));
+    }
+
+    #[test]
+    fn test_jobs_from_directory_scans_matching_files() {
+        let base = std::env::temp_dir().join("oxigaf_batch_processor_test_scan");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("create test dir");
+        std::fs::write(base.join("a.ply"), b"x").expect("write a.ply");
+        std::fs::write(base.join("b.ply"), b"x").expect("write b.ply");
+        std::fs::write(base.join("c.txt"), b"x").expect("write c.txt (should be ignored)");
+
+        let dir_str = base.to_string_lossy().to_string();
+        let jobs = jobs_from_directory(&dir_str, "ply", "/output").expect("scan ok");
+        assert_eq!(jobs.len(), 2);
+        let mut names: Vec<&str> = jobs.iter().map(|j| j.name.as_str()).collect();
+        names.sort();
+        assert_eq!(names, vec!["a.ply", "b.ply"]);
+        let mut ids: Vec<usize> = jobs.iter().map(|j| j.id).collect();
+        ids.sort();
+        assert_eq!(ids, vec![0, 1]);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_jobs_from_directory_empty_dir_scans_to_empty_jobs() {
+        let base = std::env::temp_dir().join("oxigaf_batch_processor_test_scan_empty");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("create test dir");
+
+        let dir_str = base.to_string_lossy().to_string();
+        let jobs = jobs_from_directory(&dir_str, "ply", "/output").expect("scan ok");
+        assert!(jobs.is_empty());
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     // -----------------------------------------------------------------------
@@ -1390,5 +1782,24 @@ mod tests {
         let waves = merged.plan().expect("plan ok");
         assert_eq!(waves.len(), 1);
         assert_eq!(waves[0].len(), 2);
+    }
+
+    #[test]
+    fn test_merge_batches_non_contiguous_ids_no_collision() {
+        // `a` has ids [0, 2] (a gap at 1); job_count() would wrongly compute
+        // offset = 2, colliding with a's own job id 2. The correct offset is
+        // max(id) + 1 = 3.
+        let a = BatchProcessor::from_jobs(vec![
+            BatchJob::new(0, "a0", "a0.ply", "a0_out.ply"),
+            BatchJob::new(2, "a2", "a2.ply", "a2_out.ply"),
+        ])
+        .expect("ok");
+        let b = BatchProcessor::from_jobs(vec![BatchJob::new(0, "b0", "b0.ply", "b0_out.ply")])
+            .expect("ok");
+
+        let merged = merge_batches(a, b).expect("merge should not collide");
+        let mut ids: Vec<usize> = merged.jobs.iter().map(|j| j.id).collect();
+        ids.sort();
+        assert_eq!(ids, vec![0, 2, 3]);
     }
 }

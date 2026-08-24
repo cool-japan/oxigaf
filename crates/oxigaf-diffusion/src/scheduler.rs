@@ -3,6 +3,7 @@
 //! Implements the deterministic DDIM sampling loop used by Stable Diffusion 2.1
 //! and the GAF multi-view diffusion model.
 
+use crate::{DiffusionError, DiffusionResult};
 use candle_core::{DType, Device, Result, Tensor};
 
 /// DDIM scheduler state.
@@ -38,9 +39,15 @@ impl DdimScheduler {
 
         let mut alphas_cumprod = Vec::with_capacity(num_train_timesteps);
         let mut cumprod = 1.0_f64;
+        // `num_train_timesteps == 1` would otherwise divide by
+        // `(1 - 1) as f64 == 0.0`, producing `0.0/0.0 = NaN` and poisoning
+        // every alpha with NaN (the loop body never runs at all when
+        // `num_train_timesteps == 0`, so that case needs no guard). A
+        // single-step schedule's only meaningful beta is `beta_start`
+        // itself, which this denominator choice produces exactly.
+        let denom = num_train_timesteps.saturating_sub(1).max(1) as f64;
         for i in 0..num_train_timesteps {
-            let beta = beta_start
-                + (beta_end - beta_start) * (i as f64) / ((num_train_timesteps - 1) as f64);
+            let beta = beta_start + (beta_end - beta_start) * (i as f64) / denom;
             let beta = beta * beta; // scaled-linear
             let alpha = 1.0 - beta;
             cumprod *= alpha;
@@ -56,9 +63,29 @@ impl DdimScheduler {
     }
 
     /// Configure evenly-spaced timesteps for a given number of inference steps.
-    pub fn set_timesteps(&mut self, num_inference_steps: usize) {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DiffusionError::InvalidConfig`] if `num_inference_steps` is
+    /// `0` (this used to panic with "attempt to divide by zero") or exceeds
+    /// `num_train_timesteps` (this used to silently truncate the integer
+    /// division to `step = 0`, emitting a schedule of `num_inference_steps`
+    /// identical zero timesteps instead of an error).
+    pub fn set_timesteps(&mut self, num_inference_steps: usize) -> DiffusionResult<()> {
+        if num_inference_steps == 0 {
+            return Err(DiffusionError::InvalidConfig(
+                "num_inference_steps must be > 0".to_string(),
+            ));
+        }
+        if num_inference_steps > self.num_train_timesteps {
+            return Err(DiffusionError::InvalidConfig(format!(
+                "num_inference_steps ({}) must not exceed num_train_timesteps ({})",
+                num_inference_steps, self.num_train_timesteps
+            )));
+        }
         let step = self.num_train_timesteps / num_inference_steps;
         self.timesteps = (0..num_inference_steps).rev().map(|i| i * step).collect();
+        Ok(())
     }
 
     /// Return the current list of timesteps (descending).
@@ -73,7 +100,31 @@ impl DdimScheduler {
     /// - `sample`: the current noisy latent x_t.
     ///
     /// Returns the denoised latent x_{t-1}.
-    pub fn step(&self, model_output: &Tensor, t: usize, sample: &Tensor) -> Result<Tensor> {
+    ///
+    /// # Errors
+    ///
+    /// - [`DiffusionError::InvalidTimestep`] if `t >= num_train_timesteps`
+    ///   (this used to index `alphas_cumprod[t]` unchecked and panic).
+    /// - [`DiffusionError::SchedulerNotInitialized`] if [`Self::set_timesteps`]
+    ///   was never called (this used to divide by
+    ///   `self.timesteps.len() == 0` and panic).
+    /// - [`DiffusionError::Candle`] if an underlying tensor operation fails.
+    pub fn step(
+        &self,
+        model_output: &Tensor,
+        t: usize,
+        sample: &Tensor,
+    ) -> DiffusionResult<Tensor> {
+        if t >= self.num_train_timesteps {
+            return Err(DiffusionError::InvalidTimestep {
+                value: t,
+                max: self.num_train_timesteps.saturating_sub(1),
+            });
+        }
+        if self.timesteps.is_empty() {
+            return Err(DiffusionError::SchedulerNotInitialized);
+        }
+
         let alpha_prod_t = self.alphas_cumprod[t];
         let alpha_prod_t_prev = if t > 0 {
             // find previous timestep
@@ -115,17 +166,37 @@ impl DdimScheduler {
         let sqrt_one_minus_alpha_prod_prev = (1.0 - alpha_prod_t_prev).sqrt();
 
         // x_{t-1} = sqrt(α_{t-1}) · x_0 + sqrt(1-α_{t-1}) · ε
-        (&pred_x0 * sqrt_alpha_prod_prev)? + (&pred_epsilon * sqrt_one_minus_alpha_prod_prev)?
+        let prev_sample = ((&pred_x0 * sqrt_alpha_prod_prev)?
+            + (&pred_epsilon * sqrt_one_minus_alpha_prod_prev)?)?;
+        Ok(prev_sample)
     }
 
     /// Add noise to latents for a given timestep (forward diffusion process).
     ///
     /// x_t = sqrt(α_t) · x_0 + sqrt(1-α_t) · noise
-    pub fn add_noise(&self, original: &Tensor, noise: &Tensor, timestep: usize) -> Result<Tensor> {
+    ///
+    /// # Errors
+    ///
+    /// - [`DiffusionError::InvalidTimestep`] if `timestep >= num_train_timesteps`
+    ///   (this used to index `alphas_cumprod[timestep]` unchecked and panic).
+    /// - [`DiffusionError::Candle`] if an underlying tensor operation fails.
+    pub fn add_noise(
+        &self,
+        original: &Tensor,
+        noise: &Tensor,
+        timestep: usize,
+    ) -> DiffusionResult<Tensor> {
+        if timestep >= self.num_train_timesteps {
+            return Err(DiffusionError::InvalidTimestep {
+                value: timestep,
+                max: self.num_train_timesteps.saturating_sub(1),
+            });
+        }
         let alpha = self.alphas_cumprod[timestep];
         let sqrt_alpha = alpha.sqrt();
         let sqrt_one_minus_alpha = (1.0 - alpha).sqrt();
-        (original * sqrt_alpha)? + (noise * sqrt_one_minus_alpha)?
+        let noisy = ((original * sqrt_alpha)? + (noise * sqrt_one_minus_alpha)?)?;
+        Ok(noisy)
     }
 
     /// Create a tensor of timestep values on the given device.

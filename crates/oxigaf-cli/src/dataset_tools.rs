@@ -136,11 +136,17 @@ impl FileEntry {
     }
 
     /// Return the lowercase file extension (empty string if none).
-    pub fn extension(&self) -> &str {
-        // Compute lazily from the path's extension bytes.
-        // We need to return a `&str` with the lifetime of `self`.
-        // Store the result of lossy conversion by referencing the path's OsStr.
-        self.path.extension().and_then(|s| s.to_str()).unwrap_or("")
+    ///
+    /// Returns an owned `String` (rather than borrowing from `self.path`)
+    /// because lowercasing an extension that contains uppercase bytes
+    /// necessarily allocates; `entry.extension() == "png"` still works via
+    /// `PartialEq<str>`/`PartialEq<&str>` on `String`.
+    pub fn extension(&self) -> String {
+        self.path
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(str::to_lowercase)
+            .unwrap_or_default()
     }
 }
 
@@ -283,8 +289,12 @@ pub struct SplitConfig {
     pub test_ratio: f32,
     /// Seed for the xorshift64 PRNG used when shuffling.
     pub seed: u64,
-    /// Whether to shuffle indices before splitting.
+    /// Whether to shuffle indices before splitting. Ignored when `strategy`
+    /// is [`DatasetSplitStrategy::Sequential`] (original order is kept).
     pub shuffle: bool,
+    /// How indices are ordered before slicing into train/val/test ranges.
+    /// See [`split_dataset`] for the exact semantics of each variant.
+    pub strategy: DatasetSplitStrategy,
 }
 
 impl Default for SplitConfig {
@@ -295,6 +305,7 @@ impl Default for SplitConfig {
             test_ratio: 0.1,
             seed: 42,
             shuffle: true,
+            strategy: DatasetSplitStrategy::Random,
         }
     }
 }
@@ -304,19 +315,36 @@ impl Default for SplitConfig {
 // ---------------------------------------------------------------------------
 
 /// Strategy controlling how entries are assigned to splits.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DatasetSplitStrategy {
     /// Shuffle the dataset then assign contiguous ranges to each split.
     Random,
-    /// Assign the first N% to train, next M% to val, remainder to test.
+    /// Assign the first N% to train, next M% to val, remainder to test, in
+    /// original scan order (`SplitConfig::shuffle` is ignored).
     Sequential,
-    /// Stratified split (not yet implemented; falls back to `Random`).
+    /// Stratified split: hold each group of a caller-supplied key together
+    /// within its own train/val/test slice, so no single key is spread
+    /// unevenly across splits.
+    ///
+    /// [`split_dataset`] takes only an item *count* (`n: usize`), with no
+    /// per-item labels to stratify on; requesting this strategy through
+    /// that entry point logs a warning and falls back to the same behaviour
+    /// as [`DatasetSplitStrategy::Random`]. Callers that have a stratum key
+    /// per item should call [`split_dataset_stratified`] directly instead,
+    /// which performs a real per-group split.
     Stratified,
 }
 
 // ---------------------------------------------------------------------------
 // DatasetScanner
 // ---------------------------------------------------------------------------
+
+/// Maximum directory recursion depth for [`DatasetScanner::scan`].
+///
+/// A backstop against pathological/adversarial directory trees; the primary
+/// cycle guard is the canonicalised visited-path set in `scan_dir`, which
+/// alone is sufficient to stop a genuine symlink cycle.
+const MAX_SCAN_DEPTH: usize = 128;
 
 /// Configurable directory scanner that produces [`FileEntry`] lists.
 pub struct DatasetScanner {
@@ -360,6 +388,11 @@ impl DatasetScanner {
     }
 
     /// Scan `dir` and return all matching [`FileEntry`] records sorted by path.
+    ///
+    /// Symlinked files and directories are resolved and scanned like real
+    /// entries (a common way to assemble a dataset without copying files);
+    /// recursion into symlinked directories is guarded against cycles by a
+    /// canonicalised visited-path set plus [`MAX_SCAN_DEPTH`].
     pub fn scan(&self, dir: &Path) -> Result<Vec<FileEntry>, DatasetError> {
         if !dir.exists() || !dir.is_dir() {
             return Err(DatasetError::DirectoryNotFound {
@@ -367,7 +400,8 @@ impl DatasetScanner {
             });
         }
         let mut entries = Vec::new();
-        self.scan_dir(dir, &mut entries)?;
+        let mut visited = HashSet::new();
+        self.scan_dir(dir, &mut entries, &mut visited, 0)?;
         entries.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(entries)
     }
@@ -386,15 +420,46 @@ impl DatasetScanner {
     }
 
     // Internal recursive scan implementation.
-    fn scan_dir(&self, dir: &Path, out: &mut Vec<FileEntry>) -> Result<(), DatasetError> {
+    //
+    // `DirEntry::metadata` does not follow symlinks (on Unix it is
+    // equivalent to `symlink_metadata`), so a symlink entry's `meta.is_dir()`
+    // and `meta.is_file()` are both `false` and it used to be silently
+    // dropped without recursing into it or recording it. Resolve the link
+    // target explicitly via `std::fs::metadata` (which *does* follow
+    // symlinks) and treat it as whatever it points to. `visited` (populated
+    // with canonicalised directory paths) plus `MAX_SCAN_DEPTH` guard
+    // against a symlink cycle causing an infinite loop or stack overflow.
+    fn scan_dir(
+        &self,
+        dir: &Path,
+        out: &mut Vec<FileEntry>,
+        visited: &mut HashSet<PathBuf>,
+        depth: usize,
+    ) -> Result<(), DatasetError> {
+        if depth > MAX_SCAN_DEPTH {
+            return Ok(());
+        }
+        if let Ok(canonical) = dir.canonicalize() {
+            if !visited.insert(canonical) {
+                return Ok(()); // already visited this real directory: cycle
+            }
+        }
+
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
-            let meta = entry.metadata()?;
+            let mut meta = entry.metadata()?;
+
+            if meta.file_type().is_symlink() {
+                match std::fs::metadata(&path) {
+                    Ok(target_meta) => meta = target_meta,
+                    Err(_) => continue, // broken symlink target: skip
+                }
+            }
 
             if meta.is_dir() {
                 if self.recursive {
-                    self.scan_dir(&path, out)?;
+                    self.scan_dir(&path, out, visited, depth + 1)?;
                 }
                 continue;
             }
@@ -529,9 +594,16 @@ pub fn shuffle_indices(indices: &mut [usize], seed: u64) {
 
 /// Partition `n` items into train/val/test subsets using the supplied [`SplitConfig`].
 ///
-/// The split ratios must sum to approximately 1.0 (within 1e-4). When
-/// `config.shuffle` is `true` the indices are shuffled with [`shuffle_indices`]
-/// before being divided.
+/// The split ratios must sum to approximately 1.0 (within 1e-4).
+/// [`SplitConfig::strategy`] selects how indices are ordered before slicing
+/// into contiguous train/val/test ranges:
+/// - [`DatasetSplitStrategy::Random`] (default): shuffle with
+///   [`shuffle_indices`] when `config.shuffle` is `true`.
+/// - [`DatasetSplitStrategy::Sequential`]: keep the original `0..n` order;
+///   `config.shuffle` is ignored.
+/// - [`DatasetSplitStrategy::Stratified`]: this entry point has no per-item
+///   labels to stratify on, so it logs a warning and behaves like `Random`.
+///   Use [`split_dataset_stratified`] for a real per-group split.
 pub fn split_dataset(n: usize, config: &SplitConfig) -> Result<DatasetSplit, DatasetError> {
     let sum = config.train_ratio + config.val_ratio + config.test_ratio;
     if (sum - 1.0_f32).abs() >= 1e-4 {
@@ -554,16 +626,123 @@ pub fn split_dataset(n: usize, config: &SplitConfig) -> Result<DatasetSplit, Dat
 
     let mut indices: Vec<usize> = (0..n).collect();
 
-    if config.shuffle {
-        shuffle_indices(&mut indices, config.seed);
+    match config.strategy {
+        DatasetSplitStrategy::Sequential => {
+            // Keep the original 0..n order; config.shuffle is ignored.
+        }
+        DatasetSplitStrategy::Random => {
+            if config.shuffle {
+                shuffle_indices(&mut indices, config.seed);
+            }
+        }
+        DatasetSplitStrategy::Stratified => {
+            tracing::warn!(
+                "DatasetSplitStrategy::Stratified was requested via split_dataset(), which \
+                 has no per-item labels to stratify on; falling back to Random. Use \
+                 split_dataset_stratified() for a real per-group stratified split."
+            );
+            if config.shuffle {
+                shuffle_indices(&mut indices, config.seed);
+            }
+        }
     }
 
+    let (train_indices, val_indices, test_indices) = slice_into_splits(&indices, config);
+
+    Ok(DatasetSplit {
+        train_indices,
+        val_indices,
+        test_indices,
+        total_items: n,
+    })
+}
+
+/// Split a caller-ordered slice of indices into contiguous train/val/test
+/// ranges using `config`'s ratios. Shared by [`split_dataset`] and
+/// [`split_dataset_stratified`] so both apply ratios identically.
+fn slice_into_splits(
+    indices: &[usize],
+    config: &SplitConfig,
+) -> (Vec<usize>, Vec<usize>, Vec<usize>) {
+    let n = indices.len();
     let train_end = (n as f32 * config.train_ratio).floor() as usize;
     let val_end = train_end + (n as f32 * config.val_ratio).floor() as usize;
 
-    let train_indices = indices[..train_end].to_vec();
-    let val_indices = indices[train_end..val_end].to_vec();
-    let test_indices = indices[val_end..].to_vec();
+    (
+        indices[..train_end].to_vec(),
+        indices[train_end..val_end].to_vec(),
+        indices[val_end..].to_vec(),
+    )
+}
+
+/// Partition items into train/val/test subsets while keeping each `key`
+/// group (e.g. a subject/scene identifier) from being spread unevenly
+/// across splits: [`SplitConfig`]'s ratios are applied independently within
+/// every distinct key, and the resulting index sets are concatenated.
+///
+/// `keys[i]` is the stratification label for item `i`; `keys.len()`
+/// determines `n` (there is no separate item count to pass). Within each
+/// group, indices are shuffled with a group-specific derivative of
+/// `config.seed` when `config.shuffle` is `true` (ignored for
+/// [`DatasetSplitStrategy::Sequential`], same as [`split_dataset`]).
+///
+/// # Errors
+/// Returns [`DatasetError::InvalidSplitRatios`] under the same condition as
+/// [`split_dataset`].
+pub fn split_dataset_stratified<K: std::hash::Hash + Eq + Ord + Clone>(
+    keys: &[K],
+    config: &SplitConfig,
+) -> Result<DatasetSplit, DatasetError> {
+    let sum = config.train_ratio + config.val_ratio + config.test_ratio;
+    if (sum - 1.0_f32).abs() >= 1e-4 {
+        return Err(DatasetError::InvalidSplitRatios {
+            train: config.train_ratio,
+            val: config.val_ratio,
+            test: config.test_ratio,
+            sum,
+        });
+    }
+
+    let n = keys.len();
+    if n == 0 {
+        return Ok(DatasetSplit {
+            train_indices: vec![],
+            val_indices: vec![],
+            test_indices: vec![],
+            total_items: 0,
+        });
+    }
+
+    // Group item indices by key. A `BTreeMap` (rather than a `HashMap`)
+    // keeps group iteration order deterministic across runs regardless of
+    // `K`'s hash implementation, which keeps the group-specific seed
+    // derivation below reproducible.
+    let mut groups: std::collections::BTreeMap<K, Vec<usize>> = std::collections::BTreeMap::new();
+    for (idx, key) in keys.iter().enumerate() {
+        groups.entry(key.clone()).or_default().push(idx);
+    }
+
+    let shuffle = !matches!(config.strategy, DatasetSplitStrategy::Sequential) && config.shuffle;
+
+    let mut train_indices = Vec::new();
+    let mut val_indices = Vec::new();
+    let mut test_indices = Vec::new();
+
+    for (group_idx, (_key, mut group)) in groups.into_iter().enumerate() {
+        if shuffle {
+            // Derive a distinct-but-reproducible seed per group so that
+            // groups don't all shuffle identically (which would otherwise
+            // correlate their train/val/test boundaries).
+            let group_seed = config
+                .seed
+                .wrapping_add((group_idx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            shuffle_indices(&mut group, group_seed);
+        }
+        let (mut g_train, mut g_val, mut g_test) = slice_into_splits(&group, config);
+        train_indices.append(&mut g_train);
+        val_indices.append(&mut g_val);
+        test_indices.append(&mut g_test);
+    }
 
     Ok(DatasetSplit {
         train_indices,
@@ -1086,6 +1265,7 @@ mod tests {
             test_ratio: 0.2,
             seed: 1,
             shuffle: true,
+            strategy: DatasetSplitStrategy::Random,
         };
         assert!(matches!(
             split_dataset(10, &config),
@@ -1155,6 +1335,127 @@ mod tests {
         };
         let split = split_dataset(10, &config).expect("split ok");
         // With no shuffle, train gets indices 0..7 (floor(10*0.8)=8)
+        assert_eq!(split.train_indices, vec![0, 1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    // Regression coverage for: `DatasetSplitStrategy` was defined and
+    // re-exported but `SplitConfig` had no field for it, so it could never
+    // be read -- selecting `Sequential` had no effect at all.
+    #[test]
+    fn test_split_sequential_strategy_ignores_shuffle_flag() {
+        let config = SplitConfig {
+            strategy: DatasetSplitStrategy::Sequential,
+            shuffle: true, // must be ignored by Sequential
+            seed: 12345,
+            ..Default::default()
+        };
+        let split = split_dataset(10, &config).expect("split ok");
+        assert_eq!(split.train_indices, vec![0, 1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(split.val_indices, vec![8]);
+        assert_eq!(split.test_indices, vec![9]);
+    }
+
+    #[test]
+    fn test_split_random_strategy_is_default_and_shuffles() {
+        let config = SplitConfig {
+            strategy: DatasetSplitStrategy::Random,
+            shuffle: true,
+            seed: 7,
+            ..Default::default()
+        };
+        let split = split_dataset(20, &config).expect("split ok");
+        assert_ne!(
+            split.train_indices,
+            vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+            "Random with shuffle=true should (almost certainly) not be sequential order"
+        );
+    }
+
+    // Regression coverage for: the `Stratified` variant's doc claimed it
+    // "falls back to Random", but no code read the enum at all, so
+    // selecting it silently produced no fallback and no error. It must now
+    // actually behave like the documented fallback when driven through
+    // `split_dataset` (which has no per-item labels to truly stratify on).
+    #[test]
+    fn test_split_stratified_via_split_dataset_falls_back_sanely() {
+        let config = SplitConfig {
+            strategy: DatasetSplitStrategy::Stratified,
+            shuffle: false,
+            ..Default::default()
+        };
+        let split = split_dataset(10, &config).expect("split ok");
+        let covered = split.train_count() + split.val_count() + split.test_count();
+        assert_eq!(covered, 10, "fallback must still produce a complete split");
+        assert!(validate_split(&split).is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // split_dataset_stratified: real per-group stratified splitting
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_split_dataset_stratified_keeps_ratio_within_each_group() {
+        // Two groups of 10 items each ("a" and "b"); each group's 80/10/10
+        // split should be computed independently, not against the pooled 20.
+        let keys: Vec<&str> = (0..10).map(|_| "a").chain((0..10).map(|_| "b")).collect();
+        let config = SplitConfig::default();
+        let split = split_dataset_stratified(&keys, &config).expect("split ok");
+
+        assert_eq!(split.total_items, 20);
+        assert_eq!(split.train_count(), 16); // 8 from each group
+        assert_eq!(split.val_count(), 2); // 1 from each group
+        assert_eq!(split.test_count(), 2); // 1 from each group
+        assert!(validate_split(&split).is_ok());
+
+        // Every train index must resolve to a real key, and both groups
+        // must be represented in the train set (not just the larger-index
+        // group), proving the split was computed per-group.
+        let group_a_in_train = split
+            .train_indices
+            .iter()
+            .filter(|&&i| keys[i] == "a")
+            .count();
+        let group_b_in_train = split
+            .train_indices
+            .iter()
+            .filter(|&&i| keys[i] == "b")
+            .count();
+        assert_eq!(group_a_in_train, 8);
+        assert_eq!(group_b_in_train, 8);
+    }
+
+    #[test]
+    fn test_split_dataset_stratified_empty_keys() {
+        let keys: Vec<&str> = vec![];
+        let config = SplitConfig::default();
+        let split = split_dataset_stratified(&keys, &config).expect("split ok");
+        assert_eq!(split.total_items, 0);
+    }
+
+    #[test]
+    fn test_split_dataset_stratified_invalid_ratios() {
+        let keys = vec!["a", "b", "c"];
+        let config = SplitConfig {
+            train_ratio: 0.5,
+            val_ratio: 0.5,
+            test_ratio: 0.5,
+            ..Default::default()
+        };
+        assert!(matches!(
+            split_dataset_stratified(&keys, &config),
+            Err(DatasetError::InvalidSplitRatios { .. })
+        ));
+    }
+
+    #[test]
+    fn test_split_dataset_stratified_sequential_ignores_shuffle() {
+        let keys: Vec<&str> = (0..10).map(|_| "a").collect();
+        let config = SplitConfig {
+            strategy: DatasetSplitStrategy::Sequential,
+            shuffle: true,
+            ..Default::default()
+        };
+        let split = split_dataset_stratified(&keys, &config).expect("split ok");
         assert_eq!(split.train_indices, vec![0, 1, 2, 3, 4, 5, 6, 7]);
     }
 
@@ -1506,6 +1807,84 @@ mod tests {
         let scanner = DatasetScanner::new().with_recursive(false);
         let entries = scanner.scan(&dir).expect("scan ok");
         assert_eq!(entries.len(), 1);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // Regression coverage for: `DirEntry::metadata` does not follow
+    // symlinks, so a symlinked file used to be silently dropped (matched
+    // neither `is_dir()` nor `is_file()`) instead of being scanned like a
+    // real file.
+    #[cfg(unix)]
+    #[test]
+    fn test_scanner_follows_symlinked_file() {
+        use std::os::unix::fs::symlink;
+
+        let dir = make_temp_dir();
+        let real_dir = make_temp_dir();
+        let real_file = write_temp_file(&real_dir, "real.png", b"real");
+        symlink(&real_file, dir.join("linked.png")).expect("create symlink");
+
+        let scanner = DatasetScanner::new();
+        let entries = scanner.scan(&dir).expect("scan ok");
+        assert_eq!(
+            entries.len(),
+            1,
+            "symlinked file must be scanned, not silently skipped"
+        );
+        assert_eq!(entries[0].name, "linked.png");
+
+        fs::remove_dir_all(&dir).ok();
+        fs::remove_dir_all(&real_dir).ok();
+    }
+
+    // Regression coverage for the same bug, but for a symlinked *directory*
+    // (a common way to assemble a dataset from frames/subdirs living
+    // elsewhere without copying them).
+    #[cfg(unix)]
+    #[test]
+    fn test_scanner_follows_symlinked_directory() {
+        use std::os::unix::fs::symlink;
+
+        let dir = make_temp_dir();
+        let real_dir = make_temp_dir();
+        write_temp_file(&real_dir, "nested.png", b"nested");
+        symlink(&real_dir, dir.join("linked_dir")).expect("create symlink");
+
+        let scanner = DatasetScanner::new().with_recursive(true);
+        let entries = scanner.scan(&dir).expect("scan ok");
+        assert_eq!(
+            entries.len(),
+            1,
+            "file inside a symlinked directory must be found via recursion"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+        fs::remove_dir_all(&real_dir).ok();
+    }
+
+    // A symlink cycle (a directory symlinking back to one of its own
+    // ancestors) must terminate instead of recursing forever.
+    #[cfg(unix)]
+    #[test]
+    fn test_scanner_symlink_cycle_terminates() {
+        use std::os::unix::fs::symlink;
+
+        let dir = make_temp_dir();
+        write_temp_file(&dir, "top.png", b"top");
+        // `dir/self_link` -> `dir` (a direct cycle back to the scan root).
+        symlink(&dir, dir.join("self_link")).expect("create symlink cycle");
+
+        let scanner = DatasetScanner::new().with_recursive(true);
+        let result = scanner.scan(&dir);
+        assert!(result.is_ok(), "a symlink cycle must not error the scan");
+        let entries = result.expect("scan ok");
+        assert_eq!(
+            entries.len(),
+            1,
+            "the cycle must not be traversed more than once (found: {:?})",
+            entries.iter().map(|e| &e.name).collect::<Vec<_>>()
+        );
+
         fs::remove_dir_all(&dir).ok();
     }
 

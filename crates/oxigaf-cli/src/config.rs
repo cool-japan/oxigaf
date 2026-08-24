@@ -81,6 +81,37 @@ impl Default for DeviceSection {
     }
 }
 
+impl DeviceSection {
+    /// Map the configured backend name to a `wgpu::Backends` bitflag.
+    ///
+    /// Recognises `"vulkan"`, `"metal"`, `"dx12"`/`"d3d12"`, and
+    /// `"gl"`/`"opengl"` (case-insensitively); anything else -- including an
+    /// empty string -- maps to `wgpu::Backends::all()` (auto-select).
+    ///
+    /// # Caution for callers
+    ///
+    /// [`DeviceSection::backend`] currently defaults to the literal string
+    /// `"vulkan"` (see [`DeviceSection::default`]), not an `Option`, so this
+    /// function cannot distinguish "the user explicitly asked for Vulkan"
+    /// from "the field is sitting at its baked-in default". Wiring this
+    /// unconditionally into `pipeline::request_gpu_device` would therefore
+    /// request a Vulkan-only instance for every user who has never touched
+    /// `[device]`, which has no adapters on macOS (Metal-only) and would
+    /// regress GPU detection there. Only apply the mapped value when some
+    /// other signal indicates the user actually chose a backend, or change
+    /// `DeviceSection::backend` to `Option<String>` with no default first.
+    #[allow(dead_code)] // not yet wired into pipeline::request_gpu_device; see followups.
+    pub fn to_wgpu_backends(&self) -> wgpu::Backends {
+        match self.backend.to_ascii_lowercase().as_str() {
+            "vulkan" => wgpu::Backends::VULKAN,
+            "metal" => wgpu::Backends::METAL,
+            "dx12" | "d3d12" => wgpu::Backends::DX12,
+            "gl" | "opengl" => wgpu::Backends::GL,
+            _ => wgpu::Backends::all(),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // [training]
 // ---------------------------------------------------------------------------
@@ -400,19 +431,32 @@ impl ProjectConfig {
 /// 3. Project config file (./oxigaf.toml)
 /// 4. User config file (~/.config/oxigaf/config.toml)
 /// 5. Default values (lowest)
+///
+/// Layers 1-3 (below) are merged as raw TOML *tables* before anything is
+/// deserialised into a [`ProjectConfig`]. This matters: once a layer has
+/// been deserialised, "a field was explicitly written to a value that
+/// happens to equal the struct default" and "a field was never mentioned"
+/// become indistinguishable, because `#[serde(default)]` has already filled
+/// in a concrete value either way. A struct-level "does this differ from
+/// the default?" merge (as used for layer 5 below, and as this function
+/// used to do for every layer) therefore silently keeps the lower-priority
+/// layer's value whenever the higher-priority layer's value happens to
+/// equal the default -- inverting the documented priority order for that
+/// case. Merging TOML tables directly avoids this: a key that no layer
+/// mentions simply stays absent from the merged table, and defaults are
+/// applied exactly once, in the final deserialisation.
 pub fn load_hierarchical_config(
     cli_config_path: Option<&Path>,
     override_values: Option<&ProjectConfig>,
 ) -> Result<ProjectConfig> {
-    // Start with defaults
-    let mut config = ProjectConfig::default();
+    let mut merged_toml = toml::Value::Table(toml::map::Map::new());
 
     // Layer 1: User config (~/.config/oxigaf/config.toml)
     if let Some(user_config_path) = get_user_config_path() {
         if user_config_path.exists() {
             tracing::debug!("Loading user config from: {}", user_config_path.display());
-            let user_config = load_config_from_file(&user_config_path)?;
-            config = merge_configs(config, user_config);
+            let user_value = load_toml_value(&user_config_path)?;
+            merged_toml = merge_toml_values(merged_toml, user_value);
         }
     }
 
@@ -423,23 +467,55 @@ pub fn load_hierarchical_config(
             "Loading project config from: {}",
             project_config_path.display()
         );
-        let project_config = load_config_from_file(&project_config_path)?;
-        config = merge_configs(config, project_config);
+        let project_value = load_toml_value(&project_config_path)?;
+        merged_toml = merge_toml_values(merged_toml, project_value);
     }
 
-    // Layer 3: CLI-specified config file
+    // Layer 3: CLI-specified config file.
+    //
+    // `TrainArgs::config` (cli.rs) has `#[arg(default_value = "oxigaf.toml")]`
+    // rather than being an `Option`, so `cli_config_path` is *always*
+    // `Some(..)` in practice, even when the user never passed `--config`.
+    // Treat a missing path as "no project config file" (fall back to
+    // whatever earlier layers / defaults already produced) only when it is
+    // that implicit default name; a missing path the user explicitly named
+    // is still a hard error.
     if let Some(path) = cli_config_path {
-        tracing::debug!("Loading CLI-specified config from: {}", path.display());
-        let cli_file_config = load_config_from_file(path)?;
-        config = merge_configs(config, cli_file_config);
+        if path.exists() {
+            tracing::debug!("Loading CLI-specified config from: {}", path.display());
+            let cli_value = load_toml_value(path)?;
+            merged_toml = merge_toml_values(merged_toml, cli_value);
+        } else if is_default_config_name(path) {
+            tracing::debug!(
+                "CLI-specified config {} not found; using values from earlier layers/defaults",
+                path.display()
+            );
+        } else {
+            anyhow::bail!("Config file not found: {}", path.display());
+        }
     }
+
+    let mut config: ProjectConfig = merged_toml
+        .try_into()
+        .context("Failed to materialise merged configuration")?;
 
     // Layer 4: Environment variables
     config = apply_env_overrides(config)?;
 
     // Layer 5: CLI arguments (always take priority, regardless of value)
     // Note: For actual CLI usage, it's recommended to apply CLI overrides
-    // directly after calling this function with override_values=None
+    // directly after calling this function with override_values=None.
+    //
+    // Unlike layers 1-3 above, this layer necessarily still uses the
+    // struct-level "differs from default" merge (`merge_configs`): the
+    // caller hands us an already-materialised `ProjectConfig`, which -- like
+    // any deserialised layer -- has no way left to represent "this field
+    // was intentionally left unset". That is a known, narrower limitation
+    // of this specific parameter (its own doc note below), not the general
+    // bug the TOML-table merge above fixes for file-based layers; it is
+    // primarily used by tests; production CLI overrides are applied by the
+    // caller field-by-field after this function returns, which has no such
+    // ambiguity.
     if let Some(overrides) = override_values {
         // For override_values, we do a simple overlay: any field that's been
         // explicitly set in the override takes priority. Since we can't detect
@@ -453,6 +529,18 @@ pub fn load_hierarchical_config(
     Ok(config)
 }
 
+/// Whether a missing `cli_config_path` in [`load_hierarchical_config`] should
+/// be treated as "no CLI-specified config file" (fall back to whatever
+/// earlier layers / defaults already produced) rather than a hard error.
+///
+/// True only for the implicit default file name (`TrainArgs::config`'s
+/// `default_value = "oxigaf.toml"`, regardless of which directory it is
+/// joined with) -- a path the user explicitly named that turns out to be
+/// missing is always an error.
+fn is_default_config_name(path: &Path) -> bool {
+    path.ends_with("oxigaf.toml")
+}
+
 /// Get user config path (~/.config/oxigaf/config.toml)
 fn get_user_config_path() -> Option<PathBuf> {
     let mut path = dirs::config_dir()?;
@@ -461,13 +549,38 @@ fn get_user_config_path() -> Option<PathBuf> {
     Some(path)
 }
 
-/// Load config from a file without checking if it's the default oxigaf.toml
-fn load_config_from_file(path: &Path) -> Result<ProjectConfig> {
+/// Load a config file as a raw [`toml::Value`], without deserialising into
+/// [`ProjectConfig`]. Used so hierarchical file layers can be deep-merged as
+/// TOML tables (see [`merge_toml_values`]) before a single final
+/// deserialisation into a concrete config.
+fn load_toml_value(path: &Path) -> Result<toml::Value> {
     let contents = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read config file: {}", path.display()))?;
-    let config: ProjectConfig = toml::from_str(&contents)
-        .with_context(|| format!("Failed to parse config file: {}", path.display()))?;
-    Ok(config)
+    toml::from_str(&contents)
+        .with_context(|| format!("Failed to parse config file: {}", path.display()))
+}
+
+/// Deep-merge two TOML values: when both sides are tables, recursively merge
+/// key by key with `overlay` winning on any key present in both; otherwise
+/// `overlay` replaces `base` outright (this also covers a key present as a
+/// table on one side and a scalar/array on the other -- the overlay's shape
+/// wins). This lets a higher-priority config layer override a single leaf
+/// key (e.g. `training.total_iterations`) without needing to repeat every
+/// other key from lower-priority layers.
+fn merge_toml_values(base: toml::Value, overlay: toml::Value) -> toml::Value {
+    match (base, overlay) {
+        (toml::Value::Table(mut base_table), toml::Value::Table(overlay_table)) => {
+            for (key, overlay_value) in overlay_table {
+                let merged = match base_table.remove(&key) {
+                    Some(base_value) => merge_toml_values(base_value, overlay_value),
+                    None => overlay_value,
+                };
+                base_table.insert(key, merged);
+            }
+            toml::Value::Table(base_table)
+        }
+        (_, overlay_value) => overlay_value,
+    }
 }
 
 /// Merge two configs (second takes priority)
@@ -957,30 +1070,12 @@ fn apply_env_overrides(mut config: ProjectConfig) -> Result<ProjectConfig> {
 // ---------------------------------------------------------------------------
 // Loading
 // ---------------------------------------------------------------------------
-
-/// Load and validate a [`ProjectConfig`] from a TOML file.
-///
-/// If `path` does not exist and is the default `oxigaf.toml`, returns the
-/// default configuration instead of erroring.
-#[allow(dead_code)]
-pub fn load_config(path: &Path) -> Result<ProjectConfig> {
-    if path.exists() {
-        let contents = std::fs::read_to_string(path)
-            .with_context(|| format!("Failed to read config file: {}", path.display()))?;
-        let config: ProjectConfig = toml::from_str(&contents)
-            .with_context(|| format!("Failed to parse config file: {}", path.display()))?;
-        config.validate()?;
-        Ok(config)
-    } else if path.ends_with("oxigaf.toml") {
-        tracing::info!(
-            "Config file not found at {}, using defaults",
-            path.display()
-        );
-        Ok(ProjectConfig::default())
-    } else {
-        anyhow::bail!("Config file not found: {}", path.display())
-    }
-}
+//
+// The former standalone `load_config` helper (single-file load with a
+// "missing default oxigaf.toml -> defaults" fallback) has been superseded:
+// its logic is now inlined directly into `load_hierarchical_config`'s Layer
+// 3 handling above, which is the only place that needs it. It had no
+// callers anywhere in this crate or its test suites.
 
 /// Generate a default TOML configuration string that can be written to a file.
 #[allow(dead_code)]
@@ -994,11 +1089,15 @@ pub fn generate_default_config() -> Result<String> {
 // ---------------------------------------------------------------------------
 
 /// Expand a leading `~` in a path to the user's home directory.
+///
+/// Uses [`dirs::home_dir`] rather than reading `$HOME` directly so that this
+/// also works on Windows (`USERPROFILE`), where `$HOME` is not normally set.
 pub fn expand_tilde(path: &Path) -> PathBuf {
     let s = path.to_string_lossy();
     if s.starts_with("~/") || s == "~" {
-        if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(s.replacen('~', &home, 1));
+        if let Some(home) = dirs::home_dir() {
+            let home_str = home.to_string_lossy();
+            return PathBuf::from(s.replacen('~', &home_str, 1));
         }
     }
     path.to_path_buf()
@@ -1044,9 +1143,175 @@ total_iterations = 5000
 
     #[test]
     fn expand_tilde_works() {
-        // Use a unique env var to avoid conflicts in parallel tests
-        std::env::set_var("HOME", "/home/test");
+        // Assert against `dirs::home_dir()` directly (rather than mutating
+        // the process-wide `HOME` env var, which is both a data race with
+        // other tests running in parallel in this module and not portable
+        // to Windows, where `expand_tilde`'s underlying `dirs::home_dir()`
+        // consults `USERPROFILE` instead). This exercises exactly what the
+        // implementation promises on whatever platform the test runs on.
+        let Some(home) = dirs::home_dir() else {
+            // No resolvable home directory in this environment (e.g. a
+            // minimal/sandboxed CI container) -- nothing to assert.
+            return;
+        };
         let p = expand_tilde(Path::new("~/.cache/oxigaf"));
-        assert_eq!(p, PathBuf::from("/home/test/.cache/oxigaf"));
+        assert_eq!(p, home.join(".cache/oxigaf"));
+    }
+
+    #[test]
+    fn expand_tilde_leaves_non_tilde_paths_untouched() {
+        assert_eq!(
+            expand_tilde(Path::new("/abs/path")),
+            PathBuf::from("/abs/path")
+        );
+        assert_eq!(
+            expand_tilde(Path::new("relative/x")),
+            PathBuf::from("relative/x")
+        );
+    }
+
+    #[test]
+    fn to_wgpu_backends_maps_known_names() {
+        let mut device = DeviceSection::default();
+        device.backend = "metal".to_string();
+        assert_eq!(device.to_wgpu_backends(), wgpu::Backends::METAL);
+        device.backend = "VULKAN".to_string();
+        assert_eq!(device.to_wgpu_backends(), wgpu::Backends::VULKAN);
+        device.backend = "dx12".to_string();
+        assert_eq!(device.to_wgpu_backends(), wgpu::Backends::DX12);
+        device.backend = "gl".to_string();
+        assert_eq!(device.to_wgpu_backends(), wgpu::Backends::GL);
+    }
+
+    #[test]
+    fn to_wgpu_backends_unknown_falls_back_to_all() {
+        let mut device = DeviceSection::default();
+        device.backend = "nonsense".to_string();
+        assert_eq!(device.to_wgpu_backends(), wgpu::Backends::all());
+        device.backend = String::new();
+        assert_eq!(device.to_wgpu_backends(), wgpu::Backends::all());
+    }
+
+    // -----------------------------------------------------------------------
+    // is_default_config_name / load_hierarchical_config Layer 3 decision
+    //
+    // Regression coverage for: `oxigaf train` used to hard-fail whenever
+    // `./oxigaf.toml` did not exist, because `TrainArgs::config` always
+    // supplies `Some("oxigaf.toml")` (its clap default) and the old code
+    // called `load_config_from_file` unconditionally for that path. These
+    // are pure/hermetic: no filesystem access, no reliance on cwd or
+    // `$HOME`, unlike `load_hierarchical_config` itself (see
+    // `tests/config_hierarchy_tests.rs` for that end-to-end coverage).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn is_default_config_name_bare() {
+        assert!(is_default_config_name(Path::new("oxigaf.toml")));
+    }
+
+    #[test]
+    fn is_default_config_name_with_directory() {
+        assert!(is_default_config_name(Path::new("some/dir/oxigaf.toml")));
+        assert!(is_default_config_name(Path::new("./oxigaf.toml")));
+    }
+
+    #[test]
+    fn is_default_config_name_rejects_custom_names() {
+        assert!(!is_default_config_name(Path::new("my-config.toml")));
+        assert!(!is_default_config_name(Path::new("nonexistent.toml")));
+        assert!(!is_default_config_name(Path::new(
+            "configs/oxigaf-prod.toml"
+        )));
+    }
+
+    // -----------------------------------------------------------------------
+    // merge_toml_values
+    //
+    // Regression coverage for: the old struct-level "does the override
+    // differ from `Default::default()`?" merge silently kept a
+    // lower-priority layer's value whenever a higher-priority layer
+    // explicitly wrote a value that happened to equal the struct default
+    // (e.g. re-stating `total_iterations = 15000`), inverting the
+    // documented layer priority for that case.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn merge_toml_values_overlay_scalar_wins() {
+        let base: toml::Value = toml::from_str("value = 1").unwrap();
+        let overlay: toml::Value = toml::from_str("value = 2").unwrap();
+        let merged = merge_toml_values(base, overlay);
+        assert_eq!(merged["value"].as_integer(), Some(2));
+    }
+
+    #[test]
+    fn merge_toml_values_keeps_base_keys_not_in_overlay() {
+        let base: toml::Value = toml::from_str("a = 1\nb = 2").unwrap();
+        let overlay: toml::Value = toml::from_str("b = 20").unwrap();
+        let merged = merge_toml_values(base, overlay);
+        assert_eq!(merged["a"].as_integer(), Some(1));
+        assert_eq!(merged["b"].as_integer(), Some(20));
+    }
+
+    #[test]
+    fn merge_toml_values_recurses_into_nested_tables() {
+        let base: toml::Value = toml::from_str(
+            r#"
+            [training]
+            total_iterations = 15000
+            image_size = 512
+            "#,
+        )
+        .unwrap();
+        let overlay: toml::Value = toml::from_str(
+            r#"
+            [training]
+            total_iterations = 5000
+            "#,
+        )
+        .unwrap();
+        let merged = merge_toml_values(base, overlay);
+        // Overridden leaf wins...
+        assert_eq!(
+            merged["training"]["total_iterations"].as_integer(),
+            Some(5000)
+        );
+        // ...and a leaf the overlay's table never mentioned survives from base.
+        assert_eq!(merged["training"]["image_size"].as_integer(), Some(512));
+    }
+
+    #[test]
+    fn merge_toml_values_explicit_default_value_beats_lower_layer() {
+        // This is exactly the scenario from the audit finding: a
+        // lower-priority layer (e.g. the user config) sets a non-default
+        // value, and a higher-priority layer (e.g. the project config)
+        // explicitly re-states the struct default. The higher-priority
+        // layer must still win, because it was merged as raw TOML -- there
+        // is no "differs from Default::default()" heuristic in the way.
+        let user_config: toml::Value =
+            toml::from_str("[training]\ntotal_iterations = 5000").unwrap();
+        let project_config: toml::Value =
+            toml::from_str("[training]\ntotal_iterations = 15000").unwrap(); // == struct default
+
+        let merged = merge_toml_values(toml::Value::Table(toml::map::Map::new()), user_config);
+        let merged = merge_toml_values(merged, project_config);
+
+        let config: ProjectConfig = merged.try_into().expect("deserialise merged config");
+        assert_eq!(
+            config.training.total_iterations, 15_000,
+            "higher-priority layer's explicitly-default value must win over \
+             the lower-priority layer's non-default value"
+        );
+    }
+
+    #[test]
+    fn merge_toml_values_empty_table_deserialises_to_defaults() {
+        let merged = toml::Value::Table(toml::map::Map::new());
+        let config: ProjectConfig = merged.try_into().expect("deserialise empty table");
+        let default_config = ProjectConfig::default();
+        assert_eq!(
+            config.training.total_iterations,
+            default_config.training.total_iterations
+        );
+        assert_eq!(config.device.backend, default_config.device.backend);
     }
 }

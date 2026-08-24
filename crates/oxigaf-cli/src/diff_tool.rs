@@ -23,6 +23,7 @@
 //! println!("{}", format_model_diff(&diff));
 //! ```
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use thiserror::Error;
@@ -212,6 +213,17 @@ pub struct ModelDiff {
     pub step_b: usize,
     /// Number of Gaussians (both models must agree).
     pub n_gaussians: usize,
+    /// Number of Gaussians whose fields actually fed the statistics below.
+    ///
+    /// Equal to `n_gaussians` unless [`DiffConfig::include_inactive`] is
+    /// `false` (for [`diff_models`]) or some Gaussians in A/B went unmatched
+    /// (for [`diff_models_variable`], where it equals the matched-pair
+    /// count). When this is `0`, every [`FieldDiff`] below reports the
+    /// vacuous "nothing changed" statistics (`cosine_similarity: 1.0`, all
+    /// zero magnitudes) for lack of anything to compare -- callers must
+    /// check this field to distinguish that from the models genuinely being
+    /// identical.
+    pub n_compared: usize,
     /// Statistics for position differences.
     pub position_diff: FieldDiff,
     /// Statistics for opacity differences.
@@ -290,14 +302,10 @@ fn mean_f32(data: &[f32]) -> f32 {
     sum / data.len() as f32
 }
 
-/// Compute population standard deviation of a slice. Returns 0.0 for empty input.
-fn std_f32(data: &[f32], mean: f32) -> f32 {
-    if data.is_empty() {
-        return 0.0;
-    }
-    let variance = data.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / data.len() as f32;
-    variance.sqrt()
-}
+// The former `std_f32` two-pass helper (population std dev over a
+// materialised slice) has no remaining callers: `compute_field_diff` now
+// computes standard deviation in its single streaming pass via
+// `E[d^2] - E[d]^2` instead of allocating a `diffs` array to feed this.
 
 // ---------------------------------------------------------------------------
 // compute_field_diff
@@ -338,30 +346,48 @@ pub fn compute_field_diff(
         });
     }
 
-    // Build differences array.
-    let diffs: Vec<f32> = field_a
-        .iter()
-        .zip(field_b.iter())
-        .map(|(a, b)| b - a)
-        .collect();
+    // Single streaming pass over the paired elements: accumulate everything
+    // every statistic below needs without materialising an O(n)
+    // intermediate `diffs` array (the diff/model-comparison path this feeds
+    // routinely runs on multi-million-Gaussian snapshots).
+    let mut sum_d = 0.0f32;
+    let mut sum_d2 = 0.0f32;
+    let mut max_abs_change = 0.0f32;
+    let mut changed_count = 0usize;
+    let mut dot_ab = 0.0f32;
+    let mut norm_a_sq = 0.0f32;
+    let mut norm_b_sq = 0.0f32;
 
-    let mean_change = mean_f32(&diffs);
-    let std_change = std_f32(&diffs, mean_change);
+    for (&a, &b) in field_a.iter().zip(field_b.iter()) {
+        let d = b - a;
+        sum_d += d;
+        sum_d2 += d * d;
+        let abs_d = d.abs();
+        if abs_d > max_abs_change {
+            max_abs_change = abs_d;
+        }
+        if abs_d > epsilon {
+            changed_count += 1;
+        }
+        dot_ab += a * b;
+        norm_a_sq += a * a;
+        norm_b_sq += b * b;
+    }
 
-    let max_abs_change = diffs.iter().map(|d| d.abs()).fold(0.0f32, f32::max);
-
-    let rms_change = (diffs.iter().map(|d| d * d).sum::<f32>() / n as f32).sqrt();
-
-    let changed_count = diffs.iter().filter(|d| d.abs() > epsilon).count();
-    let fraction_changed = changed_count as f32 / n as f32;
-
-    let l2_distance = diffs.iter().map(|d| d * d).sum::<f32>().sqrt();
+    let n_f = n as f32;
+    let mean_change = sum_d / n_f;
+    // Population variance via E[d^2] - E[d]^2 (algebraically identical to
+    // the two-pass `mean(sum((d - mean)^2))` this replaces); clamped at 0 to
+    // guard against a tiny negative value from floating-point cancellation.
+    let variance = (sum_d2 / n_f - mean_change * mean_change).max(0.0);
+    let std_change = variance.sqrt();
+    let rms_change = (sum_d2 / n_f).sqrt();
+    let fraction_changed = changed_count as f32 / n_f;
+    let l2_distance = sum_d2.sqrt();
 
     // Cosine similarity.
-    let dot_ab: f32 = field_a.iter().zip(field_b.iter()).map(|(a, b)| a * b).sum();
-    let norm_a: f32 = field_a.iter().map(|a| a * a).sum::<f32>().sqrt();
-    let norm_b: f32 = field_b.iter().map(|b| b * b).sum::<f32>().sqrt();
-
+    let norm_a = norm_a_sq.sqrt();
+    let norm_b = norm_b_sq.sqrt();
     let cosine_similarity = if norm_a == 0.0 && norm_b == 0.0 {
         // Both zero vectors — consider them identical.
         1.0
@@ -425,52 +451,26 @@ pub fn diff_models(
             .filter(|&i| a.activated_opacity(i) >= 0.1 || b.activated_opacity(i) >= 0.1)
             .collect()
     };
+    let n_compared = active_indices.len();
 
-    // Helper to gather flat elements for a given set of Gaussian indices,
-    // with a stride (e.g. stride=3 for positions).
-    let gather = |data: &[f32], indices: &[usize], stride: usize| -> Vec<f32> {
-        let mut out = Vec::with_capacity(indices.len() * stride);
-        for &i in indices {
-            for s in 0..stride {
-                out.push(data[i * stride + s]);
-            }
-        }
-        out
-    };
+    // Gather active fields. When `include_inactive` is true (the default)
+    // -- or an explicit filter happens to keep every Gaussian -- this
+    // borrows the snapshot's arrays directly rather than copying the whole
+    // model: `gather_field` only allocates when `active_indices` is a
+    // proper subset.
+    let pos_a = gather_field(&a.positions, &active_indices, 3);
+    let pos_b = gather_field(&b.positions, &active_indices, 3);
+    let opa_a = gather_field(&a.opacities, &active_indices, 1);
+    let opa_b = gather_field(&b.opacities, &active_indices, 1);
+    let sca_a = gather_field(&a.scales, &active_indices, 3);
+    let sca_b = gather_field(&b.scales, &active_indices, 3);
+    let col_a = gather_field(&a.colors, &active_indices, 3);
+    let col_b = gather_field(&b.colors, &active_indices, 3);
 
-    let gather1 = |data: &[f32], indices: &[usize]| -> Vec<f32> {
-        indices.iter().map(|&i| data[i]).collect()
-    };
-
-    // Gather active fields.
-    let pos_a = gather(&a.positions, &active_indices, 3);
-    let pos_b = gather(&b.positions, &active_indices, 3);
-    let opa_a = gather1(&a.opacities, &active_indices);
-    let opa_b = gather1(&b.opacities, &active_indices);
-    let sca_a = gather(&a.scales, &active_indices, 3);
-    let sca_b = gather(&b.scales, &active_indices, 3);
-    let col_a = gather(&a.colors, &active_indices, 3);
-    let col_b = gather(&b.colors, &active_indices, 3);
-
-    let normalize_field = |fa: &[f32], fb: &[f32]| -> (Vec<f32>, Vec<f32>) {
-        if !config.normalize {
-            return (fa.to_vec(), fb.to_vec());
-        }
-        let mean_mag_a = fa.iter().map(|x| x.abs()).sum::<f32>() / fa.len().max(1) as f32;
-        if mean_mag_a == 0.0 {
-            return (fa.to_vec(), fb.to_vec());
-        }
-        let scale = 1.0 / mean_mag_a;
-        (
-            fa.iter().map(|x| x * scale).collect(),
-            fb.iter().map(|x| x * scale).collect(),
-        )
-    };
-
-    let (pa, pb) = normalize_field(&pos_a, &pos_b);
-    let (oa, ob) = normalize_field(&opa_a, &opa_b);
-    let (sa, sb) = normalize_field(&sca_a, &sca_b);
-    let (ca, cb) = normalize_field(&col_a, &col_b);
+    let (pa, pb) = normalize_field_pair(&pos_a, &pos_b, config.normalize);
+    let (oa, ob) = normalize_field_pair(&opa_a, &opa_b, config.normalize);
+    let (sa, sb) = normalize_field_pair(&sca_a, &sca_b, config.normalize);
+    let (ca, cb) = normalize_field_pair(&col_a, &col_b, config.normalize);
 
     let position_diff = compute_field_diff(&pa, &pb, "position", eps)?;
     let opacity_diff = compute_field_diff(&oa, &ob, "opacity", eps)?;
@@ -491,6 +491,7 @@ pub fn diff_models(
         step_a: a.step,
         step_b: b.step,
         n_gaussians: n,
+        n_compared,
         position_diff,
         opacity_diff,
         scale_diff,
@@ -500,6 +501,49 @@ pub fn diff_models(
         removed_gaussians: 0,
         summary_score,
     })
+}
+
+/// Gather `data[i * stride .. i * stride + stride]` for each `i` in
+/// `indices`, or borrow `data` outright when `indices` covers every
+/// Gaussian in it (the common case: `DiffConfig::include_inactive` is
+/// `true` by default, or an explicit filter happens to keep everything).
+/// `indices` is assumed sorted and free of duplicates (true for every
+/// caller in this module, which all build it via `(0..n).filter(..)`), so
+/// `indices.len() * stride == data.len()` is a safe proxy for "this is
+/// really the identity range and a copy is unnecessary".
+fn gather_field<'a>(data: &'a [f32], indices: &[usize], stride: usize) -> Cow<'a, [f32]> {
+    if indices.len().saturating_mul(stride) == data.len() {
+        return Cow::Borrowed(data);
+    }
+    let mut out = Vec::with_capacity(indices.len() * stride);
+    for &i in indices {
+        for s in 0..stride {
+            out.push(data[i * stride + s]);
+        }
+    }
+    Cow::Owned(out)
+}
+
+/// Normalise a pair of fields by the mean magnitude of `fa`, or borrow both
+/// unchanged when `normalize` is `false` (the default) rather than always
+/// copying, even when there is nothing to scale.
+fn normalize_field_pair<'a>(
+    fa: &'a [f32],
+    fb: &'a [f32],
+    normalize: bool,
+) -> (Cow<'a, [f32]>, Cow<'a, [f32]>) {
+    if !normalize {
+        return (Cow::Borrowed(fa), Cow::Borrowed(fb));
+    }
+    let mean_mag_a = fa.iter().map(|x| x.abs()).sum::<f32>() / fa.len().max(1) as f32;
+    if mean_mag_a == 0.0 {
+        return (Cow::Borrowed(fa), Cow::Borrowed(fb));
+    }
+    let scale = 1.0 / mean_mag_a;
+    (
+        Cow::Owned(fa.iter().map(|x| x * scale).collect()),
+        Cow::Owned(fb.iter().map(|x| x * scale).collect()),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -664,25 +708,10 @@ pub fn diff_models_variable(
     // ------------------------------------------------------------------
     // Optional normalisation.
     // ------------------------------------------------------------------
-    let normalize_pair = |fa: &[f32], fb: &[f32]| -> (Vec<f32>, Vec<f32>) {
-        if !config.normalize {
-            return (fa.to_vec(), fb.to_vec());
-        }
-        let mean_mag_a = fa.iter().map(|x| x.abs()).sum::<f32>() / fa.len().max(1) as f32;
-        if mean_mag_a == 0.0 {
-            return (fa.to_vec(), fb.to_vec());
-        }
-        let scale = 1.0 / mean_mag_a;
-        (
-            fa.iter().map(|x| x * scale).collect(),
-            fb.iter().map(|x| x * scale).collect(),
-        )
-    };
-
-    let (pa, pb) = normalize_pair(&pos_a_flat, &pos_b_flat);
-    let (oa, ob) = normalize_pair(&opa_a_flat, &opa_b_flat);
-    let (sa, sb) = normalize_pair(&sca_a_flat, &sca_b_flat);
-    let (ca, cb) = normalize_pair(&col_a_flat, &col_b_flat);
+    let (pa, pb) = normalize_field_pair(&pos_a_flat, &pos_b_flat, config.normalize);
+    let (oa, ob) = normalize_field_pair(&opa_a_flat, &opa_b_flat, config.normalize);
+    let (sa, sb) = normalize_field_pair(&sca_a_flat, &sca_b_flat, config.normalize);
+    let (ca, cb) = normalize_field_pair(&col_a_flat, &col_b_flat, config.normalize);
 
     let eps = config.epsilon;
     let position_diff = compute_field_diff(&pa, &pb, "position", eps)?;
@@ -706,6 +735,7 @@ pub fn diff_models_variable(
         step_a: a.step,
         step_b: b.step,
         n_gaussians: matched_count,
+        n_compared: matched_count,
         position_diff,
         opacity_diff,
         scale_diff,
@@ -729,9 +759,15 @@ pub fn format_model_diff(diff: &ModelDiff) -> String {
         diff.name_a, diff.step_a, diff.name_b, diff.step_b, step_delta
     ));
     s.push_str(&format!(
-        "  Gaussians : {} | Added: {} | Removed: {}\n",
-        diff.n_gaussians, diff.added_gaussians, diff.removed_gaussians
+        "  Gaussians : {} | Compared: {} | Added: {} | Removed: {}\n",
+        diff.n_gaussians, diff.n_compared, diff.added_gaussians, diff.removed_gaussians
     ));
+    if diff.n_compared == 0 {
+        s.push_str(
+            "  WARNING: 0 Gaussians were compared -- the statistics below are vacuous, \
+             not evidence the models are identical.\n",
+        );
+    }
     s.push_str(&format!(
         "  Summary score : {:.6} (0=identical, 1=completely different)\n",
         diff.summary_score
@@ -1528,6 +1564,109 @@ mod tests {
             diff_models(&a, &b, &config),
             Err(DiffError::EmptyModelB)
         ));
+    }
+
+    #[test]
+    fn test_diff_models_n_compared_matches_default_include_inactive() {
+        // include_inactive: true (the default) -- every Gaussian counts as
+        // compared, matching n_gaussians.
+        let a = make_snapshot("a", 0, 10, 0.5);
+        let config = DiffConfig::default();
+        let d = diff_models(&a, &a, &config).expect("ok");
+        assert_eq!(d.n_gaussians, 10);
+        assert_eq!(d.n_compared, 10);
+    }
+
+    // Regression coverage for: two models where every Gaussian is inactive
+    // (activated opacity < 0.1) used to report `cosine_similarity: 1.0` and
+    // all-zero change statistics -- indistinguishable from "these models
+    // are identical" -- with nothing indicating that zero Gaussians were
+    // actually compared.
+    #[test]
+    fn test_diff_models_all_inactive_reports_zero_compared_not_identical() {
+        let n = 5;
+        // sigmoid(-10) ~= 4.5e-5, well under the 0.1 activation threshold:
+        // every Gaussian in both snapshots is "inactive".
+        let very_negative = vec![-10.0_f32; n];
+        let a = make_snapshot_vals(
+            "a",
+            0,
+            vec![0.0; n * 3],
+            very_negative.clone(),
+            vec![0.0; n * 3],
+            vec![0.0; n * 3],
+        );
+        // Genuinely different positions from `a`, so an *honest* comparison
+        // (if these Gaussians had been included) would not be "identical".
+        let b = make_snapshot_vals(
+            "b",
+            1,
+            vec![5.0; n * 3],
+            very_negative,
+            vec![0.0; n * 3],
+            vec![0.0; n * 3],
+        );
+        let config = DiffConfig {
+            include_inactive: false,
+            ..DiffConfig::default()
+        };
+        let diff = diff_models(&a, &b, &config).expect("diff ok");
+
+        assert_eq!(
+            diff.n_gaussians, n,
+            "total Gaussian count is still reported"
+        );
+        assert_eq!(
+            diff.n_compared, 0,
+            "no Gaussian passed the activation threshold, so none were compared"
+        );
+
+        let text = format_model_diff(&diff);
+        assert!(
+            text.contains("WARNING"),
+            "output must warn that the comparison is vacuous: {text}"
+        );
+        assert!(
+            text.contains("Compared: 0"),
+            "output must surface n_compared: {text}"
+        );
+    }
+
+    #[test]
+    fn test_diff_models_n_compared_reflects_partial_activity() {
+        let n = 4;
+        // Gaussians 0,1 active (opacity logit 5.0 -> sigmoid ~0.993);
+        // Gaussians 2,3 inactive (opacity logit -10.0 -> sigmoid ~4.5e-5).
+        let opacities = vec![5.0, 5.0, -10.0, -10.0];
+        let a = make_snapshot_vals(
+            "a",
+            0,
+            vec![0.0; n * 3],
+            opacities.clone(),
+            vec![0.0; n * 3],
+            vec![0.0; n * 3],
+        );
+        let b = make_snapshot_vals(
+            "b",
+            1,
+            vec![1.0; n * 3],
+            opacities,
+            vec![0.0; n * 3],
+            vec![0.0; n * 3],
+        );
+        let config = DiffConfig {
+            include_inactive: false,
+            ..DiffConfig::default()
+        };
+        let diff = diff_models(&a, &b, &config).expect("diff ok");
+        assert_eq!(diff.n_gaussians, 4);
+        assert_eq!(
+            diff.n_compared, 2,
+            "only the 2 active Gaussians should be compared"
+        );
+        // The 2 active Gaussians moved by 1.0 on every axis, so this must
+        // not report "no change" the way an all-inactive comparison would.
+        assert!(diff.position_diff.rms_change > 0.5);
     }
 
     // ------------------------------------------------------------------

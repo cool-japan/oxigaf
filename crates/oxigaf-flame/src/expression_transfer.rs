@@ -334,10 +334,18 @@ impl ExpressionPcaBasis {
     /// - `n_components`: number of principal components to extract.
     /// - `seed`: random seed for power-iteration initialisation (0 is handled gracefully).
     ///
+    /// If the data's effective rank (after centering) is smaller than
+    /// `n_components` — e.g. because there are fewer independent samples
+    /// than requested components — fewer components are returned than
+    /// requested. The returned [`ExpressionPcaBasis::n_components`] always
+    /// equals `components.len()` and reflects how many were actually found;
+    /// callers must not assume it equals the requested count.
+    ///
     /// # Errors
     ///
     /// - [`ExpressionTransferError::EmptyBasis`] — no samples provided.
     /// - [`ExpressionTransferError::TooManyComponents`] — `n_components > dim`.
+    /// - [`ExpressionTransferError::DimMismatch`] — samples have inconsistent lengths.
     pub fn fit(
         samples: &[Vec<f32>],
         n_components: usize,
@@ -348,6 +356,14 @@ impl ExpressionPcaBasis {
         }
 
         let dim = samples[0].len();
+        for s in samples.iter().skip(1) {
+            if s.len() != dim {
+                return Err(ExpressionTransferError::DimMismatch {
+                    src: s.len(),
+                    tgt: dim,
+                });
+            }
+        }
         if n_components > dim {
             return Err(ExpressionTransferError::TooManyComponents {
                 n: n_components,
@@ -407,6 +423,7 @@ impl ExpressionPcaBasis {
         for _ in 0..n_components {
             // Initialise with a random unit vector.
             let mut v = random_unit_vector(dim, &mut rng_state);
+            let mut refined = false;
 
             // Power iteration (30 steps).
             for _ in 0..30 {
@@ -414,10 +431,25 @@ impl ExpressionPcaBasis {
                 let u = xt_times_w(&x, &xv);
                 let n_u = norm(&u);
                 if n_u < 1e-12 {
-                    // Data (after deflation) is zero in this direction.
+                    // The residual data (after deflating the components
+                    // found so far) carries no further energy in any
+                    // direction: the effective rank of the dataset has been
+                    // exhausted. `v` has not been updated by this step, so
+                    // it must not be treated as a converged eigenvector.
                     break;
                 }
                 v = u.into_iter().map(|val| val / n_u).collect();
+                refined = true;
+            }
+
+            if !refined {
+                // Not even the first power-iteration step produced any
+                // signal, so `v` is still the untouched random seed — it is
+                // not orthogonal to the already-accepted components and
+                // carries no real variance. Stop here instead of accepting
+                // it as a spurious "principal component"; `n_components`
+                // below reports the smaller, honest count.
+                break;
             }
 
             // Compute explained variance: ||X * v||² / N.
@@ -437,12 +469,14 @@ impl ExpressionPcaBasis {
             components.push(v);
         }
 
+        let n_components_found = components.len();
+
         Ok(Self {
             components,
             explained_variance,
             mean,
             dim,
-            n_components,
+            n_components: n_components_found,
             total_variance,
         })
     }
@@ -993,6 +1027,66 @@ mod tests {
         assert!(
             (cumvar - 1.0).abs() < 0.05,
             "cumulative variance for all components should be ~1.0, got {cumvar}"
+        );
+    }
+
+    // Regression test: `fit` must reject samples of inconsistent length
+    // instead of silently truncating them via `zip` and producing a wrong
+    // mean/variance/components with no error.
+    #[test]
+    fn test_pca_fit_rejects_ragged_samples() {
+        let samples = vec![
+            vec![0.1, 0.2, 0.3, 0.4],
+            vec![0.5, 0.6, 0.7], // one dimension short
+            vec![0.2, 0.1, 0.4, 0.3],
+        ];
+        let result = ExpressionPcaBasis::fit(&samples, 2, 1);
+        assert!(
+            matches!(result, Err(ExpressionTransferError::DimMismatch { .. })),
+            "ragged samples must be rejected, got {result:?}"
+        );
+    }
+
+    // Regression test: requesting more components than the data's effective
+    // rank must truncate the basis (and report the smaller count via
+    // `n_components`) rather than pushing the still-random power-iteration
+    // seed as a spurious, non-orthogonal "component".
+    #[test]
+    fn test_pca_fit_truncates_when_rank_exhausted() {
+        // Effective rank is 1: every sample is a scalar multiple of the
+        // same direction, so after the first component is extracted the
+        // residual data is exactly zero and no further real component
+        // exists, no matter how many are requested.
+        let direction = [1.0_f32, 2.0, -1.0, 0.5];
+        let samples: Vec<Vec<f32>> = (0..8)
+            .map(|i| {
+                let scale = (i as f32) - 3.5;
+                direction.iter().map(|&d| d * scale).collect()
+            })
+            .collect();
+
+        let basis = ExpressionPcaBasis::fit(&samples, 4, 99).expect("fit should not error");
+        assert_eq!(
+            basis.n_components,
+            basis.components.len(),
+            "n_components must always match components.len()"
+        );
+        assert_eq!(
+            basis.explained_variance.len(),
+            basis.components.len(),
+            "explained_variance must have one entry per accepted component"
+        );
+        assert_eq!(
+            basis.n_components, 1,
+            "rank-1 data must yield exactly 1 real component, got {}",
+            basis.n_components
+        );
+        // The single accepted component must be a genuine (not random)
+        // direction: it should explain essentially all of the variance.
+        let cumvar = basis.cumulative_variance(1);
+        assert!(
+            cumvar > 0.99,
+            "the one real component should explain ~100% of variance, got {cumvar}"
         );
     }
 

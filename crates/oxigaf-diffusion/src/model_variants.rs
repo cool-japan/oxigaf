@@ -180,13 +180,18 @@ pub struct UNetVariantConfig {
     /// - SDXL: `[4, 2]`
     pub attention_resolutions: Vec<usize>,
 
-    /// Channels per attention head. `Some` for SD1/2, `None` for SDXL (uses `num_heads`).
+    /// Channels per attention head, used uniformly across all levels when set.
+    ///
+    /// `Some` for SD1.5/Zero123 (uniform 64-dim head, head *count* varies per
+    /// level as `channels_at_level(i) / 64`). `None` for SD2.1/SDXL, which
+    /// instead specify an explicit head count per level via
+    /// [`Self::num_heads_per_level`].
     pub head_channels: Option<usize>,
 
     /// Number of transformer layers per resolution level.
     ///
     /// - SD1/2: `[1, 1, 1, 1]`
-    /// - SDXL: `[1, 2, 10, 10, 2, 1]`
+    /// - SDXL: `[1, 2, 10]` (one entry per down-level, matching `channel_mult`)
     pub transformer_depth: Vec<usize>,
 
     /// Cross-attention embedding dimension for CLIP conditioning.
@@ -208,8 +213,14 @@ pub struct UNetVariantConfig {
     /// Whether to use flash attention for memory-efficient O(N) attention.
     pub use_flash_attention: bool,
 
-    /// Explicit number of attention heads (SDXL: 8, others use `head_channels`).
-    pub num_heads: Option<usize>,
+    /// Explicit number of attention heads per resolution level.
+    ///
+    /// Used when [`Self::head_channels`] is `None`: SD2.1 uses `[5, 10, 20, 20]`,
+    /// SDXL uses `[5, 10, 20]` (both give a uniform 64-dim head, since
+    /// `channels_at_level(i) / num_heads_per_level[i] == 64` at every level).
+    /// Empty when the config instead uses a uniform [`Self::head_channels`]
+    /// (SD1.5, Zero123).
+    pub num_heads_per_level: Vec<usize>,
 }
 
 impl UNetVariantConfig {
@@ -226,15 +237,28 @@ impl UNetVariantConfig {
         self.channel_mult.len()
     }
 
-    /// Rough estimate of the total number of trainable parameters.
+    /// A coarse **relative sizing index**, not a real parameter count.
     ///
     /// Uses the heuristic:
     /// `model_channels² × Σᵢ(channel_mult[i] × (num_res_blocks×2 + transformer_depth[i])) × 4`
     ///
-    /// This is a ballpark estimate suitable for comparison:
-    /// - SD1 ≈ 860M
-    /// - SD2 ≈ 865M
-    /// - SDXL ≈ 2.6B
+    /// This omits attention QKV/output projections, cross-attention layers,
+    /// GroupNorm affine parameters, timestep/label embeddings, and conv bias
+    /// terms, so its absolute value is **not** the model's real parameter
+    /// count — it is roughly 40-90x smaller, and the gap is not a constant
+    /// multiplier (it grows with transformer depth, so SDXL is further off
+    /// than SD1.5). For reference, the real published U-Net parameter counts
+    /// are approximately:
+    /// - SD1.5 ≈ 860M (this heuristic: ≈ 22.5M)
+    /// - SD2.1 ≈ 865M (this heuristic: ≈ 22.5M)
+    /// - SDXL ≈ 2.6B (this heuristic: ≈ 29.9M)
+    ///
+    /// Use this value only to *compare* configurations against each other
+    /// (e.g. [`are_configs_compatible`]-adjacent sizing checks, or confirming
+    /// that one variant is architecturally larger than another) — never as a
+    /// stand-in for a real parameter count or a memory-sizing budget on its
+    /// own (see [`Self::estimated_vram_mb`] for a memory estimate that does
+    /// not depend on this being accurate in absolute terms).
     pub fn estimated_params(&self) -> u64 {
         let mc = self.model_channels as u64;
         let level_sum: u64 = self
@@ -251,25 +275,49 @@ impl UNetVariantConfig {
 
     /// Estimated VRAM usage for inference (in MB) at a given image size and batch.
     ///
-    /// Uses the heuristic:
-    /// - Latent bytes: `(image_size/8)² × latent_channels × batch × 4 bytes`
-    ///   (scaled by a factor of 1000 to capture U-Net intermediate activations)
-    /// - Activation bytes: `estimated_params × 2 bytes ÷ 10`
-    ///
-    /// The latent term is multiplied by 1000 to account for the many intermediate
-    /// activation tensors at each U-Net resolution level, making the latent
-    /// contribution visible and properly scaled relative to batch and image size.
+    /// Sums three explicit, per-level components instead of a global fudge
+    /// factor:
+    /// - **Latent bytes**: `(image_size/8)² × latent_channels × batch × 4`, the
+    ///   input/output latent tensor itself.
+    /// - **Activation bytes**: for each resolution level `i` (spatial side
+    ///   halved once per level relative to the latent, per the standard U-Net
+    ///   downsampling schedule), `side² × channels_at_level(i) × batch × 4`,
+    ///   counted twice per ResNet block (`num_res_blocks`) to cover both the
+    ///   block's hidden activation and its output/skip-connection buffer.
+    /// - **Attention bytes**: for levels present in `attention_resolutions`
+    ///   (tracked via the running downsample factor `ds`, matching the
+    ///   original latent-diffusion `ds ∈ attention_resolutions` convention),
+    ///   the `seq_len² × batch × 4` score matrix per transformer layer at
+    ///   that level, where `seq_len = side²`.
+    /// - **Weight bytes**: `estimated_params() × 2` (fp16 weights). Since
+    ///   [`Self::estimated_params`] is a relative index rather than a true
+    ///   parameter count, this term is a lower bound, not an exact figure.
     pub fn estimated_vram_mb(&self, image_size: u32, batch_size: usize) -> u64 {
         let latent_side = (image_size / 8) as u64;
-        // Multiply by 1000 to account for U-Net intermediate activations at each level
-        let latent_bytes = latent_side
-            * latent_side
-            * self.family.latent_channels() as u64
-            * batch_size as u64
-            * 4
-            * 1000;
-        let activation_bytes = self.estimated_params() * 2 / 10;
-        (latent_bytes + activation_bytes) / (1024 * 1024)
+        let batch = batch_size as u64;
+
+        let latent_bytes =
+            latent_side * latent_side * self.family.latent_channels() as u64 * batch * 4;
+
+        let mut activation_bytes: u64 = 0;
+        let mut ds: usize = 1;
+        for level in 0..self.num_levels() {
+            let side = (latent_side >> level).max(1);
+            let channels = self.channels_at_level(level) as u64;
+            let per_block = side * side * channels * batch * 4;
+            activation_bytes += per_block * 2 * self.num_res_blocks as u64;
+
+            if self.attention_resolutions.contains(&ds) {
+                let seq_len = side * side;
+                let td = self.transformer_depth.get(level).copied().unwrap_or(1) as u64;
+                activation_bytes += seq_len * seq_len * batch * 4 * td.max(1);
+            }
+            ds = ds.saturating_mul(2);
+        }
+
+        let weight_bytes = self.estimated_params() * 2;
+
+        (latent_bytes + activation_bytes + weight_bytes) / (1024 * 1024)
     }
 
     /// Returns `true` if this configuration uses dual CLIP encoders (SDXL only).
@@ -282,7 +330,7 @@ impl UNetVariantConfig {
         format!(
             "UNetVariantConfig {{ family: {:?}, channels: {}, levels: {}, \
              cross_attn_dim: {}, in/out: {}/{}, dual_encoder: {}, \
-             est_params: {}M, linear_proj: {} }}",
+             size_index: {}M, linear_proj: {} }}",
             self.family,
             self.model_channels,
             self.num_levels(),
@@ -293,6 +341,87 @@ impl UNetVariantConfig {
             self.estimated_params() / 1_000_000,
             self.use_linear_projection,
         )
+    }
+
+    /// Resolve the number of attention heads at each resolution level.
+    ///
+    /// Returns [`Self::num_heads_per_level`] directly when it is non-empty
+    /// (SD2.1, SDXL). Otherwise derives a per-level head count from
+    /// [`Self::head_channels`] (SD1.5, Zero123: `channels_at_level(i) /
+    /// head_channels`), falling back to a 64-dim head when neither is set.
+    /// The result always has exactly [`Self::num_levels`] entries.
+    fn head_counts_per_level(&self) -> Vec<usize> {
+        if !self.num_heads_per_level.is_empty() {
+            return (0..self.num_levels())
+                .map(|i| self.num_heads_per_level.get(i).copied().unwrap_or(1).max(1))
+                .collect();
+        }
+        let hc = self.head_channels.unwrap_or(64).max(1);
+        (0..self.num_levels())
+            .map(|level| (self.channels_at_level(level) / hc).max(1))
+            .collect()
+    }
+
+    /// Convert this U-Net variant configuration into a
+    /// [`crate::config::DiffusionConfig`] that [`crate::unet::MultiViewUNet`]
+    /// and [`crate::pipeline::MultiViewDiffusionPipeline`] can actually
+    /// consume.
+    ///
+    /// Maps `model_channels` → `base_channels`, `channel_mult`,
+    /// `transformer_depth` → `transformer_layers_per_block`,
+    /// `cross_attention_dim`, `in_channels`/`out_channels`, and
+    /// `use_linear_projection`/`use_flash_attention` directly. Per-level
+    /// attention head counts come from [`Self::head_counts_per_level`].
+    /// `image_size`/`latent_size` are derived from `self.family`. Fields not
+    /// captured by this configuration at all (guidance scale, inference step
+    /// count, VAE normalization scale, offload strategy, ...) are taken from
+    /// [`crate::config::DiffusionConfig::default`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelVariantError::InvalidConfig`] if the resulting
+    /// configuration fails [`crate::config::DiffusionConfig::validate`] (for
+    /// example, a hand-built custom variant whose `model_channels` is not
+    /// divisible by the default `norm_num_groups`).
+    pub fn to_diffusion_config(
+        &self,
+        num_views: usize,
+    ) -> Result<crate::config::DiffusionConfig, ModelVariantError> {
+        let num_levels = self.num_levels();
+        let mut transformer_layers_per_block: Vec<usize> = self
+            .transformer_depth
+            .iter()
+            .copied()
+            .take(num_levels)
+            .collect();
+        while transformer_layers_per_block.len() < num_levels {
+            transformer_layers_per_block.push(1);
+        }
+
+        let native_res = self.family.native_resolution();
+        let vae_scale = self.family.vae_scale_factor();
+
+        let config = crate::config::DiffusionConfig {
+            num_views,
+            image_size: native_res as usize,
+            latent_size: (native_res / vae_scale) as usize,
+            latent_channels: self.family.latent_channels(),
+            unet_in_channels: self.in_channels,
+            unet_out_channels: self.out_channels,
+            cross_attention_dim: self.cross_attention_dim,
+            base_channels: self.model_channels,
+            channel_mult: self.channel_mult.clone(),
+            layers_per_block: self.num_res_blocks,
+            attention_head_dim: self.head_counts_per_level(),
+            transformer_layers_per_block,
+            use_linear_projection: self.use_linear_projection,
+            use_flash_attention: self.use_flash_attention,
+            ..crate::config::DiffusionConfig::default()
+        };
+        config
+            .validate()
+            .map_err(|e| ModelVariantError::InvalidConfig(e.to_string()))?;
+        Ok(config)
     }
 }
 
@@ -320,7 +449,7 @@ pub fn sd15_config() -> UNetVariantConfig {
         out_channels: 4,
         use_linear_projection: false,
         use_flash_attention: false,
-        num_heads: None,
+        num_heads_per_level: Vec::new(),
     }
 }
 
@@ -328,7 +457,8 @@ pub fn sd15_config() -> UNetVariantConfig {
 ///
 /// - 320 base channels, 4 levels `[1, 2, 4, 4]`
 /// - Cross-attention dim: 1024 (ViT-H/14 CLIP)
-/// - 8 explicit attention heads, linear projection enabled
+/// - Per-level attention heads `[5, 10, 20, 20]` (uniform 64-dim heads),
+///   linear projection enabled
 pub fn sd21_config() -> UNetVariantConfig {
     UNetVariantConfig {
         family: ModelFamily::SD2,
@@ -343,7 +473,7 @@ pub fn sd21_config() -> UNetVariantConfig {
         out_channels: 4,
         use_linear_projection: true,
         use_flash_attention: false,
-        num_heads: Some(8),
+        num_heads_per_level: vec![5, 10, 20, 20],
     }
 }
 
@@ -351,8 +481,11 @@ pub fn sd21_config() -> UNetVariantConfig {
 ///
 /// - 320 base channels, 3 levels `[1, 2, 4]`
 /// - Cross-attention dim: 2048 (dual CLIP encoder concatenation)
-/// - 8 explicit attention heads, linear projection enabled
-/// - Deeper transformer blocks at inner levels: `[1, 2, 10, 10, 2, 1]`
+/// - Per-level attention heads `[5, 10, 20]` (uniform 64-dim heads), linear
+///   projection enabled
+/// - Deeper transformer blocks at inner levels: `[1, 2, 10]` (one entry per
+///   down-level, matching `channel_mult`; level 0 has no attention at all,
+///   per `attention_resolutions`)
 pub fn sdxl_config() -> UNetVariantConfig {
     UNetVariantConfig {
         family: ModelFamily::SDXL,
@@ -361,13 +494,13 @@ pub fn sdxl_config() -> UNetVariantConfig {
         num_res_blocks: 2,
         attention_resolutions: vec![4, 2],
         head_channels: None,
-        transformer_depth: vec![1, 2, 10, 10, 2, 1],
+        transformer_depth: vec![1, 2, 10],
         cross_attention_dim: 2048,
         in_channels: 4,
         out_channels: 4,
         use_linear_projection: true,
         use_flash_attention: false,
-        num_heads: Some(8),
+        num_heads_per_level: vec![5, 10, 20],
     }
 }
 
@@ -389,7 +522,7 @@ pub fn zero123_config() -> UNetVariantConfig {
         out_channels: 4,
         use_linear_projection: false,
         use_flash_attention: false,
-        num_heads: None,
+        num_heads_per_level: Vec::new(),
     }
 }
 
@@ -488,6 +621,27 @@ impl MultiViewAdapterConfig {
             ));
         }
         Ok(())
+    }
+
+    /// Convert [`Self::base`] into a [`crate::config::DiffusionConfig`], using
+    /// [`Self::num_views`] for the resulting config's view count.
+    ///
+    /// This wires the adapter's base U-Net configuration into the crate's
+    /// real pipeline configuration type (see
+    /// [`UNetVariantConfig::to_diffusion_config`]). Cross-view attention
+    /// placement (`cross_view_attention_levels`, `cross_view_dim`) and camera
+    /// pose conditioning (`use_camera_conditioning`, `camera_embed_dim`) are
+    /// not yet modeled by [`crate::config::DiffusionConfig`] /
+    /// [`crate::unet::MultiViewUNet`], so they are not applied by this
+    /// conversion; wiring those into the U-Net's actual layer construction is
+    /// tracked as a follow-up.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelVariantError::InvalidConfig`] under the same conditions
+    /// as [`UNetVariantConfig::to_diffusion_config`].
+    pub fn to_diffusion_config(&self) -> Result<crate::config::DiffusionConfig, ModelVariantError> {
+        self.base.to_diffusion_config(self.num_views)
     }
 }
 
@@ -677,8 +831,11 @@ pub fn config_diff(a: &UNetVariantConfig, b: &UNetVariantConfig) -> Vec<String> 
             a.use_flash_attention, b.use_flash_attention
         ));
     }
-    if a.num_heads != b.num_heads {
-        diffs.push(format!("num_heads: {:?} vs {:?}", a.num_heads, b.num_heads));
+    if a.num_heads_per_level != b.num_heads_per_level {
+        diffs.push(format!(
+            "num_heads_per_level: {:?} vs {:?}",
+            a.num_heads_per_level, b.num_heads_per_level
+        ));
     }
 
     diffs
@@ -1012,5 +1169,120 @@ mod tests {
             summary.contains("768"),
             "Should contain cross_attention_dim"
         );
+    }
+
+    // 36. sd21_config / sdxl_config report per-level heads matching a uniform
+    // 64-dim head, not a single flat num_heads=8 (regression for the
+    // architecture-mismatch bug).
+    #[test]
+    fn test_sd21_sdxl_num_heads_per_level_matches_64_dim_head() {
+        let sd21 = sd21_config();
+        assert_eq!(sd21.num_heads_per_level, vec![5, 10, 20, 20]);
+        for level in 0..sd21.num_levels() {
+            assert_eq!(
+                sd21.channels_at_level(level) / sd21.num_heads_per_level[level],
+                64,
+                "sd21 level {level} should have 64-dim heads"
+            );
+        }
+
+        let sdxl = sdxl_config();
+        assert_eq!(sdxl.num_heads_per_level, vec![5, 10, 20]);
+        for level in 0..sdxl.num_levels() {
+            assert_eq!(
+                sdxl.channels_at_level(level) / sdxl.num_heads_per_level[level],
+                64,
+                "sdxl level {level} should have 64-dim heads"
+            );
+        }
+    }
+
+    // 37. sdxl_config's transformer_depth has one entry per down-level,
+    // matching channel_mult (regression for the 6-vs-3 length mismatch).
+    #[test]
+    fn test_sdxl_transformer_depth_matches_num_levels() {
+        let cfg = sdxl_config();
+        assert_eq!(cfg.transformer_depth.len(), cfg.num_levels());
+        assert_eq!(cfg.transformer_depth, vec![1, 2, 10]);
+    }
+
+    // 38. UNetVariantConfig::to_diffusion_config wires a variant into a real,
+    // validated DiffusionConfig (regression for the "unreachable module" bug).
+    #[test]
+    fn test_sd15_to_diffusion_config() {
+        let cfg = sd15_config();
+        let diffusion_config = cfg
+            .to_diffusion_config(4)
+            .expect("sd15 should convert to a valid DiffusionConfig");
+        assert!(diffusion_config.validate().is_ok());
+        assert_eq!(diffusion_config.num_views, 4);
+        assert_eq!(diffusion_config.base_channels, 320);
+        assert_eq!(diffusion_config.channel_mult, vec![1, 2, 4, 4]);
+        assert_eq!(diffusion_config.cross_attention_dim, 768);
+        assert_eq!(diffusion_config.unet_in_channels, 4);
+        assert_eq!(diffusion_config.unet_out_channels, 4);
+        assert_eq!(diffusion_config.layers_per_block, 2);
+        // SD1.5 uses uniform 64-dim heads: channels_at_level(i) / 64.
+        assert_eq!(diffusion_config.attention_head_dim, vec![5, 10, 20, 20]);
+    }
+
+    // 39. sdxl_config converts with its per-level head counts and trimmed
+    // transformer depth threaded through correctly.
+    #[test]
+    fn test_sdxl_to_diffusion_config() {
+        let cfg = sdxl_config();
+        let diffusion_config = cfg
+            .to_diffusion_config(2)
+            .expect("sdxl should convert to a valid DiffusionConfig");
+        assert!(diffusion_config.validate().is_ok());
+        assert_eq!(diffusion_config.attention_head_dim, vec![5, 10, 20]);
+        assert_eq!(
+            diffusion_config.transformer_layers_per_block,
+            vec![1, 2, 10]
+        );
+        assert_eq!(diffusion_config.cross_attention_dim, 2048);
+        assert_eq!(diffusion_config.image_size, 1024);
+        assert_eq!(diffusion_config.latent_size, 128);
+    }
+
+    // 40. MultiViewAdapterConfig::to_diffusion_config threads num_views from
+    // the adapter into the resulting DiffusionConfig.
+    #[test]
+    fn test_multi_view_adapter_to_diffusion_config() {
+        let base = sd15_config();
+        let adapter = MultiViewAdapterConfig::from_base(base, 6);
+        let diffusion_config = adapter
+            .to_diffusion_config()
+            .expect("adapter should convert to a valid DiffusionConfig");
+        assert_eq!(diffusion_config.num_views, 6);
+    }
+
+    // 41. estimated_vram_mb no longer depends on an unexplained magic
+    // multiplier: a config with more transformer depth at attended levels
+    // should report more VRAM than an otherwise-identical config with less
+    // (regression for the 1000x fudge-factor bug).
+    #[test]
+    fn test_estimated_vram_reflects_transformer_depth() {
+        let shallow = sd15_config();
+        let mut deep = sd15_config();
+        deep.transformer_depth = vec![4, 4, 4, 4];
+        assert!(
+            deep.estimated_vram_mb(512, 1) > shallow.estimated_vram_mb(512, 1),
+            "deeper transformer blocks at attended levels should need more VRAM"
+        );
+    }
+
+    // 42. estimated_vram_mb is strictly positive for every standard variant
+    // (sanity check on the new per-level activation model).
+    #[test]
+    fn test_estimated_vram_positive_for_all_variants() {
+        for cfg in [
+            sd15_config(),
+            sd21_config(),
+            sdxl_config(),
+            zero123_config(),
+        ] {
+            assert!(cfg.estimated_vram_mb(512, 1) > 0);
+        }
     }
 }

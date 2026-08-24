@@ -199,13 +199,21 @@ pub struct DebugConfig {
     /// release builds but disable them at runtime.
     pub enabled: bool,
     /// If `true`, panic immediately upon detecting any NaN.
+    ///
+    /// Only takes effect when this crate is built with the `gpu_debug`
+    /// Cargo feature; otherwise it is accepted but has no effect, so a
+    /// default (production) build never contains a reachable `panic!` from
+    /// this path.
     pub panic_on_nan: bool,
     /// If `true`, panic immediately upon detecting any Inf.
+    ///
+    /// Same `gpu_debug`-feature gating as [`DebugConfig::panic_on_nan`].
     pub panic_on_inf: bool,
     /// If `true`, log even healthy tensors via `tracing::trace!`.
     pub log_all_checks: bool,
     /// Maximum number of bad-tensor records to retain. Older records are
-    /// dropped when this limit is reached (FIFO eviction).
+    /// dropped when this limit is reached (FIFO eviction). `0` retains no
+    /// records at all.
     pub max_records: usize,
 }
 
@@ -255,8 +263,10 @@ impl DebugHooks {
     /// synthetic healthy report is returned immediately.
     ///
     /// When [`DebugConfig::panic_on_nan`] or [`DebugConfig::panic_on_inf`] is
-    /// set, the method panics after recording (giving you the full record before
-    /// aborting).
+    /// set AND this crate is built with the `gpu_debug` Cargo feature, the
+    /// method panics after recording (giving you the full record before
+    /// aborting). Without that feature the flags are accepted but inert,
+    /// so a default (production) build never panics here.
     pub fn check(&self, name: impl Into<String>, data: &[f32]) -> TensorHealth {
         self.check_count.fetch_add(1, Ordering::Relaxed);
 
@@ -295,21 +305,30 @@ impl DebugHooks {
         if !health.is_healthy {
             self.bad_count.fetch_add(1, Ordering::Relaxed);
 
-            // Append to records with max_records eviction
-            let mut records = self.records.lock().unwrap_or_else(|e| e.into_inner());
-            if records.len() >= self.config.max_records {
-                records.remove(0);
+            // Append to records with max_records eviction. max_records == 0
+            // means "retain no records" rather than "evict from an empty
+            // Vec", which would otherwise panic on Vec::remove(0).
+            if self.config.max_records > 0 {
+                let mut records = self.records.lock().unwrap_or_else(|e| e.into_inner());
+                if records.len() >= self.config.max_records {
+                    records.remove(0);
+                }
+                records.push(health.clone());
+                drop(records);
             }
-            records.push(health.clone());
-            drop(records);
 
-            // Panic after recording so the record is visible
+            // Panic after recording so the record is visible. Gated behind
+            // the `gpu_debug` feature so a default (production) build never
+            // contains a reachable panic!: panic_on_nan/panic_on_inf are
+            // inert unless the crate is built with `--features gpu_debug`.
+            #[cfg(feature = "gpu_debug")]
             if self.config.panic_on_nan && health.nan_count > 0 {
                 panic!(
                     "DebugHooks: NaN detected in tensor '{}' ({} NaN values, first at index {:?})",
                     health.name, health.nan_count, health.first_bad_index
                 );
             }
+            #[cfg(feature = "gpu_debug")]
             if self.config.panic_on_inf && (health.pos_inf_count + health.neg_inf_count) > 0 {
                 panic!(
                     "DebugHooks: Inf detected in tensor '{}' ({} +Inf, {} -Inf)",
@@ -645,6 +664,46 @@ mod tests {
         assert_eq!(records[0].name, "tensor_2");
         assert_eq!(records[1].name, "tensor_3");
         assert_eq!(records[2].name, "tensor_4");
+    }
+
+    #[test]
+    fn test_debug_hooks_max_records_zero_does_not_panic() {
+        let hooks = DebugHooks::new(DebugConfig {
+            enabled: true,
+            max_records: 0,
+            ..Default::default()
+        });
+
+        let bad = vec![f32::NAN];
+        // Must not panic (max_records == 0 used to hit Vec::remove(0) on
+        // an empty Vec).
+        let h = hooks.check("t0", &bad);
+        assert!(!h.is_healthy);
+
+        let records = hooks.bad_records();
+        assert!(records.is_empty(), "max_records=0 should retain no records");
+
+        let (_, bad_count) = hooks.stats();
+        assert_eq!(bad_count, 1, "bad_count should still increment");
+    }
+
+    #[test]
+    #[cfg(not(feature = "gpu_debug"))]
+    fn test_debug_hooks_panic_on_nan_inert_without_gpu_debug_feature() {
+        // panic_on_nan/panic_on_inf only take effect when this crate is
+        // built with the `gpu_debug` feature; in a default build (as tests
+        // normally run) they must never cause check() to panic.
+        let hooks = DebugHooks::new(DebugConfig {
+            enabled: true,
+            panic_on_nan: true,
+            panic_on_inf: true,
+            ..Default::default()
+        });
+        let bad = vec![f32::NAN, f32::INFINITY];
+        // Must not panic.
+        let h = hooks.check("should_not_panic", &bad);
+        assert!(!h.is_healthy);
+        assert_eq!(h.nan_count, 1);
     }
 
     #[test]

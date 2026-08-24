@@ -327,6 +327,30 @@ impl ClusteringResult {
             .count()
     }
 
+    /// Build a table (indexed by cluster id) of member sample indices, in a
+    /// single O(n) pass over `assignments`.
+    ///
+    /// This is the shared building block behind [`Self::silhouette_score`]
+    /// and the free functions [`davies_bouldin_index`] and
+    /// [`describe_clusters`]/[`compute_cluster_stats`]: call it once and
+    /// reuse the result across all clusters/samples instead of re-scanning
+    /// `assignments` once per cluster (or, in `silhouette_score`'s case,
+    /// once per cluster *per sample*). Any assignment `>= self.centroids.len()`
+    /// (only possible via manual construction, since `assignments` and
+    /// `centroids` are independently public fields) is silently dropped
+    /// rather than panicking.
+    #[must_use]
+    pub fn membership_table(&self) -> Vec<Vec<usize>> {
+        let k = self.centroids.len();
+        let mut table = vec![Vec::new(); k];
+        for (i, &c) in self.assignments.iter().enumerate() {
+            if let Some(members) = table.get_mut(c) {
+                members.push(i);
+            }
+        }
+        table
+    }
+
     /// Mean silhouette score over all samples.
     ///
     /// For k == 1 (no meaningful inter-cluster distance), returns 0.0.
@@ -351,69 +375,45 @@ impl ClusteringResult {
             return Err(ExpressionClusterError::EmptyExpressions);
         }
 
+        // Precompute cluster membership once (a single O(n) pass) instead
+        // of re-scanning `assignments` for every (sample, cluster) pair
+        // below — previously O(n * k) scans on top of the unavoidable
+        // O(n^2) pairwise-distance work.
+        let membership = self.membership_table();
+        let empty: Vec<usize> = Vec::new();
+
         let mut total = 0.0_f32;
         for i in 0..num_samples {
             let expr_i = dataset
                 .get(i)
                 .ok_or(ExpressionClusterError::EmptyExpressions)?;
-            let cluster_i = self.assignments[i];
+            // `.get` (rather than direct indexing) so a `self.assignments`
+            // shorter than `dataset` degrades gracefully instead of
+            // panicking; `usize::MAX` never matches a real cluster id.
+            let cluster_i = self.assignments.get(i).copied().unwrap_or(usize::MAX);
+            let own_members = membership.get(cluster_i).unwrap_or(&empty);
 
-            // Intra-cluster mean distance
-            let intra_members: Vec<usize> = self
-                .assignments
-                .iter()
-                .enumerate()
-                .filter_map(|(j, &assign)| {
-                    if j != i && assign == cluster_i {
-                        Some(j)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-            let intra_mean_dist = if intra_members.is_empty() {
+            // Intra-cluster mean distance (excluding `i` itself).
+            let intra_mean_dist = if own_members.len() <= 1 {
                 0.0_f32
             } else {
-                let sum: f32 = intra_members
+                let sum: f32 = own_members
                     .iter()
-                    .map(|&j| {
-                        let expr_j = &dataset.expressions[j];
-                        euclidean_sq(expr_i, expr_j).sqrt()
-                    })
+                    .filter(|&&j| j != i)
+                    .map(|&j| euclidean_sq(expr_i, &dataset.expressions[j]).sqrt())
                     .sum();
-                sum / intra_members.len() as f32
+                sum / (own_members.len() - 1) as f32
             };
 
             // Nearest-cluster mean distance
             let mut nearest_cluster_dist = f32::INFINITY;
-            for cluster_idx in 0..num_clusters {
-                if cluster_idx == cluster_i {
-                    continue;
-                }
-                let other_members: Vec<usize> = self
-                    .assignments
-                    .iter()
-                    .enumerate()
-                    .filter_map(
-                        |(j, &assign)| {
-                            if assign == cluster_idx {
-                                Some(j)
-                            } else {
-                                None
-                            }
-                        },
-                    )
-                    .collect();
-                if other_members.is_empty() {
+            for (cluster_idx, other_members) in membership.iter().enumerate() {
+                if cluster_idx == cluster_i || other_members.is_empty() {
                     continue;
                 }
                 let mean_dist: f32 = other_members
                     .iter()
-                    .map(|&j| {
-                        let expr_j = &dataset.expressions[j];
-                        euclidean_sq(expr_i, expr_j).sqrt()
-                    })
+                    .map(|&j| euclidean_sq(expr_i, &dataset.expressions[j]).sqrt())
                     .sum::<f32>()
                     / other_members.len() as f32;
                 if mean_dist < nearest_cluster_dist {
@@ -569,17 +569,26 @@ pub fn kmeans_plus_plus_init(
 
         let total: f32 = dists.iter().sum();
         if total < 1e-30 {
-            // All points coincide with existing centroids — pick any remaining.
-            for expr in expressions {
-                if !centroids.iter().any(|c| {
-                    c.iter()
-                        .zip(expr.iter())
-                        .all(|(&a, &b)| (a - b).abs() < 1e-12)
-                }) {
-                    centroids.push(expr.clone());
-                    break;
-                }
-            }
+            // All points coincide with existing centroids (to within
+            // floating-point tolerance), so no point is distinct enough to
+            // pick by variance. Prefer a genuinely distinct point if one
+            // exists; otherwise fall back to a deterministic (reproducible)
+            // duplicate so this loop iteration always pushes exactly one
+            // centroid — guaranteeing the function returns exactly `k`
+            // centroids as documented, rather than silently returning
+            // fewer when the data is this degenerate.
+            let pick = expressions
+                .iter()
+                .find(|expr| {
+                    !centroids.iter().any(|c| {
+                        c.iter()
+                            .zip(expr.iter())
+                            .all(|(&a, &b)| (a - b).abs() < 1e-12)
+                    })
+                })
+                .cloned()
+                .unwrap_or_else(|| expressions[centroids.len() % n].clone());
+            centroids.push(pick);
             continue;
         }
 
@@ -615,6 +624,9 @@ pub fn kmeans_iteration(expressions: &[Vec<f32>], centroids: &[Vec<f32>]) -> Kme
     let k = centroids.len();
     if n == 0 {
         return Err(ExpressionClusterError::EmptyExpressions);
+    }
+    if k == 0 {
+        return Err(ExpressionClusterError::InvalidK { k: 0 });
     }
     let dim = expressions[0].len();
 
@@ -750,10 +762,13 @@ pub fn describe_clusters(
 ) -> Result<Vec<ExpressionCluster>, ExpressionClusterError> {
     let k = result.centroids.len();
     let mut clusters = Vec::with_capacity(k);
+    // Precompute cluster membership once (a single O(n) pass) instead of
+    // calling `cluster_members` (an O(n) scan) once per cluster.
+    let membership = result.membership_table();
 
     for id in 0..k {
         let centroid = &result.centroids[id];
-        let members = result.cluster_members(id);
+        let members = membership[id].clone();
 
         let mut sum_dist = 0.0_f32;
         let mut max_dist = 0.0_f32;
@@ -901,10 +916,14 @@ pub fn davies_bouldin_index(
         return Ok(0.0);
     }
 
+    // Precompute cluster membership once (a single O(n) pass) instead of
+    // calling `cluster_members` (an O(n) scan) once per cluster.
+    let membership = result.membership_table();
+
     // Average intra-cluster scatter per cluster (mean distance to centroid).
     let mut scatter = vec![0.0_f32; k];
     for (cluster_id, scatter_val) in scatter.iter_mut().enumerate().take(k) {
-        let members = result.cluster_members(cluster_id);
+        let members = &membership[cluster_id];
         if members.is_empty() {
             // Degenerate; treat as 0 scatter.
             continue;
@@ -1024,7 +1043,8 @@ pub fn compute_cluster_stats(
     dataset: &ExpressionDataset,
 ) -> Result<ClusterStats, ExpressionClusterError> {
     let k = result.centroids.len();
-    let cluster_sizes: Vec<usize> = (0..k).map(|id| result.cluster_size(id)).collect();
+    // A single O(n) pass instead of `k` separate O(n) `cluster_size` scans.
+    let cluster_sizes: Vec<usize> = result.membership_table().iter().map(Vec::len).collect();
 
     let silhouette = result.silhouette_score(dataset)?;
     let davies_bouldin = davies_bouldin_index(result, dataset)?;
@@ -1295,6 +1315,24 @@ mod tests {
         assert_eq!(centroids.len(), 3);
     }
 
+    #[test]
+    fn test_kmeans_pp_identical_points_still_returns_k_centroids() {
+        // Regression test: when every point coincides (a degenerate
+        // dataset), the fallback branch must still push a centroid on
+        // every iteration so the result always has exactly `k` entries,
+        // rather than silently returning fewer.
+        let exprs = vec![vec![1.0, 1.0]; 5];
+        let centroids = kmeans_plus_plus_init(&exprs, 3, 123).expect("kpp degenerate");
+        assert_eq!(
+            centroids.len(),
+            3,
+            "must return exactly k=3 centroids even for identical points"
+        );
+        for c in &centroids {
+            assert_eq!(c, &vec![1.0, 1.0]);
+        }
+    }
+
     // -----------------------------------------------------------------------
     // kmeans_iteration
     // -----------------------------------------------------------------------
@@ -1317,6 +1355,19 @@ mod tests {
         let (_, new_centroids, inertia) = kmeans_iteration(&exprs, &centroids).expect("iter");
         assert!(inertia.abs() < 1e-6, "inertia={inertia}");
         assert!((new_centroids[0][0] - 5.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_kmeans_iteration_empty_centroids_errors() {
+        // Regression test: an empty centroid slice previously panicked
+        // (index out of bounds) instead of returning an error.
+        let exprs = vec![vec![1.0, 2.0], vec![3.0, 4.0]];
+        let centroids: Vec<Vec<f32>> = Vec::new();
+        let result = kmeans_iteration(&exprs, &centroids);
+        assert!(matches!(
+            result,
+            Err(ExpressionClusterError::InvalidK { k: 0 })
+        ));
     }
 
     // -----------------------------------------------------------------------
@@ -1380,6 +1431,45 @@ mod tests {
         assert_eq!(result.cluster_members(1), vec![1, 4]);
         assert_eq!(result.cluster_size(0), 3);
         assert_eq!(result.cluster_size(1), 2);
+    }
+
+    #[test]
+    fn test_membership_table_matches_cluster_members() {
+        // `membership_table` is the shared O(n) building block behind
+        // `silhouette_score`, `davies_bouldin_index`, `describe_clusters`
+        // and `compute_cluster_stats`; it must agree exactly with the
+        // (slower, per-cluster) `cluster_members`/`cluster_size`.
+        let result = ClusteringResult {
+            assignments: vec![0, 1, 0, 0, 1, 2],
+            centroids: vec![vec![0.0], vec![1.0], vec![2.0]],
+            inertia: 0.0,
+            n_iter: 1,
+            converged: true,
+        };
+        let table = result.membership_table();
+        assert_eq!(table.len(), 3);
+        for id in 0..3 {
+            assert_eq!(table[id], result.cluster_members(id), "cluster {id}");
+            assert_eq!(table[id].len(), result.cluster_size(id), "cluster {id}");
+        }
+    }
+
+    #[test]
+    fn test_membership_table_drops_out_of_range_assignments() {
+        // `assignments` and `centroids` are independently public fields, so
+        // an assignment >= centroids.len() is a shape the type permits;
+        // `membership_table` must drop it rather than panicking.
+        let result = ClusteringResult {
+            assignments: vec![0, 99, 1],
+            centroids: vec![vec![0.0], vec![1.0]],
+            inertia: 0.0,
+            n_iter: 1,
+            converged: true,
+        };
+        let table = result.membership_table();
+        assert_eq!(table.len(), 2);
+        assert_eq!(table[0], vec![0]);
+        assert_eq!(table[1], vec![2]);
     }
 
     #[test]

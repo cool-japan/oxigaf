@@ -64,8 +64,18 @@ pub struct EditConfig {
     /// Total number of diffusion timesteps.
     pub n_timesteps: usize,
     /// Guidance scale for classifier-free guidance.
+    ///
+    /// [`sdedit_perturb`] only performs the forward (noising) step and does
+    /// not itself apply classifier-free guidance — this value is provided
+    /// for the caller's own reverse-process (denoising) sampler, which
+    /// typically applies CFG via `guidance_rescaling::apply_cfg_guidance` or
+    /// similar. It is validated by [`Self::validate`].
     pub guidance_scale: f32,
     /// Whether to use mask-based editing.
+    ///
+    /// Consulted by [`sdedit_perturb_with_mask`], which blends the noised
+    /// result back with the original latent outside the mask; plain
+    /// [`sdedit_perturb`] ignores this field entirely.
     pub use_mask: bool,
 }
 
@@ -77,6 +87,22 @@ impl Default for EditConfig {
             guidance_scale: 7.5,
             use_mask: false,
         }
+    }
+}
+
+impl EditConfig {
+    /// Validate configuration invariants that no other function in this
+    /// module checks. `strength` is validated separately by
+    /// [`edit_start_timestep`] (reachable with a descriptive error even for
+    /// callers that bypass `EditConfig`).
+    pub fn validate(&self) -> Result<(), ImageEditError> {
+        if !self.guidance_scale.is_finite() || self.guidance_scale < 0.0 {
+            return Err(ImageEditError::InvalidParam(format!(
+                "guidance_scale must be a finite value >= 0, got {}",
+                self.guidance_scale
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -118,14 +144,19 @@ fn edit_box_muller(u1: f32, u2: f32) -> (f32, f32) {
 
 /// Compute the starting timestep for SDEdit from strength.
 ///
-/// `t_start = floor(n_timesteps * strength)`
+/// `t_start = min(floor(n_timesteps * strength), n_timesteps - 1)`
+///
+/// Valid timestep indices are `0..=n_timesteps-1`; without the clamp,
+/// `strength = 1.0` would compute exactly `n_timesteps`, one past the last
+/// valid index for an `alpha_bars` array of that length.
 ///
 /// Returns `InvalidStrength` if `strength` is not in `(0, 1]`.
 pub fn edit_start_timestep(strength: f32, n_timesteps: usize) -> Result<usize, ImageEditError> {
     if strength <= 0.0 || strength > 1.0 {
         return Err(ImageEditError::InvalidStrength(strength));
     }
-    Ok((n_timesteps as f32 * strength).floor() as usize)
+    let raw = (n_timesteps as f32 * strength).floor() as usize;
+    Ok(raw.min(n_timesteps.saturating_sub(1)))
 }
 
 /// Compute the cosine noise schedule alpha-bar values.
@@ -260,9 +291,10 @@ pub fn edit_sample_noise(n: usize, state: &mut u64) -> Vec<f32> {
 
 /// Apply SDEdit: add noise at the strength-controlled starting timestep.
 ///
-/// 1. Compute `t_start = floor(n_timesteps * strength)`.
-/// 2. Sample Gaussian noise.
-/// 3. Apply `edit_add_noise` at `t_start`.
+/// 1. Validate `config` (see [`EditConfig::validate`]).
+/// 2. Compute `t_start = min(floor(n_timesteps * strength), n_timesteps - 1)`.
+/// 3. Sample Gaussian noise.
+/// 4. Apply `edit_add_noise` at `t_start`.
 ///
 /// Returns `(noisy_latent, timestep_used)`.
 pub fn sdedit_perturb(
@@ -274,10 +306,39 @@ pub fn sdedit_perturb(
     if latent.is_empty() {
         return Err(ImageEditError::EmptyInput);
     }
+    config.validate()?;
     let t_start = edit_start_timestep(config.strength, config.n_timesteps)?;
     let noise = edit_sample_noise(latent.len(), state);
     let noisy = edit_add_noise(latent, &noise, t_start, alpha_bars)?;
     Ok((noisy, t_start))
+}
+
+/// Same as [`sdedit_perturb`], but when `config.use_mask` is set, blends the
+/// noised result back with the original latent so only the masked region
+/// is actually perturbed (`mask == 1.0` → use the noised value, `mask ==
+/// 0.0` → keep `latent` unchanged), matching the `Inpaint` convention used
+/// by `image_editing::apply_inpaint_mask`.
+///
+/// When `config.use_mask` is `false`, `mask` is ignored and this behaves
+/// exactly like `sdedit_perturb`. When `true`, `mask` is required.
+pub fn sdedit_perturb_with_mask(
+    latent: &[f32],
+    config: &EditConfig,
+    alpha_bars: &[f32],
+    state: &mut u64,
+    mask: Option<&EditMask>,
+) -> Result<(Vec<f32>, usize), ImageEditError> {
+    let (noisy, t_start) = sdedit_perturb(latent, config, alpha_bars, state)?;
+    if !config.use_mask {
+        return Ok((noisy, t_start));
+    }
+    let m = mask.ok_or_else(|| {
+        ImageEditError::InvalidMask(
+            "EditConfig::use_mask is set but no mask was provided".to_string(),
+        )
+    })?;
+    let blended = edit_blend_with_mask(latent, &noisy, m)?;
+    Ok((blended, t_start))
 }
 
 // ---------------------------------------------------------------------------
@@ -376,7 +437,11 @@ pub fn edit_lerp_latents(a: &[f32], b: &[f32], alpha: f32) -> Result<Vec<f32>, I
 
 /// Spherical linear interpolation (slerp) between two latents.
 ///
-/// Treats each latent as a vector on the unit hypersphere.
+/// Treats each latent as a vector on the unit hypersphere. `alpha = 0.0`
+/// returns (a copy of) `a`; `alpha = 1.0` returns (a copy of) `b` — the
+/// opposite convention from [`edit_lerp_latents`], but matching
+/// `identity_conditioning::ident_slerp` and
+/// `image_variations::spherical_interpolate_latents` elsewhere in this crate.
 /// Falls back to linear interpolation when the vectors are nearly parallel
 /// (`dot > 0.9999` after normalization).
 pub fn edit_slerp_latents(a: &[f32], b: &[f32], alpha: f32) -> Result<Vec<f32>, ImageEditError> {
@@ -393,9 +458,11 @@ pub fn edit_slerp_latents(a: &[f32], b: &[f32], alpha: f32) -> Result<Vec<f32>, 
     let norm_a = a.iter().fold(0.0f32, |acc, &x| acc + x * x).sqrt();
     let norm_b = b.iter().fold(0.0f32, |acc, &x| acc + x * x).sqrt();
 
-    // If either vector is zero-norm, fall back to lerp.
+    // If either vector is zero-norm, fall back to lerp. edit_lerp_latents
+    // uses the opposite alpha convention (alpha=1 -> a, alpha=0 -> b), so
+    // the argument is flipped to preserve *this* function's own convention.
     if norm_a < 1e-12 || norm_b < 1e-12 {
-        return edit_lerp_latents(a, b, alpha);
+        return edit_lerp_latents(a, b, 1.0 - alpha);
     }
 
     let dot: f32 = a
@@ -405,8 +472,9 @@ pub fn edit_slerp_latents(a: &[f32], b: &[f32], alpha: f32) -> Result<Vec<f32>, 
         .sum();
 
     if dot > 0.9999 {
-        // Nearly parallel - linear interpolation is stable.
-        return edit_lerp_latents(a, b, alpha);
+        // Nearly parallel - linear interpolation is stable. Flip alpha for
+        // the same reason as the zero-norm fallback above.
+        return edit_lerp_latents(a, b, 1.0 - alpha);
     }
 
     let theta = dot.clamp(-1.0, 1.0).acos();
@@ -694,8 +762,11 @@ mod tests {
 
     #[test]
     fn start_timestep_strength_one() {
+        // Valid timestep indices are 0..=n_timesteps-1, so strength=1.0 (the
+        // documented maximum) must clamp to the last valid index instead of
+        // returning n_timesteps itself.
         let t = edit_start_timestep(1.0, 1000).unwrap();
-        assert_eq!(t, 1000);
+        assert_eq!(t, 999);
     }
 
     #[test]
@@ -966,6 +1037,149 @@ mod tests {
         assert_eq!(noisy.len(), latent.len());
     }
 
+    #[test]
+    fn sdedit_perturb_succeeds_at_max_strength() {
+        // Regression test: strength=1.0 is documented as the maximum legal
+        // value, but previously edit_start_timestep(1.0, n) == n, which
+        // edit_add_noise's bounds check rejected as out of range whenever
+        // alpha_bars.len() == n (the normal case). It must succeed.
+        let ab = edit_cosine_alpha_bars(1000);
+        let latent = make_latent_val(16, 0.5);
+        let config = EditConfig {
+            strength: 1.0,
+            n_timesteps: 1000,
+            ..Default::default()
+        };
+        let mut state = 42u64;
+        let result = sdedit_perturb(&latent, &config, &ab, &mut state);
+        assert!(
+            result.is_ok(),
+            "strength=1.0 should not error: {:?}",
+            result.err()
+        );
+        let (_, t) = result.unwrap();
+        assert_eq!(t, 999);
+    }
+
+    // -----------------------------------------------------------------------
+    // EditConfig::validate
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn edit_config_validate_default_ok() {
+        assert!(EditConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn edit_config_validate_rejects_negative_guidance_scale() {
+        let config = EditConfig {
+            guidance_scale: -1.0,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn edit_config_validate_rejects_nan_guidance_scale() {
+        let config = EditConfig {
+            guidance_scale: f32::NAN,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn sdedit_perturb_rejects_invalid_guidance_scale() {
+        let ab = edit_cosine_alpha_bars(1000);
+        let latent = make_latent_val(8, 0.5);
+        let config = EditConfig {
+            guidance_scale: -5.0,
+            ..Default::default()
+        };
+        let mut state = 1u64;
+        assert!(sdedit_perturb(&latent, &config, &ab, &mut state).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // sdedit_perturb_with_mask
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sdedit_perturb_with_mask_disabled_matches_plain_perturb() {
+        let ab = edit_cosine_alpha_bars(1000);
+        let latent = make_latent_val(16, 0.5);
+        let config = EditConfig {
+            strength: 0.5,
+            n_timesteps: 1000,
+            use_mask: false,
+            ..Default::default()
+        };
+        let mut s1 = 7u64;
+        let mut s2 = 7u64;
+        let (plain, t1) = sdedit_perturb(&latent, &config, &ab, &mut s1).unwrap();
+        let (masked, t2) = sdedit_perturb_with_mask(&latent, &config, &ab, &mut s2, None).unwrap();
+        assert_eq!(t1, t2);
+        assert_eq!(plain, masked);
+    }
+
+    #[test]
+    fn sdedit_perturb_with_mask_zero_mask_preserves_original() {
+        let ab = edit_cosine_alpha_bars(1000);
+        let latent = make_latent_val(16, 0.5);
+        let mask = make_mask(4, 4, 0.0); // preserve everywhere
+        let config = EditConfig {
+            strength: 0.9,
+            n_timesteps: 1000,
+            use_mask: true,
+            ..Default::default()
+        };
+        let mut state = 7u64;
+        let (result, _) =
+            sdedit_perturb_with_mask(&latent, &config, &ab, &mut state, Some(&mask)).unwrap();
+        for (r, l) in result.iter().zip(latent.iter()) {
+            assert!(
+                (r - l).abs() < 1e-5,
+                "mask=0 should preserve original: {} vs {}",
+                r,
+                l
+            );
+        }
+    }
+
+    #[test]
+    fn sdedit_perturb_with_mask_one_mask_matches_unmasked_noise() {
+        let ab = edit_cosine_alpha_bars(1000);
+        let latent = make_latent_val(16, 0.5);
+        let mask = make_mask(4, 4, 1.0); // edit everywhere
+        let config = EditConfig {
+            strength: 0.6,
+            n_timesteps: 1000,
+            use_mask: true,
+            ..Default::default()
+        };
+        let mut s1 = 3u64;
+        let mut s2 = 3u64;
+        let (plain, _) = sdedit_perturb(&latent, &config, &ab, &mut s1).unwrap();
+        let (masked, _) =
+            sdedit_perturb_with_mask(&latent, &config, &ab, &mut s2, Some(&mask)).unwrap();
+        for (p, m) in plain.iter().zip(masked.iter()) {
+            assert!((p - m).abs() < 1e-5, "mask=1 should match unmasked noise");
+        }
+    }
+
+    #[test]
+    fn sdedit_perturb_with_mask_missing_mask_errors() {
+        let ab = edit_cosine_alpha_bars(1000);
+        let latent = make_latent_val(16, 0.5);
+        let config = EditConfig {
+            use_mask: true,
+            ..Default::default()
+        };
+        let mut state = 7u64;
+        let err = sdedit_perturb_with_mask(&latent, &config, &ab, &mut state, None).unwrap_err();
+        assert!(matches!(err, ImageEditError::InvalidMask(_)));
+    }
+
     // -----------------------------------------------------------------------
     // EditMask methods (new ones added to mod.rs)
     // -----------------------------------------------------------------------
@@ -982,6 +1196,20 @@ mod tests {
         let m = EditMask::all_ones(4, 4);
         assert!(m.data.iter().all(|&v| (v - 1.0).abs() < 1e-6));
         assert_eq!(m.data.len(), 16);
+    }
+
+    #[test]
+    fn mask_all_ones_takes_height_then_width() {
+        // Regression test: all_ones(height, width) must match the
+        // (height, width) parameter order used by EditMask::new and
+        // EditMask::from_data, not the reverse.
+        let m = EditMask::all_ones(3, 5); // height=3, width=5
+        assert_eq!(m.height, 3);
+        assert_eq!(m.width, 5);
+        assert_eq!(m.data.len(), 15);
+        let expected = EditMask::new(3, 5, 1.0);
+        assert_eq!(m.height, expected.height);
+        assert_eq!(m.width, expected.width);
     }
 
     #[test]
@@ -1070,6 +1298,35 @@ mod tests {
         let m = EditMask::new(8, 8, 0.0);
         let s = m.smooth(1.0);
         assert!(s.data.iter().all(|&v| v.abs() < 1e-5));
+    }
+
+    #[test]
+    fn mask_smooth_sigma_zero_still_thresholds() {
+        // Regression test: sigma <= 0 must skip the Gaussian pass but still
+        // binarise the mask per the documented contract, instead of
+        // returning the original (possibly non-binary) data unmodified.
+        let data = vec![0.6f32, 0.4, 0.5, 0.9];
+        let m = EditMask::from_data(2, 2, data).unwrap();
+        let s = m.smooth(0.0);
+        assert_eq!(s.data, vec![1.0, 0.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn mask_smooth_nan_sigma_does_not_zero_the_mask() {
+        // Regression test: NaN sigma previously fell through into the
+        // kernel-building code (since `NaN <= 0.0` is false) and produced an
+        // all-zero mask via a NaN-poisoned normalisation. It must instead be
+        // treated like sigma <= 0 (skip blur, still threshold).
+        let m = EditMask::all_ones(4, 4);
+        let s = m.smooth(f32::NAN);
+        assert!(s.data.iter().all(|&v| (v - 1.0).abs() < 1e-6));
+    }
+
+    #[test]
+    fn mask_smooth_infinite_sigma_does_not_panic() {
+        let m = EditMask::new(4, 4, 0.7);
+        let s = m.smooth(f32::INFINITY);
+        assert!(s.data.iter().all(|&v| (v - 1.0).abs() < 1e-6));
     }
 
     // -----------------------------------------------------------------------
@@ -1201,6 +1458,75 @@ mod tests {
         let a = make_latent_val(8, 1.0);
         let b = make_latent_val(4, 1.0);
         assert!(edit_slerp_latents(&a, &b, 0.5).is_err());
+    }
+
+    #[test]
+    fn slerp_alpha_zero_and_one_match_own_convention_general_path() {
+        // Non-parallel vectors so the general slerp formula (not a
+        // fallback) is exercised.
+        let a = vec![1.0f32, 0.0, 0.0, 0.0];
+        let b = vec![0.0f32, 1.0, 0.0, 0.0];
+
+        let at_zero = edit_slerp_latents(&a, &b, 0.0).unwrap();
+        for (r, ai) in at_zero.iter().zip(a.iter()) {
+            assert!(
+                (r - ai).abs() < 1e-4,
+                "alpha=0 should return a: {} vs {}",
+                r,
+                ai
+            );
+        }
+
+        let at_one = edit_slerp_latents(&a, &b, 1.0).unwrap();
+        for (r, bi) in at_one.iter().zip(b.iter()) {
+            assert!(
+                (r - bi).abs() < 1e-4,
+                "alpha=1 should return b: {} vs {}",
+                r,
+                bi
+            );
+        }
+    }
+
+    #[test]
+    fn slerp_alpha_zero_and_one_match_own_convention_near_parallel_fallback() {
+        // Regression test for the alpha-convention bug: the near-parallel
+        // lerp fallback must agree with the general-path convention
+        // (alpha=0 -> a, alpha=1 -> b), not edit_lerp_latents' own
+        // (opposite) convention.
+        let a = vec![1.0f32, 0.0, 0.0, 0.0];
+        let b = vec![1.0f32, 1e-8, 0.0, 0.0]; // dot > 0.9999 -> triggers fallback
+
+        let at_zero = edit_slerp_latents(&a, &b, 0.0).unwrap();
+        for (r, ai) in at_zero.iter().zip(a.iter()) {
+            assert!(
+                (r - ai).abs() < 1e-4,
+                "alpha=0 should return a: {} vs {}",
+                r,
+                ai
+            );
+        }
+
+        let at_one = edit_slerp_latents(&a, &b, 1.0).unwrap();
+        for (r, bi) in at_one.iter().zip(b.iter()) {
+            assert!(
+                (r - bi).abs() < 1e-4,
+                "alpha=1 should return b: {} vs {}",
+                r,
+                bi
+            );
+        }
+    }
+
+    #[test]
+    fn slerp_alpha_zero_matches_own_convention_zero_norm_fallback() {
+        let a = vec![1.0f32, 2.0, 3.0];
+        let zero = vec![0.0f32, 0.0, 0.0]; // triggers the zero-norm fallback
+        let at_zero = edit_slerp_latents(&a, &zero, 0.0).unwrap();
+        assert_eq!(
+            at_zero, a,
+            "alpha=0 should return a even when b is zero-norm"
+        );
     }
 
     // -----------------------------------------------------------------------

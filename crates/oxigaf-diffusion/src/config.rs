@@ -183,12 +183,201 @@ impl Default for DiffusionConfig {
 
 impl DiffusionConfig {
     /// Channel count for a given U-Net stage index.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `stage >= self.num_stages()` (i.e. `stage >= self.channel_mult.len()`).
+    /// Callers that cannot guarantee `stage` is in range should use
+    /// [`Self::try_stage_channels`] instead, or call [`Self::validate`] once at
+    /// construction time to catch a malformed config before this is ever reached.
     pub fn stage_channels(&self, stage: usize) -> usize {
+        debug_assert!(
+            stage < self.channel_mult.len(),
+            "stage_channels: stage index {stage} out of range (channel_mult has {} entries)",
+            self.channel_mult.len()
+        );
         self.base_channels * self.channel_mult[stage]
+    }
+
+    /// Checked variant of [`Self::stage_channels`] that returns `None` instead
+    /// of panicking when `stage` is out of range.
+    pub fn try_stage_channels(&self, stage: usize) -> Option<usize> {
+        self.channel_mult
+            .get(stage)
+            .map(|&mult| self.base_channels * mult)
     }
 
     /// Total number of U-Net stages.
     pub fn num_stages(&self) -> usize {
         self.channel_mult.len()
+    }
+
+    /// Validates internal consistency of the configuration.
+    ///
+    /// Checks that:
+    /// - `num_views > 0`.
+    /// - `guidance_scale >= 1.0`.
+    /// - `image_size` is a positive multiple of 8, and `latent_size == image_size / 8`
+    ///   (the VAE's implicit 8x downsampling factor).
+    /// - `norm_num_groups > 0`, and every stage's channel count
+    ///   (`stage_channels(i)` for `i` in `0..num_stages()`) is evenly divisible by it,
+    ///   as required by `nn::group_norm`.
+    /// - `attention_head_dim` and `transformer_layers_per_block` each have at least
+    ///   `num_stages()` entries.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::DiffusionError::InvalidConfig`] describing the first check
+    /// that fails.
+    pub fn validate(&self) -> crate::DiffusionResult<()> {
+        if self.num_views == 0 {
+            return Err(crate::DiffusionError::InvalidConfig(
+                "num_views must be > 0".to_string(),
+            ));
+        }
+        if self.guidance_scale < 1.0 {
+            return Err(crate::DiffusionError::InvalidConfig(format!(
+                "guidance_scale must be >= 1.0, got {}",
+                self.guidance_scale
+            )));
+        }
+        if self.image_size == 0 || self.image_size % 8 != 0 {
+            return Err(crate::DiffusionError::InvalidConfig(format!(
+                "image_size must be a positive multiple of 8, got {}",
+                self.image_size
+            )));
+        }
+        let expected_latent_size = self.image_size / 8;
+        if self.latent_size != expected_latent_size {
+            return Err(crate::DiffusionError::InvalidConfig(format!(
+                "latent_size ({}) must equal image_size / 8 ({expected_latent_size})",
+                self.latent_size
+            )));
+        }
+        if self.norm_num_groups == 0 {
+            return Err(crate::DiffusionError::InvalidConfig(
+                "norm_num_groups must be > 0".to_string(),
+            ));
+        }
+        let num_stages = self.num_stages();
+        if self.attention_head_dim.len() < num_stages {
+            return Err(crate::DiffusionError::InvalidConfig(format!(
+                "attention_head_dim has {} entries, need >= {num_stages} (num_stages)",
+                self.attention_head_dim.len()
+            )));
+        }
+        if self.transformer_layers_per_block.len() < num_stages {
+            return Err(crate::DiffusionError::InvalidConfig(format!(
+                "transformer_layers_per_block has {} entries, need >= {num_stages} (num_stages)",
+                self.transformer_layers_per_block.len()
+            )));
+        }
+        for stage in 0..num_stages {
+            // Safe: stage is bounded by num_stages() == channel_mult.len().
+            let ch = self.stage_channels(stage);
+            if ch % self.norm_num_groups != 0 {
+                return Err(crate::DiffusionError::InvalidConfig(format!(
+                    "stage {stage} channel count {ch} is not divisible by norm_num_groups {}",
+                    self.norm_num_groups
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_config_validates_ok() {
+        assert!(DiffusionConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_rejects_zero_num_views() {
+        let config = DiffusionConfig {
+            num_views: 0,
+            ..DiffusionConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_rejects_guidance_scale_below_one() {
+        let config = DiffusionConfig {
+            guidance_scale: 0.5,
+            ..DiffusionConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_rejects_latent_size_mismatch() {
+        let config = DiffusionConfig {
+            image_size: 512,
+            // Should be 512 / 8 = 64.
+            latent_size: 32,
+            ..DiffusionConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_accepts_consistent_latent_size() {
+        let config = DiffusionConfig {
+            image_size: 512,
+            latent_size: 64,
+            ..DiffusionConfig::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_rejects_norm_num_groups_zero() {
+        let config = DiffusionConfig {
+            norm_num_groups: 0,
+            ..DiffusionConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_rejects_channel_not_divisible_by_norm_groups() {
+        let config = DiffusionConfig {
+            base_channels: 33,
+            norm_num_groups: 32,
+            ..DiffusionConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_rejects_short_attention_head_dim() {
+        let config = DiffusionConfig {
+            attention_head_dim: vec![5, 10],
+            ..DiffusionConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_try_stage_channels_valid_returns_some() {
+        let config = DiffusionConfig::default();
+        assert_eq!(config.try_stage_channels(0), Some(320));
+    }
+
+    #[test]
+    fn test_try_stage_channels_out_of_range_returns_none() {
+        let config = DiffusionConfig::default();
+        assert_eq!(config.try_stage_channels(config.num_stages()), None);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_stage_channels_out_of_range_panics() {
+        let config = DiffusionConfig::default();
+        let _ = config.stage_channels(config.num_stages());
     }
 }

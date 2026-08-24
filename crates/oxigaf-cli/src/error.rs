@@ -198,7 +198,7 @@ impl CliError {
     pub fn suggestion(&self) -> Option<&'static str> {
         match self {
             Self::ConfigNotFound { .. } => Some(
-                "Create a configuration file with `oxigaf config init`, \
+                "Create a configuration file with `oxigaf config-cmd init`, \
                  or specify a path with `--config <path>`",
             ),
             Self::ConfigParseError { .. } => Some(
@@ -206,7 +206,7 @@ impl CliError {
                  unclosed brackets, or invalid escape sequences.",
             ),
             Self::ConfigValidationError { .. } => Some(
-                "Review the configuration values. Run `oxigaf config validate` \
+                "Review the configuration values. Run `oxigaf config-cmd validate` \
                  for detailed field-by-field validation.",
             ),
             Self::FlameModelInvalid { .. } => Some(

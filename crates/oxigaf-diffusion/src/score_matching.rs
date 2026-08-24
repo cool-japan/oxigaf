@@ -19,8 +19,10 @@
 //! L_DSM(σ) = E_{x~p, ε~N(0,I)} [ w(σ) || s_θ(x + σ·ε) − (−ε/σ) ||² ]
 //! ```
 //!
-//! where the target score of a Gaussian perturbation kernel is `−ε/σ²` in the
-//! normalised form (with σ² absorbed into the expectation).
+//! where the target score of a Gaussian perturbation kernel is `−ε/σ`: for
+//! `x_t = x_0 + σ·ε`, the perturbation kernel is `N(x_0, σ²I)`, so
+//! `∇_{x_t} log p = −(x_t − x_0)/σ² = −σ·ε/σ² = −ε/σ` — only *one* power of
+//! `σ` in the denominator, not two.
 //!
 //! ## References
 //!
@@ -307,7 +309,8 @@ pub fn sm_add_noise(
 
 /// Compute the scalar Denoising Score Matching loss.
 ///
-/// Target score = −ε / σ² (the analytical score of a Gaussian kernel).
+/// Target score = −ε / σ (the analytical score of a Gaussian kernel; see the
+/// module-level derivation — only one power of σ, not σ²).
 /// Loss = w(σ) · (1/N) · Σ_i ||predicted_score_i − target_score_i||²
 pub fn sm_dsm_loss(
     predicted_scores: &[f32],
@@ -328,12 +331,12 @@ pub fn sm_dsm_loss(
         return Err(ScoreMatchingError::EmptyInput("batch".to_string()));
     }
 
-    let sigma2 = batch.sigma * batch.sigma + config.eps;
+    let sigma_denom = batch.sigma.max(config.eps);
     let weight = sm_loss_weight(batch.sigma, &config.loss_weighting)?;
 
     let mut sum_sq = 0.0_f32;
     for (&noise_val, &score_val) in batch.noise.iter().zip(predicted_scores.iter()) {
-        let target = -noise_val / sigma2;
+        let target = -noise_val / sigma_denom;
         let diff = score_val - target;
         sum_sq += diff * diff;
     }
@@ -369,7 +372,7 @@ pub fn sm_dsm_loss_per_sample(
         return Err(ScoreMatchingError::EmptyInput("batch".to_string()));
     }
 
-    let sigma2 = batch.sigma * batch.sigma + config.eps;
+    let sigma_denom = batch.sigma.max(config.eps);
     let weight = sm_loss_weight(batch.sigma, &config.loss_weighting)?;
     let mut per_sample = Vec::with_capacity(batch.n);
 
@@ -377,7 +380,7 @@ pub fn sm_dsm_loss_per_sample(
         let offset = s * batch.d;
         let mut sq = 0.0_f32;
         for d in 0..batch.d {
-            let target = -batch.noise[offset + d] / sigma2;
+            let target = -batch.noise[offset + d] / sigma_denom;
             let diff = predicted_scores[offset + d] - target;
             sq += diff * diff;
         }
@@ -542,14 +545,21 @@ pub fn sm_ism_loss(
 /// Sliced Score Matching loss using random projections.
 ///
 /// For each projection v_k:
-/// `L_k = (v_k^T s)² + 2 · v_k^T · (s_perturbed − s) / eps`
+/// `L_k = (v_k^T s)² + 2 · v_k^T · (s_perturbed_k − s) / eps`
 ///
 /// The total loss is the mean over all N × n_proj terms.
 ///
 /// # Arguments
-/// * `scores` — s_θ(x), shape [N × D]
-/// * `scores_perturbed` — s_θ(x + eps·v), shape [N × D] (one projection direction)
-/// * `projections` — random projection vectors, shape [n_proj × D]
+/// * `scores` — s_θ(x), shape `[N × D]`
+/// * `scores_perturbed` — `s_θ(x + eps·v_k)` for every projection `k`,
+///   flattened projection-major as `[n_proj × N × D]`: block `k` (offset
+///   `k * N * D`) holds the perturbed score for all `N` samples under
+///   projection `v_k`. One evaluation per projection is required because
+///   each projection perturbs the input in a different direction — reusing
+///   a single perturbed array for every `k` (as if `n_proj == 1`) silently
+///   mixes a valid Jacobian-vector estimate for one projection with invalid
+///   ones for the rest.
+/// * `projections` — random projection vectors, shape `[n_proj × D]`
 /// * `eps` — finite-difference step
 /// * `n`, `d` — batch size and dimensionality
 /// * `n_proj` — number of projection directions
@@ -569,9 +579,10 @@ pub fn sm_sliced_score_matching_loss(
             got: scores.len(),
         });
     }
-    if scores_perturbed.len() != total {
+    let expected_perturbed_len = n_proj * total;
+    if scores_perturbed.len() != expected_perturbed_len {
         return Err(ScoreMatchingError::DimensionMismatch {
-            expected: total,
+            expected: expected_perturbed_len,
             got: scores_perturbed.len(),
         });
     }
@@ -599,14 +610,18 @@ pub fn sm_sliced_score_matching_loss(
         let s_offset = s * d;
         for p in 0..n_proj {
             let p_offset = p * d;
+            // Block p of scores_perturbed holds s_θ(x + eps·v_p) for every
+            // sample, so this projection's perturbed evaluation is at
+            // p * total + s_offset, not s_offset alone.
+            let sp_offset = p * total + s_offset;
             // vT s
             let mut vts = 0.0_f32;
-            // vT (s_perturbed - s) / eps
+            // vT (s_perturbed_p - s) / eps
             let mut vt_jv = 0.0_f32;
             for dd in 0..d {
                 let v = projections[p_offset + dd];
                 let sc = scores[s_offset + dd];
-                let sc_p = scores_perturbed[s_offset + dd];
+                let sc_p = scores_perturbed[sp_offset + dd];
                 vts += v * sc;
                 vt_jv += v * (sc_p - sc) * inv_eps;
             }
@@ -641,15 +656,20 @@ impl ScoreFunction {
         Self { config, sigma_data }
     }
 
-    /// Compute the DSM loss (not weighted by σ schedule).
+    /// Compute the DSM loss, *not* weighted by the configured σ schedule
+    /// (`w(σ) ≡ 1` regardless of `self.config.loss_weighting`).
+    ///
+    /// Use [`Self::weighted_loss`] to apply `self.config.loss_weighting`
+    /// instead.
     pub fn loss(&self, predicted: &[f32], batch: &NoisyBatch) -> Result<f32, ScoreMatchingError> {
-        sm_dsm_loss(predicted, batch, &self.config)
+        let unweighted_config = ScoreMatchingConfig {
+            loss_weighting: SmWeighting::Uniform,
+            ..self.config.clone()
+        };
+        sm_dsm_loss(predicted, batch, &unweighted_config)
     }
 
-    /// Compute the DSM loss weighted by the configured weighting scheme.
-    ///
-    /// Equivalent to `sm_dsm_loss` (weight is already baked in), kept as an
-    /// explicit entry point to make the API intent clear.
+    /// Compute the DSM loss weighted by `self.config.loss_weighting`.
     pub fn weighted_loss(
         &self,
         predicted: &[f32],
@@ -658,10 +678,12 @@ impl ScoreFunction {
         sm_dsm_loss(predicted, batch, &self.config)
     }
 
-    /// Compute the analytical target score: `−noise / σ²` element-wise.
+    /// Compute the analytical target score: `−noise / σ` element-wise (see
+    /// the module-level derivation for why this is a single power of σ, not
+    /// σ²).
     pub fn target_score(&self, batch: &NoisyBatch) -> Vec<f32> {
-        let sigma2 = batch.sigma * batch.sigma + self.config.eps;
-        batch.noise.iter().map(|&e| -e / sigma2).collect()
+        let sigma_denom = batch.sigma.max(self.config.eps);
+        batch.noise.iter().map(|&e| -e / sigma_denom).collect()
     }
 
     /// Compute the Karras-preconditioned target.
@@ -1064,8 +1086,8 @@ mod tests {
             loss_weighting: SmWeighting::Uniform,
             ..default_config()
         };
-        let sigma2 = sigma * sigma + config.eps;
-        let target: Vec<f32> = noise.iter().map(|&e| -e / sigma2).collect();
+        let sigma_denom = sigma.max(config.eps);
+        let target: Vec<f32> = noise.iter().map(|&e| -e / sigma_denom).collect();
 
         let batch = NoisyBatch {
             clean: vec![0.0; 4],
@@ -1109,8 +1131,8 @@ mod tests {
             eps: 0.0,
             ..default_config()
         };
-        // target = -1/4, predicted = 0 => diff = 1/4 => sq = 1/16
-        // weight = 4, loss = 4 * 1/16 = 0.25
+        // target = -noise/sigma = -1/2, predicted = 0 => diff = 1/2 => sq = 1/4
+        // weight (SmWeighting::Sigma2) = sigma^2 = 4, loss = 4 * 1/4 = 1.0
         let predicted = vec![0.0_f32];
         let batch = NoisyBatch {
             clean: vec![0.0],
@@ -1121,10 +1143,43 @@ mod tests {
             d: 1,
         };
         let loss = sm_dsm_loss(&predicted, &batch, &config).unwrap();
-        let expected = 4.0 * (1.0_f32 / 16.0);
+        let expected = 4.0 * (1.0_f32 / 4.0);
         assert!(
             (loss - expected).abs() < 1e-5,
             "loss={loss} expected={expected}"
+        );
+    }
+
+    /// Regression test: the DSM target score is `-eps/sigma` (one power of
+    /// sigma), not `-eps/sigma^2`. This directly checks the target formula
+    /// used inside `sm_dsm_loss` at a sigma where the two forms diverge
+    /// sharply (sigma=0.002, the EDM default sigma_min — the old sigma^2
+    /// form was off by a factor of 500 there).
+    #[test]
+    fn test_dsm_loss_target_is_first_power_of_sigma() {
+        let sigma = 0.002_f32;
+        let noise = vec![1.0_f32];
+        let config = ScoreMatchingConfig {
+            loss_weighting: SmWeighting::Uniform,
+            eps: 0.0,
+            ..default_config()
+        };
+        // Feed the *correct* target (-noise/sigma) as "predicted" so a
+        // correct implementation reports ~zero loss.
+        let predicted = vec![-1.0_f32 / sigma];
+        let batch = NoisyBatch {
+            clean: vec![0.0],
+            noisy: vec![sigma],
+            noise,
+            sigma,
+            n: 1,
+            d: 1,
+        };
+        let loss = sm_dsm_loss(&predicted, &batch, &config).unwrap();
+        assert!(
+            loss.abs() < 1e-3,
+            "predicted=-noise/sigma should give ~0 loss under the correct \
+             (first-power) target, got {loss}"
         );
     }
 
@@ -1407,13 +1462,45 @@ mod tests {
         let d = 3;
         let n_proj = 2;
         let zeros = vec![0.0_f32; n * d];
+        let zeros_perturbed = vec![0.0_f32; n_proj * n * d];
         let proj = vec![1.0_f32; n_proj * d];
         let loss =
-            sm_sliced_score_matching_loss(&zeros, &zeros, &proj, 0.01, n, d, n_proj).unwrap();
+            sm_sliced_score_matching_loss(&zeros, &zeros_perturbed, &proj, 0.01, n, d, n_proj)
+                .unwrap();
         assert!(
             loss.abs() < 1e-10,
             "SSM loss should be 0 for zero scores, got {loss}"
         );
+    }
+
+    #[test]
+    fn test_sliced_sm_scores_perturbed_wrong_length_error() {
+        // Regression: scores_perturbed must be [n_proj * N * D] (one
+        // perturbed evaluation per projection), not [N * D] reused for
+        // every projection.
+        let n = 4;
+        let d = 3;
+        let n_proj = 2;
+        let scores = vec![0.0_f32; n * d];
+        let scores_perturbed_single_block = vec![0.0_f32; n * d]; // missing the n_proj factor
+        let proj = vec![1.0_f32; n_proj * d];
+        let err = sm_sliced_score_matching_loss(
+            &scores,
+            &scores_perturbed_single_block,
+            &proj,
+            0.01,
+            n,
+            d,
+            n_proj,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ScoreMatchingError::DimensionMismatch {
+                expected,
+                got
+            } if expected == n_proj * n * d && got == n * d
+        ));
     }
 
     #[test]
@@ -1422,8 +1509,40 @@ mod tests {
         let d = 4;
         let n_proj = 2;
         let s = vec![0.0_f32; n * d];
+        let s_perturbed = vec![0.0_f32; n_proj * n * d];
         let bad_proj = vec![0.0_f32; n_proj * (d + 1)]; // wrong size
-        assert!(sm_sliced_score_matching_loss(&s, &s, &bad_proj, 0.01, n, d, n_proj).is_err());
+        assert!(
+            sm_sliced_score_matching_loss(&s, &s_perturbed, &bad_proj, 0.01, n, d, n_proj).is_err()
+        );
+    }
+
+    /// Regression test: each projection must use its own perturbed-score
+    /// block. Two projections with opposite-signed perturbations should
+    /// give a symmetric-but-opposite Jacobian-vector term, not the same
+    /// term twice — averaging to a specific known value only reachable when
+    /// each projection reads its own block.
+    #[test]
+    fn test_sliced_sm_uses_per_projection_perturbed_block() {
+        let n = 1;
+        let d = 1;
+        let n_proj = 2;
+        let scores = vec![0.0_f32]; // s = 0 => (v^T s)^2 term is 0 for both projections
+        let eps = 0.1_f32;
+        // Projection 0: v=1, perturbed score = 1.0 => vT(s_p - s)/eps = (1.0-0.0)/0.1 = 10
+        // Projection 1: v=1, perturbed score = -1.0 => vT(s_p - s)/eps = (-1.0-0.0)/0.1 = -10
+        let scores_perturbed = vec![1.0_f32, -1.0_f32]; // [n_proj * n * d], block-major
+        let proj = vec![1.0_f32, 1.0_f32]; // both projections use v=1
+        let loss =
+            sm_sliced_score_matching_loss(&scores, &scores_perturbed, &proj, eps, n, d, n_proj)
+                .unwrap();
+        // L_0 = 0 + 2*10 = 20, L_1 = 0 + 2*(-10) = -20; mean over n*n_proj=2 => 0.
+        // Reusing a single perturbed block (the old bug) could not produce
+        // this exact cancellation, since both projections would then read
+        // the SAME perturbed value.
+        assert!(
+            loss.abs() < 1e-4,
+            "expected the two projections' terms to cancel, got {loss}"
+        );
     }
 
     #[test]
@@ -1485,9 +1604,9 @@ mod tests {
             d: 1,
         };
         let target = sf.target_score(&batch);
-        let sigma2 = sigma * sigma;
+        let sigma_denom = sigma; // eps == 0.0, so max(sigma, eps) == sigma
         for (i, (&t, &e)) in target.iter().zip(noise.iter()).enumerate() {
-            let expected = -e / sigma2;
+            let expected = -e / sigma_denom;
             assert!(
                 (t - expected).abs() < 1e-6,
                 "target[{i}]={t} expected={expected}"
@@ -1505,8 +1624,8 @@ mod tests {
         let sf = ScoreFunction::new(config, 1.0);
         let sigma = 1.0;
         let noise = vec![0.5_f32, -0.3];
-        let sigma2 = sigma * sigma;
-        let target: Vec<f32> = noise.iter().map(|&e| -e / sigma2).collect();
+        let sigma_denom = sigma; // eps == 0.0, so max(sigma, eps) == sigma
+        let target: Vec<f32> = noise.iter().map(|&e| -e / sigma_denom).collect();
         let batch = NoisyBatch {
             clean: vec![0.0; 2],
             noisy: vec![0.5, -0.3],
@@ -1519,8 +1638,50 @@ mod tests {
         assert!(loss.abs() < 1e-6, "loss={loss}");
     }
 
+    /// Regression test: `loss()` is documented "not weighted by σ schedule",
+    /// but it used to share `weighted_loss()`'s body verbatim, so it silently
+    /// applied `self.config.loss_weighting` too. Use sigma=2 with the default
+    /// `SmWeighting::Sigma2` config, where weight = sigma^2 = 4 != 1, so a
+    /// still-weighted `loss()` and the correctly-unweighted one would give
+    /// different, checkable numbers.
     #[test]
-    fn test_score_function_weighted_loss_equals_loss() {
+    fn test_score_function_loss_is_genuinely_unweighted() {
+        let config = default_config(); // SmWeighting::Sigma2
+        let sf = ScoreFunction::new(config, 1.0);
+        let clean = zero_clean(2, 2);
+        let batch = sm_add_noise(&clean, 2.0, 42, 2, 2).unwrap();
+        let pred = vec![0.0_f32; 4];
+
+        let unweighted = sf.loss(&pred, &batch).unwrap();
+        let weighted = sf.weighted_loss(&pred, &batch).unwrap();
+
+        // weighted_loss applies SmWeighting::Sigma2 => weight = sigma^2 = 4,
+        // so it must be ~4x the genuinely-unweighted loss.
+        assert!(
+            (weighted - 4.0 * unweighted).abs() < 1e-4,
+            "weighted={weighted} should be ~4x unweighted={unweighted}"
+        );
+
+        // Cross-check loss() against the Uniform-weighted value directly.
+        let uniform_config = ScoreMatchingConfig {
+            loss_weighting: SmWeighting::Uniform,
+            ..default_config()
+        };
+        let expected_unweighted = sm_dsm_loss(&pred, &batch, &uniform_config).unwrap();
+        assert!(
+            (unweighted - expected_unweighted).abs() < 1e-10,
+            "loss() must match an explicitly-Uniform-weighted sm_dsm_loss call"
+        );
+    }
+
+    /// At sigma=1, `SmWeighting::Sigma2`'s weight (1^2 = 1) coincides with
+    /// `Uniform`'s weight (1), so `loss()` and `weighted_loss()` happen to
+    /// agree numerically — this is a coincidence of that specific sigma, not
+    /// a general equivalence (see
+    /// `test_score_function_loss_is_genuinely_unweighted` for sigma=2, where
+    /// they differ).
+    #[test]
+    fn test_score_function_weighted_loss_equals_loss_at_sigma_one() {
         let config = default_config();
         let sf = ScoreFunction::new(config, 1.0);
         let clean = zero_clean(4, 4);

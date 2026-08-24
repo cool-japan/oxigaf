@@ -232,6 +232,25 @@ impl Default for WeightingConfig {
     }
 }
 
+impl WeightingConfig {
+    /// Validate this configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PromptWeightingError::InvalidWeight`] if `max_weight` is
+    /// not finite or `max_weight < 1.0` — the same requirement
+    /// [`clamp_weights`] enforces, since `max_weight` is meant to be passed
+    /// to it as the clamp bound.
+    pub fn validate(&self) -> Result<(), PromptWeightingError> {
+        if !self.max_weight.is_finite() || self.max_weight < 1.0 {
+            return Err(PromptWeightingError::InvalidWeight {
+                weight: self.max_weight,
+            });
+        }
+        Ok(())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // WeightStats
 // ---------------------------------------------------------------------------
@@ -323,13 +342,24 @@ pub fn parse_weighted_prompt(prompt: &str) -> Result<WeightedPrompt, PromptWeigh
                 i += 1;
             }
             ')' => {
-                // Find the matching frame.
-                let frame = stack
-                    .iter()
-                    .rposition(|f| f.kind == GroupKind::Paren)
-                    .ok_or(PromptWeightingError::UnmatchedParen { pos: byte_pos })?;
-
-                let frame = stack.remove(frame);
+                // The innermost open group must itself be a `(` — searching
+                // the whole stack (as `rposition` used to) would happily
+                // pop a Paren frame out from *underneath* a still-open
+                // Bracket frame for malformed input like `"([text)]"`,
+                // silently accepting interleaved nesting and leaving
+                // `current_weight` restored to the wrong level.
+                let top_is_paren = matches!(stack.last(), Some(f) if f.kind == GroupKind::Paren);
+                if !top_is_paren {
+                    return Err(PromptWeightingError::UnmatchedParen { pos: byte_pos });
+                }
+                let frame = match stack.pop() {
+                    Some(f) => f,
+                    None => {
+                        // Unreachable: `top_is_paren` above already
+                        // confirmed a frame is present.
+                        return Err(PromptWeightingError::UnmatchedParen { pos: byte_pos });
+                    }
+                };
 
                 // Check whether the accumulated text has a trailing `:weight`.
                 let (segment_text, segment_weight) = extract_weight_suffix(
@@ -360,12 +390,20 @@ pub fn parse_weighted_prompt(prompt: &str) -> Result<WeightedPrompt, PromptWeigh
                 i += 1;
             }
             ']' => {
-                let frame_idx = stack
-                    .iter()
-                    .rposition(|f| f.kind == GroupKind::Bracket)
-                    .ok_or(PromptWeightingError::UnmatchedParen { pos: byte_pos })?;
-
-                let frame = stack.remove(frame_idx);
+                // Same top-of-stack requirement as `)` above.
+                let top_is_bracket =
+                    matches!(stack.last(), Some(f) if f.kind == GroupKind::Bracket);
+                if !top_is_bracket {
+                    return Err(PromptWeightingError::UnmatchedParen { pos: byte_pos });
+                }
+                let frame = match stack.pop() {
+                    Some(f) => f,
+                    None => {
+                        // Unreachable: `top_is_bracket` above already
+                        // confirmed a frame is present.
+                        return Err(PromptWeightingError::UnmatchedParen { pos: byte_pos });
+                    }
+                };
 
                 flush_segment(&current_text, current_weight, &mut result_tokens);
                 current_text.clear();
@@ -546,11 +584,24 @@ pub fn normalize_weights(weights: &mut [f32]) {
 }
 
 /// Clamp all weights to the closed interval `[1/max_w, max_w]`.
-pub fn clamp_weights(weights: &mut [f32], max_w: f32) {
+///
+/// # Errors
+///
+/// Returns [`PromptWeightingError::InvalidWeight`] if `max_w` is not finite
+/// or `max_w < 1.0`. Both conditions would otherwise make `f32::clamp`
+/// panic: it requires `min <= max`, i.e. `1.0 / max_w <= max_w`, which only
+/// holds for finite `max_w >= 1.0` (for example `max_w = 0.5` gives `lo =
+/// 2.0 > max_w`; `max_w <= 0.0` gives a non-positive or infinite `lo`; NaN
+/// fails every comparison).
+pub fn clamp_weights(weights: &mut [f32], max_w: f32) -> Result<(), PromptWeightingError> {
+    if !max_w.is_finite() || max_w < 1.0 {
+        return Err(PromptWeightingError::InvalidWeight { weight: max_w });
+    }
     let lo = 1.0 / max_w;
     for w in weights.iter_mut() {
         *w = w.clamp(lo, max_w);
     }
+    Ok(())
 }
 
 /// Merge two weighted prompts by concatenating their token lists.
@@ -751,6 +802,35 @@ mod tests {
         assert!(matches!(err, PromptWeightingError::UnmatchedParen { .. }));
     }
 
+    // Regression test: interleaved (non-LIFO) nesting like `"([text)]"` used
+    // to be silently accepted by popping the Paren frame out from
+    // underneath the still-open Bracket frame (via `rposition` searching
+    // the whole stack instead of checking the top). It must now be
+    // rejected as malformed.
+    #[test]
+    fn test_parse_interleaved_nesting_is_rejected() {
+        let err = parse_weighted_prompt("([text)]").unwrap_err();
+        assert!(matches!(err, PromptWeightingError::UnmatchedParen { .. }));
+    }
+
+    // A `)` that doesn't match the innermost Bracket frame is rejected too.
+    #[test]
+    fn test_parse_paren_close_inside_bracket_is_rejected() {
+        let err = parse_weighted_prompt("[(text])").unwrap_err();
+        assert!(matches!(err, PromptWeightingError::UnmatchedParen { .. }));
+    }
+
+    // Well-formed *properly-nested* mixed groups (not interleaved) must
+    // still parse successfully — the fix only rejects non-LIFO closing.
+    #[test]
+    fn test_parse_properly_nested_mixed_groups_still_works() {
+        let p = parse_weighted_prompt("([text])").expect("well-nested groups should parse");
+        assert_eq!(p.tokens.len(), 1);
+        assert_eq!(p.tokens[0].text, "text");
+        // Paren default boost (1.1) then Bracket reduce (0.9): 1.1 * 0.9.
+        assert!((p.tokens[0].weight - (1.1 * 0.9)).abs() < 1e-4);
+    }
+
     #[test]
     fn test_parse_explicit_weight_nested() {
         // Explicit weight should resolve against outer weight (1.0 here).
@@ -948,9 +1028,63 @@ mod tests {
     #[test]
     fn test_clamp_weights() {
         let mut w = vec![0.1f32, 0.5, 1.0, 2.0, 5.0];
-        clamp_weights(&mut w, 2.0);
+        clamp_weights(&mut w, 2.0).expect("max_w=2.0 is valid");
         for &v in &w {
             assert!((0.5..=2.0).contains(&v), "out of range: {v}");
+        }
+    }
+
+    // Regression tests: `clamp_weights` used to panic (via `f32::clamp`'s
+    // `min <= max` requirement) instead of erroring for every `max_w` value
+    // that cannot form a valid `[1/max_w, max_w]` interval.
+    #[test]
+    fn test_clamp_weights_rejects_zero() {
+        let mut w = vec![1.0f32];
+        let result = clamp_weights(&mut w, 0.0);
+        assert!(matches!(
+            result,
+            Err(PromptWeightingError::InvalidWeight { .. })
+        ));
+    }
+
+    #[test]
+    fn test_clamp_weights_rejects_negative() {
+        let mut w = vec![1.0f32];
+        let result = clamp_weights(&mut w, -2.0);
+        assert!(matches!(
+            result,
+            Err(PromptWeightingError::InvalidWeight { .. })
+        ));
+    }
+
+    #[test]
+    fn test_clamp_weights_rejects_nan() {
+        let mut w = vec![1.0f32];
+        let result = clamp_weights(&mut w, f32::NAN);
+        assert!(matches!(
+            result,
+            Err(PromptWeightingError::InvalidWeight { .. })
+        ));
+    }
+
+    #[test]
+    fn test_clamp_weights_rejects_below_one() {
+        // max_w = 0.5 is positive and finite, but 1/max_w = 2.0 > max_w,
+        // which would still make `f32::clamp` panic.
+        let mut w = vec![1.0f32];
+        let result = clamp_weights(&mut w, 0.5);
+        assert!(matches!(
+            result,
+            Err(PromptWeightingError::InvalidWeight { .. })
+        ));
+    }
+
+    #[test]
+    fn test_clamp_weights_accepts_exactly_one() {
+        let mut w = vec![0.1f32, 5.0];
+        clamp_weights(&mut w, 1.0).expect("max_w=1.0 is the valid boundary");
+        for &v in &w {
+            assert!((v - 1.0).abs() < 1e-6, "expected exactly 1.0, got {v}");
         }
     }
 
@@ -1086,6 +1220,35 @@ mod tests {
         assert_eq!(cfg.scale_mode, WeightScaleMode::Multiply);
         assert!((cfg.max_weight - 2.0).abs() < 1e-6);
         assert!(!cfg.normalize);
+    }
+
+    #[test]
+    fn test_weighting_config_default_validates_ok() {
+        assert!(WeightingConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn test_weighting_config_validate_rejects_max_weight_below_one() {
+        let cfg = WeightingConfig {
+            max_weight: 0.5,
+            ..WeightingConfig::default()
+        };
+        assert!(matches!(
+            cfg.validate(),
+            Err(PromptWeightingError::InvalidWeight { .. })
+        ));
+    }
+
+    #[test]
+    fn test_weighting_config_validate_rejects_non_finite_max_weight() {
+        let cfg = WeightingConfig {
+            max_weight: f32::INFINITY,
+            ..WeightingConfig::default()
+        };
+        assert!(matches!(
+            cfg.validate(),
+            Err(PromptWeightingError::InvalidWeight { .. })
+        ));
     }
 
     // -- Additional coverage -------------------------------------------------

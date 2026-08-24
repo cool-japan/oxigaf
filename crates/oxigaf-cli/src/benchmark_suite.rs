@@ -71,12 +71,10 @@ pub struct BenchmarkConfig {
     pub warmup: usize,
     /// Minimum total elapsed time (ms) before stopping early (0.0 = no minimum).
     ///
-    /// When positive, [`time_fn`] keeps timing additional iterations beyond
-    /// `iterations` (Criterion-style) until the cumulative measured elapsed
-    /// time reaches this floor, so that very cheap operations still yield
-    /// statistically meaningful timing data rather than being dominated by
-    /// clock-resolution noise. Bounded by an internal safety cap so a
-    /// near-zero-cost closure cannot spin indefinitely trying to reach it.
+    /// When positive, [`time_fn`] keeps timing iterations beyond `iterations`
+    /// (Criterion-style, capped by an internal safety limit) until the
+    /// cumulative elapsed time reaches this floor, so cheap operations still
+    /// yield statistically meaningful data instead of clock-resolution noise.
     pub min_time_ms: f64,
     /// Human-readable unit name for throughput reporting (e.g. `"items"`, `"Gaussians"`).
     pub throughput_unit: String,
@@ -290,21 +288,19 @@ fn vec_std(v: &[f64], mean: f64) -> f64 {
 // Core timing machinery
 // ---------------------------------------------------------------------------
 
-/// Safety cap on the number of *extra* iterations [`time_fn`] will run to
-/// satisfy [`BenchmarkConfig::min_time_ms`], on top of `config.iterations`.
-/// Bounds worst-case runtime for a near-zero-cost closure whose measured
-/// per-call time can round to ~0 ns at typical clock resolution.
+/// Safety cap on the *extra* iterations [`time_fn`] will run to satisfy
+/// [`BenchmarkConfig::min_time_ms`], bounding worst-case runtime for a
+/// near-zero-cost closure whose measured time can round to ~0 ns.
 const MAX_EXTRA_ITERATIONS_FOR_MIN_TIME: usize = 1_000_000;
 
 /// Run a closure `f` according to `config` and collect per-iteration timings.
 ///
-/// Warmup calls are not timed. The returned `Vec<f64>` has exactly
-/// `config.iterations` entries, each in nanoseconds — unless
-/// `config.min_time_ms > 0.0` and that many timed iterations complete
-/// faster than the floor, in which case additional iterations are timed
-/// (up to [`MAX_EXTRA_ITERATIONS_FOR_MIN_TIME`] beyond `config.iterations`)
-/// until the cumulative elapsed time reaches `min_time_ms`. The returned
-/// vector's length is always the *actual* number of timed iterations.
+/// Warmup calls are not timed. Normally returns exactly `config.iterations`
+/// entries (nanoseconds each); if `config.min_time_ms > 0.0` and those
+/// iterations finish faster than that floor, additional iterations are
+/// timed (capped by [`MAX_EXTRA_ITERATIONS_FOR_MIN_TIME`]) until the
+/// cumulative elapsed time reaches it. The returned vector's length is
+/// always the *actual* number of timed iterations.
 ///
 /// # Errors
 ///
@@ -659,19 +655,17 @@ pub fn create_default_suite() -> BenchmarkSuite {
 /// Build the default suite (via [`create_default_suite`]) and actually run
 /// every entry, returning a suite whose `results` are populated.
 ///
-/// [`BenchmarkEntry`] deliberately does not store a callable — the actual
-/// function is passed to [`run_suite_entry`] at execution time — so
-/// `create_default_suite()`'s entries alone cannot be mechanically executed;
-/// this function resolves that name-to-closure mapping for the six built-in
-/// entries, each backed by one of the `bench_*` functions in this module at
-/// the problem size implied by its name (`_1k` = 1 000, `_1m` = 1 000 000).
+/// [`BenchmarkEntry`] deliberately stores no callable (see [`run_suite_entry`]),
+/// so `create_default_suite()`'s entries alone cannot be executed; this
+/// resolves that name-to-closure mapping for the six built-in entries, each
+/// backed by a `bench_*` function at the size implied by its name (`_1k` =
+/// 1 000, `_1m` = 1 000 000).
 ///
 /// # Errors
 ///
-/// Returns [`BenchmarkError::BenchmarkNotFound`] if `create_default_suite`
-/// is ever extended with an entry name this function does not know how to
-/// run (keeping that error variant genuinely reachable rather than dead).
-/// Propagates any error from [`run_suite_entry`].
+/// [`BenchmarkError::BenchmarkNotFound`] if `create_default_suite` is ever
+/// extended with a name this function does not know how to run. Propagates
+/// any error from [`run_suite_entry`].
 pub fn run_default_suite() -> Result<BenchmarkSuite, BenchmarkError> {
     let mut suite = BenchmarkSuite::new();
     let planned = create_default_suite();
@@ -887,6 +881,7 @@ mod tests {
         assert_eq!(cfg.min_time_ms, 0.0);
         assert_eq!(cfg.throughput_unit, "items");
         assert_eq!(cfg.throughput_count, 1);
+        assert_eq!(cfg.outlier_sigma, None);
     }
 
     #[test]
@@ -1065,6 +1060,45 @@ mod tests {
         assert!(time_fn(|| {}, &cfg).is_err());
     }
 
+    #[test]
+    fn test_time_fn_min_time_ms_extends_iterations() {
+        let cfg = BenchmarkConfig {
+            iterations: 2,
+            warmup: 0,
+            min_time_ms: 5.0, // far more than 2 trivial iterations will take
+            ..Default::default()
+        };
+        let mut counter = 0usize;
+        let timings = time_fn(
+            || {
+                counter += 1;
+                // A small sleep so each iteration takes a measurable,
+                // non-zero amount of time without relying on the safety cap.
+                std::thread::sleep(std::time::Duration::from_micros(200));
+            },
+            &cfg,
+        )
+        .expect("time_fn failed");
+        assert!(
+            timings.len() > 2,
+            "expected more than 2 iterations to reach the min_time_ms floor, got {}",
+            timings.len()
+        );
+        assert_eq!(counter, timings.len());
+    }
+
+    #[test]
+    fn test_time_fn_min_time_ms_zero_does_not_extend() {
+        let cfg = BenchmarkConfig {
+            iterations: 3,
+            warmup: 0,
+            min_time_ms: 0.0,
+            ..Default::default()
+        };
+        let timings = time_fn(|| {}, &cfg).expect("time_fn failed");
+        assert_eq!(timings.len(), 3);
+    }
+
     // -----------------------------------------------------------------------
     // build_benchmark_result
     // -----------------------------------------------------------------------
@@ -1125,6 +1159,45 @@ mod tests {
         let timings: Vec<f64> = (0..17).map(|i| (i + 1) as f64 * 100.0).collect();
         let result = build_benchmark_result("test", timings, &cfg);
         assert_eq!(result.iterations, 17);
+    }
+
+    #[test]
+    fn test_build_result_carries_throughput_unit_from_config() {
+        let cfg = BenchmarkConfig {
+            throughput_unit: "Gaussians".to_string(),
+            ..Default::default()
+        };
+        let result = build_benchmark_result("test", vec![100.0, 200.0], &cfg);
+        assert_eq!(result.throughput_unit, "Gaussians");
+    }
+
+    #[test]
+    fn test_build_result_outlier_sigma_none_keeps_all_timings() {
+        let cfg = BenchmarkConfig {
+            outlier_sigma: None,
+            ..Default::default()
+        };
+        let mut timings: Vec<f64> = (0..20).map(|_| 100.0).collect();
+        timings.push(10_000.0);
+        let result = build_benchmark_result("test", timings, &cfg);
+        assert_eq!(result.iterations, 21);
+    }
+
+    #[test]
+    fn test_build_result_outlier_sigma_some_filters_timings() {
+        let cfg = BenchmarkConfig {
+            outlier_sigma: Some(2.0),
+            ..Default::default()
+        };
+        let mut timings: Vec<f64> = (0..20).map(|_| 100.0).collect();
+        timings.push(10_000.0);
+        let n_before = timings.len();
+        let result = build_benchmark_result("test", timings, &cfg);
+        assert!(
+            result.iterations < n_before,
+            "expected the outlier to be filtered out, got {} iterations",
+            result.iterations
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1309,6 +1382,31 @@ mod tests {
     }
 
     #[test]
+    fn test_run_default_suite_populates_all_results() {
+        let suite = run_default_suite().expect("run_default_suite failed");
+        assert_eq!(suite.entries.len(), 6);
+        assert_eq!(suite.results.len(), 6);
+        let names: Vec<&str> = suite.results.iter().map(|r| r.name.as_str()).collect();
+        assert!(names.contains(&"vec_sum_1k"));
+        assert!(names.contains(&"vec_sum_1m"));
+        assert!(names.contains(&"vec_dot_1k"));
+        assert!(names.contains(&"sort_1k"));
+        assert!(names.contains(&"gauss_centroid_1k"));
+        assert!(names.contains(&"gauss_bbox_1k"));
+    }
+
+    #[test]
+    fn test_run_default_suite_gaussian_entries_use_gaussians_unit() {
+        let suite = run_default_suite().expect("run_default_suite failed");
+        let centroid = suite
+            .results
+            .iter()
+            .find(|r| r.name == "gauss_centroid_1k")
+            .expect("gauss_centroid_1k result present");
+        assert_eq!(centroid.throughput_unit, "Gaussians");
+    }
+
+    #[test]
     fn test_run_suite_entry_pushes_result() {
         let mut suite = BenchmarkSuite::new();
         let cfg = BenchmarkConfig {
@@ -1479,7 +1577,7 @@ mod tests {
             std_ns: 50.0,
             throughput: 810_000.0,
             throughput_unit: "items".to_string(),
-            cv:0.05,
+            cv: 0.05,
         };
         let s = format_benchmark_result(&r);
         assert!(!s.is_empty());
@@ -1498,7 +1596,7 @@ mod tests {
             std_ns: 50_000.0,
             throughput: 1000.0,
             throughput_unit: "items".to_string(),
-            cv:0.05,
+            cv: 0.05,
         };
         let s = format_benchmark_result(&r);
         assert!(s.contains("mean="), "got: {}", s);
@@ -1517,11 +1615,30 @@ mod tests {
             std_ns: 50.0,
             throughput: 5_000_000.0,
             throughput_unit: "items".to_string(),
-            cv:0.02,
+            cv: 0.02,
         };
         let s = format_benchmark_result(&r);
         assert!(s.contains("throughput="), "got: {}", s);
         assert!(s.contains("M"), "got: {}", s);
+    }
+
+    #[test]
+    fn test_format_benchmark_result_uses_configured_unit_not_hardcoded_items() {
+        let r = BenchmarkResult {
+            name: "gauss_bench".to_string(),
+            iterations: 10,
+            mean_ns: 1_000.0,
+            median_ns: 1_000.0,
+            min_ns: 900.0,
+            max_ns: 1_100.0,
+            std_ns: 50.0,
+            throughput: 5_000.0,
+            cv: 0.02,
+            throughput_unit: "Gaussians".to_string(),
+        };
+        let s = format_benchmark_result(&r);
+        assert!(s.contains("Gaussians/s"), "got: {}", s);
+        assert!(!s.contains("items/s"), "got: {}", s);
     }
 
     // -----------------------------------------------------------------------
@@ -1540,7 +1657,7 @@ mod tests {
             std_ns: 50.0,
             throughput: 1_000_000.0,
             throughput_unit: "items".to_string(),
-            cv:0.05,
+            cv: 0.05,
         };
         let report = SuiteReport {
             n_benchmarks: 1,
@@ -1567,7 +1684,7 @@ mod tests {
             std_ns: 500.0,
             throughput: 100_000.0,
             throughput_unit: "items".to_string(),
-            cv:0.05,
+            cv: 0.05,
         };
         let r2 = BenchmarkResult {
             name: "fast_one".to_string(),
@@ -1579,7 +1696,7 @@ mod tests {
             std_ns: 5.0,
             throughput: 10_000_000.0,
             throughput_unit: "items".to_string(),
-            cv:0.05,
+            cv: 0.05,
         };
         let report = SuiteReport {
             n_benchmarks: 2,
@@ -1609,7 +1726,7 @@ mod tests {
             std_ns: 5.0,
             throughput: 1e7,
             throughput_unit: "items".to_string(),
-            cv:0.05,
+            cv: 0.05,
         };
         let slow = BenchmarkResult {
             name: "slow".to_string(),
@@ -1621,7 +1738,7 @@ mod tests {
             std_ns: 50.0,
             throughput: 1e6,
             throughput_unit: "items".to_string(),
-            cv:0.05,
+            cv: 0.05,
         };
         // a=slow, b=fast → speedup = 1000/100 = 10 → a is 10× slower
         let cmp = compare_benchmarks(&slow, &fast);
@@ -1641,7 +1758,7 @@ mod tests {
             std_ns: 5.0,
             throughput: 2e6,
             throughput_unit: "items".to_string(),
-            cv:0.01,
+            cv: 0.01,
         };
         let cmp = compare_benchmarks(&r, &r);
         assert!((cmp.speedup - 1.0).abs() < 0.01);
@@ -1661,7 +1778,7 @@ mod tests {
             std_ns: 10.0,
             throughput: 5e6,
             throughput_unit: "items".to_string(),
-            cv:0.05,
+            cv: 0.05,
         };
         let b = BenchmarkResult {
             name: "beta".to_string(),
@@ -1673,7 +1790,7 @@ mod tests {
             std_ns: 10.0,
             throughput: 2.5e6,
             throughput_unit: "items".to_string(),
-            cv:0.025,
+            cv: 0.025,
         };
         let cmp = compare_benchmarks(&a, &b);
         assert_eq!(cmp.name_a, "alpha");
@@ -1814,7 +1931,7 @@ mod tests {
             std_ns: 12.0,
             throughput: 4e6,
             throughput_unit: "items".to_string(),
-            cv:0.048,
+            cv: 0.048,
         };
         let report = SuiteReport {
             n_benchmarks: 1,
@@ -1846,7 +1963,7 @@ mod tests {
             std_ns: 2.0,
             throughput: 2e7,
             throughput_unit: "items".to_string(),
-            cv:0.04,
+            cv: 0.04,
         };
         let b = BenchmarkResult {
             name: "b".to_string(),
@@ -1858,7 +1975,7 @@ mod tests {
             std_ns: 5.0,
             throughput: 5e6,
             throughput_unit: "items".to_string(),
-            cv:0.025,
+            cv: 0.025,
         };
         let cmp = compare_benchmarks(&a, &b);
         // speedup = 50/200 = 0.25 → a is faster

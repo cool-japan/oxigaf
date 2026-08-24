@@ -59,6 +59,10 @@ pub enum ConditioningError {
     /// Cannot normalise a zero-norm vector.
     #[error("Normalization failed: zero-norm vector")]
     ZeroNorm,
+
+    /// A parameter value was non-finite (NaN or ±∞).
+    #[error("Non-finite value {value} in {param_name}")]
+    NonFiniteValue { param_name: String, value: f32 },
 }
 
 // ---------------------------------------------------------------------------
@@ -82,6 +86,12 @@ pub struct FlameConditioningConfig {
     pub n_shape_coeffs: usize,
     /// How many leading expression coefficients to encode (default: 50).
     pub n_expression_coeffs: usize,
+    /// How many leading pose coefficients to encode (default: 15, i.e. 5
+    /// FLAME joints × 3 axis-angle components). Pose values are zero-padded
+    /// or truncated to this length before projection, exactly like shape and
+    /// expression, so the pose projection matrix depends only on this value
+    /// (not on the raw pose slice's length).
+    pub n_pose_coeffs: usize,
     /// L2-normalise the final output vector (default: true).
     pub normalize_output: bool,
 }
@@ -96,6 +106,7 @@ impl Default for FlameConditioningConfig {
             use_translation: false,
             n_shape_coeffs: 100,
             n_expression_coeffs: 50,
+            n_pose_coeffs: 15,
             normalize_output: true,
         }
     }
@@ -219,11 +230,17 @@ fn xorshift64(state: &mut u64) -> u64 {
     *state
 }
 
-/// Map a raw u64 from xorshift64 to a float in `[-scale, scale]`.
+/// Map a raw u64 from xorshift64 to a float in `[-scale, scale)`.
 #[inline]
 fn xorshift_to_float(raw: u64, scale: f32) -> f32 {
-    // Map to [0, 1) then to [-scale, scale]
-    let unit = (raw >> 11) as f32 / (1u64 << 53) as f32;
+    // Map to [0, 1) then to [-scale, scale). Uses the top 24 bits (f32's
+    // mantissa width, including the implicit bit) rather than 53: building a
+    // 53-bit integer and converting it to f32 rounds some inputs up to
+    // exactly 2^53, which is exactly 1.0 after the division — silently
+    // breaking the documented "< scale" bound (and wasting the extra 29 bits,
+    // which f32 cannot represent anyway). A 24-bit integer divided by 2^24 is
+    // always exactly representable and strictly < 1.0.
+    let unit = (raw >> 40) as f32 / (1u32 << 24) as f32;
     unit * 2.0 * scale - scale
 }
 
@@ -286,6 +303,57 @@ impl LinearEmbedding {
 }
 
 // ---------------------------------------------------------------------------
+// Cached projection matrices
+// ---------------------------------------------------------------------------
+//
+// `LinearEmbedding::new(in_dim, out_dim, seed)` is a pure function of its
+// three arguments, but the free `encode_*` functions below previously called
+// it fresh on *every* invocation. With the defaults (e.g. a 512x1700 shape
+// projection), that regenerates ~870K PRNG-derived f32 weights per call, and
+// `condition_from_flame_params` does this three or four times per call with
+// the same fixed seeds every time. Cache built matrices keyed by
+// `(in_dim, out_dim, seed)` so repeated calls with the same shape/seed reuse
+// one instance instead of re-running xorshift64 from scratch.
+static EMBEDDING_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<
+        std::collections::HashMap<(usize, usize, u64), std::sync::Arc<LinearEmbedding>>,
+    >,
+> = std::sync::OnceLock::new();
+
+/// Fetches (or lazily builds and caches) a [`LinearEmbedding`] for the given
+/// shape and seed.
+fn cached_linear_embedding(
+    in_dim: usize,
+    out_dim: usize,
+    seed: u64,
+) -> Result<std::sync::Arc<LinearEmbedding>, ConditioningError> {
+    let cache =
+        EMBEDDING_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let key = (in_dim, out_dim, seed);
+
+    if let Ok(guard) = cache.lock() {
+        if let Some(existing) = guard.get(&key) {
+            return Ok(existing.clone());
+        }
+    }
+
+    let built = std::sync::Arc::new(LinearEmbedding::new(in_dim, out_dim, seed)?);
+
+    // Recover from a poisoned lock rather than panicking (no unwrap()):
+    // a panic in another thread while holding the lock is not this
+    // function's concern, and the map contents remain valid to read/write.
+    let mut guard = match cache.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    // Another thread may have raced us and inserted first; prefer whichever
+    // instance is already cached so concurrent callers observe one canonical
+    // matrix rather than silently-different (but numerically equivalent) ones.
+    let entry = guard.entry(key).or_insert(built);
+    Ok(entry.clone())
+}
+
+// ---------------------------------------------------------------------------
 // Output types
 // ---------------------------------------------------------------------------
 
@@ -326,17 +394,27 @@ pub struct ConditioningStats {
 // ---------------------------------------------------------------------------
 
 /// Wrap an angle (in radians) to `[-π, π]`.
+///
+/// Uses a closed-form reduction rather than a `while` loop: for `|x|` above
+/// roughly `2^24 * 2π ≈ 1.05e8`, the f32 ulp exceeds `2π`, so
+/// `v -= 2.0 * PI` becomes a no-op and a naive loop never terminates (a true
+/// hang, not merely a slow one — and `f32::INFINITY` hangs identically since
+/// `inf - 2π == inf`). Non-finite input is guarded explicitly and mapped to
+/// `0.0` rather than being fed to `rem_euclid`, which would itself return
+/// `NaN`.
 #[inline]
 fn wrap_to_pi(x: f32) -> f32 {
     use std::f32::consts::PI;
-    let mut v = x;
-    while v > PI {
-        v -= 2.0 * PI;
+    if !x.is_finite() {
+        return 0.0;
     }
-    while v < -PI {
-        v += 2.0 * PI;
+    let two_pi = 2.0 * PI;
+    let wrapped = x.rem_euclid(two_pi); // in [0, two_pi)
+    if wrapped > PI {
+        wrapped - two_pi
+    } else {
+        wrapped
     }
-    v
 }
 
 /// Take the first `n` values from `src`, padding with 0.0 if `src` is shorter.
@@ -388,7 +466,7 @@ pub fn encode_shape_params(
     let values = take_or_pad(params, n_coeffs);
     let enc = SinusoidalEncoding::default();
     let features = enc.encode_slice(&values);
-    let layer = LinearEmbedding::new(features.len(), embed_dim, seed)?;
+    let layer = cached_linear_embedding(features.len(), embed_dim, seed)?;
     layer.forward(&features)
 }
 
@@ -416,36 +494,65 @@ pub fn encode_expression_params(
     let values = take_or_pad(params, n_coeffs);
     let enc = SinusoidalEncoding::default();
     let features = enc.encode_slice(&values);
-    let layer = LinearEmbedding::new(features.len(), embed_dim, seed)?;
+    let layer = cached_linear_embedding(features.len(), embed_dim, seed)?;
     layer.forward(&features)
 }
 
 /// Encode pose parameters (axis-angle representation).
 ///
-/// Each pose value is first wrapped to `[-π, π]` to handle angle periodicity,
-/// then encoded via sinusoidal features and projected to `embed_dim`.
+/// Unlike [`encode_shape_params`]/[`encode_expression_params`], earlier
+/// versions of this function encoded `params` at its *native* length instead
+/// of normalising to a fixed `n_coeffs` first. Because the projection matrix
+/// depends on the input dimension, two poses of different lengths (e.g. 15
+/// vs. 6 values) were projected by two unrelated random matrices, making
+/// their outputs incomparable even though both had `dim == embed_dim` — so
+/// [`blend_conditioning`]/[`conditioning_similarity`] would silently
+/// blend/compare noise. `params` is now normalised to `n_coeffs` via
+/// [`take_or_pad`] first, exactly like the other components, so the
+/// projection matrix is a pure function of `(n_coeffs, embed_dim, seed)`.
+///
+/// Each (normalised) pose value is wrapped to `[-π, π]` to handle angle
+/// periodicity, then encoded via sinusoidal features and projected to
+/// `embed_dim`.
 ///
 /// # Errors
 ///
-/// * [`ConditioningError::EmptyParams`] — if `params` is empty.
-/// * [`ConditioningError::InvalidEmbeddingDim`] — if `embed_dim == 0`.
+/// * [`ConditioningError::InvalidEmbeddingDim`] — if `embed_dim == 0` or `n_coeffs == 0`.
+/// * [`ConditioningError::EmptyParams`] — if `params` is empty (matching the
+///   siblings' `n_coeffs == 0` check, this stays a hard error rather than
+///   silently zero-padding, since an empty pose slice is usually a caller
+///   bug rather than an intentional "neutral pose").
+/// * [`ConditioningError::NonFiniteValue`] — if any value in `params` is NaN
+///   or infinite (an unguarded non-finite value could otherwise hang angle
+///   wrapping; see [`wrap_to_pi`]).
 pub fn encode_pose_params(
     params: &[f32],
+    n_coeffs: usize,
     embed_dim: usize,
     seed: u64,
 ) -> Result<Vec<f32>, ConditioningError> {
     if embed_dim == 0 {
         return Err(ConditioningError::InvalidEmbeddingDim { dim: embed_dim });
     }
+    if n_coeffs == 0 {
+        return Err(ConditioningError::InvalidEmbeddingDim { dim: n_coeffs });
+    }
     if params.is_empty() {
         return Err(ConditioningError::EmptyParams {
             param_name: "pose_params".to_string(),
         });
     }
-    let wrapped: Vec<f32> = params.iter().map(|&v| wrap_to_pi(v)).collect();
+    if let Some(&bad) = params.iter().find(|v| !v.is_finite()) {
+        return Err(ConditioningError::NonFiniteValue {
+            param_name: "pose_params".to_string(),
+            value: bad,
+        });
+    }
+    let values = take_or_pad(params, n_coeffs);
+    let wrapped: Vec<f32> = values.iter().map(|&v| wrap_to_pi(v)).collect();
     let enc = SinusoidalEncoding::default();
     let features = enc.encode_slice(&wrapped);
-    let layer = LinearEmbedding::new(features.len(), embed_dim, seed)?;
+    let layer = cached_linear_embedding(features.len(), embed_dim, seed)?;
     layer.forward(&features)
 }
 
@@ -466,7 +573,7 @@ pub fn encode_translation(
     }
     let enc = SinusoidalEncoding::default();
     let features = enc.encode_slice(translation);
-    let layer = LinearEmbedding::new(features.len(), embed_dim, seed)?;
+    let layer = cached_linear_embedding(features.len(), embed_dim, seed)?;
     layer.forward(&features)
 }
 
@@ -535,8 +642,13 @@ pub fn condition_from_flame_params(
     }
 
     if config.use_pose {
-        let enc = encode_pose_params(pose_params, config.embedding_dim, 0x3000)?;
-        source_pose = pose_params.len();
+        let enc = encode_pose_params(
+            pose_params,
+            config.n_pose_coeffs,
+            config.embedding_dim,
+            0x3000,
+        )?;
+        source_pose = pose_params.len().min(config.n_pose_coeffs);
         parts.push(enc);
     }
 
@@ -999,13 +1111,13 @@ mod tests {
     #[test]
     fn test_encode_pose_params_dim() {
         let pose = make_pose_params();
-        let out = encode_pose_params(&pose, 64, 20).expect("ok");
+        let out = encode_pose_params(&pose, 15, 64, 20).expect("ok");
         assert_eq!(out.len(), 64);
     }
 
     #[test]
     fn test_encode_pose_params_empty_error() {
-        let err = encode_pose_params(&[], 64, 1).unwrap_err();
+        let err = encode_pose_params(&[], 15, 64, 1).unwrap_err();
         assert!(matches!(err, ConditioningError::EmptyParams { .. }));
     }
 
@@ -1013,9 +1125,42 @@ mod tests {
     fn test_encode_pose_params_zero_embed_error() {
         let pose = make_pose_params();
         assert!(matches!(
-            encode_pose_params(&pose, 0, 1),
+            encode_pose_params(&pose, 15, 0, 1),
             Err(ConditioningError::InvalidEmbeddingDim { .. })
         ));
+    }
+
+    #[test]
+    fn test_encode_pose_params_zero_n_coeffs_error() {
+        let pose = make_pose_params();
+        assert!(matches!(
+            encode_pose_params(&pose, 0, 64, 1),
+            Err(ConditioningError::InvalidEmbeddingDim { .. })
+        ));
+    }
+
+    #[test]
+    fn test_encode_pose_params_non_finite_error() {
+        let pose = vec![0.1f32, f32::NAN, 0.2];
+        assert!(matches!(
+            encode_pose_params(&pose, 3, 64, 1),
+            Err(ConditioningError::NonFiniteValue { .. })
+        ));
+        let pose_inf = vec![0.1f32, f32::INFINITY, 0.2];
+        assert!(matches!(
+            encode_pose_params(&pose_inf, 3, 64, 1),
+            Err(ConditioningError::NonFiniteValue { .. })
+        ));
+    }
+
+    #[test]
+    fn test_encode_pose_params_shorter_than_n_coeffs_padded() {
+        // A pose shorter than n_coeffs pads with zeros, like shape/expression,
+        // rather than deriving a differently-shaped (and thus incomparable)
+        // projection matrix from the raw input length.
+        let pose = vec![0.3f32, -0.1];
+        let out = encode_pose_params(&pose, 15, 64, 20).expect("ok");
+        assert_eq!(out.len(), 64);
     }
 
     #[test]
@@ -1023,8 +1168,8 @@ mod tests {
         // Angles beyond ±π should give same result as wrapped equivalents
         let pose_large = vec![3.0 * PI, -4.0 * PI, 0.0f32];
         let pose_wrapped: Vec<f32> = pose_large.iter().map(|&v| wrap_to_pi(v)).collect();
-        let enc_large = encode_pose_params(&pose_large, 32, 50).expect("ok");
-        let enc_wrapped = encode_pose_params(&pose_wrapped, 32, 50).expect("ok");
+        let enc_large = encode_pose_params(&pose_large, 3, 32, 50).expect("ok");
+        let enc_wrapped = encode_pose_params(&pose_wrapped, 3, 32, 50).expect("ok");
         for (a, b) in enc_large.iter().zip(enc_wrapped.iter()) {
             assert!(
                 (a - b).abs() < 1e-4,
@@ -1570,5 +1715,85 @@ mod tests {
     fn test_wrap_to_pi_large_negative() {
         let w = wrap_to_pi(-7.0 * PI);
         assert!(w.abs() <= PI + 1e-5);
+    }
+
+    #[test]
+    fn test_wrap_to_pi_non_finite_does_not_hang() {
+        // Regression test for an infinite `while` loop: for |x| above roughly
+        // 2^24 * 2π, `v -= 2.0 * PI` becomes a float no-op and the old
+        // while-loop implementation never terminated. This test completing
+        // at all (not timing out) is the assertion; the returned value is
+        // also checked as a secondary sanity check.
+        assert_eq!(wrap_to_pi(f32::INFINITY), 0.0);
+        assert_eq!(wrap_to_pi(f32::NEG_INFINITY), 0.0);
+        assert_eq!(wrap_to_pi(f32::NAN), 0.0);
+        let w = wrap_to_pi(1e12);
+        assert!((-PI..=PI).contains(&w), "wrap_to_pi(1e12) = {w}");
+    }
+
+    // --- xorshift_to_float tests --------------------------------------------
+
+    #[test]
+    fn test_xorshift_to_float_never_reaches_positive_scale() {
+        // Regression test for the same "53 bits rounded into an f32" bug as
+        // adaptive_sampling::uniform_f32: the result must be strictly < scale.
+        let mut state = 12345u64;
+        let scale = 1.0f32;
+        for _ in 0..100_000 {
+            let raw = xorshift64(&mut state);
+            let v = xorshift_to_float(raw, scale);
+            assert!(
+                v < scale,
+                "xorshift_to_float must be strictly < scale, got {v}"
+            );
+            assert!(v >= -scale);
+        }
+    }
+
+    // --- encode_pose_params comparability regression ------------------------
+
+    #[test]
+    fn test_pose_projection_independent_of_raw_input_length() {
+        // The bug: encode_pose_params used to derive its projection matrix
+        // from `params.len()` directly, so a 15-value and a 3-value pose (both
+        // representing "mostly zero rotation") were projected by two
+        // *different* random matrices and were not comparable, even under an
+        // identical `n_coeffs`. With n_coeffs normalising both inputs first,
+        // a short pose padded with the *same* values as a longer pose (in its
+        // leading positions) followed by zeros should produce embeddings from
+        // one coherent projection space -- concretely, two pose slices that
+        // both zero-pad out to the same n_coeffs-length vector must yield
+        // identical embeddings regardless of how long the raw input was.
+        let short = vec![0.2f32, -0.1, 0.05];
+        let mut long = short.clone();
+        long.extend(std::iter::repeat(0.0f32).take(12)); // pad to 15 explicitly
+        let n_coeffs = 15;
+
+        let enc_short = encode_pose_params(&short, n_coeffs, 32, 0x3000).expect("ok");
+        let enc_long = encode_pose_params(&long, n_coeffs, 32, 0x3000).expect("ok");
+        assert_eq!(
+            enc_short, enc_long,
+            "short (auto-padded) and explicitly-padded pose of the same \
+             semantic content must encode identically once n_coeffs is fixed"
+        );
+    }
+
+    // --- cached_linear_embedding ---------------------------------------------
+
+    #[test]
+    fn test_cached_linear_embedding_same_key_reused() {
+        let a = cached_linear_embedding(17, 8, 0xABCD).expect("ok");
+        let b = cached_linear_embedding(17, 8, 0xABCD).expect("ok");
+        assert_eq!(
+            a.weights, b.weights,
+            "same (in_dim, out_dim, seed) must reuse the same matrix"
+        );
+    }
+
+    #[test]
+    fn test_cached_linear_embedding_different_seed_differs() {
+        let a = cached_linear_embedding(17, 8, 1).expect("ok");
+        let b = cached_linear_embedding(17, 8, 2).expect("ok");
+        assert_ne!(a.weights, b.weights);
     }
 }

@@ -17,15 +17,29 @@ pub enum StepPattern {
     /// indices = [step_size-1, 2*step_size-1, …], reversed (high → low).
     Uniform,
     /// Quadratic spacing: more steps near t=0 for better final-quality
-    /// denoising. `timestep[i] = total * (1 - (i/num_steps)^2)`.
+    /// denoising. `timestep[i] = total * (1 - (i/(num_steps-1))^2)`, so the
+    /// schedule spans the full range and reaches exactly `t=0` at the final
+    /// step (`i = num_steps-1`).
     Quadratic,
     /// Exponential spacing: very dense early steps (high-noise region).
-    /// `timestep[i] = total * exp(-3.0 * i/num_steps)`.
+    /// `timestep[i] = total * exp(-3.0 * i/(num_steps-1))`, with the final
+    /// step forced to exactly `t=0` (a pure exponential only approaches 0
+    /// asymptotically and would otherwise leave the schedule one denoising
+    /// pass short of the clean end of the trajectory).
     Exponential,
-    /// Leading steps: first `num_steps` of the original `total` timesteps.
+    /// Leading: evenly spaced steps anchored at the start of the schedule
+    /// (diffusers' `timestep_spacing="leading"`) — `i * (total/num_steps)`
+    /// for `i in 0..num_steps`, spanning the *full* `[0, total)` range and
+    /// reaching exactly `t=0` at the final (lowest-noise) step. This is
+    /// distinct from simply taking the first `num_steps` *adjacent*
+    /// timesteps `0..num_steps`, which would barely denoise at all.
     Leading,
-    /// Trailing steps: last `num_steps` of the original `total` timesteps
-    /// (the low-noise end near t = 0).
+    /// Trailing: evenly spaced steps anchored at the end of the schedule
+    /// (diffusers' `timestep_spacing="trailing"`), spanning the *full*
+    /// `[0, total)` range from just below `total` down toward (but not
+    /// always exactly reaching) `0`. This is distinct from simply taking
+    /// the last `num_steps` *adjacent* timesteps `(total-num_steps)..total`,
+    /// which would stay at the high-noise end and barely denoise at all.
     Trailing,
     /// Custom user-provided timestep indices (must all be < total_training_steps).
     Custom(Vec<usize>),
@@ -52,17 +66,22 @@ impl StepPattern {
         indices
     }
 
-    /// Quadratic spacing: `timestep[i] = total * (1 - (i/num_steps)^2)`.
+    /// Quadratic spacing: `timestep[i] = total * (1 - (i/(num_steps-1))^2)`.
     /// Results are clamped to [0, total-1], deduplicated, sorted descending.
+    /// Using `num_steps-1` (rather than `num_steps`) in the denominator is
+    /// what makes the final sample (`i = num_steps-1`) land exactly on
+    /// `t=1.0`, i.e. index 0 — with plain `num_steps` the loop never
+    /// evaluates `i = num_steps` and the schedule falls one step short of
+    /// t=0.
     pub fn quadratic_indices(total: usize, num_steps: usize) -> Vec<usize> {
         if num_steps == 0 || total == 0 {
             return Vec::new();
         }
         let total_f = total as f32;
-        let n_f = num_steps as f32;
+        let denom = num_steps.saturating_sub(1).max(1) as f32;
         let mut indices: Vec<usize> = (0..num_steps)
             .map(|i| {
-                let t = i as f32 / n_f;
+                let t = i as f32 / denom;
                 let raw = total_f * (1.0 - t * t);
                 // clamp to [0, total-1]
                 (raw as usize).min(total - 1)
@@ -73,22 +92,34 @@ impl StepPattern {
         indices
     }
 
-    /// Exponential spacing: `timestep[i] = total * exp(-3.0 * i/num_steps)`.
-    /// Dense at the beginning (high noise), sparse later.
-    /// Results clamped to [0, total-1], deduplicated, sorted descending.
+    /// Exponential spacing: `timestep[i] = total * exp(-3.0 * i/(num_steps-1))`.
+    /// Dense at the beginning (high noise), sparse later. Results clamped to
+    /// [0, total-1], deduplicated, sorted descending.
+    ///
+    /// A pure exponential curve only approaches 0 asymptotically (never
+    /// reaching it for any finite `i`), so the final sample
+    /// (`i = num_steps-1`) is forced to exactly `t=0` rather than
+    /// evaluating the curve there — otherwise the schedule would always
+    /// leave the denoising trajectory one step short of the clean end,
+    /// regardless of how the loop is indexed.
     pub fn exponential_indices(total: usize, num_steps: usize) -> Vec<usize> {
         if num_steps == 0 || total == 0 {
             return Vec::new();
         }
         let total_f = total as f32;
-        let n_f = num_steps as f32;
         let lambda = 3.0_f32;
+        let denom = num_steps.saturating_sub(1).max(1) as f32;
+        let last = num_steps - 1;
         let mut indices: Vec<usize> = (0..num_steps)
             .map(|i| {
-                let t = i as f32 / n_f;
-                let raw = total_f * (-lambda * t).exp();
-                // clamp to [0, total-1]
-                (raw as usize).min(total - 1)
+                if num_steps > 1 && i == last {
+                    0
+                } else {
+                    let t = i as f32 / denom;
+                    let raw = total_f * (-lambda * t).exp();
+                    // clamp to [0, total-1]
+                    (raw as usize).min(total - 1)
+                }
             })
             .collect();
         indices.sort_unstable_by(|a, b| b.cmp(a));
@@ -96,47 +127,85 @@ impl StepPattern {
         indices
     }
 
-    /// Leading: the first `num_steps` of `0..total`, sorted descending.
+    /// Leading: evenly spaced indices `i * step_ratio` for `i in
+    /// 0..num_steps`, where `step_ratio = total / num_steps`
+    /// (diffusers' `timestep_spacing="leading"`), sorted descending.
+    ///
+    /// Spans the full `[0, total)` range — this is *not* the same as taking
+    /// the first `num_steps` adjacent indices `0..num_steps`, which would
+    /// cluster entirely at the already-near-clean end and barely denoise.
     fn leading_indices(total: usize, num_steps: usize) -> Vec<usize> {
         if num_steps == 0 || total == 0 {
             return Vec::new();
         }
-        let count = num_steps.min(total);
-        let mut indices: Vec<usize> = (0..count).collect();
+        let step_ratio = (total / num_steps).max(1);
+        let mut indices: Vec<usize> = (0..num_steps)
+            .map(|i| (i * step_ratio).min(total - 1))
+            .collect();
         indices.sort_unstable_by(|a, b| b.cmp(a));
+        indices.dedup();
         indices
     }
 
-    /// Trailing: the last `num_steps` of `0..total`, sorted descending.
+    /// Trailing: evenly spaced indices anchored at the end of the schedule
+    /// — `round(total - i * step_ratio) - 1` for `i in 0..num_steps`, where
+    /// `step_ratio = total / num_steps` (diffusers' `timestep_spacing =
+    /// "trailing"`), sorted descending.
+    ///
+    /// Spans the full `[0, total)` range — this is *not* the same as taking
+    /// the last `num_steps` adjacent indices `(total-num_steps)..total`,
+    /// which would cluster entirely at the high-noise end and barely
+    /// denoise (four adjacent timesteps out of e.g. 1000 leave `alpha_bar`
+    /// almost unchanged across the whole schedule).
     fn trailing_indices(total: usize, num_steps: usize) -> Vec<usize> {
         if num_steps == 0 || total == 0 {
             return Vec::new();
         }
-        let count = num_steps.min(total);
-        let start = total - count;
-        let mut indices: Vec<usize> = (start..total).collect();
+        let step_ratio = (total as f32 / num_steps as f32).max(1.0);
+        let mut indices: Vec<usize> = (0..num_steps)
+            .map(|i| {
+                let raw = total as f32 - i as f32 * step_ratio;
+                let idx = raw.round() - 1.0;
+                idx.clamp(0.0, (total - 1) as f32) as usize
+            })
+            .collect();
         indices.sort_unstable_by(|a, b| b.cmp(a));
+        indices.dedup();
         indices
     }
 
     /// Compute the timestep index list for this pattern.
     ///
-    /// For [`StepPattern::Custom`], the provided indices are validated against
-    /// `total` and returned as a descending-sorted, deduplicated list.
-    pub fn indices(&self, total: usize, num_steps: usize) -> Vec<usize> {
+    /// For [`StepPattern::Custom`], every provided index must be `< total`;
+    /// otherwise this returns [`DiffusionError::InvalidTimestep`]. All other
+    /// variants always succeed (they only ever generate values already
+    /// clamped to `[0, total)`) and return values sorted descending,
+    /// deduplicated.
+    ///
+    /// # Errors
+    ///
+    /// [`DiffusionError::InvalidTimestep`] if `self` is
+    /// [`StepPattern::Custom`] and contains a value `>= total`. Previously
+    /// out-of-range `Custom` entries were silently dropped instead of
+    /// rejected, despite this method's doc claiming they were "validated".
+    pub fn indices(&self, total: usize, num_steps: usize) -> Result<Vec<usize>, DiffusionError> {
         match self {
-            StepPattern::Uniform => Self::uniform_indices(total, num_steps),
-            StepPattern::Quadratic => Self::quadratic_indices(total, num_steps),
-            StepPattern::Exponential => Self::exponential_indices(total, num_steps),
-            StepPattern::Leading => Self::leading_indices(total, num_steps),
-            StepPattern::Trailing => Self::trailing_indices(total, num_steps),
+            StepPattern::Uniform => Ok(Self::uniform_indices(total, num_steps)),
+            StepPattern::Quadratic => Ok(Self::quadratic_indices(total, num_steps)),
+            StepPattern::Exponential => Ok(Self::exponential_indices(total, num_steps)),
+            StepPattern::Leading => Ok(Self::leading_indices(total, num_steps)),
+            StepPattern::Trailing => Ok(Self::trailing_indices(total, num_steps)),
             StepPattern::Custom(v) => {
+                if let Some(&bad) = v.iter().find(|&&x| x >= total) {
+                    return Err(DiffusionError::InvalidTimestep {
+                        value: bad,
+                        max: total.saturating_sub(1),
+                    });
+                }
                 let mut out = v.clone();
-                // Clamp to valid range
-                out.retain(|&x| x < total);
                 out.sort_unstable_by(|a, b| b.cmp(a));
                 out.dedup();
-                out
+                Ok(out)
             }
         }
     }
@@ -211,7 +280,12 @@ impl StepScheduleConfig {
 
     /// Compute the ordered list of timestep indices (high → low) for this
     /// configuration.
-    pub fn timestep_indices(&self) -> Vec<usize> {
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`StepPattern::indices`] — only reachable with
+    /// [`StepPattern::Custom`] containing an index `>= total_training_steps`.
+    pub fn timestep_indices(&self) -> Result<Vec<usize>, DiffusionError> {
         self.pattern
             .indices(self.total_training_steps, self.inference_steps)
     }
@@ -231,6 +305,13 @@ pub struct DdimStepScheduler {
     /// as `timesteps` (i.e., the first entry corresponds to the highest
     /// timestep).
     pub alphas_cumprod: Vec<f32>,
+    /// `alphas_cumprod_all[0]` — signal retention at the very first
+    /// training timestep of the *original* (un-subsampled) noise schedule.
+    /// Used as the `alpha_prev` fallback for the final inference step when
+    /// `config.set_alpha_to_one` is `false`, matching diffusers'
+    /// `DDIMScheduler.final_alpha_cumprod` convention (see
+    /// [`Self::step_with_noise_pred`]).
+    alpha_at_t0: f32,
     current_step: usize,
 }
 
@@ -251,12 +332,18 @@ impl DdimStepScheduler {
                 config.total_training_steps
             )));
         }
-        let timesteps = config.timestep_indices();
+        let timesteps = config.timestep_indices()?;
         let alphas_cumprod: Vec<f32> = timesteps.iter().map(|&t| alphas_cumprod_all[t]).collect();
+        // Safe: `config.validate()` above requires `inference_steps >= 1`
+        // and `inference_steps <= total_training_steps`, which together
+        // force `total_training_steps >= 1`; the length check just above
+        // then guarantees `alphas_cumprod_all` has at least one element.
+        let alpha_at_t0 = alphas_cumprod_all[0];
         Ok(Self {
             config,
             timesteps,
             alphas_cumprod,
+            alpha_at_t0,
             current_step: 0,
         })
     }
@@ -271,11 +358,20 @@ impl DdimStepScheduler {
     /// Standard DDIM formula (η = 0):
     /// ```text
     /// alpha_t    = alphas_cumprod[current_step]
-    /// alpha_prev = alphas_cumprod[current_step + 1]  (or 1.0 at the last step)
+    /// alpha_prev = alphas_cumprod[current_step + 1]  (or the t=0 fallback at the last step)
     /// x0_pred    = (sample - sqrt(1 - alpha_t) * noise_pred) / sqrt(alpha_t)
     /// dir_xt     = sqrt(1 - alpha_prev) * noise_pred
     /// prev       = sqrt(alpha_prev) * x0_pred + dir_xt
     /// ```
+    ///
+    /// At the final step, `alpha_prev` is `1.0` when `config.set_alpha_to_one`
+    /// is `true`, or `alphas_cumprod_all[0]` (the *original* schedule's t=0
+    /// value, passed to [`Self::new`]) when `false` — matching diffusers'
+    /// `DDIMScheduler.final_alpha_cumprod` convention. Either way this must
+    /// differ from `alpha_t` (unless the schedule already selected t=0), so
+    /// the final step always moves the sample; it previously fell back to
+    /// `alpha_t` itself when `set_alpha_to_one` was `false` (the default),
+    /// making that step a no-op that reconstructed the input exactly.
     ///
     /// If `config.clip_denoised` is `true`, `x0_pred` is clamped to [-1, 1].
     ///
@@ -306,9 +402,7 @@ impl DdimStepScheduler {
         } else if self.config.set_alpha_to_one {
             1.0_f32
         } else {
-            // Use the actual alpha at the last selected timestep (same as
-            // current since we've reached the end).
-            self.alphas_cumprod[self.current_step]
+            self.alpha_at_t0
         };
 
         let sqrt_alpha_t = alpha_t.sqrt();
@@ -488,32 +582,60 @@ mod tests {
 
     #[test]
     fn test_trailing_indices() {
-        let indices = StepPattern::Trailing.indices(1000, 4);
-        // Trailing should give the last 4 indices: 999, 998, 997, 996
+        let indices = StepPattern::Trailing.indices(1000, 4).unwrap();
+        // Regression: Trailing must span the *full* schedule (diffusers
+        // convention), not just the four highest adjacent timesteps (which
+        // is what the doc claimed but the old code did not implement).
         assert_eq!(indices.len(), 4);
         assert_eq!(indices[0], 999);
-        assert_eq!(indices[3], 996);
+        assert_eq!(indices[3], 249);
         assert!(is_strictly_decreasing(&indices));
+        assert!(
+            indices[0] - indices[3] > 500,
+            "Trailing steps must span most of the schedule, got {indices:?}"
+        );
     }
 
     #[test]
     fn test_leading_indices() {
-        let indices = StepPattern::Leading.indices(1000, 4);
-        // Leading should give the first 4 indices descending: 3, 2, 1, 0
+        let indices = StepPattern::Leading.indices(1000, 4).unwrap();
+        // Regression: Leading must span the *full* schedule (diffusers
+        // convention: i * step_ratio for i in 0..num_steps), not cluster at
+        // the low-noise end as four adjacent indices 3,2,1,0.
         assert_eq!(indices.len(), 4);
-        assert_eq!(indices[0], 3);
+        assert_eq!(indices[0], 750);
         assert_eq!(indices[3], 0);
         assert!(is_strictly_decreasing(&indices));
+        assert!(
+            indices[0] - indices[3] > 500,
+            "Leading steps must span most of the schedule, got {indices:?}"
+        );
     }
 
     #[test]
     fn test_custom_pattern() {
         let custom = StepPattern::Custom(vec![500, 200, 800, 100]);
-        let indices = custom.indices(1000, 4); // num_steps ignored for Custom
-                                               // Should be sorted descending and all < 1000
+        let indices = custom.indices(1000, 4).unwrap(); // num_steps ignored for Custom
+                                                        // Should be sorted descending and all < 1000
         assert!(is_strictly_decreasing(&indices));
         assert_eq!(indices[0], 800);
         assert_eq!(indices[3], 100);
+    }
+
+    #[test]
+    fn test_custom_pattern_out_of_range_is_rejected() {
+        // Regression: out-of-range Custom indices used to be silently
+        // dropped ("clamped") rather than rejected, despite `indices`'s doc
+        // claiming they were validated.
+        let custom = StepPattern::Custom(vec![500, 1200, 800]);
+        let err = custom.indices(1000, 3).unwrap_err();
+        assert!(matches!(
+            err,
+            DiffusionError::InvalidTimestep {
+                value: 1200,
+                max: 999
+            }
+        ));
     }
 
     // -----------------------------------------------------------------------
@@ -565,7 +687,7 @@ mod tests {
     #[test]
     fn test_timestep_indices_from_config() {
         let cfg = StepScheduleConfig::fast_4step();
-        let indices = cfg.timestep_indices();
+        let indices = cfg.timestep_indices().unwrap();
         assert_eq!(indices.len(), 4);
         // All < 1000
         assert!(indices.iter().all(|&x| x < 1000));
@@ -651,6 +773,79 @@ mod tests {
         assert!(!sched.is_done());
         assert_eq!(sched.steps_remaining(), 4);
         assert!(sched.current_timestep().is_some());
+    }
+
+    /// Regression test: with `set_alpha_to_one` at its default (`false`),
+    /// the final DDIM step previously fell back to `alpha_prev = alpha_t`
+    /// (the same value as the current step), making the update reconstruct
+    /// the input sample exactly instead of denoising it.
+    #[test]
+    fn test_final_step_is_not_a_noop_by_default() {
+        let alphas = make_alphas(1000);
+        let cfg = StepScheduleConfig::new(4, StepPattern::Uniform); // set_alpha_to_one: false
+        let mut sched = DdimStepScheduler::new(cfg, &alphas).expect("valid config");
+
+        let n = 8_usize;
+        let sample: Vec<f32> = (0..n).map(|i| i as f32 * 0.1).collect();
+        let noise_pred: Vec<f32> = vec![0.3_f32; n];
+
+        // Drive to the final step.
+        for _ in 0..3 {
+            sched
+                .step_with_noise_pred(&noise_pred, &sample)
+                .expect("step ok");
+        }
+        assert_eq!(sched.steps_remaining(), 1);
+
+        let out = sched
+            .step_with_noise_pred(&noise_pred, &sample)
+            .expect("final step ok");
+        let max_diff = out
+            .iter()
+            .zip(sample.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            max_diff > 1e-3,
+            "final DDIM step should not reproduce the input sample, max diff={max_diff}"
+        );
+    }
+
+    /// With `set_alpha_to_one = true`, `alpha_prev` at the final step is
+    /// exactly `1.0`, so `dir_xt` vanishes and the output equals the
+    /// (optionally clamped) `x0_pred` exactly.
+    #[test]
+    fn test_final_step_set_alpha_to_one_snaps_to_x0() {
+        let alphas = make_alphas(1000);
+        let cfg = StepScheduleConfig {
+            set_alpha_to_one: true,
+            clip_denoised: false,
+            ..StepScheduleConfig::new(4, StepPattern::Uniform)
+        };
+        let mut sched = DdimStepScheduler::new(cfg, &alphas).expect("valid config");
+
+        let sample = vec![0.5_f32; 4];
+        let noise_pred = vec![0.2_f32; 4];
+        for _ in 0..3 {
+            sched
+                .step_with_noise_pred(&noise_pred, &sample)
+                .expect("step ok");
+        }
+        let alpha_t = sched.alphas_cumprod[3];
+        let sqrt_alpha_t = alpha_t.sqrt();
+        let sqrt_one_minus_alpha_t = (1.0 - alpha_t).sqrt();
+        let expected_x0: Vec<f32> = sample
+            .iter()
+            .zip(noise_pred.iter())
+            .map(|(&s, &e)| (s - sqrt_one_minus_alpha_t * e) / sqrt_alpha_t)
+            .collect();
+
+        let out = sched
+            .step_with_noise_pred(&noise_pred, &sample)
+            .expect("final step ok");
+        for (o, x0) in out.iter().zip(expected_x0.iter()) {
+            assert!((o - x0).abs() < 1e-4, "out={o} expected_x0={x0}");
+        }
     }
 
     // -----------------------------------------------------------------------

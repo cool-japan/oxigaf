@@ -6,9 +6,12 @@
 //! # Usage
 //!
 //! ```bash
-//! cargo run --example convert_npy_to_safetensors --features safetensors \
+//! cargo run --example convert_npy_to_safetensors \
 //!     -- path/to/flame/npy/dir output.safetensors
 //! ```
+//!
+//! Note: safetensors I/O is always available in `oxigaf-flame` (it is not
+//! gated behind a Cargo feature), so no `--features` flag is needed.
 //!
 //! # Input
 //!
@@ -18,9 +21,9 @@
 //! - shapedirs.npy
 //! - expressiondirs.npy
 //! - posedirs.npy
-//! - J_regressor.npy
+//! - j_regressor.npy
 //! - kintree_table.npy
-//! - weights.npy
+//! - lbs_weights.npy
 //!
 //! # Output
 //!

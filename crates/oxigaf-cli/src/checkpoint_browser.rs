@@ -10,6 +10,19 @@ use thiserror::Error;
 // ---------------------------------------------------------------------------
 
 /// Errors that can arise during checkpoint browsing operations.
+///
+/// [`BrowserError::ParseError`] is returned by [`BrowserCheckpoint::try_from_path`]
+/// and [`BrowserError::CheckpointNotFound`] by
+/// [`CheckpointBrowser::find_at_step_exact`]. The remaining variants —
+/// [`BrowserError::NoCheckpoints`], [`BrowserError::InvalidParam`], and
+/// [`BrowserError::TooFewCheckpoints`] — are reserved for the CLI command
+/// layer that will eventually scan a directory and construct a
+/// [`CheckpointBrowser`] from it (that wiring does not exist yet —
+/// `checkpoint_browser` is not reachable from any subcommand): this module
+/// performs no directory I/O of its own (see the module doc), and the
+/// existing `find_psnr_elbow`/`estimate_steps_to_psnr` query functions
+/// already use `Option` idiomatically for "not enough data" rather than
+/// needing a typed error.
 #[derive(Debug, Error)]
 pub enum BrowserError {
     #[error("No checkpoints found in {0}")]
@@ -52,24 +65,43 @@ pub struct BrowserCheckpoint {
 }
 
 impl BrowserCheckpoint {
-    /// Construct a `BrowserCheckpoint` by parsing metadata from a path string.
-    ///
-    /// Only the filename component is used for parsing; no actual I/O is performed.
-    pub fn from_path(path: &str) -> Self {
-        let step = parse_step_from_path(path).unwrap_or(0);
-        let psnr = parse_psnr_from_path(path);
-        let tags = extract_tags_from_path(path);
+    /// Build a checkpoint record for `path` with an already-resolved `step`.
+    fn build(path: &str, step: usize) -> Self {
         Self {
             path: path.to_string(),
             step,
             epoch: None,
-            psnr,
+            psnr: parse_psnr_from_path(path),
             loss: None,
             n_gaussians: None,
             timestamp: None,
             file_size_bytes: 0,
-            tags,
+            tags: extract_tags_from_path(path),
         }
+    }
+
+    /// Construct a `BrowserCheckpoint` by parsing metadata from a path string.
+    ///
+    /// Only the filename component is used for parsing; no actual I/O is
+    /// performed. When the training step cannot be determined from the
+    /// path, this falls back to step `0` rather than failing — use
+    /// [`Self::try_from_path`] when an unparseable step should be treated
+    /// as an error instead.
+    pub fn from_path(path: &str) -> Self {
+        let step = parse_step_from_path(path).unwrap_or(0);
+        Self::build(path, step)
+    }
+
+    /// Like [`Self::from_path`], but returns [`BrowserError::ParseError`]
+    /// instead of silently defaulting to step `0` when no training step can
+    /// be determined from the path.
+    pub fn try_from_path(path: &str) -> Result<Self, BrowserError> {
+        let step = parse_step_from_path(path).ok_or_else(|| {
+            BrowserError::ParseError(format!(
+                "could not determine a training step from path '{path}'"
+            ))
+        })?;
+        Ok(Self::build(path, step))
     }
 
     /// Return `true` if this checkpoint is tagged or named as "best".
@@ -84,11 +116,17 @@ impl BrowserCheckpoint {
         lower.contains("final") || self.tags.iter().any(|t| t == "final")
     }
 
-    /// Composite quality score in `[0, 1]`.
+    /// Composite quality score, *typically* in `[0, 1]` but not clamped:
     ///
-    /// - PSNR available: `psnr / 50.0`
-    /// - Loss available: `1.0 - loss.min(1.0)`
+    /// - PSNR available: `psnr / 50.0` — unbounded above for PSNR > 50 dB
+    ///   (routine for a well-converged synthetic scene) and negative for a
+    ///   negative PSNR parsed from a filename.
+    /// - Loss available: `1.0 - loss.min(1.0)` — negative for loss > 1.0.
     /// - Neither: `0.0`
+    ///
+    /// [`BrowserSort::ByQualityScore`] still orders correctly regardless,
+    /// since it only compares these values against each other; a caller
+    /// that needs a normalised `[0, 1]` fraction should clamp explicitly.
     pub fn quality_score(&self) -> f32 {
         if let Some(psnr) = self.psnr {
             psnr / 50.0
@@ -328,6 +366,20 @@ impl CheckpointBrowser {
         self.find_nearest_step(step)
     }
 
+    /// Find the checkpoint at exactly `step`, without falling back to the
+    /// nearest one.
+    ///
+    /// Unlike [`Self::find_at_step`] (which silently substitutes the
+    /// nearest checkpoint when there is no exact match, giving the caller
+    /// no way to tell the two cases apart), this returns
+    /// [`BrowserError::CheckpointNotFound`] when `step` is not present.
+    pub fn find_at_step_exact(&self, step: usize) -> Result<&BrowserCheckpoint, BrowserError> {
+        self.checkpoints
+            .iter()
+            .find(|c| c.step == step)
+            .ok_or_else(|| BrowserError::CheckpointNotFound(step.to_string()))
+    }
+
     /// Find the checkpoint whose step is nearest to the target.
     pub fn find_nearest_step(&self, step: usize) -> Option<&BrowserCheckpoint> {
         self.checkpoints
@@ -509,6 +561,66 @@ pub fn find_psnr_elbow(checkpoints: &[BrowserCheckpoint]) -> Option<usize> {
     Some(trend[elbow_idx + 1].0)
 }
 
+/// Ordinary least-squares fit of `psnr = slope * step + intercept` over
+/// `trend`, extrapolated to find the number of *additional* steps (beyond
+/// the last observed one) needed to reach `target_psnr`.
+///
+/// Returns `None` when the trend has fewer than 2 points, the step values
+/// are degenerate (no variance — e.g. every checkpoint claims the same
+/// step), or the fitted slope is not positive (PSNR isn't improving).
+///
+/// Accumulates in `f64` and centres `step` on its mean before forming the
+/// normal-equation denominator. The naive single-pass f32 formula
+/// (`n*Σx² - (Σx)²`) subtracts two nearly-equal ~1e10+ magnitude
+/// quantities for realistic step values (up to hundreds of thousands),
+/// which loses nearly all significant digits in f32's 24-bit mantissa —
+/// and the resulting near-zero-magnitude `f32::EPSILON` guard then fails
+/// to catch anything but an exactly-zero denominator. Centring computes the
+/// same quantity (`n * Σ(x-x̄)²`, by the standard sum-of-squares identity)
+/// directly, without cancellation, so the degeneracy guard below is
+/// actually meaningful.
+fn fit_steps_to_psnr(trend: &[(usize, f32)], target_psnr: f32) -> Option<usize> {
+    if trend.len() < 2 {
+        return None;
+    }
+
+    let n = trend.len() as f64;
+    let x_mean = trend.iter().map(|(s, _)| *s as f64).sum::<f64>() / n;
+    let y_mean = trend.iter().map(|(_, p)| *p as f64).sum::<f64>() / n;
+
+    let mut sxx = 0.0f64;
+    let mut sxy = 0.0f64;
+    for (step, psnr) in trend {
+        let dx = *step as f64 - x_mean;
+        let dy = *psnr as f64 - y_mean;
+        sxx += dx * dx;
+        sxy += dx * dy;
+    }
+
+    // Relative-to-magnitude guard: catches "all steps identical" (sxx
+    // exactly 0) without being fooled by the huge absolute scale of real
+    // step counts.
+    if sxx <= f64::EPSILON * x_mean.abs().max(1.0) {
+        return None;
+    }
+
+    let slope = sxy / sxx;
+    let intercept = y_mean - slope * x_mean;
+
+    if slope <= 0.0 {
+        return None;
+    }
+
+    // target_psnr = slope * step + intercept → step = (target - intercept) / slope
+    let target_step = (target_psnr as f64 - intercept) / slope;
+    let last_step = trend.last().map(|(s, _)| *s as f64).unwrap_or(0.0);
+    if target_step <= last_step {
+        return Some(0);
+    }
+
+    Some((target_step - last_step).ceil() as usize)
+}
+
 /// Estimate the number of additional steps required to reach a target PSNR.
 ///
 /// Uses linear extrapolation through the last available PSNR points.
@@ -519,37 +631,7 @@ pub fn estimate_steps_to_psnr(
     target_psnr: f32,
 ) -> Option<usize> {
     let trend = psnr_trend(checkpoints);
-    if trend.len() < 2 {
-        return None;
-    }
-
-    // Use all points for a simple linear regression (least squares)
-    let n = trend.len() as f32;
-    let sum_x: f32 = trend.iter().map(|(s, _)| *s as f32).sum();
-    let sum_y: f32 = trend.iter().map(|(_, p)| *p).sum();
-    let sum_xx: f32 = trend.iter().map(|(s, _)| (*s as f32).powi(2)).sum();
-    let sum_xy: f32 = trend.iter().map(|(s, p)| *s as f32 * *p).sum();
-
-    let denom = n * sum_xx - sum_x * sum_x;
-    if denom.abs() < f32::EPSILON {
-        return None;
-    }
-
-    let slope = (n * sum_xy - sum_x * sum_y) / denom;
-    let intercept = (sum_y - slope * sum_x) / n;
-
-    if slope <= 0.0 {
-        return None;
-    }
-
-    // target_psnr = slope * step + intercept → step = (target - intercept) / slope
-    let target_step = (target_psnr - intercept) / slope;
-    let last_step = trend.last().map(|(s, _)| *s as f32).unwrap_or(0.0);
-    if target_step <= last_step {
-        return Some(0);
-    }
-
-    Some((target_step - last_step).ceil() as usize)
+    fit_steps_to_psnr(&trend, target_psnr)
 }
 
 /// Compute statistics about the step spacing between checkpoints.
@@ -593,10 +675,64 @@ pub fn checkpoint_spacing_stats(checkpoints: &[BrowserCheckpoint]) -> SpacingSta
 // Parsing utilities
 // ---------------------------------------------------------------------------
 
+/// Returns `true` when `tok` is a poor step-number candidate because it
+/// looks like a date or a raw timestamp rather than a training step: purely
+/// numeric and either longer than 8 digits (implausible as a step count —
+/// more likely a Unix timestamp), or exactly 8 digits forming a plausible
+/// `YYYYMMDD` date.
+fn looks_like_date_or_timestamp(tok: &str) -> bool {
+    if tok.is_empty() || !tok.chars().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    if tok.len() > 8 {
+        return true;
+    }
+    if tok.len() == 8 {
+        let year = tok[0..4].parse::<u32>().unwrap_or(0);
+        let month = tok[4..6].parse::<u32>().unwrap_or(0);
+        let day = tok[6..8].parse::<u32>().unwrap_or(0);
+        return (1970..=9999).contains(&year)
+            && (1..=12).contains(&month)
+            && (1..=31).contains(&day);
+    }
+    false
+}
+
+/// Returns `true` if some token other than `tokens[skip]` is a plausible
+/// (non-date/timestamp-shaped) numeric step candidate.
+fn has_better_step_candidate(tokens: &[&str], skip: usize) -> bool {
+    tokens.iter().enumerate().any(|(idx, tok)| {
+        idx != skip
+            && !tok.is_empty()
+            && tok.chars().all(|c| c.is_ascii_digit())
+            && !looks_like_date_or_timestamp(tok)
+    })
+}
+
+/// Parse `tokens[idx]` as a step number, rejecting it in favour of `None`
+/// only when it looks like a date/timestamp *and* a better candidate exists
+/// elsewhere in `tokens` — a lone date-shaped number is still accepted
+/// (some evidence beats none), it just loses to a better alternative when
+/// one is available.
+fn accept_step_candidate(tokens: &[&str], tok: &str, idx: usize) -> Option<usize> {
+    let n = tok.parse::<usize>().ok()?;
+    if looks_like_date_or_timestamp(tok) && has_better_step_candidate(tokens, idx) {
+        None
+    } else {
+        Some(n)
+    }
+}
+
 /// Parse a step number from a checkpoint filename or path.
 ///
 /// Recognises patterns like: `"ckpt_1000"`, `"step_1000"`, `"checkpoint-1000"`,
 /// `"model_1000.json"`. Takes the last occurring number after a recognised prefix.
+///
+/// A numeric token that looks like a date (`YYYYMMDD`) or a raw timestamp
+/// (more than 8 digits) is treated as a poor step candidate and skipped
+/// whenever a more plausible numeric token exists elsewhere in the
+/// filename — e.g. `"checkpoint_20260101_1000.json"` yields `1000`, not the
+/// embedded date.
 pub fn parse_step_from_path(path: &str) -> Option<usize> {
     // Extract the filename component
     let filename = path.rsplit(['/', '\\']).next().unwrap_or(path);
@@ -618,12 +754,13 @@ pub fn parse_step_from_path(path: &str) -> Option<usize> {
         let lower = tokens[i].to_ascii_lowercase();
         if keywords.iter().any(|k| *k == lower) {
             if let Some(next) = tokens.get(i + 1) {
-                if let Ok(n) = next.parse::<usize>() {
+                if let Some(n) = accept_step_candidate(&tokens, next, i + 1) {
                     return Some(n);
                 }
-                // Skip over another keyword ("checkpoint_step_1000")
+                // Skip over another keyword, or a rejected date/timestamp
+                // ("checkpoint_step_1000", "checkpoint_20260101_1000")
                 if let Some(after) = tokens.get(i + 2) {
-                    if let Ok(n) = after.parse::<usize>() {
+                    if let Some(n) = accept_step_candidate(&tokens, after, i + 2) {
                         return Some(n);
                     }
                 }
@@ -632,22 +769,27 @@ pub fn parse_step_from_path(path: &str) -> Option<usize> {
         i += 1;
     }
 
-    // Fallback: last purely-numeric token after at least one non-numeric token
+    // Fallback: last purely-numeric token after at least one non-numeric
+    // token, preferring one that isn't date/timestamp-shaped.
     let mut found_non_numeric = false;
     let mut last_number: Option<usize> = None;
+    let mut last_plausible_number: Option<usize> = None;
     for tok in &tokens {
         let is_numeric = !tok.is_empty() && tok.chars().all(|c| c.is_ascii_digit());
         if is_numeric {
             if found_non_numeric {
                 if let Ok(n) = tok.parse::<usize>() {
                     last_number = Some(n);
+                    if !looks_like_date_or_timestamp(tok) {
+                        last_plausible_number = Some(n);
+                    }
                 }
             }
         } else if !tok.is_empty() {
             found_non_numeric = true;
         }
     }
-    last_number
+    last_plausible_number.or(last_number)
 }
 
 /// Parse a PSNR value from a checkpoint filename.
@@ -909,6 +1051,38 @@ mod tests {
         assert_eq!(parse_step_from_path("model_best_500"), Some(500));
     }
 
+    #[test]
+    fn test_parse_step_prefers_step_over_embedded_date() {
+        // The date "20260101" immediately follows the "checkpoint" keyword,
+        // but "1000" (the real step) is a better, non-date-shaped candidate
+        // elsewhere in the filename.
+        assert_eq!(
+            parse_step_from_path("checkpoint_20260101_1000.json"),
+            Some(1000)
+        );
+    }
+
+    #[test]
+    fn test_parse_step_prefers_step_over_trailing_date() {
+        assert_eq!(parse_step_from_path("run_1000_20260101.json"), Some(1000));
+    }
+
+    #[test]
+    fn test_parse_step_falls_back_to_date_when_no_better_candidate() {
+        // A lone date-shaped number is still better than nothing.
+        assert_eq!(parse_step_from_path("backup_20260101.json"), Some(20260101));
+    }
+
+    #[test]
+    fn test_parse_step_prefers_step_over_long_timestamp() {
+        // A 10-digit token is implausible as a step count (more likely a
+        // Unix timestamp) and must lose to a shorter, plausible candidate.
+        assert_eq!(
+            parse_step_from_path("snapshot_1735689600_1000.json"),
+            Some(1000)
+        );
+    }
+
     // -----------------------------------------------------------------------
     // parse_psnr_from_path
     // -----------------------------------------------------------------------
@@ -1006,6 +1180,18 @@ mod tests {
     fn test_from_path_zero_step_fallback() {
         let c = BrowserCheckpoint::from_path("model.json");
         assert_eq!(c.step, 0);
+    }
+
+    #[test]
+    fn test_try_from_path_ok() {
+        let c = BrowserCheckpoint::try_from_path("ckpt_step_5000.json").expect("should parse");
+        assert_eq!(c.step, 5000);
+    }
+
+    #[test]
+    fn test_try_from_path_errors_when_step_unparseable() {
+        let result = BrowserCheckpoint::try_from_path("model.json");
+        assert!(matches!(result, Err(BrowserError::ParseError(_))));
     }
 
     #[test]
@@ -1311,6 +1497,27 @@ mod tests {
         assert_eq!(found.step, 300);
     }
 
+    #[test]
+    fn test_find_at_step_exact_method_returns_exact_match() {
+        let browser =
+            CheckpointBrowser::new(make_checkpoints_with_psnr(), BrowserConfig::default());
+        let found = browser
+            .find_at_step_exact(200)
+            .expect("step 200 should exist");
+        assert_eq!(found.step, 200);
+    }
+
+    #[test]
+    fn test_find_at_step_exact_method_errors_without_falling_back_to_nearest() {
+        // Unlike `find_at_step`, `find_at_step_exact` must not silently
+        // substitute the nearest checkpoint (step 200) for a step that
+        // isn't actually present.
+        let browser =
+            CheckpointBrowser::new(make_checkpoints_with_psnr(), BrowserConfig::default());
+        let result = browser.find_at_step_exact(175);
+        assert!(matches!(result, Err(BrowserError::CheckpointNotFound(_))));
+    }
+
     // -----------------------------------------------------------------------
     // at_percentile
     // -----------------------------------------------------------------------
@@ -1513,6 +1720,39 @@ mod tests {
         // Target already reached
         let estimate = estimate_steps_to_psnr(&ckpts, 25.0);
         assert_eq!(estimate, Some(0));
+    }
+
+    #[test]
+    fn test_estimate_steps_to_psnr_precise_at_realistic_step_magnitude() {
+        // Regression test for catastrophic cancellation: with step values
+        // around 250,000 (routine for a long training run), the naive f32
+        // formula `n*sum_xx - sum_x^2` subtracts two ~1e10-magnitude
+        // quantities that are nearly equal, destroying the tiny (~10)
+        // magnitude signal that actually encodes the slope. The exact
+        // answer here is computable by hand: steps 250000..=250004 with
+        // psnr 20.0, 20.1, ..., 20.4 is a perfect line of slope 0.1 and
+        // intercept -24980.0, so reaching psnr=21.0 needs exactly 6 more
+        // steps past the last observed one (250004).
+        let mut ckpts = Vec::new();
+        for i in 0..5u32 {
+            let mut c = BrowserCheckpoint::from_path(&format!("ckpt_{}.json", 250_000 + i));
+            c.psnr = Some(20.0 + i as f32 * 0.1);
+            ckpts.push(c);
+        }
+        let estimate = estimate_steps_to_psnr(&ckpts, 21.0);
+        assert_eq!(estimate, Some(6), "expected exactly 6 extra steps");
+    }
+
+    #[test]
+    fn test_estimate_steps_to_psnr_degenerate_identical_steps_is_none() {
+        // All checkpoints claim the same step: the fit is undefined (zero
+        // variance in x), and must not panic or return a nonsense value.
+        let mut c1 = BrowserCheckpoint::from_path("ckpt_1000.json");
+        c1.psnr = Some(20.0);
+        let mut c2 = BrowserCheckpoint::from_path("ckpt_1000_b.json");
+        c2.step = 1000;
+        c2.psnr = Some(25.0);
+        assert!(estimate_steps_to_psnr(&[c1, c2], 30.0).is_none());
     }
 
     // -----------------------------------------------------------------------

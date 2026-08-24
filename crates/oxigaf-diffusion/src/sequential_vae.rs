@@ -2,13 +2,38 @@
 //!
 //! The standard diffusion pipeline passes all N views through the VAE in one
 //! batch, which requires O(N · H · W) memory.  On GPUs with less than ~6 GB
-//! of VRAM this can OOM.  This module processes views one chunk at a time so
-//! peak GPU memory is O(chunk_size · H · W) regardless of the total view count.
+//! of VRAM this can OOM.
+//!
+//! Two API shapes are provided:
+//!
+//! - [`encode_sequential`] / [`decode_sequential`] — convenience wrappers
+//!   that accumulate every view's result into one [`EncodedViews`] /
+//!   [`DecodedViews`] before returning. Because they hand back the *entire*
+//!   batch at once, their own peak memory is `O(N · H · W)` — the same order
+//!   as a single batched call — regardless of `chunk_size`; chunking only
+//!   changes how many views are processed per inner pass, not how much is
+//!   retained.
+//! - [`encode_sequential_streaming`] / [`decode_sequential_streaming`] — the
+//!   functions that actually deliver the low-memory guarantee. Each
+//!   processed chunk is hand to a caller-supplied callback and then dropped
+//!   before the next chunk starts, so *this module's own* working set is
+//!   `O(chunk_size · H · W)` regardless of the total view count. [`encode_sequential`]
+//!   / [`decode_sequential`] are implemented on top of these by accumulating
+//!   every chunk, which is precisely the part that reintroduces `O(N)`
+//!   memory — call the streaming variants directly and consume each chunk
+//!   immediately (write it out, upload it, etc.) instead of collecting it if
+//!   the memory bound needs to hold in your own code too.
+//!
+//! [`peak_memory_bytes`] reports the bound the *streaming* functions achieve
+//! (`chunk_size · element_count · 4` bytes), independent of `num_views` —
+//! that independence is the point of streaming. It does not describe
+//! [`encode_sequential`] / [`decode_sequential`], whose actual peak scales
+//! with `num_views`; see [`batch_memory_bytes`] for that figure.
 //!
 //! # Simulation note
 //!
-//! Because OxiGAF ships without pre-trained VAE weights, the `encode_sequential`
-//! and `decode_sequential` functions provide a **simulation**:
+//! Because OxiGAF ships without pre-trained VAE weights, the encode/decode
+//! functions in this module provide a **simulation**:
 //!
 //! - **Encode**: strided-subsample the spatial dimensions by 8× and apply the
 //!   `latent_scale` factor.  Input channels are mapped to latent channels by
@@ -203,8 +228,91 @@ pub struct DecodedViews {
 // encode_sequential
 // ---------------------------------------------------------------------------
 
-/// Encode a slice of RGB images into latent representations, one chunk at a
-/// time, to minimise peak memory.
+/// Encode a slice of RGB images into latent representations one chunk at a
+/// time, invoking `on_chunk` with each freshly-computed chunk of latents
+/// before moving on to the next one.
+///
+/// Unlike [`encode_sequential`], this function never retains more than
+/// `config.chunk_size` encoded views at once internally — each chunk is
+/// handed to `on_chunk` and then dropped. Peak memory inside this function is
+/// therefore genuinely `O(chunk_size · H · W)` regardless of the total view
+/// count (matching [`peak_memory_bytes`]), as long as `on_chunk` does not
+/// itself accumulate every chunk it receives.
+///
+/// Returns the total number of views encoded. Per-view geometry
+/// (`latent_height`/`latent_width`/`latent_channels`) is available from
+/// `config` and does not vary across chunks.
+///
+/// # Errors
+///
+/// Returns [`DiffusionError::InvalidConfig`] when:
+/// - `images` is empty.
+/// - Any image has the wrong element count.
+/// - Config validation fails.
+///
+/// Propagates whatever error `on_chunk` returns, short-circuiting any
+/// remaining chunks.
+pub fn encode_sequential_streaming<F>(
+    images: &[Vec<f32>],
+    config: &SequentialVaeConfig,
+    mut on_chunk: F,
+) -> Result<usize, DiffusionError>
+where
+    F: FnMut(Vec<Vec<f32>>) -> Result<(), DiffusionError>,
+{
+    config.validate()?;
+
+    if images.is_empty() {
+        return Err(DiffusionError::InvalidConfig(
+            "images slice must not be empty".into(),
+        ));
+    }
+
+    let expected_len = config.image_element_count();
+    let lh = config.latent_height();
+    let lw = config.latent_width();
+    let lc = config.latent_channels;
+    let ih = config.image_height;
+    let iw = config.image_width;
+    let scale = config.latent_scale;
+
+    let mut total = 0usize;
+
+    // Process in chunks of `chunk_size`; `chunk_latents` is reallocated
+    // fresh for every chunk and moved into `on_chunk`, so at most one
+    // chunk's worth of encoded output is ever live inside this function.
+    for chunk in images.chunks(config.chunk_size) {
+        let mut chunk_latents: Vec<Vec<f32>> = Vec::with_capacity(chunk.len());
+        for image in chunk {
+            if image.len() != expected_len {
+                return Err(DiffusionError::InvalidConfig(format!(
+                    "image has {} elements but expected {} (3 × {} × {})",
+                    image.len(),
+                    expected_len,
+                    ih,
+                    iw,
+                )));
+            }
+
+            chunk_latents.push(encode_one_image(image, lc, lh, lw, iw, scale));
+        }
+        total += chunk_latents.len();
+        on_chunk(chunk_latents)?;
+    }
+
+    Ok(total)
+}
+
+/// Encode a slice of RGB images into latent representations, accumulating
+/// every view's result before returning.
+///
+/// This is a convenience wrapper around [`encode_sequential_streaming`] that
+/// collects all chunks into one [`EncodedViews`]. Because it must hold every
+/// output simultaneously to return it, **its own peak memory is `O(num_views
+/// · H · W)`, not `O(chunk_size · H · W)`** — see the module docs. Call
+/// [`encode_sequential_streaming`] directly and consume each chunk
+/// immediately instead of collecting it when the low-memory bound needs to
+/// hold in the caller's code too.
 ///
 /// # Arguments
 ///
@@ -222,44 +330,18 @@ pub fn encode_sequential(
     images: &[Vec<f32>],
     config: &SequentialVaeConfig,
 ) -> Result<EncodedViews, DiffusionError> {
-    config.validate()?;
-
-    if images.is_empty() {
-        return Err(DiffusionError::InvalidConfig(
-            "images slice must not be empty".into(),
-        ));
-    }
-
-    let expected_len = config.image_element_count();
     let lh = config.latent_height();
     let lw = config.latent_width();
     let lc = config.latent_channels;
-    let ih = config.image_height;
-    let iw = config.image_width;
-    let scale = config.latent_scale;
 
     let mut latents: Vec<Vec<f32>> = Vec::with_capacity(images.len());
-
-    // Process in chunks of `chunk_size`.
-    for chunk in images.chunks(config.chunk_size) {
-        for image in chunk {
-            if image.len() != expected_len {
-                return Err(DiffusionError::InvalidConfig(format!(
-                    "image has {} elements but expected {} (3 × {} × {})",
-                    image.len(),
-                    expected_len,
-                    ih,
-                    iw,
-                )));
-            }
-
-            let latent = encode_one_image(image, lc, lh, lw, iw, scale);
-            latents.push(latent);
-        }
-    }
+    let num_views = encode_sequential_streaming(images, config, |chunk| {
+        latents.extend(chunk);
+        Ok(())
+    })?;
 
     Ok(EncodedViews {
-        num_views: latents.len(),
+        num_views,
         latent_height: lh,
         latent_width: lw,
         latent_channels: lc,
@@ -271,17 +353,34 @@ pub fn encode_sequential(
 // decode_sequential
 // ---------------------------------------------------------------------------
 
-/// Decode latent representations back to RGB images, one chunk at a time.
+/// Decode latent representations back to RGB images one chunk at a time,
+/// invoking `on_chunk` with each freshly-decoded chunk of images before
+/// moving on to the next one.
+///
+/// Unlike [`decode_sequential`], this function never retains more than
+/// `config.chunk_size` decoded images at once internally, so its own peak
+/// memory is genuinely `O(chunk_size · H · W)` — see
+/// [`encode_sequential_streaming`] for the same guarantee on the encode
+/// side, and the module docs for the full explanation.
+///
+/// Returns the total number of views decoded.
 ///
 /// # Errors
 ///
 /// Returns [`DiffusionError::InvalidConfig`] when:
 /// - Config validation fails.
 /// - Any latent has the wrong element count.
-pub fn decode_sequential(
+///
+/// Propagates whatever error `on_chunk` returns, short-circuiting any
+/// remaining chunks.
+pub fn decode_sequential_streaming<F>(
     encoded: &EncodedViews,
     config: &SequentialVaeConfig,
-) -> Result<DecodedViews, DiffusionError> {
+    mut on_chunk: F,
+) -> Result<usize, DiffusionError>
+where
+    F: FnMut(Vec<Vec<f32>>) -> Result<(), DiffusionError>,
+{
     config.validate()?;
 
     let expected_latent_len = config.latent_element_count();
@@ -293,9 +392,10 @@ pub fn decode_sequential(
     let lw = config.latent_width();
     let scale = config.latent_scale;
 
-    let mut images: Vec<Vec<f32>> = Vec::with_capacity(encoded.latents.len());
+    let mut total = 0usize;
 
     for chunk in encoded.latents.chunks(config.chunk_size) {
+        let mut chunk_images: Vec<Vec<f32>> = Vec::with_capacity(chunk.len());
         for latent in chunk {
             if latent.len() != expected_latent_len {
                 return Err(DiffusionError::InvalidConfig(format!(
@@ -308,13 +408,52 @@ pub fn decode_sequential(
                 )));
             }
 
-            let image = decode_one_latent(latent, (lc, lh, lw), (out_c, out_h, out_w), scale);
-            images.push(image);
+            chunk_images.push(decode_one_latent(
+                latent,
+                (lc, lh, lw),
+                (out_c, out_h, out_w),
+                scale,
+            ));
         }
+        total += chunk_images.len();
+        on_chunk(chunk_images)?;
     }
 
+    Ok(total)
+}
+
+/// Decode latent representations back to RGB images, accumulating every
+/// view's result before returning.
+///
+/// This is a convenience wrapper around [`decode_sequential_streaming`] that
+/// collects all chunks into one [`DecodedViews`]. Because it must hold every
+/// output simultaneously to return it, **its own peak memory is `O(num_views
+/// · H · W)`, not `O(chunk_size · H · W)`** — see the module docs. Call
+/// [`decode_sequential_streaming`] directly and consume each chunk
+/// immediately instead of collecting it when the low-memory bound needs to
+/// hold in the caller's code too.
+///
+/// # Errors
+///
+/// Returns [`DiffusionError::InvalidConfig`] when:
+/// - Config validation fails.
+/// - Any latent has the wrong element count.
+pub fn decode_sequential(
+    encoded: &EncodedViews,
+    config: &SequentialVaeConfig,
+) -> Result<DecodedViews, DiffusionError> {
+    let out_h = config.image_height;
+    let out_w = config.image_width;
+    let out_c: usize = 3;
+
+    let mut images: Vec<Vec<f32>> = Vec::with_capacity(encoded.latents.len());
+    let num_views = decode_sequential_streaming(encoded, config, |chunk| {
+        images.extend(chunk);
+        Ok(())
+    })?;
+
     Ok(DecodedViews {
-        num_views: images.len(),
+        num_views,
         height: out_h,
         width: out_w,
         channels: out_c,
@@ -326,10 +465,21 @@ pub fn decode_sequential(
 // Memory estimation
 // ---------------------------------------------------------------------------
 
-/// Peak memory used (bytes) by the sequential approach for the given configuration.
+/// Peak memory used (bytes) by the streaming sequential approach for the
+/// given configuration.
 ///
-/// Sequential processing keeps only `chunk_size` images in memory at once.
-/// Memory = chunk_size × image_element_count × 4 bytes/f32.
+/// This is the bound [`encode_sequential_streaming`] /
+/// [`decode_sequential_streaming`] actually achieve: only `chunk_size`
+/// images are ever live inside those functions at once, so
+/// `memory = chunk_size × image_element_count × 4 bytes/f32` — independent
+/// of `num_views` by construction, which is why `_num_views` is unused here
+/// (it exists only so this function's signature matches
+/// [`batch_memory_bytes`] for [`memory_reduction_ratio`]).
+///
+/// [`encode_sequential`] / [`decode_sequential`] do *not* achieve this bound
+/// — they accumulate every chunk before returning, so their actual peak
+/// scales with `num_views` like [`batch_memory_bytes`] rather than with
+/// `chunk_size`; see the module docs.
 pub fn peak_memory_bytes(config: &SequentialVaeConfig, _num_views: usize) -> usize {
     config.chunk_size * config.image_element_count() * std::mem::size_of::<f32>()
 }
@@ -692,5 +842,99 @@ mod tests {
         let views: Vec<Vec<f32>> = (0..3).map(|_| synthetic_image(&cfg)).collect();
         let encoded = encode_sequential(&views, &cfg).expect("encoding failed");
         assert_eq!(encoded.num_views, 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // Streaming variants: genuine O(chunk_size) peak memory
+    // -----------------------------------------------------------------------
+    //
+    // Regression coverage for the "cosmetic chunking" bug: `encode_sequential`
+    // / `decode_sequential` accumulate every chunk, so chunking them did not
+    // change their own peak memory at all — it was semantically identical to
+    // a flat iteration. `encode_sequential_streaming` /
+    // `decode_sequential_streaming` are the functions that actually bound
+    // their own working set to `chunk_size`; the tests below verify that
+    // bound is real (never more than `chunk_size` items reach the callback
+    // at once) and that the results are numerically identical to the
+    // accumulating convenience wrappers.
+
+    #[test]
+    fn test_encode_streaming_never_exceeds_chunk_size() {
+        let cfg = SequentialVaeConfig::new(2, 4, 64, 64, 0.18215);
+        let views: Vec<Vec<f32>> = (0..7).map(|_| synthetic_image(&cfg)).collect();
+
+        let mut max_chunk_len = 0usize;
+        let mut total_seen = 0usize;
+        let num_views = encode_sequential_streaming(&views, &cfg, |chunk| {
+            max_chunk_len = max_chunk_len.max(chunk.len());
+            total_seen += chunk.len();
+            Ok(())
+        })
+        .expect("streaming encode failed");
+
+        assert_eq!(num_views, 7);
+        assert_eq!(total_seen, 7);
+        assert!(
+            max_chunk_len <= 2,
+            "a chunk exceeded config.chunk_size=2: got {max_chunk_len}"
+        );
+    }
+
+    #[test]
+    fn test_decode_streaming_never_exceeds_chunk_size() {
+        let cfg = SequentialVaeConfig::new(3, 4, 64, 64, 0.18215);
+        let views: Vec<Vec<f32>> = (0..8).map(|_| synthetic_image(&cfg)).collect();
+        let encoded = encode_sequential(&views, &cfg).expect("encode failed");
+
+        let mut max_chunk_len = 0usize;
+        let mut total_seen = 0usize;
+        let num_views = decode_sequential_streaming(&encoded, &cfg, |chunk| {
+            max_chunk_len = max_chunk_len.max(chunk.len());
+            total_seen += chunk.len();
+            Ok(())
+        })
+        .expect("streaming decode failed");
+
+        assert_eq!(num_views, 8);
+        assert_eq!(total_seen, 8);
+        assert!(
+            max_chunk_len <= 3,
+            "a chunk exceeded config.chunk_size=3: got {max_chunk_len}"
+        );
+    }
+
+    #[test]
+    fn test_encode_streaming_matches_accumulating_wrapper() {
+        let cfg = SequentialVaeConfig::new(2, 4, 64, 64, 0.18215);
+        let views: Vec<Vec<f32>> = (0..5).map(|_| synthetic_image(&cfg)).collect();
+
+        let accumulated = encode_sequential(&views, &cfg).expect("encode failed");
+
+        let mut streamed: Vec<Vec<f32>> = Vec::new();
+        encode_sequential_streaming(&views, &cfg, |chunk| {
+            streamed.extend(chunk);
+            Ok(())
+        })
+        .expect("streaming encode failed");
+
+        assert_eq!(accumulated.latents, streamed);
+    }
+
+    #[test]
+    fn test_encode_streaming_propagates_callback_error() {
+        let cfg = SequentialVaeConfig::new(1, 4, 64, 64, 0.18215);
+        let views: Vec<Vec<f32>> = (0..3).map(|_| synthetic_image(&cfg)).collect();
+        let result = encode_sequential_streaming(&views, &cfg, |_chunk| {
+            Err(DiffusionError::InvalidConfig("stop".into()))
+        });
+        assert!(result.is_err(), "callback error must propagate");
+    }
+
+    #[test]
+    fn test_encode_streaming_empty_images_error() {
+        let cfg = SequentialVaeConfig::new(1, 4, 64, 64, 0.18215);
+        let empty: Vec<Vec<f32>> = vec![];
+        let result = encode_sequential_streaming(&empty, &cfg, |_| Ok(()));
+        assert!(result.is_err(), "empty images slice should return an error");
     }
 }

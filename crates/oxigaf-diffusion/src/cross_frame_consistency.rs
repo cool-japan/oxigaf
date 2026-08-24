@@ -50,13 +50,19 @@ pub enum ConsistencyError {
 ///
 /// Pixels are stored as `R0,G0,B0, R1,G1,B1, …` in row-major order.
 /// Values are expected to be in `[0, 1]`.
+///
+/// The fields are private and the invariant `pixels.len() == width *
+/// height * 3` is enforced at construction time (via [`Frame::new`] or
+/// [`Frame::from_pixels`], the only ways to build one), so every function
+/// that indexes `pixels` using `width`/`height` is panic-free by
+/// construction rather than by ad hoc bounds checks.
 pub struct Frame {
     /// Interleaved RGB values; length must equal `width * height * 3`.
-    pub pixels: Vec<f32>,
+    pixels: Vec<f32>,
     /// Image width in pixels.
-    pub width: usize,
+    width: usize,
     /// Image height in pixels.
-    pub height: usize,
+    height: usize,
 }
 
 impl Frame {
@@ -93,6 +99,24 @@ impl Frame {
             width,
             height,
         })
+    }
+
+    /// Image width in pixels.
+    #[inline]
+    pub fn width(&self) -> usize {
+        self.width
+    }
+
+    /// Image height in pixels.
+    #[inline]
+    pub fn height(&self) -> usize {
+        self.height
+    }
+
+    /// Read-only access to the interleaved RGB pixel buffer.
+    #[inline]
+    pub fn pixels(&self) -> &[f32] {
+        &self.pixels
     }
 
     /// Number of pixels (not channels).
@@ -193,8 +217,13 @@ pub fn cfc_to_grayscale(frame: &Frame) -> Vec<f32> {
 
 /// Bilinear sample of an RGB frame at sub-pixel coordinates `(x, y)`.
 ///
-/// Out-of-range coordinates are clamped to the frame boundary.
+/// Out-of-range coordinates are clamped to the frame boundary. Returns
+/// `[0.0; 3]` for a zero-width or zero-height frame, since there is no
+/// pixel to sample.
 pub fn cfc_bilinear_sample(frame: &Frame, x: f32, y: f32) -> [f32; 3] {
+    if frame.width == 0 || frame.height == 0 {
+        return [0.0; 3];
+    }
     let w = frame.width as f32;
     let h = frame.height as f32;
 
@@ -330,27 +359,49 @@ pub fn cfc_compute_flow(
         });
     }
 
+    let grey_a = cfc_to_grayscale(frame_a);
+    let grey_b = cfc_to_grayscale(frame_b);
+    cfc_compute_flow_from_grayscale(&grey_a, &grey_b, frame_a.width, frame_a.height, config)
+}
+
+/// Core of [`cfc_compute_flow`], given precomputed grayscale planes.
+///
+/// Shared with the sequence-level fast path in [`cfc_sequence_consistency`],
+/// which precomputes each frame's grayscale plane once and reuses it across
+/// the (up to two) consecutive pairs it appears in, instead of recomputing
+/// it on every [`cfc_compute_flow`]/[`cfc_ssim`] call.
+fn cfc_compute_flow_from_grayscale(
+    grey_a: &[f32],
+    grey_b: &[f32],
+    width: usize,
+    height: usize,
+    config: &FlowConfig,
+) -> Result<(Vec<f32>, Vec<f32>), ConsistencyError> {
     if config.scale == 0 {
         return Err(ConsistencyError::InvalidConfig(
             "FlowConfig::scale must be >= 1".to_string(),
         ));
     }
 
-    let grey_a = cfc_to_grayscale(frame_a);
-    let grey_b = cfc_to_grayscale(frame_b);
-
-    let (ds_a, dw, dh) = downscale_grey(&grey_a, frame_a.width, frame_a.height, config.scale);
-    let (ds_b, _, _) = downscale_grey(&grey_b, frame_b.width, frame_b.height, config.scale);
+    let (ds_a, dw, dh) = downscale_grey(grey_a, width, height, config.scale);
+    let (ds_b, _, _) = downscale_grey(grey_b, width, height, config.scale);
 
     let n = dw * dh;
     let mut u = vec![0.0_f32; n]; // flow_x at downscaled res
     let mut v = vec![0.0_f32; n]; // flow_y at downscaled res
+                                  // Reused scratch buffers for the previous iteration's values, swapped
+                                  // in each iteration instead of cloning `u`/`v` (2 * n_iterations fewer
+                                  // full-length allocations). Every element of `u`/`v` is overwritten
+                                  // unconditionally by the inner loop below before being read again, so
+                                  // the stale contents left behind by the swap are never observed.
+    let mut u_prev = vec![0.0_f32; n];
+    let mut v_prev = vec![0.0_f32; n];
 
     let alpha_sq = config.alpha * config.alpha;
 
     for _iter in 0..config.n_iterations {
-        let u_prev = u.clone();
-        let v_prev = v.clone();
+        std::mem::swap(&mut u, &mut u_prev);
+        std::mem::swap(&mut v, &mut v_prev);
 
         for row in 0..dh {
             for col in 0..dw {
@@ -395,8 +446,8 @@ pub fn cfc_compute_flow(
 
     // Upscale back to original resolution
     let factor = config.scale as f32;
-    let full_u = upscale_flow(&u, dw, dh, frame_a.width, frame_a.height, factor);
-    let full_v = upscale_flow(&v, dw, dh, frame_a.width, frame_a.height, factor);
+    let full_u = upscale_flow(&u, dw, dh, width, height, factor);
+    let full_v = upscale_flow(&v, dw, dh, width, height, factor);
 
     Ok((full_u, full_v))
 }
@@ -436,6 +487,24 @@ pub fn cfc_warp_frame(
         }
     }
     Ok(out)
+}
+
+/// Negate a flow field: `(fx, fy) -> (-fx, -fy)`.
+///
+/// [`cfc_compute_flow`] estimates the *forward* A→B flow (a point at `(x,
+/// y)` in `A` appears at `(x+u, y+v)` in `B`). [`cfc_warp_frame`] performs
+/// a *backward* warp, `warped(x) = frame(x + flow(x))`, which needs the
+/// target→source flow to align `warped(frame_a)` with `frame_b`. Negating
+/// the forward flow is the correct first-order approximation to that
+/// inversion (exact for a spatially-uniform/translational flow field, and
+/// the standard small-motion approximation otherwise) — call this before
+/// warping `frame_a` toward `frame_b` with a flow computed from the same
+/// pair, never `cfc_warp_frame` itself, which is correct as documented.
+fn negate_flow(fx: &[f32], fy: &[f32]) -> (Vec<f32>, Vec<f32>) {
+    (
+        fx.iter().map(|&v| -v).collect(),
+        fy.iter().map(|&v| -v).collect(),
+    )
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -518,50 +587,69 @@ pub fn cfc_rmse(frame_a: &Frame, frame_b: &Frame) -> Result<f32, ConsistencyErro
 /// - [`ConsistencyError::FrameDimensionMismatch`] on dimension mismatch.
 pub fn cfc_ssim(frame_a: &Frame, frame_b: &Frame) -> Result<f32, ConsistencyError> {
     check_dims(frame_a, frame_b)?;
+    // Work on luminance channel only for SSIM
+    let la = cfc_to_grayscale(frame_a);
+    let lb = cfc_to_grayscale(frame_b);
+    Ok(cfc_ssim_from_grayscale(
+        &la,
+        &lb,
+        frame_a.width,
+        frame_a.height,
+    ))
+}
 
+/// Core of [`cfc_ssim`], given precomputed grayscale planes.
+///
+/// Shared with the sequence-level fast path in [`cfc_sequence_consistency`]
+/// (see [`cfc_compute_flow_from_grayscale`] for why).
+fn cfc_ssim_from_grayscale(la: &[f32], lb: &[f32], w: usize, h: usize) -> f32 {
     const WIN: usize = 8;
     const C1: f32 = 0.0001;
     const C2: f32 = 0.0009;
 
-    let w = frame_a.width;
-    let h = frame_a.height;
-
     let mut ssim_sum = 0.0_f32;
     let mut n_windows = 0u32;
-
-    // Work on luminance channel only for SSIM
-    let la = cfc_to_grayscale(frame_a);
-    let lb = cfc_to_grayscale(frame_b);
 
     let mut wy = 0;
     while wy + WIN <= h {
         let mut wx = 0;
         while wx + WIN <= w {
-            let mut sum_a = 0.0_f32;
-            let mut sum_b = 0.0_f32;
-            let mut sum_aa = 0.0_f32;
-            let mut sum_bb = 0.0_f32;
-            let mut sum_ab = 0.0_f32;
             let count = (WIN * WIN) as f32;
 
+            // First pass: means.
+            let mut sum_a = 0.0_f32;
+            let mut sum_b = 0.0_f32;
             for ry in 0..WIN {
                 for rx in 0..WIN {
                     let idx = (wy + ry) * w + (wx + rx);
-                    let a = la[idx];
-                    let b = lb[idx];
-                    sum_a += a;
-                    sum_b += b;
-                    sum_aa += a * a;
-                    sum_bb += b * b;
-                    sum_ab += a * b;
+                    sum_a += la[idx];
+                    sum_b += lb[idx];
                 }
             }
-
             let mu_a = sum_a / count;
             let mu_b = sum_b / count;
-            let sig_aa = (sum_aa / count) - mu_a * mu_a;
-            let sig_bb = (sum_bb / count) - mu_b * mu_b;
-            let sig_ab = (sum_ab / count) - mu_a * mu_b;
+
+            // Second pass: (co)variances from centered differences. This
+            // avoids the catastrophic cancellation of the one-pass
+            // `E[x^2] - E[x]^2` form, which can go slightly negative in f32
+            // for near-saturated inputs and flip the SSIM denominator's
+            // sign.
+            let mut sig_aa = 0.0_f32;
+            let mut sig_bb = 0.0_f32;
+            let mut sig_ab = 0.0_f32;
+            for ry in 0..WIN {
+                for rx in 0..WIN {
+                    let idx = (wy + ry) * w + (wx + rx);
+                    let da = la[idx] - mu_a;
+                    let db = lb[idx] - mu_b;
+                    sig_aa += da * da;
+                    sig_bb += db * db;
+                    sig_ab += da * db;
+                }
+            }
+            let sig_aa = (sig_aa / count).max(0.0);
+            let sig_bb = (sig_bb / count).max(0.0);
+            let sig_ab = sig_ab / count;
 
             let numerator = (2.0 * mu_a * mu_b + C1) * (2.0 * sig_ab + C2);
             let denominator = (mu_a * mu_a + mu_b * mu_b + C1) * (sig_aa + sig_bb + C2);
@@ -584,15 +672,15 @@ pub fn cfc_ssim(frame_a: &Frame, frame_b: &Frame) -> Result<f32, ConsistencyErro
             .sum::<f32>()
             / la.len() as f32;
         let sig_aa: f32 =
-            la.iter().map(|&a| (a - mu_a) * (a - mu_a)).sum::<f32>() / la.len() as f32;
+            (la.iter().map(|&a| (a - mu_a) * (a - mu_a)).sum::<f32>() / la.len() as f32).max(0.0);
         let sig_bb: f32 =
-            lb.iter().map(|&b| (b - mu_b) * (b - mu_b)).sum::<f32>() / lb.len() as f32;
+            (lb.iter().map(|&b| (b - mu_b) * (b - mu_b)).sum::<f32>() / lb.len() as f32).max(0.0);
         let num = (2.0 * mu_a * mu_b + C1) * (2.0 * sig_ab + C2);
         let den = (mu_a * mu_a + mu_b * mu_b + C1) * (sig_aa + sig_bb + C2);
-        return Ok(num / den);
+        return num / den;
     }
 
-    Ok(ssim_sum / n_windows as f32)
+    ssim_sum / n_windows as f32
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -624,7 +712,11 @@ pub fn cfc_frame_pair_consistency(
     flow_config: &FlowConfig,
 ) -> Result<FramePairConsistency, ConsistencyError> {
     let (fx, fy) = cfc_compute_flow(frame_a, frame_b, flow_config)?;
-    let warped = cfc_warp_frame(frame_a, &fx, &fy)?;
+    // cfc_compute_flow returns the forward A→B flow; cfc_warp_frame needs
+    // the negated flow to correctly backward-warp frame_a toward frame_b
+    // (see `negate_flow`).
+    let (neg_fx, neg_fy) = negate_flow(&fx, &fy);
+    let warped = cfc_warp_frame(frame_a, &neg_fx, &neg_fy)?;
 
     let psnr = cfc_psnr(&warped, frame_b)?;
     let ssim = cfc_ssim(&warped, frame_b)?;
@@ -774,48 +866,92 @@ pub fn cfc_sequence_consistency(
         });
     }
 
+    if use_optical_flow && flow_config.scale == 0 {
+        return Err(ConsistencyError::InvalidConfig(
+            "FlowConfig::scale must be >= 1".to_string(),
+        ));
+    }
+
     let n_pairs = frames.len() - 1;
     let mut per_pair_psnr = Vec::with_capacity(n_pairs);
     let mut per_pair_ssim = Vec::with_capacity(n_pairs);
     let mut per_pair_warp_error = Vec::with_capacity(n_pairs);
 
+    // Grayscale planes are needed by both the optical-flow and SSIM paths;
+    // precompute each frame's plane once and reuse it across the (up to
+    // two) consecutive pairs it appears in, instead of recomputing it
+    // several times per pair inside cfc_compute_flow/cfc_ssim (only the
+    // pair-specific warped frame, which cannot be precomputed, still needs
+    // a fresh conversion).
+    let greys: Vec<Vec<f32>> = frames.iter().map(cfc_to_grayscale).collect();
+
     for i in 0..n_pairs {
-        let pair = if use_optical_flow {
-            cfc_frame_pair_consistency(&frames[i], &frames[i + 1], flow_config)?
+        check_dims(&frames[i], &frames[i + 1])?;
+        let (psnr, ssim, warp_error) = if use_optical_flow {
+            let (fx, fy) = cfc_compute_flow_from_grayscale(
+                &greys[i],
+                &greys[i + 1],
+                frames[i].width,
+                frames[i].height,
+                flow_config,
+            )?;
+            // Negate: cfc_compute_flow(_from_grayscale) returns the forward
+            // flow, but cfc_warp_frame needs the negated flow to
+            // backward-warp frames[i] toward frames[i + 1] (see
+            // `negate_flow`).
+            let (neg_fx, neg_fy) = negate_flow(&fx, &fy);
+            let warped = cfc_warp_frame(&frames[i], &neg_fx, &neg_fy)?;
+            let warped_grey = cfc_to_grayscale(&warped);
+            let psnr = cfc_psnr(&warped, &frames[i + 1])?;
+            let ssim = cfc_ssim_from_grayscale(
+                &warped_grey,
+                &greys[i + 1],
+                frames[i].width,
+                frames[i].height,
+            );
+            let warp_error = cfc_mae(&warped, &frames[i + 1])?;
+            (psnr, ssim, warp_error)
         } else {
-            cfc_frame_difference(&frames[i], &frames[i + 1])?
+            let psnr = cfc_psnr(&frames[i], &frames[i + 1])?;
+            let ssim = cfc_ssim_from_grayscale(
+                &greys[i],
+                &greys[i + 1],
+                frames[i].width,
+                frames[i].height,
+            );
+            let warp_error = cfc_mae(&frames[i], &frames[i + 1])?;
+            (psnr, ssim, warp_error)
         };
-        per_pair_psnr.push(pair.psnr);
-        per_pair_ssim.push(pair.ssim);
-        per_pair_warp_error.push(pair.mean_warp_error);
+        per_pair_psnr.push(psnr);
+        per_pair_ssim.push(ssim);
+        per_pair_warp_error.push(warp_error);
     }
 
-    // Aggregate
-    let mean_psnr = {
-        // Filter out infinities for mean (treat inf as max finite value)
-        let finite: Vec<f32> = per_pair_psnr
-            .iter()
-            .filter(|v| v.is_finite())
-            .cloned()
-            .collect();
-        if finite.is_empty() {
-            f32::INFINITY
-        } else {
-            finite.iter().copied().sum::<f32>() / finite.len() as f32
-        }
-    };
-    let mean_ssim = per_pair_ssim.iter().copied().sum::<f32>() / n_pairs as f32;
-    let mean_warp_error = per_pair_warp_error.iter().copied().sum::<f32>() / n_pairs as f32;
-
-    // Variance of PSNR (use finite values)
+    // Aggregate. `finite_psnr` (infinities filtered out, treating inf as a
+    // perfect/unbounded match) is built once and shared by the mean and the
+    // variance below instead of being collected twice.
     let finite_psnr: Vec<f32> = per_pair_psnr
         .iter()
         .filter(|v| v.is_finite())
         .cloned()
         .collect();
+    let mean_psnr = if finite_psnr.is_empty() {
+        f32::INFINITY
+    } else {
+        finite_psnr.iter().copied().sum::<f32>() / finite_psnr.len() as f32
+    };
+    let mean_ssim = per_pair_ssim.iter().copied().sum::<f32>() / n_pairs as f32;
+    let mean_warp_error = per_pair_warp_error.iter().copied().sum::<f32>() / n_pairs as f32;
+
+    // Variance of PSNR (use finite values); `mean_psnr` above is exactly
+    // the mean of `finite_psnr` whenever it is non-empty, which is
+    // guaranteed here since `finite_psnr.len() >= 2 > 0`.
     let temporal_variance = if finite_psnr.len() >= 2 {
-        let m = finite_psnr.iter().copied().sum::<f32>() / finite_psnr.len() as f32;
-        finite_psnr.iter().map(|&v| (v - m) * (v - m)).sum::<f32>() / finite_psnr.len() as f32
+        finite_psnr
+            .iter()
+            .map(|&v| (v - mean_psnr) * (v - mean_psnr))
+            .sum::<f32>()
+            / finite_psnr.len() as f32
     } else {
         0.0
     };
@@ -866,7 +1002,10 @@ pub fn cfc_sequence_consistency(
 /// Configuration for the temporal consistency training loss.
 #[derive(Debug, Clone)]
 pub struct ConsistencyLossConfig {
-    /// Weight for PSNR-derived penalty (default 0.0; rarely used directly in loss).
+    /// Weight for the PSNR-derived penalty term (default 0.0). Implemented
+    /// as `psnr_weight * mean_pair_mse`: minimizing MSE is equivalent to
+    /// maximizing PSNR (`PSNR = -10·log10(MSE)`), without the `-∞` blow-up
+    /// a raw `-PSNR` term would produce for identical frames.
     pub psnr_weight: f32,
     /// Weight for L1 frame-difference term (default 1.0).
     pub l1_weight: f32,
@@ -900,6 +1039,9 @@ pub struct ConsistencyLoss {
     pub warp_term: f32,
     /// Second-order temporal smoothness term.
     pub smooth_term: f32,
+    /// PSNR-derived penalty term (mean per-pair MSE; see
+    /// [`ConsistencyLossConfig::psnr_weight`]).
+    pub psnr_term: f32,
 }
 
 /// Mean L1 distance between the pixel buffers of two frames.
@@ -920,9 +1062,17 @@ fn mean_l1_frames(a: &Frame, b: &Frame) -> f32 {
 /// # Loss formula
 /// ```text
 /// loss = l1_weight        * mean(|f_t - f_{t-1}|)
-///      + warp_weight      * mean(|warp(f_{t-1}) - f_t|)
+///      + warp_weight      * mean(|warp(f_{t-1}) - f_t|)     [0 unless use_optical_flow]
 ///      + smooth_weight    * mean(|f_t - 2·f_{t-1} + f_{t-2}|)
+///      + psnr_weight      * mean(MSE(f_t, f_{t-1}))
 /// ```
+///
+/// The `warp` term requires `config.use_optical_flow == true`; otherwise it
+/// is exactly `0.0` regardless of `warp_weight`, since there is no
+/// motion-compensated frame to compare without flow. The `psnr` term is the
+/// raw per-pair MSE rather than `-10·log10(MSE)`, so minimizing the loss is
+/// equivalent to maximizing PSNR without a `-∞` blow-up when frames are
+/// identical.
 ///
 /// # Errors
 /// - [`ConsistencyError::TooShort`] when `frames.len() < 2` for L1/warp terms,
@@ -962,18 +1112,21 @@ pub fn cfc_consistency_loss(
     let l1_term = l1_sum / n_pairs as f32;
 
     // ── Warp term ─────────────────────────────────────────────────────────────
-    let warp_term = if config.warp_weight > 0.0 {
+    // Only meaningful when optical flow is actually enabled: without it,
+    // there is no motion-compensated comparison to make, so the term is 0
+    // regardless of `warp_weight` rather than silently degenerating into a
+    // duplicate of `l1_term` (which used to make `warp_weight` secretly
+    // re-scale the L1 term instead of doing nothing).
+    let warp_term = if config.warp_weight > 0.0 && config.use_optical_flow {
         let mut warp_sum = 0.0_f32;
         for i in 0..n_pairs {
-            let warp_err = if config.use_optical_flow {
-                let (fx, fy) = cfc_compute_flow(&frames[i], &frames[i + 1], flow_config)?;
-                let warped = cfc_warp_frame(&frames[i], &fx, &fy)?;
-                mean_l1_frames(&warped, &frames[i + 1])
-            } else {
-                // Without flow, warp term degenerates to L1
-                mean_l1_frames(&frames[i], &frames[i + 1])
-            };
-            warp_sum += warp_err;
+            let (fx, fy) = cfc_compute_flow(&frames[i], &frames[i + 1], flow_config)?;
+            // Negate: cfc_compute_flow returns the forward flow, but
+            // cfc_warp_frame needs the negated flow to backward-warp
+            // frames[i] toward frames[i + 1] (see `negate_flow`).
+            let (neg_fx, neg_fy) = negate_flow(&fx, &fy);
+            let warped = cfc_warp_frame(&frames[i], &neg_fx, &neg_fy)?;
+            warp_sum += mean_l1_frames(&warped, &frames[i + 1]);
         }
         warp_sum / n_pairs as f32
     } else {
@@ -1011,15 +1164,29 @@ pub fn cfc_consistency_loss(
         0.0
     };
 
+    // ── PSNR-derived term ───────────────────────────────────────────────────
+    let psnr_term = if config.psnr_weight > 0.0 {
+        let mut mse_sum = 0.0_f32;
+        for i in 0..n_pairs {
+            check_dims(&frames[i], &frames[i + 1])?;
+            mse_sum += frame_mse(&frames[i], &frames[i + 1]);
+        }
+        mse_sum / n_pairs as f32
+    } else {
+        0.0
+    };
+
     let total = config.l1_weight * l1_term
         + config.warp_weight * warp_term
-        + config.temporal_smooth_weight * smooth_term;
+        + config.temporal_smooth_weight * smooth_term
+        + config.psnr_weight * psnr_term;
 
     Ok(ConsistencyLoss {
         total,
         l1_term,
         warp_term,
         smooth_term,
+        psnr_term,
     })
 }
 
@@ -1060,8 +1227,8 @@ pub fn cfc_format_report(report: &SequenceConsistencyReport) -> String {
 /// Format a [`ConsistencyLoss`] as a human-readable string.
 pub fn cfc_format_loss(loss: &ConsistencyLoss) -> String {
     format!(
-        "ConsistencyLoss {{ total: {:.6}, l1: {:.6}, warp: {:.6}, smooth: {:.6} }}",
-        loss.total, loss.l1_term, loss.warp_term, loss.smooth_term
+        "ConsistencyLoss {{ total: {:.6}, l1: {:.6}, warp: {:.6}, smooth: {:.6}, psnr: {:.6} }}",
+        loss.total, loss.l1_term, loss.warp_term, loss.smooth_term, loss.psnr_term
     )
 }
 
@@ -1120,6 +1287,48 @@ mod tests {
             pixels,
             width: w,
             height: h,
+        }
+    }
+
+    /// A frame whose luminance varies only with column (Iy = 0 exactly),
+    /// avoiding the aperture-problem ambiguity a 2D gradient introduces for
+    /// optical flow: the per-pixel Horn-Schunck constraint `Ix*u + It = 0`
+    /// alone determines `u`.
+    fn x_ramp_frame(w: usize, h: usize) -> Frame {
+        let mut pixels = Vec::with_capacity(w * h * 3);
+        for _row in 0..h {
+            for col in 0..w {
+                let v = col as f32 / w.max(1) as f32;
+                pixels.push(v);
+                pixels.push(v);
+                pixels.push(v);
+            }
+        }
+        Frame {
+            pixels,
+            width: w,
+            height: h,
+        }
+    }
+
+    /// Shift a frame's content right by `shift` pixels, clamping at the
+    /// left edge (column 0 repeats).
+    fn shift_right_frame(f: &Frame, shift: usize) -> Frame {
+        let mut pixels = vec![0.0_f32; f.pixels.len()];
+        for row in 0..f.height {
+            for col in 0..f.width {
+                let src_col = col.saturating_sub(shift);
+                let src_idx = (row * f.width + src_col) * 3;
+                let dst_idx = (row * f.width + col) * 3;
+                pixels[dst_idx] = f.pixels[src_idx];
+                pixels[dst_idx + 1] = f.pixels[src_idx + 1];
+                pixels[dst_idx + 2] = f.pixels[src_idx + 2];
+            }
+        }
+        Frame {
+            pixels,
+            width: f.width,
+            height: f.height,
         }
     }
 
@@ -1296,6 +1505,18 @@ mod tests {
         assert!((rgb[2] - 0.6).abs() < 1e-5);
     }
 
+    #[test]
+    fn test_bilinear_sample_zero_dimension_frame_no_panic() {
+        let f = Frame::new(0, 0);
+        assert_eq!(cfc_bilinear_sample(&f, 5.0, 5.0), [0.0, 0.0, 0.0]);
+
+        let f2 = Frame::new(0, 4);
+        assert_eq!(cfc_bilinear_sample(&f2, 1.0, 1.0), [0.0, 0.0, 0.0]);
+
+        let f3 = Frame::new(4, 0);
+        assert_eq!(cfc_bilinear_sample(&f3, 1.0, 1.0), [0.0, 0.0, 0.0]);
+    }
+
     // ── cfc_compute_flow ──────────────────────────────────────────────────────
 
     #[test]
@@ -1368,6 +1589,97 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn test_optical_flow_warp_uses_negated_flow_not_raw() -> Result<(), ConsistencyError> {
+        // cfc_compute_flow estimates the FORWARD (A->B) flow; cfc_warp_frame
+        // performs a backward warp and needs the negated flow. Using an
+        // x-only ramp avoids the aperture-problem ambiguity a 2D gradient
+        // introduces, and a small alpha (relative to the ramp's spatial
+        // gradient, ~1/24) lets the data term dominate so a translating
+        // scene actually recovers u ~= 1.
+        let a = x_ramp_frame(24, 24);
+        let b = shift_right_frame(&a, 1);
+        let config = FlowConfig {
+            alpha: 0.005,
+            n_iterations: 100,
+            scale: 1,
+        };
+
+        let (fx, fy) = cfc_compute_flow(&a, &b, &config)?;
+        let raw_warped = cfc_warp_frame(&a, &fx, &fy)?;
+        let raw_error = cfc_mae(&raw_warped, &b)?;
+
+        let (neg_fx, neg_fy) = negate_flow(&fx, &fy);
+        let negated_warped = cfc_warp_frame(&a, &neg_fx, &neg_fy)?;
+        let negated_error = cfc_mae(&negated_warped, &b)?;
+
+        assert!(
+            negated_error < raw_error,
+            "negated (fixed) pairing should reduce warp error relative to \
+             the raw (buggy) pairing: negated={negated_error} raw={raw_error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_frame_pair_consistency_beats_raw_pairing_baseline() -> Result<(), ConsistencyError> {
+        let a = x_ramp_frame(24, 24);
+        let b = shift_right_frame(&a, 1);
+        let config = FlowConfig {
+            alpha: 0.005,
+            n_iterations: 100,
+            scale: 1,
+        };
+
+        // Baseline: what the OLD (buggy) code computed — raw, un-negated flow.
+        let (fx, fy) = cfc_compute_flow(&a, &b, &config)?;
+        let raw_error = cfc_mae(&cfc_warp_frame(&a, &fx, &fy)?, &b)?;
+
+        let paired = cfc_frame_pair_consistency(&a, &b, &config)?;
+
+        assert!(
+            paired.mean_warp_error < raw_error,
+            "cfc_frame_pair_consistency should use the negated (fixed) flow \
+             pairing, beating the raw (buggy) pairing baseline: fixed={} raw={}",
+            paired.mean_warp_error,
+            raw_error
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_consistency_loss_warp_term_beats_raw_pairing_baseline() -> Result<(), ConsistencyError>
+    {
+        let a = x_ramp_frame(24, 24);
+        let b = shift_right_frame(&a, 1);
+        let flow_cfg = FlowConfig {
+            alpha: 0.005,
+            n_iterations: 100,
+            scale: 1,
+        };
+
+        let (fx, fy) = cfc_compute_flow(&a, &b, &flow_cfg)?;
+        let raw_error = cfc_mae(&cfc_warp_frame(&a, &fx, &fy)?, &b)?;
+
+        let cfg = ConsistencyLossConfig {
+            l1_weight: 0.0,
+            warp_weight: 1.0,
+            temporal_smooth_weight: 0.0,
+            use_optical_flow: true,
+            psnr_weight: 0.0,
+        };
+        let loss = cfc_consistency_loss(&[a, b], &cfg, &flow_cfg)?;
+
+        assert!(
+            loss.warp_term < raw_error,
+            "cfc_consistency_loss's warp term should use the negated (fixed) \
+             flow pairing, beating the raw (buggy) pairing baseline: fixed={} raw={}",
+            loss.warp_term,
+            raw_error
+        );
+        Ok(())
+    }
+
     // ── cfc_psnr ─────────────────────────────────────────────────────────────
 
     #[test]
@@ -1433,6 +1745,33 @@ mod tests {
             cfc_ssim(&a, &b),
             Err(ConsistencyError::FrameDimensionMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn test_ssim_near_saturated_values_stays_in_range() -> Result<(), ConsistencyError> {
+        // Near-saturated luminance (~0.999) is where the naive one-pass
+        // variance E[x^2] - E[x]^2 can go slightly negative in f32 due to
+        // catastrophic cancellation, which used to be able to flip the
+        // SSIM denominator's sign and produce values outside a sane range.
+        let w = 8;
+        let h = 8;
+        let mut pixels_a = Vec::with_capacity(w * h * 3);
+        let mut pixels_b = Vec::with_capacity(w * h * 3);
+        for i in 0..(w * h) {
+            let jitter = if i % 2 == 0 { 0.0005 } else { -0.0005 };
+            let va = (0.999_f32 + jitter).clamp(0.0, 1.0);
+            let vb = (0.998_f32 - jitter).clamp(0.0, 1.0);
+            pixels_a.extend_from_slice(&[va, va, va]);
+            pixels_b.extend_from_slice(&[vb, vb, vb]);
+        }
+        let a = Frame::from_pixels(pixels_a, w, h)?;
+        let b = Frame::from_pixels(pixels_b, w, h)?;
+        let s = cfc_ssim(&a, &b)?;
+        assert!(
+            s.is_finite() && (-1.0..=1.0 + 1e-3).contains(&s),
+            "SSIM should stay in a sane range even for near-saturated input, got {s}"
+        );
+        Ok(())
     }
 
     // ── cfc_mae ───────────────────────────────────────────────────────────────
@@ -1685,28 +2024,33 @@ mod tests {
 
     #[test]
     fn test_consistency_loss_warp_weight_applied() -> Result<(), ConsistencyError> {
+        // use_optical_flow must be true for warp_weight to have any effect
+        // (see test_consistency_loss_warp_term_zero_when_flow_disabled for
+        // the case where it is not).
         let fa = uniform_frame(8, 8, 0.0, 0.0, 0.0);
         let fb = uniform_frame(8, 8, 1.0, 1.0, 1.0);
         let fc = uniform_frame(8, 8, 0.5, 0.5, 0.5);
         let cfg_no_warp = ConsistencyLossConfig {
             warp_weight: 0.0,
             temporal_smooth_weight: 0.0,
+            use_optical_flow: true,
             ..Default::default()
         };
         let cfg_with_warp = ConsistencyLossConfig {
             warp_weight: 1.0,
             temporal_smooth_weight: 0.0,
+            use_optical_flow: true,
             ..Default::default()
         };
-        let frames_no: Vec<Frame> = [fa.pixels.clone(), fb.pixels.clone(), fc.pixels.clone()]
-            .into_iter()
-            .zip([(8usize, 8usize), (8, 8), (8, 8)])
-            .map(|(p, (w, h))| Frame {
-                pixels: p,
-                width: w,
-                height: h,
-            })
-            .collect();
+        let frames_no: Vec<Frame> = [
+            fa.pixels().to_vec(),
+            fb.pixels().to_vec(),
+            fc.pixels().to_vec(),
+        ]
+        .into_iter()
+        .zip([(8usize, 8usize), (8, 8), (8, 8)])
+        .map(|(p, (w, h))| Frame::from_pixels(p, w, h).expect("valid pixel buffer"))
+        .collect();
         let loss_no = cfc_consistency_loss(&frames_no, &cfg_no_warp, &FlowConfig::default())?;
         let loss_with =
             cfc_consistency_loss(&[fa, fb, fc], &cfg_with_warp, &FlowConfig::default())?;
@@ -1714,6 +2058,28 @@ mod tests {
         assert!(loss_no.total > 0.0);
         assert!(loss_with.total > 0.0);
         assert_ne!(loss_no.total, loss_with.total);
+        Ok(())
+    }
+
+    #[test]
+    fn test_consistency_loss_warp_term_zero_when_flow_disabled() -> Result<(), ConsistencyError> {
+        // Regression test: warp_term must be exactly 0 when use_optical_flow
+        // is false, regardless of warp_weight — it must not silently
+        // degenerate into a duplicate of l1_term.
+        let fa = uniform_frame(8, 8, 0.0, 0.0, 0.0);
+        let fb = uniform_frame(8, 8, 1.0, 1.0, 1.0);
+        let cfg = ConsistencyLossConfig {
+            warp_weight: 5.0, // large — would previously have dominated the loss
+            use_optical_flow: false,
+            temporal_smooth_weight: 0.0,
+            ..Default::default()
+        };
+        let loss = cfc_consistency_loss(&[fa, fb], &cfg, &FlowConfig::default())?;
+        assert_eq!(
+            loss.warp_term, 0.0,
+            "warp_term must be 0 when optical flow is disabled, got {}",
+            loss.warp_term
+        );
         Ok(())
     }
 
@@ -1727,6 +2093,46 @@ mod tests {
         assert_eq!(cfg.warp_weight, 0.5);
         assert_eq!(cfg.temporal_smooth_weight, 0.1);
         assert!(!cfg.use_optical_flow);
+    }
+
+    #[test]
+    fn test_consistency_loss_psnr_weight_applied() -> Result<(), ConsistencyError> {
+        // Regression test: psnr_weight must actually affect `total`.
+        let cfg_zero = ConsistencyLossConfig {
+            l1_weight: 0.0,
+            warp_weight: 0.0,
+            temporal_smooth_weight: 0.0,
+            psnr_weight: 0.0,
+            use_optical_flow: false,
+        };
+        let cfg_nonzero = ConsistencyLossConfig {
+            psnr_weight: 2.0,
+            ..cfg_zero.clone()
+        };
+        let frames_zero = vec![
+            uniform_frame(8, 8, 0.0, 0.0, 0.0),
+            uniform_frame(8, 8, 0.2, 0.2, 0.2),
+        ];
+        let frames_nonzero = vec![
+            uniform_frame(8, 8, 0.0, 0.0, 0.0),
+            uniform_frame(8, 8, 0.2, 0.2, 0.2),
+        ];
+        let loss_zero = cfc_consistency_loss(&frames_zero, &cfg_zero, &FlowConfig::default())?;
+        let loss_nonzero =
+            cfc_consistency_loss(&frames_nonzero, &cfg_nonzero, &FlowConfig::default())?;
+        assert_eq!(
+            loss_zero.total, 0.0,
+            "all weights zero should give zero loss"
+        );
+        assert!(
+            loss_nonzero.psnr_term > 0.0,
+            "psnr_term should be nonzero for differing frames"
+        );
+        assert!(
+            (loss_nonzero.total - cfg_nonzero.psnr_weight * loss_nonzero.psnr_term).abs() < 1e-6,
+            "total should equal psnr_weight * psnr_term when all other weights are 0"
+        );
+        Ok(())
     }
 
     // ── FlowConfig default ───────────────────────────────────────────────────
@@ -1781,6 +2187,7 @@ mod tests {
             l1_term: 0.1,
             warp_term: 0.02,
             smooth_term: 0.003,
+            psnr_term: 0.0,
         };
         let s = cfc_format_loss(&loss);
         assert!(!s.is_empty());

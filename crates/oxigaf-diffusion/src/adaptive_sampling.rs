@@ -51,6 +51,10 @@ pub enum AdaptiveSamplingError {
     /// All sampling weights are zero; cannot sample.
     #[error("Empty weight distribution: all weights are zero")]
     ZeroWeights,
+
+    /// Unrecognized beta-schedule name passed to a string-based convenience API.
+    #[error("Invalid schedule {schedule:?}: expected \"linear\" or \"cosine\"")]
+    InvalidSchedule { schedule: String },
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -72,10 +76,18 @@ pub fn xorshift64(state: &mut u64) -> u64 {
     *state
 }
 
-/// Generates a uniform float in `[0, 1)` using 53 mantissa bits.
+/// Generates a uniform float in `[0, 1)`.
+///
+/// Uses the top 24 bits of the xorshift64 draw (f32's mantissa width,
+/// including the implicit bit) rather than 53: converting a 53-bit integer to
+/// `f32` can round values within half an f32 ulp of `2^53` up to exactly
+/// `2^53`, which then divides out to exactly `1.0` — silently violating the
+/// documented `[0, 1)` contract (the extra 29 bits are also wasted work,
+/// since f32 cannot represent them). A 24-bit integer divided by `2^24` is
+/// always exactly representable and strictly `< 1.0`.
 #[inline]
 pub fn uniform_f32(state: &mut u64) -> f32 {
-    (xorshift64(state) >> 11) as f32 / (1u64 << 53) as f32
+    (xorshift64(state) >> 40) as f32 / (1u32 << 24) as f32
 }
 
 /// Generates a standard normal sample via Box-Muller transform.
@@ -186,17 +198,54 @@ impl LogNormalSampler {
     }
 
     /// Maps a sigma value to a discrete timestep index in `[0, max_timesteps − 1]`.
+    ///
+    /// Inverts the Karras et al. (EDM) rho-space schedule — the same
+    /// parameterisation `sample_sigma` draws from and that
+    /// `consistency_model::CmNoiseSchedule::sigma_at_step` uses — rather than
+    /// interpolating linearly in sigma. `sample_sigma` draws from a
+    /// log-normal distribution that is heavily concentrated near `sigma_min`
+    /// (e.g. with the default parameters, 95% of draws land in roughly
+    /// `[0.027, 3.32]` out of the full `[0.002, 80]` range); a linear-in-sigma
+    /// map collapses nearly all of those samples into the first few percent
+    /// of the timestep range, defeating the point of log-normal sampling
+    /// (spreading training across perceptually-important noise levels).
+    ///
+    /// `frac == 0.0` at `sigma_min` and `frac == 1.0` at `sigma_max`, matching
+    /// the convention (see the tests below) that timestep `0` is the least
+    /// noisy and `max_timesteps - 1` is the most noisy — the same direction
+    /// as the previous linear-in-sigma implementation, just correctly warped.
     pub fn sigma_to_timestep(&self, sigma: f32, max_timesteps: usize) -> usize {
-        if max_timesteps == 0 {
+        if max_timesteps <= 1 {
             return 0;
         }
-        let range = self.sigma_max - self.sigma_min;
-        let frac = if range > 0.0 {
-            (sigma - self.sigma_min) / range
+        const RHO: f32 = 7.0;
+        let lo = self.sigma_min.min(self.sigma_max);
+        let hi = self.sigma_min.max(self.sigma_max);
+        let sigma_c = sigma.clamp(lo, hi);
+
+        let frac = if self.sigma_min > 0.0 && self.sigma_max > self.sigma_min {
+            let inv_rho = 1.0 / RHO;
+            let sigma_min_rho = self.sigma_min.powf(inv_rho);
+            let sigma_max_rho = self.sigma_max.powf(inv_rho);
+            let denom = sigma_max_rho - sigma_min_rho;
+            if denom > 1e-12 {
+                ((sigma_c.powf(inv_rho) - sigma_min_rho) / denom).clamp(0.0, 1.0)
+            } else {
+                0.0
+            }
         } else {
-            0.0
+            // Degenerate configuration (non-positive sigma_min, where the
+            // rho-space power is undefined): fall back to linear-in-sigma so
+            // the function stays well-defined rather than producing NaN.
+            let range = self.sigma_max - self.sigma_min;
+            if range > 0.0 {
+                ((sigma_c - self.sigma_min) / range).clamp(0.0, 1.0)
+            } else {
+                0.0
+            }
         };
-        let t = (frac * max_timesteps as f32).round() as isize;
+
+        let t = (frac * (max_timesteps as f32 - 1.0)).round() as isize;
         t.clamp(0, (max_timesteps as isize) - 1) as usize
     }
 
@@ -221,8 +270,9 @@ pub struct MinSnrWeighter {
     pub gamma: f32,
     /// Total number of diffusion timesteps (default: 1000).
     pub max_timesteps: usize,
-    /// Noise schedule: "linear" or "cosine" (default: "cosine").
-    pub schedule: String,
+    /// Noise schedule used to derive ᾱ_t (default: `Cosine { offset: 0.008 }`,
+    /// matching Nichol & Dhariwal 2021).
+    pub schedule: crate::ddpm_sampler::BetaSchedule,
 }
 
 impl Default for MinSnrWeighter {
@@ -230,7 +280,7 @@ impl Default for MinSnrWeighter {
         Self {
             gamma: 5.0,
             max_timesteps: 1000,
-            schedule: "cosine".to_string(),
+            schedule: crate::ddpm_sampler::BetaSchedule::Cosine { offset: 0.008 },
         }
     }
 }
@@ -241,25 +291,53 @@ impl MinSnrWeighter {
         if self.gamma <= 0.0 || !self.gamma.is_finite() {
             return Err(AdaptiveSamplingError::InvalidGamma { gamma: self.gamma });
         }
+        if self.max_timesteps == 0 {
+            return Err(AdaptiveSamplingError::InvalidTimestepCount { n: 0 });
+        }
         Ok(())
     }
 
-    /// Computes ᾱ_t (cumulative product of (1 − β)) for the given timestep.
-    fn alpha_bar(&self, t: usize) -> f32 {
-        match self.schedule.as_str() {
-            "linear" => {
-                // Simple linear schedule: ᾱ_t decreases linearly from 1 to 0.
-                let frac = t as f32 / self.max_timesteps.max(1) as f32;
-                (1.0 - frac).max(0.0)
+    /// Computes ᾱ_t (cumulative product of (1 − β)) for the given timestep,
+    /// under the configured beta schedule.
+    fn alpha_bar(&self, t: usize) -> Result<f32, AdaptiveSamplingError> {
+        use crate::ddpm_sampler::BetaSchedule;
+        match &self.schedule {
+            BetaSchedule::Cosine { offset } => {
+                // Closed-form Nichol & Dhariwal (2021) -- O(1). This is the
+                // same continuous function that
+                // `ddpm_sampler::cosine_beta_schedule` discretises via its
+                // beta_t = 1 - abar(t)/abar(t-1) derivation, so using it
+                // directly here is both correct and avoids rebuilding a
+                // full-length schedule for a single-timestep query.
+                let n = self.max_timesteps.max(1) as f32;
+                let t_frac = t as f32 / n;
+                let arg = (t_frac + offset) / (1.0 + offset) * PI / 2.0;
+                Ok(arg.cos().powi(2))
             }
             _ => {
-                // Cosine schedule (Nichol & Dhariwal 2021).
-                let s = 0.008_f32;
-                let t_frac = t as f32 / self.max_timesteps.max(1) as f32;
-                let arg = (t_frac + s) / (1.0 + s) * PI / 2.0;
-                arg.cos().powi(2)
+                // Linear / Sigmoid / Scaled: no closed form for the
+                // cumulative product, so delegate to the canonical
+                // ddpm_sampler schedule (this is the "linear" fix: it now
+                // uses the real DDPM linear-*beta* schedule and its actual
+                // cumulative product, not `1 - t/T` in alpha-bar space).
+                let cumprod = self.alphas_cumprod_all()?;
+                Ok(cumprod.get(t).copied().unwrap_or(0.0))
             }
         }
+    }
+
+    /// ᾱ for every timestep `0..max_timesteps`, computed once via
+    /// [`crate::ddpm_sampler::DdpmSchedule`]. Used by the non-closed-form
+    /// schedule branch so a full sweep (e.g. from [`Self::compute_all_weights`])
+    /// costs O(max_timesteps) total rather than re-deriving the whole
+    /// schedule for every single timestep queried.
+    fn alphas_cumprod_all(&self) -> Result<Vec<f32>, AdaptiveSamplingError> {
+        let ddpm =
+            crate::ddpm_sampler::DdpmSchedule::new(self.max_timesteps, self.schedule.clone())
+                .map_err(|_| AdaptiveSamplingError::InvalidTimestepCount {
+                    n: self.max_timesteps,
+                })?;
+        Ok(ddpm.alphas_cumprod)
     }
 
     /// Computes the signal-to-noise ratio at timestep `t`.
@@ -270,7 +348,7 @@ impl MinSnrWeighter {
         if t > max_t {
             return Err(AdaptiveSamplingError::TimestepOutOfRange { t, max_t });
         }
-        let ab = self.alpha_bar(t);
+        let ab = self.alpha_bar(t)?;
         let snr = ab / (1.0 - ab).max(1e-8);
         Ok(snr)
     }
@@ -286,15 +364,50 @@ impl MinSnrWeighter {
 
     /// Computes Min-SNR weights for every timestep `0..max_timesteps`.
     pub fn compute_all_weights(&self) -> Result<Vec<f32>, AdaptiveSamplingError> {
-        (0..self.max_timesteps)
-            .map(|t| self.compute_weight(t))
-            .collect()
+        use crate::ddpm_sampler::BetaSchedule;
+        match &self.schedule {
+            BetaSchedule::Cosine { .. } => (0..self.max_timesteps)
+                .map(|t| self.compute_weight(t))
+                .collect(),
+            _ => {
+                // Avoid the O(max_timesteps) closed-form-free rebuild per
+                // timestep: compute the cumulative-product array once and
+                // map over it directly.
+                let cumprod = self.alphas_cumprod_all()?;
+                Ok(cumprod
+                    .iter()
+                    .map(|&ab| {
+                        let snr = ab / (1.0 - ab).max(1e-8);
+                        snr.min(self.gamma) / snr.max(1e-8)
+                    })
+                    .collect())
+            }
+        }
     }
 
-    /// Samples a timestep proportional to its Min-SNR weight.
-    pub fn sample_timestep_minsnr(&self, state: &mut u64) -> Result<usize, AdaptiveSamplingError> {
-        let weights = self.compute_all_weights()?;
-        sample_cdf(&weights, state)
+    /// Samples a timestep **uniformly** and returns it together with its
+    /// Min-SNR loss weight `min(SNR_t, γ) / SNR_t`.
+    ///
+    /// Min-SNR-gamma (Hang et al. 2023) defines `min(SNR, γ)/SNR` as a *loss
+    /// reweighting* term applied under uniform timestep sampling — it is not
+    /// a sampling density. An earlier version of this function fed the
+    /// weight straight into [`sample_cdf`], sampling t *proportional* to the
+    /// weight; with the defaults that biases sampling roughly 1000:1 toward
+    /// the noisiest timesteps (SNR is tiny there, so `min(SNR,γ)/SNR ≈ 1`,
+    /// vs. `≈ γ/SNR ≪ 1` for low-noise timesteps), starving near-clean steps
+    /// of training signal — the opposite of Min-SNR's stated goal of
+    /// balancing training across the schedule. Callers should scale their
+    /// per-sample loss by the returned weight.
+    pub fn sample_timestep_minsnr(
+        &self,
+        state: &mut u64,
+    ) -> Result<(usize, f32), AdaptiveSamplingError> {
+        if self.max_timesteps == 0 {
+            return Err(AdaptiveSamplingError::ZeroWeights);
+        }
+        let t = (xorshift64(state) as usize) % self.max_timesteps;
+        let weight = self.compute_weight(t)?;
+        Ok((t, weight))
     }
 }
 
@@ -324,11 +437,33 @@ impl Default for UniformSampler {
 }
 
 impl UniformSampler {
-    /// Samples a timestep uniformly from `[low, high]`, clamped to `[0, max_timesteps − 1]`.
-    pub fn sample_timestep_uniform(&self, state: &mut u64) -> usize {
-        let range = self.high.saturating_sub(self.low) + 1;
-        let t = xorshift64(state) as usize % range + self.low;
-        t.min(self.max_timesteps.saturating_sub(1))
+    /// Validates that `low <= high` and `high < max_timesteps`.
+    ///
+    /// Without this check, `high < low` would make
+    /// `high.saturating_sub(low) + 1` collapse to `1`, so
+    /// `sample_timestep_uniform` would silently always return `low` with no
+    /// error, and an out-of-range `high >= max_timesteps` would silently bias
+    /// the distribution toward the final timestep via clamping.
+    pub fn validate(&self) -> Result<(), AdaptiveSamplingError> {
+        if self.low > self.high {
+            return Err(AdaptiveSamplingError::InvalidTimestepCount { n: self.high });
+        }
+        if self.high >= self.max_timesteps {
+            return Err(AdaptiveSamplingError::InvalidTimestepCount { n: self.high });
+        }
+        Ok(())
+    }
+
+    /// Samples a timestep uniformly from `[low, high]`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdaptiveSamplingError::InvalidTimestepCount`] when
+    /// `low > high` or `high >= max_timesteps`; see [`Self::validate`].
+    pub fn sample_timestep_uniform(&self, state: &mut u64) -> Result<usize, AdaptiveSamplingError> {
+        self.validate()?;
+        let range = self.high - self.low + 1;
+        Ok(xorshift64(state) as usize % range + self.low)
     }
 }
 
@@ -566,17 +701,41 @@ pub struct SamplingStats {
 
 /// Convenience wrapper: compute Min-SNR sampling weights for all timesteps.
 ///
+/// `schedule` must be `"linear"` or `"cosine"` (mapped to the corresponding
+/// [`crate::ddpm_sampler::BetaSchedule`] with standard DDPM hyperparameters).
+/// Any other value is a hard error rather than silently falling back to
+/// `"cosine"`, since a typo (e.g. `"linaer"`) would otherwise produce a
+/// different, valid-looking result with no diagnostic.
+///
 /// Returns a `Vec<f32>` of length `max_timesteps` whose entries are
 /// `min(SNR_t, gamma) / SNR_t`.
+///
+/// # Errors
+///
+/// Returns [`AdaptiveSamplingError::InvalidSchedule`] for any `schedule`
+/// value other than `"linear"` or `"cosine"`.
 pub fn compute_snr_sampling_weights(
     max_timesteps: usize,
     gamma: f32,
     schedule: &str,
 ) -> Result<Vec<f32>, AdaptiveSamplingError> {
+    use crate::ddpm_sampler::BetaSchedule;
+    let schedule = match schedule {
+        "linear" => BetaSchedule::Linear {
+            start: 1e-4,
+            end: 0.02,
+        },
+        "cosine" => BetaSchedule::Cosine { offset: 0.008 },
+        other => {
+            return Err(AdaptiveSamplingError::InvalidSchedule {
+                schedule: other.to_string(),
+            });
+        }
+    };
     let weighter = MinSnrWeighter {
         gamma,
         max_timesteps,
-        schedule: schedule.to_string(),
+        schedule,
     };
     weighter.validate()?;
     weighter.compute_all_weights()
@@ -937,6 +1096,40 @@ mod tests {
     }
 
     #[test]
+    fn test_sigma_to_timestep_mid_sigma_is_not_collapsed_near_zero() {
+        // Regression test for the linear-in-sigma bug: sigma=1.0 sits at
+        // frac=(1.0-0.002)/(80-0.002)=0.0125 in *linear* sigma space, mapping
+        // to timestep ~12 under the old (buggy) implementation. Under the
+        // correct rho=7 Karras-space inversion it lands far higher (~400),
+        // since sigma^(1/7) compresses the [sigma_min, sigma_max] range much
+        // more gently. Use a loose band since this is a hand-derived anchor,
+        // not an exact-value assertion.
+        let s = LogNormalSampler::default();
+        let t = s.sigma_to_timestep(1.0, 1000);
+        assert!(
+            t > 200 && t < 600,
+            "sigma=1.0 should map to a mid-range timestep under rho-space \
+             inversion, got {t} (the old linear-in-sigma bug would give ~12)"
+        );
+    }
+
+    #[test]
+    fn test_sigma_to_timestep_monotone_in_sigma() {
+        let s = LogNormalSampler::default();
+        let sigmas = [0.002, 0.01, 0.1, 1.0, 10.0, 80.0];
+        let timesteps: Vec<usize> = sigmas
+            .iter()
+            .map(|&sig| s.sigma_to_timestep(sig, 1000))
+            .collect();
+        for w in timesteps.windows(2) {
+            assert!(
+                w[1] >= w[0],
+                "sigma_to_timestep must be non-decreasing in sigma, got {timesteps:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_lognormal_sampler_timestep_valid_range() {
         let s = LogNormalSampler::default();
         let mut state = 77u64;
@@ -953,7 +1146,10 @@ mod tests {
         let w = MinSnrWeighter::default();
         assert_eq!(w.gamma, 5.0);
         assert_eq!(w.max_timesteps, 1000);
-        assert_eq!(w.schedule, "cosine");
+        assert_eq!(
+            w.schedule,
+            crate::ddpm_sampler::BetaSchedule::Cosine { offset: 0.008 }
+        );
     }
 
     #[test]
@@ -1037,15 +1233,45 @@ mod tests {
         let w = MinSnrWeighter::default();
         let mut state = 2025u64;
         for _ in 0..100 {
-            let t = w.sample_timestep_minsnr(&mut state).expect("should sample");
+            let (t, weight) = w.sample_timestep_minsnr(&mut state).expect("should sample");
             assert!(t < 1000, "sampled timestep {t} out of range");
+            assert!(weight > 0.0, "weight must be positive, got {weight}");
         }
+    }
+
+    #[test]
+    fn test_minsnr_weighter_sample_is_uniform_not_weight_biased() {
+        // Regression test: sampling used to be proportional to the min-SNR
+        // weight, which (with the default gamma=5, cosine schedule) biases
+        // sampling ~1300:1 toward the noisiest timesteps. Uniform sampling
+        // should put a comparable share of draws in the low half [0, 500)
+        // and high half [500, 1000) of the range.
+        let w = MinSnrWeighter::default();
+        let mut state = 777u64;
+        let n = 20_000;
+        let mut low_half = 0usize;
+        for _ in 0..n {
+            let (t, _weight) = w.sample_timestep_minsnr(&mut state).expect("should sample");
+            if t < 500 {
+                low_half += 1;
+            }
+        }
+        let frac = low_half as f32 / n as f32;
+        assert!(
+            (0.4..0.6).contains(&frac),
+            "expected roughly half of draws in [0, 500), got {:.1}% \
+             (weight-biased sampling would give <1%)",
+            frac * 100.0
+        );
     }
 
     #[test]
     fn test_minsnr_weighter_linear_schedule() {
         let w = MinSnrWeighter {
-            schedule: "linear".to_string(),
+            schedule: crate::ddpm_sampler::BetaSchedule::Linear {
+                start: 1e-4,
+                end: 0.02,
+            },
             ..Default::default()
         };
         let snr_t0 = w.compute_snr(0).expect("linear t=0");
@@ -1053,6 +1279,29 @@ mod tests {
         assert!(
             snr_t0 > snr_t999,
             "SNR must decrease over time for linear schedule"
+        );
+    }
+
+    #[test]
+    fn test_minsnr_weighter_linear_schedule_matches_real_ddpm_beta() {
+        // The old "linear" branch computed alpha_bar = 1 - t/T directly,
+        // giving alpha_bar(0) = 1.0 exactly (a fictitious SNR of ~1e8 once
+        // combined with the (1-ab).max(1e-8) clamp). The real DDPM linear
+        // beta schedule gives alpha_bar(0) = 1 - beta_start = 1 - 1e-4 =
+        // 0.9999, not 1.0 exactly.
+        let w = MinSnrWeighter {
+            schedule: crate::ddpm_sampler::BetaSchedule::Linear {
+                start: 1e-4,
+                end: 0.02,
+            },
+            ..Default::default()
+        };
+        let snr_t0 = w.compute_snr(0).expect("linear t=0");
+        // alpha_bar(0) = 0.9999 -> SNR = 0.9999 / 0.0001 ~= 9999, not ~1e8.
+        assert!(
+            snr_t0 < 20_000.0,
+            "SNR at t=0 should reflect alpha_bar(0)=0.9999, not a fictitious \
+             alpha_bar=1.0 artifact; got {snr_t0}"
         );
     }
 
@@ -1071,7 +1320,9 @@ mod tests {
         let s = UniformSampler::default();
         let mut state = 13u64;
         for _ in 0..1_000 {
-            let t = s.sample_timestep_uniform(&mut state);
+            let t = s
+                .sample_timestep_uniform(&mut state)
+                .expect("default sampler should validate");
             assert!(t < 1000, "timestep {t} must be < 1000");
         }
     }
@@ -1085,12 +1336,53 @@ mod tests {
         };
         let mut state = 55u64;
         for _ in 0..1_000 {
-            let t = s.sample_timestep_uniform(&mut state);
+            let t = s
+                .sample_timestep_uniform(&mut state)
+                .expect("valid low/high should validate");
             assert!(
                 (200..=400).contains(&t),
                 "timestep {t} must be in [200, 400]"
             );
         }
+    }
+
+    #[test]
+    fn test_uniform_sampler_high_less_than_low_errors() {
+        // Regression test: high < low used to make
+        // `high.saturating_sub(low) + 1` collapse to 1, silently always
+        // returning `low` with no error.
+        let s = UniformSampler {
+            max_timesteps: 1000,
+            low: 500,
+            high: 100,
+        };
+        let mut state = 1u64;
+        assert!(matches!(
+            s.sample_timestep_uniform(&mut state),
+            Err(AdaptiveSamplingError::InvalidTimestepCount { .. })
+        ));
+    }
+
+    #[test]
+    fn test_uniform_sampler_high_out_of_range_errors() {
+        // Regression test: an out-of-range `high >= max_timesteps` used to be
+        // silently clamped, biasing the distribution toward the final
+        // timestep instead of erroring.
+        let s = UniformSampler {
+            max_timesteps: 100,
+            low: 0,
+            high: 500,
+        };
+        let mut state = 1u64;
+        assert!(matches!(
+            s.sample_timestep_uniform(&mut state),
+            Err(AdaptiveSamplingError::InvalidTimestepCount { .. })
+        ));
+    }
+
+    #[test]
+    fn test_uniform_sampler_validate_ok_for_defaults() {
+        assert!(UniformSampler::default().validate().is_ok());
     }
 
     // ── ContinuousSampler ────────────────────────────────────────────────────
@@ -1278,6 +1570,29 @@ mod tests {
             result,
             Err(AdaptiveSamplingError::InvalidGamma { .. })
         ));
+    }
+
+    #[test]
+    fn test_compute_snr_sampling_weights_unrecognized_schedule_errors() {
+        // Regression test: a typo used to silently fall through to the
+        // cosine schedule with no error at all.
+        let result = compute_snr_sampling_weights(100, 5.0, "linaer");
+        assert!(matches!(
+            result,
+            Err(AdaptiveSamplingError::InvalidSchedule { .. })
+        ));
+        let result2 = compute_snr_sampling_weights(100, 5.0, "scaled_linear");
+        assert!(matches!(
+            result2,
+            Err(AdaptiveSamplingError::InvalidSchedule { .. })
+        ));
+    }
+
+    #[test]
+    fn test_compute_snr_sampling_weights_linear_recognized() {
+        let weights = compute_snr_sampling_weights(1000, 5.0, "linear").expect("ok");
+        assert_eq!(weights.len(), 1000);
+        assert!(weights.iter().all(|&w| w > 0.0));
     }
 
     // ── timestep_to_sigma ────────────────────────────────────────────────────

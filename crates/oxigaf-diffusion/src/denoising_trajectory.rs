@@ -86,12 +86,18 @@ pub struct TrajectoryStep {
 }
 
 /// Full denoising trajectory from T steps to 0.
+///
+/// The fields are private and the invariant `steps[i].latent.len() ==
+/// latent_dim` for every step is enforced at construction time (via
+/// [`DenoisingTrajectory::push`], the only way to add a step), so every
+/// function that indexes a latent using `latent_dim` (or another step's
+/// latent length) is panic-free by construction.
 #[derive(Debug, Clone)]
 pub struct DenoisingTrajectory {
     /// All recorded steps.
-    pub steps: Vec<TrajectoryStep>,
+    steps: Vec<TrajectoryStep>,
     /// Dimensionality of each latent vector (set from the first pushed step).
-    pub latent_dim: usize,
+    latent_dim: usize,
 }
 
 /// Aggregate statistics about a denoising trajectory.
@@ -176,6 +182,16 @@ impl DenoisingTrajectory {
         }
         self.steps.push(step);
         Ok(())
+    }
+
+    /// All recorded steps, in order.
+    pub fn steps(&self) -> &[TrajectoryStep] {
+        &self.steps
+    }
+
+    /// Dimensionality of each latent vector (0 for an empty trajectory).
+    pub fn latent_dim(&self) -> usize {
+        self.latent_dim
     }
 
     /// Number of steps recorded.

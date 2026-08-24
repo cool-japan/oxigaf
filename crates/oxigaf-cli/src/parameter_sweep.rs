@@ -343,7 +343,7 @@ impl ParameterSweep {
         let all_trials: Vec<SweepTrial> = self.trials.clone();
         for _ in 0..10 {
             let candidate = sample_params_random(&self.config.specs, &mut self.rng_state)?;
-            let predicted = sweep_surrogate_predict(&all_trials, &candidate);
+            let predicted = sweep_surrogate_predict(&all_trials, &candidate, &self.config.specs);
             let better = if best_params.is_none() {
                 true
             } else if minimize {
@@ -542,10 +542,15 @@ pub fn sweep_grid_indices(dims: &[usize], trial_idx: usize) -> Vec<usize> {
 /// Predict the score for a candidate parameter set using inverse-distance weighted KNN.
 ///
 /// Uses K = min(5, number of completed trials).
-/// Distance is computed in normalized parameter space (each dimension scaled to \[0,1\]).
+/// Distance is computed in normalized parameter space (each dimension scaled
+/// to \[0,1\] using `specs`' declared bounds; see [`param_value_distance`]).
 /// Weight = 1 / (dist^2 + 1e-8).
 /// Returns 0.0 if there are no scored trials.
-pub fn sweep_surrogate_predict(trials: &[SweepTrial], params: &[(String, ParamValue)]) -> f64 {
+pub fn sweep_surrogate_predict(
+    trials: &[SweepTrial],
+    params: &[(String, ParamValue)],
+    specs: &[ParamSpec],
+) -> f64 {
     let scored: Vec<&SweepTrial> = trials.iter().filter(|t| t.score.is_some()).collect();
     if scored.is_empty() {
         return 0.0;
@@ -556,7 +561,7 @@ pub fn sweep_surrogate_predict(trials: &[SweepTrial], params: &[(String, ParamVa
     let mut dist_scores: Vec<(f64, f64)> = scored
         .iter()
         .map(|trial| {
-            let dist = param_distance(params, &trial.params);
+            let dist = param_distance(params, &trial.params, specs);
             let score = trial.score.unwrap_or(0.0);
             (dist, score)
         })
@@ -688,11 +693,17 @@ pub fn format_sweep_summary(summary: &SweepSummary) -> String {
 /// Rounds are ordered from the innermost (fewest configs, largest budget)
 /// to the outermost (most configs, smallest budget).
 ///
-/// Formula:
+/// Formula (matches Li et al. 2016's published Hyperband algorithm):
 /// - `s_max = floor(log_eta(max_iter))`
-/// - Round `r` (0..=s_max): `n_r = ceil((s_max+1) * eta^(s_max-r))`,
+/// - Round `r` (0..=s_max): `n_r = ceil((s_max+1) / (s_max-r+1) * eta^(s_max-r))`,
 ///   `budget_r = floor(max_iter / eta^(s_max-r))`
 /// - Returns rounds from `r=s_max` down to `r=0`.
+///
+/// The `/ (s_max-r+1)` factor was previously omitted, which over-allocated
+/// configurations in the wide/cheap rounds: for `max_iter=81, eta=3` this
+/// used to yield `5, 15, 45, 135, 405` configs per round instead of the
+/// correct `5, 8, 15, 34, 81`, so a caller budgeting total work from these
+/// counts planned several times the intended amount.
 pub fn hyperband_bracket(max_iter: usize, eta: usize) -> Vec<(usize, usize)> {
     if max_iter == 0 || eta < 2 {
         return Vec::new();
@@ -713,7 +724,10 @@ pub fn hyperband_bracket(max_iter: usize, eta: usize) -> Vec<(usize, usize)> {
         let r = s_max - r_rev; // actual r value
         let power = s_max.saturating_sub(r) as u32;
         let eta_pow = (eta as f64).powi(power as i32);
-        let n_configs = ((s_max + 1) as f64 * eta_pow).ceil() as usize;
+        // `power` here is `s_max - r`, i.e. the paper's `s` in `eta^s`; the
+        // published formula divides by `(s + 1)` = `(power + 1)`, not by
+        // `(r + 1)` (this function's own, differently-scoped `r`).
+        let n_configs = (((s_max + 1) as f64 / (power + 1) as f64) * eta_pow).ceil() as usize;
         let n_configs = n_configs.max(1);
         let budget = if eta_pow < 1.0 {
             0usize
@@ -767,29 +781,47 @@ fn sample_params_random(
 /// Compute the L2 distance between two parameter sets in normalized space.
 ///
 /// Categorical: 0.0 if same choice, 1.0 if different.
-/// Float: difference normalized to [0,1] using the observed range.
-fn param_distance(a: &[(String, ParamValue)], b: &[(String, ParamValue)]) -> f64 {
+/// Float: difference normalized to [0,1] using each parameter's declared
+/// bounds in `specs` (see [`param_value_distance`]).
+fn param_distance(
+    a: &[(String, ParamValue)],
+    b: &[(String, ParamValue)],
+    specs: &[ParamSpec],
+) -> f64 {
     let mut sq_sum = 0.0f64;
     for (name_a, val_a) in a {
         if let Some((_, val_b)) = b.iter().find(|(n, _)| n == name_a) {
-            let d = param_value_distance(val_a, val_b);
+            let spec = specs.iter().find(|s| s.name() == name_a);
+            let d = param_value_distance(spec, val_a, val_b);
             sq_sum += d * d;
         }
     }
     sq_sum.sqrt()
 }
 
-/// Distance between two ParamValues in [0, 1].
-fn param_value_distance(a: &ParamValue, b: &ParamValue) -> f64 {
+/// Distance between two `ParamValue`s in \[0, 1\].
+///
+/// `spec` (matched by name to the parameter) normalizes a `Float` distance
+/// by the parameter's actual declared range instead of the un-normalized
+/// `diff / (diff + 1.0)` this used previously -- which put every `Float`
+/// parameter on the same soft [0,1) scale regardless of magnitude (a
+/// learning rate spanning `1e-4..1e-2` always scored near 0 next to a
+/// `0..1000` parameter always near 1, making the KNN surrogate in
+/// [`sweep_surrogate_predict`] effectively blind to small-range dimensions).
+/// See [`normalized_float_distance`] for the normalization itself, used
+/// when `spec` has no usable bounds (no match, or a degenerate range).
+fn param_value_distance(spec: Option<&ParamSpec>, a: &ParamValue, b: &ParamValue) -> f64 {
     match (a, b) {
-        (ParamValue::Choice(ca), ParamValue::Choice(cb)) if ca == cb => 0.0,
-        (ParamValue::Float(fa), ParamValue::Float(fb)) => {
-            // Normalize by abs difference; clamp to [0,1].
-            let diff = (fa - fb).abs();
-            // Use a simple normalized distance assuming values are in a
-            // reasonable range; clamp to [0,1].
-            diff / (diff + 1.0)
+        (ParamValue::Choice(ca), ParamValue::Choice(cb)) => {
+            if ca == cb {
+                0.0
+            } else {
+                1.0
+            }
         }
+        (ParamValue::Float(fa), ParamValue::Float(fb)) => normalized_float_distance(spec, *fa, *fb),
+        // No `ParamSpec` variant currently produces an `Int` (see
+        // `ParamValue`'s doc); kept as a total fallback, not reachable today.
         (ParamValue::Int(ia), ParamValue::Int(ib)) => {
             let diff = (ia - ib).unsigned_abs() as f64;
             diff / (diff + 1.0)
@@ -797,6 +829,52 @@ fn param_value_distance(a: &ParamValue, b: &ParamValue) -> f64 {
         // Mixed types: treat as maximally different.
         _ => 1.0,
     }
+}
+
+/// Normalize the distance between two `Float` parameter values to \[0, 1\]
+/// using `spec`'s declared bounds (log-space for a log-scaled
+/// [`ParamSpec::Continuous`], matching how [`sweep_sample_continuous`]
+/// samples it; linear range for `Discrete`'s `values`), falling back to the
+/// spec-agnostic `diff / (diff + 1.0)` when no usable bounds are found.
+fn normalized_float_distance(spec: Option<&ParamSpec>, a: f64, b: f64) -> f64 {
+    let bounds: Option<(f64, f64, bool)> = match spec {
+        Some(ParamSpec::Continuous {
+            low,
+            high,
+            log_scale,
+            ..
+        }) => Some((*low, *high, *log_scale)),
+        Some(ParamSpec::Discrete { values, .. }) if !values.is_empty() => {
+            let low = values.iter().copied().fold(f64::INFINITY, f64::min);
+            let high = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            Some((low, high, false))
+        }
+        _ => None,
+    };
+
+    if let Some((low, high, log_scale)) = bounds {
+        if log_scale && low > 0.0 && high > 0.0 {
+            let log_low = low.ln();
+            let range = high.ln() - log_low;
+            if range.abs() > 1e-12 {
+                let na = (a.max(f64::MIN_POSITIVE).ln() - log_low) / range;
+                let nb = (b.max(f64::MIN_POSITIVE).ln() - log_low) / range;
+                return (na - nb).abs().clamp(0.0, 1.0);
+            }
+        } else {
+            let range = high - low;
+            if range.abs() > 1e-12 {
+                let na = (a - low) / range;
+                let nb = (b - low) / range;
+                return (na - nb).abs().clamp(0.0, 1.0);
+            }
+        }
+    }
+
+    // Fallback: no matching/usable spec (unmatched name, or a degenerate
+    // zero-width / non-positive-for-log-scale range).
+    let diff = (a - b).abs();
+    diff / (diff + 1.0)
 }
 
 /// Extract a numeric proxy for a parameter value given its spec.
@@ -1029,12 +1107,87 @@ mod tests {
         assert!(idx.is_empty());
     }
 
+    // ---- param_value_distance / normalized_float_distance -----------------
+
+    #[test]
+    fn test_normalized_float_distance_fallback_endpoints_and_log_scale() {
+        // No spec: preserves the pre-fix `diff/(diff+1)` behavior exactly.
+        let diff = 0.4f64;
+        assert!((normalized_float_distance(None, 0.0, 0.4) - diff / (diff + 1.0)).abs() < 1e-12);
+
+        let spec = ParamSpec::Continuous {
+            name: "lr".to_string(),
+            low: 1e-4,
+            high: 1e-2,
+            log_scale: false,
+        };
+        // Range endpoints are exactly 0.0 and 1.0 apart.
+        assert!((normalized_float_distance(Some(&spec), 1e-4, 1e-4) - 0.0).abs() < 1e-9);
+        assert!((normalized_float_distance(Some(&spec), 1e-4, 1e-2) - 1.0).abs() < 1e-9);
+
+        // log_scale computes distance in log-space (matching how
+        // `sweep_sample_continuous` samples it): the *geometric* midpoint of
+        // [1e-4, 1e-2] (1e-3) sits at normalized distance 0.5 from 1e-4.
+        let log_spec = ParamSpec::Continuous {
+            name: "lr".to_string(),
+            low: 1e-4,
+            high: 1e-2,
+            log_scale: true,
+        };
+        let dist = normalized_float_distance(Some(&log_spec), 1e-4, 1e-3);
+        assert!((dist - 0.5).abs() < 1e-6, "got {dist}");
+    }
+
+    #[test]
+    fn test_normalized_float_distance_small_and_large_range_params_are_comparable() {
+        // Regression for the finding: a 1e-4..1e-2 parameter and a 0..1000
+        // parameter, each compared at the same *relative* position in their
+        // own range, must now yield comparable (not wildly different)
+        // normalized distances -- the whole point of normalizing by each
+        // parameter's own declared range. Before this fix, the un-normalized
+        // `diff/(diff+1)` distance for the same two pairs was wildly
+        // different (~0.005 vs ~0.998), dominated by absolute scale.
+        let small_spec = ParamSpec::Continuous {
+            name: "lr".to_string(),
+            low: 1e-4,
+            high: 1e-2,
+            log_scale: false,
+        };
+        let large_spec = ParamSpec::Continuous {
+            name: "batch_scale".to_string(),
+            low: 0.0,
+            high: 1000.0,
+            log_scale: false,
+        };
+        // Each pair spans exactly half of its own parameter's range.
+        let small_dist = normalized_float_distance(Some(&small_spec), 1e-4, 1e-4 + 0.0099 / 2.0);
+        let large_dist = normalized_float_distance(Some(&large_spec), 0.0, 500.0);
+        assert!((small_dist - 0.5).abs() < 1e-6, "small_dist={small_dist}");
+        assert!((large_dist - 0.5).abs() < 1e-6, "large_dist={large_dist}");
+
+        // Choice/mixed-type handling is unaffected by the spec-normalization
+        // change: same/different choices stay 0.0/1.0, mixed types stay 1.0.
+        let adam = ParamValue::Choice("adam".into());
+        assert_eq!(
+            param_value_distance(None, &adam, &ParamValue::Choice("adam".into())),
+            0.0
+        );
+        assert_eq!(
+            param_value_distance(None, &adam, &ParamValue::Choice("sgd".into())),
+            1.0
+        );
+        assert_eq!(
+            param_value_distance(None, &ParamValue::Float(0.5), &adam),
+            1.0
+        );
+    }
+
     // ---- surrogate_predict -------------------------------------------------
 
     #[test]
     fn test_surrogate_predict_no_trials() {
         let params = vec![("lr".to_string(), ParamValue::Float(0.001))];
-        let result = sweep_surrogate_predict(&[], &params);
+        let result = sweep_surrogate_predict(&[], &params, &[]);
         assert_eq!(result, 0.0);
     }
 
@@ -1046,7 +1199,7 @@ mod tests {
             params: params.clone(),
             score: Some(0.5),
         };
-        let result = sweep_surrogate_predict(&[trial], &params);
+        let result = sweep_surrogate_predict(&[trial], &params, &[]);
         // Exact match => distance=0 => weight is huge => should predict ~0.5.
         assert!((result - 0.5).abs() < 1e-6, "result={}", result);
     }
@@ -1065,7 +1218,9 @@ mod tests {
         };
         // Query close to trial_a should predict closer to 1.0.
         let query = vec![("x".to_string(), ParamValue::Float(0.01))];
-        let result = sweep_surrogate_predict(&[trial_a, trial_b], &query);
+        // No matching spec for "x" -> falls back to the un-normalized
+        // diff/(diff+1) distance, same as before this fix.
+        let result = sweep_surrogate_predict(&[trial_a, trial_b], &query, &[]);
         assert!(result < 1.5, "Expected result < 1.5, got {}", result);
     }
 
@@ -1082,8 +1237,34 @@ mod tests {
             score: None,
         };
         let query = vec![("x".to_string(), ParamValue::Float(0.5))];
-        let result = sweep_surrogate_predict(&[scored, unscored], &query);
+        let result = sweep_surrogate_predict(&[scored, unscored], &query, &[]);
         assert!((result - 3.0).abs() < 1e-6, "result={}", result);
+    }
+
+    #[test]
+    fn test_surrogate_predict_normalizes_small_range_param_by_spec_bounds() {
+        // End-to-end through the public API: `specs` reaches `param_distance`,
+        // so a query near the top of a small (1e-4..1e-2) range predicts
+        // close to the trial at the top of that range.
+        let lr_spec = ParamSpec::Continuous {
+            name: "lr".to_string(),
+            low: 1e-4,
+            high: 1e-2,
+            log_scale: false,
+        };
+        let low = SweepTrial {
+            id: 0,
+            params: vec![("lr".to_string(), ParamValue::Float(1e-4))],
+            score: Some(1.0),
+        };
+        let high = SweepTrial {
+            id: 1,
+            params: vec![("lr".to_string(), ParamValue::Float(1e-2))],
+            score: Some(2.0),
+        };
+        let query = vec![("lr".to_string(), ParamValue::Float(9.9e-3))];
+        let result = sweep_surrogate_predict(&[low, high], &query, &[lr_spec]);
+        assert!((result - 2.0).abs() < 0.05, "got {result}");
     }
 
     // ---- compute_param_importance ------------------------------------------
@@ -1222,6 +1403,17 @@ mod tests {
             assert!(n >= 1, "n_configs must be >= 1");
             assert!(b > 0, "budget must be > 0");
         }
+    }
+
+    #[test]
+    fn test_hyperband_bracket_matches_published_algorithm_max_iter_81_eta_3() {
+        // Regression: pins the exact reference values from Li et al. 2016's
+        // published Hyperband algorithm for the textbook max_iter=81, eta=3
+        // example. The `n_configs` formula previously omitted the `/ (s+1)`
+        // divisor, which yielded 5, 15, 45, 135, 405 instead of these.
+        let brackets = hyperband_bracket(81, 3);
+        let n_configs: Vec<usize> = brackets.iter().map(|&(n, _)| n).collect();
+        assert_eq!(n_configs, vec![5, 8, 15, 34, 81], "brackets={:?}", brackets);
     }
 
     #[test]

@@ -64,6 +64,12 @@ const LEFT_EAR_INDEX: usize = 1070;
 /// Right ear vertex (approximate FLAME index).
 const RIGHT_EAR_INDEX: usize = 2725;
 
+/// Largest vertex index referenced by any of the approximate landmark
+/// indices above. A mesh with `vertices.len() <= MAX_LANDMARK_INDEX` cannot
+/// possibly share the canonical FLAME topology these indices were chosen
+/// for, since at least one of them would not resolve to a real vertex.
+const MAX_LANDMARK_INDEX: usize = RIGHT_EYE_INDICES[2];
+
 /// Target interpupillary distance for canonical normalization (metres).
 const TARGET_IPD: f32 = 0.063;
 /// Minimum allowed normalization scale.
@@ -143,15 +149,30 @@ pub struct FaceKeypoints {
 impl FaceKeypoints {
     /// Estimate keypoints from raw vertex positions.
     ///
-    /// Uses approximate FLAME vertex indices. Any out-of-bounds index falls back
-    /// to the overall centroid, so this succeeds for any non-empty slice.
+    /// Uses approximate FLAME vertex indices, which are only meaningful for
+    /// a mesh sharing the canonical FLAME 2020 topology (5023 vertices) —
+    /// see `MAX_LANDMARK_INDEX`. Rather than silently degenerating to
+    /// every keypoint equalling the mesh centroid for a smaller or
+    /// otherwise incompatible mesh (a decimated LOD, a cropped/subset mesh,
+    /// …), too-small inputs are rejected outright. The `get_or_fallback`/
+    /// `average_indices` centroid fallback is retained only as defense in
+    /// depth once every index is already known to be in range.
     ///
     /// # Errors
     ///
-    /// Returns [`CanonicalError::EmptyMesh`] when `vertices` is empty.
+    /// - Returns [`CanonicalError::EmptyMesh`] when `vertices` is empty.
+    /// - Returns [`CanonicalError::InsufficientVertices`] when `vertices`
+    ///   has `MAX_LANDMARK_INDEX` or fewer vertices, i.e. too few to contain
+    ///   every index the approximate landmark table above references.
     pub fn from_vertices(vertices: &[[f32; 3]]) -> Result<Self, CanonicalError> {
         if vertices.is_empty() {
             return Err(CanonicalError::EmptyMesh);
+        }
+        if vertices.len() <= MAX_LANDMARK_INDEX {
+            return Err(CanonicalError::InsufficientVertices {
+                required: MAX_LANDMARK_INDEX + 1,
+                got: vertices.len(),
+            });
         }
 
         let fallback = centroid(vertices);
@@ -304,6 +325,12 @@ impl FaceBoundingBox {
 /// - Scales so that the inter-pupillary distance equals `TARGET_IPD` (0.063 m).
 ///   Scale is clamped to \[0.5, 2.0\] to handle degenerate cases.
 ///
+/// If `keypoints.ipd()` is (near) zero — e.g. a degenerate mesh where the
+/// eye landmarks coincide — this silently falls back to `scale = 1.0`
+/// rather than reporting an error, for backward compatibility. Prefer
+/// [`compute_canonical_transform_checked`] when a zero IPD should surface
+/// as an error instead.
+///
 /// # Returns
 ///
 /// `(transform, scale)` where `transform` is row-major (`m[row][col]`) and
@@ -341,6 +368,28 @@ pub fn compute_canonical_transform(keypoints: &FaceKeypoints) -> ([[f32; 4]; 4],
     (transform, scale)
 }
 
+/// Like [`compute_canonical_transform`], but reports a zero (or near-zero)
+/// inter-pupillary distance as an error instead of silently substituting
+/// `scale = 1.0`.
+///
+/// A zero IPD means the left/right eye landmarks coincide, which for a
+/// genuine FLAME mesh only happens for a degenerate input (e.g. an
+/// all-identical or otherwise corrupt vertex buffer); silently proceeding
+/// with an arbitrary scale would hide that from the caller. This is what
+/// [`CanonicalFace::from_vertices`] uses internally.
+///
+/// # Errors
+///
+/// Returns [`CanonicalError::ZeroIpd`] if `keypoints.ipd() < f32::EPSILON`.
+pub fn compute_canonical_transform_checked(
+    keypoints: &FaceKeypoints,
+) -> Result<([[f32; 4]; 4], f32), CanonicalError> {
+    if keypoints.ipd() < f32::EPSILON {
+        return Err(CanonicalError::ZeroIpd);
+    }
+    Ok(compute_canonical_transform(keypoints))
+}
+
 // ---------------------------------------------------------------------------
 // 2D projection helpers
 // ---------------------------------------------------------------------------
@@ -350,10 +399,18 @@ pub fn compute_canonical_transform(keypoints: &FaceKeypoints) -> ([[f32; 4]; 4],
 /// Formula:
 /// ```text
 /// pixel_x = cx + focal_scale * vertex.x
-/// pixel_y = cy - focal_scale * vertex.y   (image Y is flipped vs world Y)
+/// pixel_y = cy + focal_scale * vertex.y
 /// ```
 ///
 /// where `cx = image_width / 2` and `cy = image_height / 2`.
+///
+/// This uses the same `+` sign for the Y term as
+/// `normal_map::Camera::project`/`project_with_recip_z` and
+/// `depth_estimation::project_point` elsewhere in this crate (for a camera
+/// with identity rotation — see `depth_estimation::default_camera` — camera
+/// space Y coincides with world Y, making the two directly comparable), so
+/// 2-D output from all three can be composited/overlaid without one being
+/// vertically mirrored relative to the others.
 ///
 /// If the vertex contains NaN values the returned pixel is `[cx, cy]`.
 #[must_use]
@@ -370,7 +427,7 @@ pub fn orthographic_project(
         return [cx, cy];
     }
 
-    [cx + focal_scale * vertex[0], cy - focal_scale * vertex[1]]
+    [cx + focal_scale * vertex[0], cy + focal_scale * vertex[1]]
 }
 
 /// Convert 3D face positions to a 2D bounding box in image space.
@@ -463,20 +520,31 @@ impl HeadOrientation {
 
 /// Estimate head orientation from 3D face keypoints.
 ///
-/// Approach (geometric approximation):
-/// - **Yaw**: `atan2(right_ear.x - left_ear.x, right_ear.z - left_ear.z)` — side-to-side rotation.
-/// - **Pitch**: `atan2(nose_tip.y - face_center.y, nose_tip.z - face_center.z)` — up-down tilt.
+/// Approach (geometric approximation), consistent with this crate's
+/// right-handed coordinate system (+X: subject's right, +Y: up, +Z: forward
+/// / out of the face — see the crate-level docs):
+/// - **Yaw**: `atan2(-(right_ear.z - left_ear.z), right_ear.x - left_ear.x)`
+///   — the ear line's deviation from the +X axis in the XZ plane, so a
+///   frontal face (ears at equal Z) reads as 0 and turning right (nose
+///   rotating toward +X) reads positive, matching [`HeadOrientation::yaw`]'s
+///   documented sign.
+/// - **Pitch**: `atan2(chin.z - forehead.z, forehead.y - chin.y)` — the
+///   chin→forehead line's deviation from the +Y axis in the YZ plane.
+///   Anchoring on chin/forehead (rather than the nose tip vs. the overall
+///   mesh centroid) keeps this near zero for a genuinely neutral head,
+///   independent of how the rest of the mesh (hair, neck, …) is
+///   distributed and hence where its centroid happens to fall.
 /// - **Roll**: `atan2(right_eye.y - left_eye.y, right_eye.x - left_eye.x)` — head tilt.
 #[must_use]
 pub fn estimate_head_orientation(keypoints: &FaceKeypoints) -> HeadOrientation {
     let yaw = f32::atan2(
+        -(keypoints.right_ear[2] - keypoints.left_ear[2]),
         keypoints.right_ear[0] - keypoints.left_ear[0],
-        keypoints.right_ear[2] - keypoints.left_ear[2],
     );
 
     let pitch = f32::atan2(
-        keypoints.nose_tip[1] - keypoints.face_center[1],
-        keypoints.nose_tip[2] - keypoints.face_center[2],
+        keypoints.chin[2] - keypoints.forehead[2],
+        keypoints.forehead[1] - keypoints.chin[1],
     );
 
     let roll = f32::atan2(
@@ -511,6 +579,12 @@ impl CanonicalFace {
     /// # Errors
     ///
     /// - [`CanonicalError::EmptyMesh`] when `vertices` is empty.
+    /// - [`CanonicalError::InsufficientVertices`] when `vertices` has too
+    ///   few vertices to share the canonical FLAME topology — see
+    ///   [`FaceKeypoints::from_vertices`].
+    /// - [`CanonicalError::ZeroIpd`] when the estimated eye keypoints
+    ///   coincide (a degenerate mesh) — see
+    ///   [`compute_canonical_transform_checked`].
     /// - [`CanonicalError::ComputationFailed`] when bounding box computation
     ///   fails (should not happen for non-empty input, but guards the
     ///   `Option`-returning API).
@@ -523,7 +597,7 @@ impl CanonicalFace {
         let bounding_box = FaceBoundingBox::from_vertices(vertices)
             .ok_or_else(|| CanonicalError::ComputationFailed("bounding box failed".into()))?;
         let orientation = estimate_head_orientation(&keypoints);
-        let (canonical_transform, scale) = compute_canonical_transform(&keypoints);
+        let (canonical_transform, scale) = compute_canonical_transform_checked(&keypoints)?;
 
         Ok(Self {
             keypoints,
@@ -649,26 +723,49 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_face_keypoints_fallback_safe() {
-        // Only 3 vertices → all landmark indices are out of bounds;
-        // all keypoints fall back to the centroid and no error is returned.
+    fn test_face_keypoints_too_few_vertices_errors() {
+        // Regression test: only 3 vertices means every hardcoded landmark
+        // index is out of bounds. This must now be rejected outright rather
+        // than silently returning every keypoint equal to the mesh
+        // centroid (which previously made e.g. `ipd()` read 0 and
+        // `compute_canonical_transform` silently pick scale=1.0 for a mesh
+        // that plainly is not a FLAME mesh).
         let verts = vec![[1.0_f32, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
-        let kp = FaceKeypoints::from_vertices(&verts);
+        let result = FaceKeypoints::from_vertices(&verts);
         assert!(
-            kp.is_ok(),
-            "fallback should prevent errors for small meshes"
+            matches!(
+                result,
+                Err(CanonicalError::InsufficientVertices { got: 3, .. })
+            ),
+            "a 3-vertex mesh must error, not silently fall back to centroid \
+             keypoints, got {result:?}"
         );
-        let kp = kp.expect("already checked");
-        // All points should equal the centroid [1/3, 1/3, 1/3].
-        let expected = 1.0 / 3.0;
-        assert!(
-            (kp.left_eye[0] - expected).abs() < 1e-5,
-            "left_eye x should be centroid"
-        );
-        assert!(
-            (kp.nose_tip[0] - expected).abs() < 1e-5,
-            "nose_tip x should be centroid"
-        );
+    }
+
+    #[test]
+    fn test_face_keypoints_100_vertices_errors() {
+        // A decimated/cropped LOD mesh with a plausible-but-too-small
+        // vertex count must also error, not silently succeed.
+        let verts = uniform_vertices(100, [0.1, 0.2, 0.3]);
+        let result = FaceKeypoints::from_vertices(&verts);
+        assert!(matches!(
+            result,
+            Err(CanonicalError::InsufficientVertices { got: 100, .. })
+        ));
+    }
+
+    #[test]
+    fn test_face_keypoints_exactly_max_index_errors() {
+        // A mesh with exactly `MAX_LANDMARK_INDEX + 1` vertices (indices
+        // 0..=MAX_LANDMARK_INDEX) must succeed; one vertex fewer must not.
+        let verts_ok = uniform_vertices(MAX_LANDMARK_INDEX + 1, [0.0, 0.0, 0.0]);
+        assert!(FaceKeypoints::from_vertices(&verts_ok).is_ok());
+
+        let verts_short = uniform_vertices(MAX_LANDMARK_INDEX, [0.0, 0.0, 0.0]);
+        assert!(matches!(
+            FaceKeypoints::from_vertices(&verts_short),
+            Err(CanonicalError::InsufficientVertices { .. })
+        ));
     }
 
     #[test]
@@ -740,6 +837,43 @@ mod tests {
     }
 
     #[test]
+    fn test_compute_canonical_transform_zero_ipd_falls_back_to_scale_one() {
+        // The unchecked variant intentionally keeps its old silent-fallback
+        // behavior for backward compatibility; pin that down explicitly.
+        let verts = uniform_vertices(MAX_LANDMARK_INDEX + 1, [0.0, 0.0, 0.0]);
+        let kp = FaceKeypoints::from_vertices(&verts).expect("enough vertices");
+        assert!(
+            kp.ipd().abs() < 1e-9,
+            "all-identical mesh must have zero IPD"
+        );
+
+        let (_transform, scale) = compute_canonical_transform(&kp);
+        assert!((scale - 1.0).abs() < 1e-6, "scale={scale}");
+    }
+
+    #[test]
+    fn test_compute_canonical_transform_checked_zero_ipd_errors() {
+        // Regression test: a genuinely degenerate (but large-enough) mesh
+        // must be reported as an error by the checked variant instead of
+        // silently producing an arbitrary scale=1.0 transform.
+        let verts = uniform_vertices(MAX_LANDMARK_INDEX + 1, [0.0, 0.0, 0.0]);
+        let kp = FaceKeypoints::from_vertices(&verts).expect("enough vertices");
+        let result = compute_canonical_transform_checked(&kp);
+        assert!(matches!(result, Err(CanonicalError::ZeroIpd)));
+    }
+
+    #[test]
+    fn test_compute_canonical_transform_checked_valid_matches_unchecked() {
+        let verts = synthetic_flame_vertices();
+        let kp = FaceKeypoints::from_vertices(&verts).expect("should succeed");
+        let (unchecked_transform, unchecked_scale) = compute_canonical_transform(&kp);
+        let (checked_transform, checked_scale) =
+            compute_canonical_transform_checked(&kp).expect("non-degenerate IPD");
+        assert!((unchecked_scale - checked_scale).abs() < 1e-9);
+        assert_eq!(unchecked_transform, checked_transform);
+    }
+
+    #[test]
     fn test_transform_vertex_identity() {
         // If face_center is at origin and IPD matches TARGET_IPD, the transform
         // should be a pure scale with no translation offset for the centre.
@@ -791,22 +925,35 @@ mod tests {
 
     #[test]
     fn test_head_orientation_frontal_face() {
-        // Symmetric face looking straight: ears at equal ±x, eyes at equal ±x.
+        // Symmetric face looking straight: ears at equal ±x (same z), eyes
+        // at equal ±x (same y), and chin/forehead sharing the same z (a
+        // perfectly vertical chin→forehead line, i.e. no forward/backward
+        // lean). A frontal, neutral head like this must report ~0 for all
+        // three angles.
         let kp = FaceKeypoints {
             face_center: [0.0, 0.0, 0.0],
             left_eye: [-0.032, 0.05, 0.0],
             right_eye: [0.032, 0.05, 0.0],
             nose_tip: [0.0, 0.0, 0.06],
-            chin: [0.0, -0.08, 0.02],
-            forehead: [0.0, 0.12, 0.01],
+            chin: [0.0, -0.08, 0.0],
+            forehead: [0.0, 0.12, 0.0],
             left_ear: [-0.08, 0.0, 0.0],
             right_ear: [0.08, 0.0, 0.0],
         };
         let ori = estimate_head_orientation(&kp);
-        // Yaw: atan2(0.08 - (-0.08), 0.0 - 0.0) = atan2(0.16, 0.0) = π/2
-        // However for a frontal face the x-difference is symmetric and z-diff is 0.
-        // The sign comes purely from the positive x-difference.
-        // What matters for this test: roll should be 0 (eyes at same y).
+        // Yaw: atan2(-(0.0 - 0.0), 0.08 - (-0.08)) = atan2(0, 0.16) = 0.
+        assert!(
+            ori.yaw.abs() < 1e-5,
+            "frontal face: yaw should be ~0, got {}",
+            ori.yaw
+        );
+        // Pitch: atan2(0.0 - 0.0, 0.12 - (-0.08)) = atan2(0, 0.2) = 0.
+        assert!(
+            ori.pitch.abs() < 1e-5,
+            "frontal face: pitch should be ~0, got {}",
+            ori.pitch
+        );
+        // Roll: eyes at same y → 0.
         assert!(
             ori.roll.abs() < 1e-5,
             "frontal face: roll should be ~0, got {}",
@@ -864,8 +1011,9 @@ mod tests {
         let (tl, br) = result.expect("already checked");
         // top-left x should be < bottom-right x
         assert!(tl[0] < br[0], "tl.x < br.x");
-        // Remember: image-y is flipped, so tl.y < br.y means the vertex with
-        // largest world-y maps to smallest image-y.
+        // `orthographic_project` maps world Y directly to pixel Y (no
+        // flip), so tl.y < br.y means the vertex with smallest world-y maps
+        // to smallest image-y.
         assert!(tl[1] < br[1]);
     }
 
@@ -931,6 +1079,27 @@ mod tests {
             matches!(result, Err(CanonicalError::EmptyMesh)),
             "empty mesh should yield EmptyMesh error"
         );
+    }
+
+    #[test]
+    fn test_canonical_face_from_too_few_vertices_errors() {
+        let verts = uniform_vertices(100, [0.0, 0.0, 0.0]);
+        let result = CanonicalFace::from_vertices(&verts);
+        assert!(matches!(
+            result,
+            Err(CanonicalError::InsufficientVertices { .. })
+        ));
+    }
+
+    #[test]
+    fn test_canonical_face_from_vertices_zero_ipd_errors() {
+        // `CanonicalFace::from_vertices` is wired to
+        // `compute_canonical_transform_checked`, so a genuinely degenerate
+        // (but large-enough) mesh must surface `ZeroIpd` instead of
+        // silently producing a `scale = 1.0` result.
+        let verts = uniform_vertices(MAX_LANDMARK_INDEX + 1, [0.0, 0.0, 0.0]);
+        let result = CanonicalFace::from_vertices(&verts);
+        assert!(matches!(result, Err(CanonicalError::ZeroIpd)));
     }
 
     #[test]

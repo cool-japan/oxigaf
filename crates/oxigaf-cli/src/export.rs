@@ -216,95 +216,320 @@ pub fn export_safetensors(model: &GaussianModel, path: &Path) -> Result<()> {
 // ---------------------------------------------------------------------------
 // PLY import
 // ---------------------------------------------------------------------------
+//
+// This reader is self-contained: it does *not* delegate to the
+// `export_ply` module even though that module has its own (also complete)
+// PLY reader. `export.rs` is compiled twice — once under `lib.rs`'s crate
+// root (which declares `pub mod export_ply;`) and once under `main.rs`'s
+// separate crate root (which does not) — so a `crate::export_ply::...`
+// reference here would compile for the library target and fail for the
+// binary target. See the module-level items below for the header parser
+// and per-property scalar decoder this implies duplicating.
 
-/// Load a [`GaussianModel`] from an ASCII PLY file.
-///
-/// The property names in the header are used to map columns to fields, so PLY
-/// files produced by other 3DGS implementations should be loadable.
-pub fn load_ply(path: &Path) -> Result<GaussianModel> {
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("Failed to read PLY file: {}", path.display()))?;
-    let mut lines = content.lines();
+/// A scalar PLY property type, with its little-endian byte width and how to
+/// decode it to `f32`. Covers every scalar type name (and alias) the PLY
+/// spec defines; `list` properties are rejected explicitly where parsed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlyScalarType {
+    I8,
+    U8,
+    I16,
+    U16,
+    I32,
+    U32,
+    F32,
+    F64,
+}
 
-    // ----- Parse header -----
-    let mut num_vertices: usize = 0;
-    let mut properties: Vec<String> = Vec::new();
+impl PlyScalarType {
+    fn from_ply_name(name: &str) -> Option<Self> {
+        match name {
+            "char" | "int8" => Some(Self::I8),
+            "uchar" | "uint8" => Some(Self::U8),
+            "short" | "int16" => Some(Self::I16),
+            "ushort" | "uint16" => Some(Self::U16),
+            "int" | "int32" => Some(Self::I32),
+            "uint" | "uint32" => Some(Self::U32),
+            "float" | "float32" => Some(Self::F32),
+            "double" | "float64" => Some(Self::F64),
+            _ => None,
+        }
+    }
 
-    for line in lines.by_ref() {
+    fn byte_width(self) -> usize {
+        match self {
+            Self::I8 | Self::U8 => 1,
+            Self::I16 | Self::U16 => 2,
+            Self::I32 | Self::U32 | Self::F32 => 4,
+            Self::F64 => 8,
+        }
+    }
+
+    /// Decode exactly `self.byte_width()` little-endian bytes to `f32`.
+    fn decode_le(self, bytes: &[u8]) -> f32 {
+        match self {
+            Self::I8 => bytes[0] as i8 as f32,
+            Self::U8 => bytes[0] as f32,
+            Self::I16 => i16::from_le_bytes([bytes[0], bytes[1]]) as f32,
+            Self::U16 => u16::from_le_bytes([bytes[0], bytes[1]]) as f32,
+            Self::I32 => i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as f32,
+            Self::U32 => u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as f32,
+            Self::F32 => f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+            Self::F64 => f64::from_le_bytes([
+                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+            ]) as f32,
+        }
+    }
+}
+
+/// One vertex property declared in a PLY header: its name and scalar type,
+/// in declaration order.
+struct PlyProperty {
+    name: String,
+    ty: PlyScalarType,
+}
+
+/// A parsed PLY header: whether the payload is binary (little-endian) or
+/// ASCII, the declared vertex count, the vertex properties in declaration
+/// order, and the byte offset in the file where the vertex data begins.
+struct PlyHeader {
+    binary: bool,
+    num_vertices: usize,
+    properties: Vec<PlyProperty>,
+    data_start: usize,
+}
+
+/// Parse a PLY header from raw file bytes, honouring the `format` line
+/// (`ascii` or `binary_little_endian`; `binary_big_endian` is an honest
+/// error, not silently misread) and collecting every `property` line under
+/// `element vertex` — not just `property float` ones — so the column map
+/// used later reflects the file's actual layout rather than an assumed
+/// canonical order.
+fn parse_ply_header(raw: &[u8]) -> Result<PlyHeader> {
+    let marker = b"end_header";
+    let marker_pos = raw
+        .windows(marker.len())
+        .position(|w| w == marker)
+        .context("PLY file has no 'end_header' line")?;
+    let mut data_start = marker_pos + marker.len();
+    if raw.get(data_start) == Some(&b'\r') {
+        data_start += 1;
+    }
+    anyhow::ensure!(
+        raw.get(data_start) == Some(&b'\n'),
+        "PLY 'end_header' is not terminated by a newline"
+    );
+    data_start += 1;
+
+    let header_text =
+        std::str::from_utf8(&raw[..data_start]).context("PLY header is not valid UTF-8")?;
+    anyhow::ensure!(
+        header_text.starts_with("ply\n") || header_text.starts_with("ply\r\n"),
+        "file does not start with the PLY magic line"
+    );
+
+    let mut format: Option<&str> = None;
+    let mut num_vertices = 0usize;
+    let mut properties: Vec<PlyProperty> = Vec::new();
+    let mut in_vertex_element = false;
+
+    for line in header_text.lines() {
         let line = line.trim();
-        if line == "end_header" {
-            break;
-        }
-        if let Some(rest) = line.strip_prefix("element vertex ") {
-            num_vertices = rest
-                .trim()
-                .parse()
-                .context("Invalid vertex count in PLY header")?;
-        }
-        if line.starts_with("property float") {
-            if let Some(name) = line.split_whitespace().last() {
-                properties.push(name.to_string());
+        if let Some(rest) = line.strip_prefix("format ") {
+            format = rest.split_whitespace().next();
+        } else if let Some(rest) = line.strip_prefix("element ") {
+            let mut parts = rest.split_whitespace();
+            let elem_name = parts.next().unwrap_or_default();
+            in_vertex_element = elem_name == "vertex";
+            if in_vertex_element {
+                num_vertices = parts
+                    .next()
+                    .context("missing vertex count in 'element vertex' line")?
+                    .parse()
+                    .context("invalid vertex count in PLY header")?;
+            }
+        } else if in_vertex_element {
+            if let Some(rest) = line.strip_prefix("property ") {
+                let parts: Vec<&str> = rest.split_whitespace().collect();
+                anyhow::ensure!(parts.len() >= 2, "malformed 'property' line: '{line}'");
+                if parts[0] == "list" {
+                    anyhow::bail!(
+                        "PLY vertex property '{}' is a list type, which is not supported for Gaussian vertex data",
+                        parts.last().unwrap_or(&"?")
+                    );
+                }
+                let ty = PlyScalarType::from_ply_name(parts[0])
+                    .with_context(|| format!("unsupported PLY property type '{}'", parts[0]))?;
+                properties.push(PlyProperty {
+                    name: parts[1].to_string(),
+                    ty,
+                });
             }
         }
     }
 
+    let format = format.context("PLY header has no 'format' line")?;
+    let binary = match format {
+        "ascii" => false,
+        "binary_little_endian" => true,
+        "binary_big_endian" => anyhow::bail!(
+            "binary_big_endian PLY files are not supported (only ascii and binary_little_endian)"
+        ),
+        other => anyhow::bail!("unrecognised PLY format '{other}'"),
+    };
     anyhow::ensure!(num_vertices > 0, "PLY file has no vertices");
-    anyhow::ensure!(!properties.is_empty(), "PLY file has no float properties");
+    anyhow::ensure!(
+        !properties.is_empty(),
+        "PLY file declares no vertex properties"
+    );
 
-    // Build property → column-index map
-    let prop_map: HashMap<&str, usize> = properties
+    Ok(PlyHeader {
+        binary,
+        num_vertices,
+        properties,
+        data_start,
+    })
+}
+
+/// Load a [`GaussianModel`] from a PLY file.
+///
+/// Supports both `ascii` and `binary_little_endian` payloads (the de facto
+/// standard produced by Kerbl et al., SuperSplat, Polycam, Luma, and this
+/// crate's own [`export_ply`]/[`export_mesh`] writers); `binary_big_endian`
+/// is rejected with an explicit error rather than misread.
+///
+/// The property names *and declared types* in the header are used to map
+/// columns to fields — properties are looked up by name, not by a fixed
+/// canonical position, so files with a different property order, extra
+/// custom properties, or non-float property types (e.g. `uchar` colour
+/// channels) are read correctly rather than silently misaligned. Every
+/// load-bearing property (`x`/`y`/`z`, `opacity`, `scale_0..2`,
+/// `rot_0..3`, `f_dc_0..2`, and every declared `f_rest_*`) is required —
+/// a file missing one is a parse error, not a silently zeroed value — and
+/// every value is a hard parse error on failure rather than a silent `0.0`.
+pub fn load_ply(path: &Path) -> Result<GaussianModel> {
+    let raw = std::fs::read(path)
+        .with_context(|| format!("Failed to read PLY file: {}", path.display()))?;
+    let header = parse_ply_header(&raw)
+        .with_context(|| format!("Failed to parse PLY header: {}", path.display()))?;
+
+    let prop_index: HashMap<&str, usize> = header
+        .properties
         .iter()
         .enumerate()
-        .map(|(i, p)| (p.as_str(), i))
+        .map(|(i, p)| (p.name.as_str(), i))
         .collect();
 
-    let idx = |name: &str| -> Option<usize> { prop_map.get(name).copied() };
-
-    // Determine SH degree from property names
-    let num_sh_rest = properties
+    // Determine SH degree from the property names actually present.
+    let num_sh_rest = header
+        .properties
         .iter()
-        .filter(|p| p.starts_with("f_rest_"))
+        .filter(|p| p.name.starts_with("f_rest_"))
         .count();
     let total_sh = 3 + num_sh_rest; // DC(3) + rest
     let bands_sq = total_sh / 3;
     let sh_degree = ((bands_sq as f32).sqrt() as u32).saturating_sub(1);
     let sh_channels = ((sh_degree + 1).pow(2) * 3) as usize;
+    let n_props = header.properties.len();
 
-    // ----- Parse vertex data -----
-    let mut gaussians = Vec::with_capacity(num_vertices);
-    let mut sh_coeffs = Vec::with_capacity(num_vertices * sh_channels);
+    // ----- Parse vertex rows (as flat f32 values, one Vec per vertex) -----
+    let rows: Vec<Vec<f32>> = if header.binary {
+        let bytes_per_row: usize = header.properties.iter().map(|p| p.ty.byte_width()).sum();
+        let data = &raw[header.data_start..];
+        let expected_bytes = header
+            .num_vertices
+            .checked_mul(bytes_per_row)
+            .context("PLY vertex count overflows when multiplied by the per-vertex byte size")?;
+        anyhow::ensure!(
+            data.len() >= expected_bytes,
+            "PLY binary data is truncated: expected at least {expected_bytes} bytes, found {}",
+            data.len()
+        );
+        // `expected_bytes <= data.len()` was just checked, so `num_vertices`
+        // here is already bounded by the real file size, not by an
+        // unchecked value taken straight from a (possibly crafted) header.
+        let mut rows = Vec::with_capacity(header.num_vertices);
+        let mut offset = 0usize;
+        for _ in 0..header.num_vertices {
+            let mut row = Vec::with_capacity(n_props);
+            for prop in &header.properties {
+                let w = prop.ty.byte_width();
+                row.push(prop.ty.decode_le(&data[offset..offset + w]));
+                offset += w;
+            }
+            rows.push(row);
+        }
+        rows
+    } else {
+        let data = &raw[header.data_start..];
+        let text = std::str::from_utf8(data).context("PLY ASCII vertex data is not valid UTF-8")?;
+        // Bound the initial reservation by what the remaining data could
+        // possibly hold (at least 1 byte per declared property per row), so
+        // a header lying about `element vertex` cannot force a
+        // multi-terabyte allocation before a single row is parsed.
+        let max_possible_rows = data.len() / n_props.max(1);
+        let mut rows = Vec::with_capacity(header.num_vertices.min(max_possible_rows.max(1)));
+        let mut n_read = 0usize;
+        for line in text.lines() {
+            if n_read >= header.num_vertices {
+                break;
+            }
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let row: Vec<f32> = line
+                .split_whitespace()
+                .map(|tok| {
+                    tok.parse::<f32>().with_context(|| {
+                        format!("cannot parse PLY value '{tok}' on data row {n_read}")
+                    })
+                })
+                .collect::<Result<_>>()?;
+            anyhow::ensure!(
+                row.len() >= n_props,
+                "PLY data row {n_read} has {} values, expected {n_props}",
+                row.len()
+            );
+            rows.push(row);
+            n_read += 1;
+        }
+        anyhow::ensure!(
+            rows.len() == header.num_vertices,
+            "PLY declares {} vertices but only {} data rows were found",
+            header.num_vertices,
+            rows.len()
+        );
+        rows
+    };
 
-    for line_num in 0..num_vertices {
-        let line = lines.next().with_context(|| {
-            format!(
-                "Unexpected end of PLY data at vertex {}/{}",
-                line_num, num_vertices
-            )
-        })?;
-        let values: Vec<f32> = line
-            .split_whitespace()
-            .map(|v| v.parse::<f32>().unwrap_or(0.0))
-            .collect();
+    // ----- Map rows to Gaussians by property name -----
+    let req = |row: &[f32], name: &str| -> Result<f32> {
+        let idx = *prop_index
+            .get(name)
+            .with_context(|| format!("PLY file is missing required property '{name}'"))?;
+        row.get(idx)
+            .copied()
+            .with_context(|| format!("PLY row is too short to contain property '{name}'"))
+    };
 
-        let get = |name: &str, default: f32| -> f32 {
-            idx(name)
-                .and_then(|i| values.get(i).copied())
-                .unwrap_or(default)
-        };
+    let mut gaussians = Vec::with_capacity(rows.len());
+    let mut sh_coeffs = Vec::with_capacity(rows.len() * sh_channels);
 
-        let x = get("x", 0.0);
-        let y = get("y", 0.0);
-        let z = get("z", 0.0);
-        let opacity = get("opacity", 0.0);
-        let scale_0 = get("scale_0", -5.0);
-        let scale_1 = get("scale_1", -5.0);
-        let scale_2 = get("scale_2", -5.0);
+    for row in &rows {
+        let x = req(row, "x")?;
+        let y = req(row, "y")?;
+        let z = req(row, "z")?;
+        let opacity = req(row, "opacity")?;
+        let scale_0 = req(row, "scale_0")?;
+        let scale_1 = req(row, "scale_1")?;
+        let scale_2 = req(row, "scale_2")?;
 
         // PLY: (w,x,y,z) → internal: (x,y,z,w)
-        let rot_w = get("rot_0", 1.0);
-        let rot_x = get("rot_1", 0.0);
-        let rot_y = get("rot_2", 0.0);
-        let rot_z = get("rot_3", 0.0);
+        let rot_w = req(row, "rot_0")?;
+        let rot_x = req(row, "rot_1")?;
+        let rot_y = req(row, "rot_2")?;
+        let rot_z = req(row, "rot_3")?;
 
         gaussians.push(GaussianAttributes {
             position: [x, y, z],
@@ -317,11 +542,11 @@ pub fn load_ply(path: &Path) -> Result<GaussianModel> {
         // SH coefficients (DC then rest)
         for c in 0..3 {
             let name = format!("f_dc_{c}");
-            sh_coeffs.push(get(&name, 0.0));
+            sh_coeffs.push(req(row, &name)?);
         }
         for r in 0..num_sh_rest {
             let name = format!("f_rest_{r}");
-            sh_coeffs.push(get(&name, 0.0));
+            sh_coeffs.push(req(row, &name)?);
         }
         // Pad to expected sh_channels if file has fewer SH than the degree implies
         let written = 3 + num_sh_rest;
@@ -330,9 +555,10 @@ pub fn load_ply(path: &Path) -> Result<GaussianModel> {
         }
     }
 
+    let n_vertices = gaussians.len();
     tracing::info!(
         "Loaded {} Gaussians (SH degree {}) from {}",
-        gaussians.len(),
+        n_vertices,
         sh_degree,
         path.display(),
     );
@@ -341,11 +567,13 @@ pub fn load_ply(path: &Path) -> Result<GaussianModel> {
         gaussians,
         sh_coeffs,
         sh_degree,
-        // FLAME binding info is not stored in PLY — use placeholders.
-        face_indices: vec![0; num_vertices],
-        barycentric: vec![[1.0 / 3.0; 3]; num_vertices],
-        local_offsets: vec![[0.0; 3]; num_vertices],
-        is_rigid: vec![true; num_vertices],
+        // FLAME binding info is not stored in PLY — use placeholders sized
+        // from the Gaussians actually parsed, not the header's claimed
+        // count (which may not match if the header lied).
+        face_indices: vec![0; n_vertices],
+        barycentric: vec![[1.0 / 3.0; 3]; n_vertices],
+        local_offsets: vec![[0.0; 3]; n_vertices],
+        is_rigid: vec![true; n_vertices],
     })
 }
 
@@ -487,6 +715,7 @@ struct GltfBufferView {
     buffer: usize,
     byte_offset: usize,
     byte_length: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
     byte_stride: Option<usize>,
 }
 
@@ -499,7 +728,9 @@ struct GltfAccessor {
     count: usize,
     #[serde(rename = "type")]
     accessor_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     min: Option<Vec<f32>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     max: Option<Vec<f32>>,
 }
 
@@ -507,7 +738,9 @@ struct GltfAccessor {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct GltfNode {
     name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     mesh: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     extensions: Option<HashMap<String, serde_json::Value>>,
 }
 
@@ -545,6 +778,7 @@ struct GltfDocument {
     buffer_views: Vec<GltfBufferView>,
     buffers: Vec<GltfBuffer>,
     extensions_used: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     extensions: Option<HashMap<String, serde_json::Value>>,
 }
 
@@ -553,6 +787,7 @@ struct GltfDocument {
 #[serde(rename_all = "camelCase")]
 struct GltfBuffer {
     byte_length: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
     uri: Option<String>,
 }
 
@@ -607,38 +842,49 @@ pub fn export_gltf(model: &GaussianModel, path: &Path, include_metadata: bool) -
     let mut buffer_views = Vec::new();
     let mut accessors = Vec::new();
 
-    // Helper to add a buffer view and accessor
-    let mut add_accessor =
-        |data: &[f32], count: usize, components: usize, accessor_type: &str| -> usize {
-            let byte_offset = buffer_data.len();
-            let byte_length = data.len() * 4;
+    // Helper to add a buffer view and accessor. `min_max`, when given, is
+    // written to the accessor's `min`/`max` fields — the glTF 2.0 spec
+    // REQUIRES these on any accessor referenced by a `POSITION` attribute
+    // (used for frustum culling / auto-framing by conforming loaders).
+    let mut add_accessor = |data: &[f32],
+                            count: usize,
+                            components: usize,
+                            accessor_type: &str,
+                            min_max: Option<(Vec<f32>, Vec<f32>)>|
+     -> usize {
+        let byte_offset = buffer_data.len();
+        let byte_length = data.len() * 4;
 
-            buffer_data.extend(bytemuck::cast_slice::<f32, u8>(data));
+        buffer_data.extend(bytemuck::cast_slice::<f32, u8>(data));
 
-            let view_idx = buffer_views.len();
-            buffer_views.push(GltfBufferView {
-                buffer: 0,
-                byte_offset,
-                byte_length,
-                byte_stride: if components > 1 {
-                    Some(components * 4)
-                } else {
-                    None
-                },
-            });
+        let view_idx = buffer_views.len();
+        buffer_views.push(GltfBufferView {
+            buffer: 0,
+            byte_offset,
+            byte_length,
+            byte_stride: if components > 1 {
+                Some(components * 4)
+            } else {
+                None
+            },
+        });
 
-            let accessor_idx = accessors.len();
-            accessors.push(GltfAccessor {
-                buffer_view: view_idx,
-                component_type: 5126, // FLOAT
-                count,
-                accessor_type: accessor_type.to_string(),
-                min: None,
-                max: None,
-            });
-
-            accessor_idx
+        let (min, max) = match min_max {
+            Some((mn, mx)) => (Some(mn), Some(mx)),
+            None => (None, None),
         };
+        let accessor_idx = accessors.len();
+        accessors.push(GltfAccessor {
+            buffer_view: view_idx,
+            component_type: 5126, // FLOAT
+            count,
+            accessor_type: accessor_type.to_string(),
+            min,
+            max,
+        });
+
+        accessor_idx
+    };
 
     // Positions (required for point cloud visualization)
     let positions: Vec<f32> = model
@@ -646,7 +892,20 @@ pub fn export_gltf(model: &GaussianModel, path: &Path, include_metadata: bool) -
         .iter()
         .flat_map(|g| g.position.iter().copied())
         .collect();
-    let pos_accessor = add_accessor(&positions, n, 3, "VEC3");
+    let pos_min_max = if n > 0 {
+        let mut min = [f32::INFINITY; 3];
+        let mut max = [f32::NEG_INFINITY; 3];
+        for chunk in positions.chunks_exact(3) {
+            for k in 0..3 {
+                min[k] = min[k].min(chunk[k]);
+                max[k] = max[k].max(chunk[k]);
+            }
+        }
+        Some((min.to_vec(), max.to_vec()))
+    } else {
+        None
+    };
+    let pos_accessor = add_accessor(&positions, n, 3, "VEC3", pos_min_max);
 
     // Rotations (quaternion xyzw)
     let rotations: Vec<f32> = model
@@ -654,7 +913,7 @@ pub fn export_gltf(model: &GaussianModel, path: &Path, include_metadata: bool) -
         .iter()
         .flat_map(|g| g.rotation.iter().copied())
         .collect();
-    let rot_accessor = add_accessor(&rotations, n, 4, "VEC4");
+    let rot_accessor = add_accessor(&rotations, n, 4, "VEC4", None);
 
     // Scales (log-scale)
     let scales: Vec<f32> = model
@@ -662,16 +921,16 @@ pub fn export_gltf(model: &GaussianModel, path: &Path, include_metadata: bool) -
         .iter()
         .flat_map(|g| g.scale.iter().copied())
         .collect();
-    let scale_accessor = add_accessor(&scales, n, 3, "VEC3");
+    let scale_accessor = add_accessor(&scales, n, 3, "VEC3", None);
 
     // Opacities (pre-sigmoid)
     let opacities: Vec<f32> = model.gaussians.iter().map(|g| g.opacity).collect();
-    let opacity_accessor = add_accessor(&opacities, n, 1, "SCALAR");
+    let opacity_accessor = add_accessor(&opacities, n, 1, "SCALAR", None);
 
     // SH coefficients
     let mut sh_data = model.sh_coeffs.clone();
     sh_data.resize(n * sh_channels, 0.0);
-    let sh_accessor = add_accessor(&sh_data, n * sh_channels, 1, "SCALAR");
+    let sh_accessor = add_accessor(&sh_data, n * sh_channels, 1, "SCALAR", None);
 
     // Build glTF document
     let metadata = if include_metadata {
@@ -957,72 +1216,346 @@ pub fn export_all_formats_parallel(
         let pb_json = multi.add(progress::export_progress(1, verbosity));
         pb_json.set_message("JSON");
 
-        // Clone model data for parallel exports
-        let model_ply = model.clone();
-        let model_safetensors = model.clone();
-        let model_gltf = model.clone();
-        let model_json = model.clone();
-
         let ply_path = output_dir.join("model.ply");
         let safetensors_path = output_dir.join("model.safetensors");
-        let gltf_path = output_dir.join("model.gltf");
+        // `export_gltf` (below) writes a self-contained GLB binary container
+        // (magic "glTF" + JSON/BIN chunks), not a plain-text .gltf document,
+        // so the output file must be named accordingly.
+        let glb_path = output_dir.join("model.glb");
         let json_path = output_dir.join("model.json");
 
-        // Spawn parallel export threads
-        let handle_ply = thread::spawn(move || {
-            let result = export_ply(&model_ply, &ply_path);
-            pb_ply.inc(1);
-            pb_ply.finish_with_message("✓ PLY");
-            result
-        });
+        // `thread::scope` lets every export thread borrow `model` directly
+        // instead of each owning a full deep clone — for a multi-million-
+        // Gaussian model the four clones this used to make could add well
+        // over a gigabyte of transient RSS for exports that are all
+        // read-only in the first place.
+        let (result_ply, result_safetensors, result_gltf, result_json) = thread::scope(|scope| {
+            let handle_ply = scope.spawn(move || {
+                let result = export_ply(model, &ply_path);
+                pb_ply.inc(1);
+                pb_ply.finish_with_message("✓ PLY");
+                result
+            });
 
-        let handle_safetensors = thread::spawn(move || {
-            let result = export_safetensors(&model_safetensors, &safetensors_path);
-            pb_safetensors.inc(1);
-            pb_safetensors.finish_with_message("✓ safetensors");
-            result
-        });
+            let handle_safetensors = scope.spawn(move || {
+                let result = export_safetensors(model, &safetensors_path);
+                pb_safetensors.inc(1);
+                pb_safetensors.finish_with_message("✓ safetensors");
+                result
+            });
 
-        let handle_gltf = thread::spawn(move || {
-            let result = export_gltf(&model_gltf, &gltf_path, true);
-            pb_gltf.inc(1);
-            pb_gltf.finish_with_message("✓ glTF");
-            result
-        });
+            let handle_gltf = scope.spawn(move || {
+                let result = export_gltf(model, &glb_path, true);
+                pb_gltf.inc(1);
+                pb_gltf.finish_with_message("✓ glTF");
+                result
+            });
 
-        let handle_json = thread::spawn(move || {
-            let result = export_json_checkpoint(&model_json, &json_path);
-            pb_json.inc(1);
-            pb_json.finish_with_message("✓ JSON");
-            result
-        });
+            let handle_json = scope.spawn(move || {
+                let result = export_json_checkpoint(model, &json_path);
+                pb_json.inc(1);
+                pb_json.finish_with_message("✓ JSON");
+                result
+            });
 
-        // Wait for all exports to complete
-        let result_ply = handle_ply
-            .join()
-            .map_err(|_| anyhow::anyhow!("PLY export thread panicked"))?;
-        let result_safetensors = handle_safetensors
-            .join()
-            .map_err(|_| anyhow::anyhow!("safetensors export thread panicked"))?;
-        let result_gltf = handle_gltf
-            .join()
-            .map_err(|_| anyhow::anyhow!("glTF export thread panicked"))?;
-        let result_json = handle_json
-            .join()
-            .map_err(|_| anyhow::anyhow!("JSON export thread panicked"))?;
+            (
+                handle_ply.join(),
+                handle_safetensors.join(),
+                handle_gltf.join(),
+                handle_json.join(),
+            )
+        });
 
         // Return first error if any
-        result_ply?;
-        result_safetensors?;
-        result_gltf?;
-        result_json?;
+        result_ply.map_err(|_| anyhow::anyhow!("PLY export thread panicked"))??;
+        result_safetensors.map_err(|_| anyhow::anyhow!("safetensors export thread panicked"))??;
+        result_gltf.map_err(|_| anyhow::anyhow!("glTF export thread panicked"))??;
+        result_json.map_err(|_| anyhow::anyhow!("JSON export thread panicked"))??;
     } else {
         // No progress bars - export sequentially
         export_ply(model, &output_dir.join("model.ply"))?;
         export_safetensors(model, &output_dir.join("model.safetensors"))?;
-        export_gltf(model, &output_dir.join("model.gltf"), true)?;
+        export_gltf(model, &output_dir.join("model.glb"), true)?;
         export_json_checkpoint(model, &output_dir.join("model.json"))?;
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_ply_path(name: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("oxigaf_export_ply_{name}.ply"));
+        p
+    }
+
+    fn make_model(n: usize) -> GaussianModel {
+        let gaussians: Vec<GaussianAttributes> = (0..n)
+            .map(|i| {
+                let f = i as f32;
+                GaussianAttributes {
+                    position: [f, f + 1.0, f + 2.0],
+                    _pad0: 0.0,
+                    rotation: [0.1, 0.2, 0.3, 0.9],
+                    scale: [-1.0, -1.5, -2.0],
+                    opacity: -0.5,
+                }
+            })
+            .collect();
+        let sh_coeffs = vec![0.1_f32, 0.2, 0.3].repeat(n);
+        GaussianModel {
+            gaussians,
+            sh_coeffs,
+            sh_degree: 0,
+            face_indices: vec![0; n],
+            barycentric: vec![[1.0 / 3.0; 3]; n],
+            local_offsets: vec![[0.0; 3]; n],
+            is_rigid: vec![true; n],
+        }
+    }
+
+    #[test]
+    fn test_load_ply_ascii_roundtrip() {
+        let path = temp_ply_path("ascii_roundtrip");
+        let model = make_model(3);
+        export_ply(&model, &path).expect("write ok");
+        let loaded = load_ply(&path).expect("load ok");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(loaded.len(), 3);
+        assert_eq!(loaded.sh_degree, 0);
+        for i in 0..3 {
+            assert!(
+                (loaded.gaussians[i].position[0] - model.gaussians[i].position[0]).abs() < 1e-4
+            );
+            assert!((loaded.gaussians[i].opacity - model.gaussians[i].opacity).abs() < 1e-4);
+        }
+    }
+
+    #[test]
+    fn test_load_ply_reads_properties_by_name_not_position() {
+        // Header intentionally out of canonical order, plus an extra
+        // unrecognised "confidence" column: a fixed-position reader would
+        // misread every field from here on, but a name-indexed reader must
+        // not.
+        let path = temp_ply_path("reordered_extra_prop");
+        let content = "ply\n\
+format ascii 1.0\n\
+comment test\n\
+element vertex 1\n\
+property float confidence\n\
+property float opacity\n\
+property float x\n\
+property float y\n\
+property float z\n\
+property float scale_0\n\
+property float scale_1\n\
+property float scale_2\n\
+property float rot_0\n\
+property float rot_1\n\
+property float rot_2\n\
+property float rot_3\n\
+property float f_dc_0\n\
+property float f_dc_1\n\
+property float f_dc_2\n\
+end_header\n\
+0.9 -1.5 1.0 2.0 3.0 -2.0 -2.0 -2.0 1.0 0.0 0.0 0.0 0.1 0.2 0.3\n";
+        std::fs::write(&path, content).expect("write ok");
+        let loaded = load_ply(&path).expect("load ok");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(loaded.len(), 1);
+        let g = &loaded.gaussians[0];
+        assert!((g.position[0] - 1.0).abs() < 1e-5, "x={}", g.position[0]);
+        assert!((g.position[1] - 2.0).abs() < 1e-5, "y={}", g.position[1]);
+        assert!((g.position[2] - 3.0).abs() < 1e-5, "z={}", g.position[2]);
+        assert!((g.opacity - (-1.5)).abs() < 1e-5, "opacity={}", g.opacity);
+        assert!((loaded.sh_coeffs[0] - 0.1).abs() < 1e-5);
+        assert!((loaded.sh_coeffs[1] - 0.2).abs() < 1e-5);
+        assert!((loaded.sh_coeffs[2] - 0.3).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_load_ply_malformed_value_is_an_error_not_zero() {
+        let path = temp_ply_path("malformed_value");
+        let content = "ply\n\
+format ascii 1.0\n\
+element vertex 1\n\
+property float x\n\
+property float y\n\
+property float z\n\
+property float opacity\n\
+property float scale_0\n\
+property float scale_1\n\
+property float scale_2\n\
+property float rot_0\n\
+property float rot_1\n\
+property float rot_2\n\
+property float rot_3\n\
+property float f_dc_0\n\
+property float f_dc_1\n\
+property float f_dc_2\n\
+end_header\n\
+1.0 2.0 NOT_A_NUMBER -1.0 -1.0 -1.0 -1.0 1.0 0.0 0.0 0.0 0.1 0.2 0.3\n";
+        std::fs::write(&path, content).expect("write ok");
+        let result = load_ply(&path);
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            result.is_err(),
+            "a corrupt token must be a parse error, not silently 0.0"
+        );
+    }
+
+    #[test]
+    fn test_load_ply_missing_required_property_is_an_error() {
+        // No "opacity" property declared at all.
+        let path = temp_ply_path("missing_opacity");
+        let content = "ply\n\
+format ascii 1.0\n\
+element vertex 1\n\
+property float x\n\
+property float y\n\
+property float z\n\
+property float scale_0\n\
+property float scale_1\n\
+property float scale_2\n\
+property float rot_0\n\
+property float rot_1\n\
+property float rot_2\n\
+property float rot_3\n\
+property float f_dc_0\n\
+property float f_dc_1\n\
+property float f_dc_2\n\
+end_header\n\
+1.0 2.0 3.0 -1.0 -1.0 -1.0 1.0 0.0 0.0 0.0 0.1 0.2 0.3\n";
+        std::fs::write(&path, content).expect("write ok");
+        let result = load_ply(&path);
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            result.is_err(),
+            "a missing required property must be an error, not a silently defaulted value"
+        );
+    }
+
+    #[test]
+    fn test_load_ply_binary_little_endian_with_mixed_property_types() {
+        // Hand-built binary_little_endian payload with a 1-byte `uchar`
+        // property interleaved among the f32 properties, proving the
+        // reader accounts for each property's declared byte width rather
+        // than assuming every property is 4 bytes wide.
+        let path = temp_ply_path("binary_mixed_types");
+        let header = "ply\n\
+format binary_little_endian 1.0\n\
+element vertex 2\n\
+property float x\n\
+property float y\n\
+property float z\n\
+property uchar material_id\n\
+property float opacity\n\
+property float scale_0\n\
+property float scale_1\n\
+property float scale_2\n\
+property float rot_0\n\
+property float rot_1\n\
+property float rot_2\n\
+property float rot_3\n\
+property float f_dc_0\n\
+property float f_dc_1\n\
+property float f_dc_2\n\
+end_header\n";
+        let mut bytes = header.as_bytes().to_vec();
+
+        // [x, y, z, opacity, scale0..2, rot0..3, f_dc0..2]
+        let rows: [[f32; 13]; 2] = [
+            [
+                1.0, 2.0, 3.0, -0.5, -1.0, -1.0, -1.0, 1.0, 0.0, 0.0, 0.0, 0.1, 0.2,
+            ],
+            [
+                4.0, 5.0, 6.0, 0.5, -2.0, -2.0, -2.0, 0.0, 1.0, 0.0, 0.0, 0.4, 0.5,
+            ],
+        ];
+        for (i, row) in rows.iter().enumerate() {
+            bytes.extend_from_slice(&row[0].to_le_bytes()); // x
+            bytes.extend_from_slice(&row[1].to_le_bytes()); // y
+            bytes.extend_from_slice(&row[2].to_le_bytes()); // z
+            bytes.push(i as u8); // material_id (uchar, 1 byte — unused downstream)
+            bytes.extend_from_slice(&row[3].to_le_bytes()); // opacity
+            bytes.extend_from_slice(&row[4].to_le_bytes()); // scale_0
+            bytes.extend_from_slice(&row[5].to_le_bytes()); // scale_1
+            bytes.extend_from_slice(&row[6].to_le_bytes()); // scale_2
+            bytes.extend_from_slice(&row[7].to_le_bytes()); // rot_0
+            bytes.extend_from_slice(&row[8].to_le_bytes()); // rot_1
+            bytes.extend_from_slice(&row[9].to_le_bytes()); // rot_2
+            bytes.extend_from_slice(&row[10].to_le_bytes()); // rot_3
+            bytes.extend_from_slice(&row[11].to_le_bytes()); // f_dc_0
+            bytes.extend_from_slice(&row[12].to_le_bytes()); // f_dc_1
+            bytes.extend_from_slice(&0.0_f32.to_le_bytes()); // f_dc_2
+        }
+
+        std::fs::write(&path, &bytes).expect("write ok");
+        let loaded = load_ply(&path).expect("load ok");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(loaded.len(), 2);
+        assert!((loaded.gaussians[0].position[0] - 1.0).abs() < 1e-5);
+        assert!((loaded.gaussians[0].opacity - (-0.5)).abs() < 1e-5);
+        assert!((loaded.gaussians[1].position[0] - 4.0).abs() < 1e-5);
+        assert!((loaded.gaussians[1].opacity - 0.5).abs() < 1e-5);
+        assert!((loaded.sh_coeffs[0] - 0.1).abs() < 1e-5);
+        assert!((loaded.sh_coeffs[3] - 0.4).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_load_ply_binary_big_endian_is_an_honest_error() {
+        let path = temp_ply_path("binary_big_endian");
+        let header =
+            "ply\nformat binary_big_endian 1.0\nelement vertex 1\nproperty float x\nend_header\n";
+        std::fs::write(&path, header).expect("write ok");
+        let result = load_ply(&path);
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            result.is_err(),
+            "binary_big_endian must be an explicit error, not a misread"
+        );
+    }
+
+    #[test]
+    fn test_export_all_formats_parallel_gltf_output_is_named_glb() {
+        // `export_gltf` writes a self-contained GLB binary container (magic
+        // "glTF" + JSON/BIN chunks), so the multi-format export must name
+        // that output `model.glb`, not `model.gltf` — which would claim a
+        // plain-text glTF document while actually holding GLB bytes.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "oxigaf_export_all_formats_glb_name_{}_{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir ok");
+
+        let model = make_model(2);
+        // `Quiet` disables progress bars, so this exercises the sequential
+        // branch deterministically.
+        export_all_formats_parallel(&model, &dir, crate::verbosity::Verbosity::Quiet)
+            .expect("export ok");
+
+        let glb_path = dir.join("model.glb");
+        assert!(glb_path.exists(), "expected model.glb to be written");
+        assert!(
+            !dir.join("model.gltf").exists(),
+            "must not write a model.gltf file for GLB content"
+        );
+        let bytes = std::fs::read(&glb_path).expect("read glb ok");
+        assert!(
+            bytes.starts_with(b"glTF"),
+            "GLB file must start with the glTF magic bytes, got {} bytes",
+            bytes.len()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

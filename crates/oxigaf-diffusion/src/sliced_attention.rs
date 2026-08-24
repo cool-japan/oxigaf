@@ -37,14 +37,22 @@ use crate::DiffusionError;
 ///
 /// ## Precision Control
 ///
-/// The `attention_precision` field selects the upcasting strategy for
-/// softmax and attention weights. The default is
-/// [`AttentionPrecision::UpcastedSoftmax`], which promotes only the softmax
-/// step to FP32 (using the log-sum-exp stable kernel in [`crate::numerics`]).
-/// Since `SlicedAttention` operates exclusively on `f32` slices, this field
-/// is currently used for documentation and future mixed-precision integration
-/// — the internal `softmax_and_weighted_v` helper is already numerically
-/// stable.
+/// The `attention_precision` field selects the softmax kernel used inside
+/// [`SlicedAttention::forward`]:
+///
+/// - [`AttentionPrecision::UpcastedSoftmax`] (the default) and
+///   [`AttentionPrecision::FullUpcast`] both use the numerically stable
+///   log-sum-exp form (row-max subtracted before `exp()`), which cannot
+///   overflow regardless of the logit magnitude. `SlicedAttention` operates
+///   exclusively on `f32` slices, so there is no separate Q/K/V tensor left
+///   to additionally upcast — the two variants therefore coincide today;
+///   that distinction only becomes meaningful once this crate gains a
+///   genuine reduced-precision (FP16/BF16) storage type to upcast *from*.
+/// - [`AttentionPrecision::Standard`] skips the row-max subtraction,
+///   mirroring what a model already running in its native (unstabilised)
+///   precision would compute. In `f32` this can still overflow to `inf`/`NaN`
+///   for sufficiently large logits (`exp(x)` overflows `f32` past `x ≈ 88.7`),
+///   exactly like the un-upcasted kernel it stands in for.
 #[derive(Debug, Clone)]
 pub struct SlicedAttentionConfig {
     /// Number of query tokens to process per chunk.
@@ -244,6 +252,16 @@ impl SlicedAttention {
             None => seq_len_q,
             Some(s) => s.min(seq_len_q).max(1),
         };
+        let precision = self.config.attention_precision;
+
+        // Scratch buffers sized for the largest possible chunk and reused
+        // across every (batch, head) tile and every chunk within it, rather
+        // than being freshly heap-allocated per chunk. Every write below
+        // covers the full `[..chunk_len * ...]` prefix it reads back, so
+        // stale data from a previous (larger) chunk is never observed.
+        let mut scores_buf = vec![0.0_f32; chunk_size * seq_len_k];
+        let mut out_buf = vec![0.0_f32; chunk_size * head_dim];
+        let mut exp_buf = vec![0.0_f32; seq_len_k];
 
         for b in 0..batch {
             for h in 0..num_heads {
@@ -267,17 +285,28 @@ impl SlicedAttention {
                     let q_chunk = &q[q_base + qi * head_dim..q_base + chunk_end * head_dim];
 
                     // Compute scores = Q_chunk @ K^T / sqrt(d): [chunk_len, seq_len_k]
-                    let scores =
-                        compute_qkt(q_chunk, k_tile, chunk_len, seq_len_k, head_dim, scale);
+                    let scores = &mut scores_buf[..chunk_len * seq_len_k];
+                    compute_qkt_into(
+                        q_chunk, k_tile, chunk_len, seq_len_k, head_dim, scale, scores,
+                    );
 
-                    // Numerically stable softmax weights and apply to V.
-                    let out_chunk =
-                        softmax_and_weighted_v(&scores, v_tile, chunk_len, seq_len_k, head_dim);
+                    // Softmax weights (kernel chosen by `precision`) and apply to V.
+                    let out_chunk = &mut out_buf[..chunk_len * head_dim];
+                    softmax_and_weighted_v_into(
+                        scores,
+                        v_tile,
+                        chunk_len,
+                        seq_len_k,
+                        head_dim,
+                        precision,
+                        &mut exp_buf,
+                        out_chunk,
+                    );
 
                     // Write output chunk.
                     let out_slice =
                         &mut output[out_base + qi * head_dim..out_base + chunk_end * head_dim];
-                    out_slice.copy_from_slice(&out_chunk);
+                    out_slice.copy_from_slice(out_chunk);
 
                     qi += chunk_size;
                 }
@@ -292,20 +321,22 @@ impl SlicedAttention {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// Compute `Q_chunk @ K^T * scale`.
+/// Compute `Q_chunk @ K^T * scale` into a caller-provided buffer.
 ///
 /// `q` has shape `[chunk_len, head_dim]` (row-major),
 /// `k` has shape `[seq_len_k, head_dim]` (row-major).
-/// Returns `scores` with shape `[chunk_len, seq_len_k]`.
-fn compute_qkt(
+/// Writes `scores` with shape `[chunk_len, seq_len_k]`; `scores.len()` must
+/// be exactly `chunk_len * seq_len_k` (callers pass a tight sub-slice of a
+/// larger reusable buffer so no allocation happens per chunk).
+fn compute_qkt_into(
     q: &[f32],
     k: &[f32],
     chunk_len: usize,
     seq_len_k: usize,
     head_dim: usize,
     scale: f32,
-) -> Vec<f32> {
-    let mut scores = vec![0.0_f32; chunk_len * seq_len_k];
+    scores: &mut [f32],
+) {
     for qi in 0..chunk_len {
         let q_row = &q[qi * head_dim..(qi + 1) * head_dim];
         for ki in 0..seq_len_k {
@@ -315,33 +346,47 @@ fn compute_qkt(
             scores[qi * seq_len_k + ki] = dot * scale;
         }
     }
-    scores
 }
 
-/// Apply row-wise numerically stable softmax to `scores` and compute weighted
-/// sum of `V`.
+/// Apply row-wise softmax to `scores` and compute the weighted sum of `V`,
+/// writing the result into a caller-provided buffer.
 ///
-/// `scores` shape: `[chunk_len, seq_len_k]`
+/// `scores` shape: `[chunk_len, seq_len_k]` (tight, no padding)
 /// `v_tile` shape: `[seq_len_k, head_dim]`
+/// `exp_row` is reusable scratch, overwritten in full every row; must have
+/// length `>= seq_len_k`.
+/// `out` receives shape `[chunk_len, head_dim]`; `out.len()` must be exactly
+/// `chunk_len * head_dim`.
 ///
-/// Returns output with shape `[chunk_len, head_dim]`.
-fn softmax_and_weighted_v(
+/// `precision` selects the softmax kernel: [`AttentionPrecision::Standard`]
+/// skips the row-max subtraction (can overflow for large logits, mirroring
+/// an un-upcasted low-precision kernel), while
+/// [`AttentionPrecision::UpcastedSoftmax`] / [`AttentionPrecision::FullUpcast`]
+/// use the numerically stable log-sum-exp form.
+#[allow(clippy::too_many_arguments)]
+fn softmax_and_weighted_v_into(
     scores: &[f32],
     v_tile: &[f32],
     chunk_len: usize,
     seq_len_k: usize,
     head_dim: usize,
-) -> Vec<f32> {
-    let mut out = vec![0.0_f32; chunk_len * head_dim];
-
+    precision: AttentionPrecision,
+    exp_row: &mut [f32],
+    out: &mut [f32],
+) {
     for qi in 0..chunk_len {
         let score_row = &scores[qi * seq_len_k..(qi + 1) * seq_len_k];
 
-        // Row max for numerical stability.
-        let max_s = score_row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        // Row max for numerical stability — skipped under `Standard`, which
+        // stands in for a model already running without extra upcasting.
+        let max_s = match precision {
+            AttentionPrecision::Standard => 0.0,
+            AttentionPrecision::UpcastedSoftmax | AttentionPrecision::FullUpcast => {
+                score_row.iter().cloned().fold(f32::NEG_INFINITY, f32::max)
+            }
+        };
 
         // Compute exp(score - max) and their sum.
-        let mut exp_row = vec![0.0_f32; seq_len_k];
         let mut sum_exp = 0.0_f32;
         for (ki, s) in score_row.iter().enumerate() {
             let e = (s - max_s).exp();
@@ -351,6 +396,7 @@ fn softmax_and_weighted_v(
 
         // Weighted sum of V rows: out[qi] = sum_k (exp_row[k] / sum_exp) * V[k]
         let out_row = &mut out[qi * head_dim..(qi + 1) * head_dim];
+        out_row.fill(0.0);
         for ki in 0..seq_len_k {
             let weight = exp_row[ki] / sum_exp;
             let v_row = &v_tile[ki * head_dim..(ki + 1) * head_dim];
@@ -359,8 +405,6 @@ fn softmax_and_weighted_v(
             }
         }
     }
-
-    out
 }
 
 // ---------------------------------------------------------------------------
@@ -728,6 +772,77 @@ mod tests {
         let cfg = SlicedAttentionConfig::new(None, 4, 32)
             .with_attention_precision(AttentionPrecision::Standard);
         assert_eq!(cfg.attention_precision, AttentionPrecision::Standard);
+    }
+
+    // ------------------------------------------------------------------
+    // Regression: `attention_precision` must actually change the kernel.
+    // ------------------------------------------------------------------
+    //
+    // Previously `attention_precision` was stored and validated but never
+    // read by `forward` — every precision setting produced identical
+    // (already-stable) output, so the field had no observable effect. These
+    // two tests use a raw pre-scale score of ~141 (comfortably past f32's
+    // ~88.7 `exp()` overflow point) to show the kernels now genuinely
+    // differ: `Standard` (no row-max subtraction) blows up to a non-finite
+    // result, while the stable variants do not.
+
+    #[test]
+    fn test_standard_precision_overflows_for_large_logits() -> Result<(), DiffusionError> {
+        let cfg = SlicedAttentionConfig::new(None, 1, 2)
+            .with_attention_precision(AttentionPrecision::Standard);
+        let attn = SlicedAttention::new(cfg)?;
+        // Raw dot products: Q·K[0] = 200 (score ≈ 141.4 after 1/sqrt(2) scale,
+        // which overflows exp() in f32), Q·K[1] = 0.
+        let q = vec![10.0_f32, 10.0];
+        let k = vec![10.0_f32, 10.0, 0.0, 0.0];
+        let v = vec![1.0_f32, 1.0, 2.0, 2.0];
+        let out = attn.forward(&q, &k, &v, 1, 1, 2)?;
+        assert!(
+            out.iter().any(|x| !x.is_finite()),
+            "Standard precision should overflow for large logits, got {out:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_upcasted_softmax_stays_finite_for_large_logits() -> Result<(), DiffusionError> {
+        // Same inputs as `test_standard_precision_overflows_for_large_logits`,
+        // but with the (default) stable kernel.
+        let cfg = SlicedAttentionConfig::new(None, 1, 2)
+            .with_attention_precision(AttentionPrecision::UpcastedSoftmax);
+        let attn = SlicedAttention::new(cfg)?;
+        let q = vec![10.0_f32, 10.0];
+        let k = vec![10.0_f32, 10.0, 0.0, 0.0];
+        let v = vec![1.0_f32, 1.0, 2.0, 2.0];
+        let out = attn.forward(&q, &k, &v, 1, 1, 2)?;
+        assert!(
+            out.iter().all(|x| x.is_finite()),
+            "UpcastedSoftmax must stay finite for large logits, got {out:?}"
+        );
+        // The dominant key (K[0], score≈141.4) should fully win over K[1]
+        // (score=0), so the output should equal V[0] = [1.0, 1.0].
+        assert!((out[0] - 1.0).abs() < 1e-3, "out={out:?}");
+        assert!((out[1] - 1.0).abs() < 1e-3, "out={out:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn test_default_precision_matches_upcasted_softmax_output() -> Result<(), DiffusionError> {
+        // Default config (no explicit attention_precision) must keep behaving
+        // exactly like the pre-existing numerically-stable kernel — this
+        // wiring must not change output for any config that doesn't opt into
+        // `Standard`.
+        let (batch, heads, seq_q, seq_k, head_dim) = (1, 2, 4, 4, 8);
+        let (q, k, v) = make_tensors(batch, heads, seq_q, seq_k, head_dim);
+        let out_default = run_forward(&q, &k, &v, batch, heads, seq_q, seq_k, head_dim, None)?;
+
+        let cfg = SlicedAttentionConfig::new(None, heads, head_dim)
+            .with_attention_precision(AttentionPrecision::UpcastedSoftmax);
+        let attn = SlicedAttention::new(cfg)?;
+        let out_explicit = attn.forward(&q, &k, &v, batch, seq_q, seq_k)?;
+
+        assert!(max_abs_diff(&out_default, &out_explicit) < 1e-6);
+        Ok(())
     }
 
     #[test]

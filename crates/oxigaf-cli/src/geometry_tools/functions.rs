@@ -3,6 +3,7 @@
 //! 🤖 Generated with [SplitRS](https://github.com/cool-japan/splitrs)
 
 use nalgebra as na;
+use rayon::prelude::*;
 
 use super::type_aliases::ObbResult;
 use super::types::{BoundingSphere, GaussianBBox, GeometryError, GeometryStats, RigidTransform};
@@ -266,6 +267,14 @@ pub fn compute_geometry_stats(
     })
 }
 /// Apply a rigid transform to all positions in-place.
+///
+/// `transform.scale` and `transform.rotation` move each Gaussian's *centre*
+/// only — they do not resize or reorient the Gaussians themselves, which are
+/// described separately by the scene's rotation and log-scale arrays. A
+/// non-identity `transform.rotation` or `transform.scale != 1.0` therefore
+/// also needs [`transform_rotations`] and/or [`transform_scales`] applied to
+/// the same scene so its Gaussians stay consistent with their new centres;
+/// see [`RigidTransform`]'s documentation.
 pub fn transform_positions(
     positions: &mut [f32],
     transform: &RigidTransform,
@@ -302,6 +311,49 @@ pub fn transform_rotations(
         rotations[base + 1] = combined[1];
         rotations[base + 2] = combined[2];
         rotations[base + 3] = combined[3];
+    }
+    Ok(())
+}
+/// Apply a rigid transform's uniform `scale` factor to all log-scale values
+/// in-place — the counterpart to [`transform_positions`]/[`transform_rotations`]
+/// for a scene's per-Gaussian size, not just its Gaussians' centres.
+///
+/// [`RigidTransform::scale`] is applied to positions by
+/// [`RigidTransform::apply_to_point`] (and hence by [`transform_positions`]),
+/// which moves every Gaussian's centre but leaves each Gaussian's own extent
+/// untouched. Calling `transform_positions` with a non-unit scale and
+/// nothing else therefore tears a scene apart — centres spread apart or pull
+/// together while every Gaussian stays its original physical size — instead
+/// of uniformly scaling it. This function scales the size half of that pair:
+/// call it on the same scene's log-scale array to keep both consistent.
+///
+/// Adds `ln(transform.scale)` to every log-scale entry, the log-space
+/// equivalent of multiplying each Gaussian's linear scale by
+/// `transform.scale`.
+///
+/// # Errors
+/// Returns [`GeometryError::InvalidTransform`] if `transform.scale` is not
+/// finite and strictly positive (scale has no real logarithm, and a
+/// non-positive scale is not a physically valid resizing), or
+/// [`GeometryError::InvalidScaleLength`] if `scales.len()` is not a multiple
+/// of 3.
+pub fn transform_scales(
+    scales: &mut [f32],
+    transform: &RigidTransform,
+) -> Result<(), GeometryError> {
+    if !(transform.scale.is_finite() && transform.scale > 0.0) {
+        return Err(GeometryError::InvalidTransform {
+            reason: format!(
+                "RigidTransform::scale must be finite and positive to transform log-scales \
+                 (log-scale has no real logarithm for scale <= 0), got {}",
+                transform.scale
+            ),
+        });
+    }
+    validate_scales(scales)?;
+    let delta = transform.scale.ln();
+    for ls in scales.iter_mut() {
+        *ls += delta;
     }
     Ok(())
 }
@@ -508,7 +560,14 @@ pub fn rescale_gaussians(scales: &mut [f32], target_mean_scale: f32) -> Result<f
 }
 /// For each Gaussian, compute the distance to its k-th nearest neighbour (1-indexed).
 ///
-/// Uses brute-force O(n²) computation — acceptable for CLI tooling.
+/// Still O(n²) total work (acceptable for CLI tooling — a k-d tree would make
+/// this O(n log n) but is not implemented here), but each point's scan now
+/// costs O(n) rather than O(n log n): the k-th smallest squared distance is
+/// found with `select_nth_unstable_by` (a partial selection) instead of a
+/// full sort, since only that one value is needed. The per-point outer loop
+/// is parallelised across points with rayon, and each worker thread reuses
+/// one scratch buffer across all the points it handles instead of allocating
+/// a fresh `Vec` per point.
 ///
 /// # Panics (never)
 /// All errors are returned as `GeometryError`.
@@ -524,23 +583,27 @@ pub fn nearest_neighbor_distances(positions: &[f32], k: usize) -> Result<Vec<f32
             reason: format!("k ({k}) must be less than number of points ({n})"),
         });
     }
-    let mut result = Vec::with_capacity(n);
-    for i in 0..n {
-        let bi = i * 3;
-        let pi = [positions[bi], positions[bi + 1], positions[bi + 2]];
-        let mut dists: Vec<f32> = (0..n)
-            .filter(|&j| j != i)
-            .map(|j| {
+    let result: Vec<f32> = (0..n)
+        .into_par_iter()
+        .map_init(Vec::new, |dists, i| {
+            let bi = i * 3;
+            let pi = [positions[bi], positions[bi + 1], positions[bi + 2]];
+            dists.clear();
+            dists.extend((0..n).filter(|&j| j != i).map(|j| {
                 let bj = j * 3;
                 let dx = positions[bj] - pi[0];
                 let dy = positions[bj + 1] - pi[1];
                 let dz = positions[bj + 2] - pi[2];
                 dx * dx + dy * dy + dz * dz
-            })
-            .collect();
-        dists.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        result.push(dists[k - 1].sqrt());
-    }
+            }));
+            // `dists.len() == n - 1` and `k < n` was validated above, so
+            // `k - 1 <= n - 2 < dists.len()`: always a valid index.
+            let (_, kth, _) = dists.select_nth_unstable_by(k - 1, |a, b| {
+                a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            kth.sqrt()
+        })
+        .collect();
     Ok(result)
 }
 /// Compute what fraction of cells in a voxel grid covering `reference_bbox` are occupied by
@@ -591,4 +654,154 @@ pub fn spatial_coverage(
     }
     let occupied = grid.iter().filter(|&&v| v).count();
     Ok(occupied as f32 / total_cells as f32)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+//
+// `geometry_tools::tests` (declared in mod.rs, sibling to this module) covers
+// the wider API surface; these are focused regression tests for the specific
+// bugs/gaps fixed directly in this file.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // transform_scales
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn transform_scales_applies_uniform_scale_to_linear_size() {
+        // Regression: `RigidTransform::from_scale` used to affect only
+        // positions (via `transform_positions`), leaving every Gaussian's
+        // own extent untouched — so scaling a cloud tore it apart instead of
+        // resizing it uniformly. `transform_scales` is the missing
+        // counterpart for the log-scale array.
+        let mut scales = vec![0.0f32; 6]; // two Gaussians, log-scale 0 => linear scale 1.0
+        let transform = RigidTransform::from_scale(2.0);
+        transform_scales(&mut scales, &transform).expect("positive scale must succeed");
+        for &ls in &scales {
+            let linear = ls.exp();
+            assert!(
+                (linear - 2.0).abs() < 1e-5,
+                "expected linear scale 2.0 after RigidTransform::from_scale(2.0), got {linear}"
+            );
+        }
+    }
+
+    #[test]
+    fn transform_scales_composes_additively_in_log_space() {
+        let mut scales = vec![1.0_f32.ln(), 2.0_f32.ln(), 3.0_f32.ln()];
+        let transform = RigidTransform::from_scale(4.0);
+        transform_scales(&mut scales, &transform).expect("positive scale must succeed");
+        let expected = [4.0_f32, 8.0, 12.0];
+        for (got, exp) in scales.iter().zip(expected.iter()) {
+            assert!(
+                (got.exp() - exp).abs() < 1e-4,
+                "expected {exp}, got {}",
+                got.exp()
+            );
+        }
+    }
+
+    #[test]
+    fn transform_scales_identity_is_noop() {
+        let original = vec![-1.0f32, 0.3, 2.7, -0.5];
+        let mut scales = original.clone();
+        transform_scales(&mut scales, &RigidTransform::identity()).expect("identity succeeds");
+        for (a, b) in scales.iter().zip(original.iter()) {
+            assert!((a - b).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn transform_scales_rejects_non_positive_scale() {
+        let mut scales = vec![0.0f32; 3];
+        for bad in [0.0f32, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let transform = RigidTransform::from_scale(bad);
+            let result = transform_scales(&mut scales, &transform);
+            assert!(
+                matches!(result, Err(GeometryError::InvalidTransform { .. })),
+                "scale {bad} should be rejected, got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn transform_scales_rejects_length_not_multiple_of_3() {
+        let mut scales = vec![0.0f32; 4];
+        let result = transform_scales(&mut scales, &RigidTransform::from_scale(2.0));
+        assert!(matches!(
+            result,
+            Err(GeometryError::InvalidScaleLength { len: 4 })
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // nearest_neighbor_distances: select_nth_unstable_by + rayon rewrite
+    // must match a straightforward, obviously-correct sequential reference.
+    // -----------------------------------------------------------------------
+
+    /// Reference (unoptimised) k-th nearest neighbour distance, for
+    /// comparison against the optimised/parallel implementation under test.
+    fn reference_kth_nn(positions: &[f32], k: usize) -> Vec<f32> {
+        let n = positions.len() / 3;
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            let pi = [positions[i * 3], positions[i * 3 + 1], positions[i * 3 + 2]];
+            let mut dists: Vec<f32> = (0..n)
+                .filter(|&j| j != i)
+                .map(|j| {
+                    let pj = [positions[j * 3], positions[j * 3 + 1], positions[j * 3 + 2]];
+                    let dx = pi[0] - pj[0];
+                    let dy = pi[1] - pj[1];
+                    let dz = pi[2] - pj[2];
+                    dx * dx + dy * dy + dz * dz
+                })
+                .collect();
+            dists.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            out.push(dists[k - 1].sqrt());
+        }
+        out
+    }
+
+    #[test]
+    fn nearest_neighbor_distances_matches_reference_for_various_k() {
+        // A deterministic, non-uniform point cloud (no RNG dependency).
+        let positions: Vec<f32> = (0..37)
+            .flat_map(|i| {
+                let f = i as f32;
+                [
+                    (f * 0.913).sin() * 10.0,
+                    (f * 1.71).cos() * 5.0,
+                    (f * 0.37) - 3.0,
+                ]
+            })
+            .collect();
+        for k in [1usize, 2, 5, 10] {
+            let got = nearest_neighbor_distances(&positions, k).expect("nn distances");
+            let want = reference_kth_nn(&positions, k);
+            assert_eq!(got.len(), want.len());
+            for (g, w) in got.iter().zip(want.iter()) {
+                assert!(
+                    (g - w).abs() < 1e-3,
+                    "k={k}: expected {w}, got {g} (select_nth_unstable_by/rayon rewrite must \
+                     match the sequential full-sort reference)"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn nearest_neighbor_distances_k1_is_closest_pair_distance() {
+        // Three colinear points 0, 1, 3: nearest neighbour of point at 0 is
+        // at distance 1 (not 3).
+        let positions = vec![0.0f32, 0.0, 0.0, 1.0, 0.0, 0.0, 3.0, 0.0, 0.0];
+        let dists = nearest_neighbor_distances(&positions, 1).expect("nn");
+        assert!((dists[0] - 1.0).abs() < 1e-5, "got {}", dists[0]);
+        assert!((dists[1] - 1.0).abs() < 1e-5, "got {}", dists[1]);
+        assert!((dists[2] - 2.0).abs() < 1e-5, "got {}", dists[2]);
+    }
 }

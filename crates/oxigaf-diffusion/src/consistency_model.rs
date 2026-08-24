@@ -142,8 +142,16 @@ impl CmNoiseSchedule {
     ///
     /// Uses the EDM formula:
     /// `σ_k = (σ_max^(1/ρ) + k/(K−1) · (σ_min^(1/ρ) − σ_max^(1/ρ)))^ρ`
+    ///
+    /// `step` is clamped to `[0, K-1]`: a `step` beyond `K-1` returns the
+    /// same value as `K-1` (σ_min) rather than extrapolating past the end
+    /// of the schedule, which could otherwise interpolate past σ_min and
+    /// raise a negative base to the (odd, for the default ρ=7) power ρ,
+    /// yielding a negative "sigma".
     pub fn sigma_at_step(&self, step: usize) -> f32 {
-        let k = self.n_training_steps.saturating_sub(1).max(1);
+        let max_step = self.n_training_steps.saturating_sub(1);
+        let step = step.min(max_step);
+        let k = max_step.max(1);
         let inv_rho = 1.0 / self.rho;
         let sigma_max_rho = self.sigma_max.powf(inv_rho);
         let sigma_min_rho = self.sigma_min.powf(inv_rho);
@@ -169,6 +177,37 @@ impl CmNoiseSchedule {
                 interpolated.powf(self.rho)
             })
             .collect()
+    }
+
+    /// A sequence of `n+1` σ values decreasing from σ_max to σ_min, using
+    /// the requested [`ConsistencySkip`] spacing strategy.
+    ///
+    /// `ConsistencySkip::Uniform` is identical to
+    /// [`Self::timestep_sigma_sequence`]. `ConsistencySkip::Exponential`
+    /// spaces σ geometrically (`σ_i = σ_max · (σ_min/σ_max)^(i/n)`), which
+    /// is denser near σ_min than the EDM ρ-curve's own uniform-`t`
+    /// parameterization.
+    pub fn timestep_sigma_sequence_with_skip(
+        &self,
+        n_steps: usize,
+        skip: ConsistencySkip,
+    ) -> Vec<f32> {
+        match skip {
+            ConsistencySkip::Uniform => self.timestep_sigma_sequence(n_steps),
+            ConsistencySkip::Exponential => {
+                if n_steps == 0 {
+                    return vec![self.sigma_max];
+                }
+                let log_max = self.sigma_max.ln();
+                let log_min = self.sigma_min.ln();
+                (0..=n_steps)
+                    .map(|i| {
+                        let t = i as f32 / n_steps as f32;
+                        (log_max + t * (log_min - log_max)).exp()
+                    })
+                    .collect()
+            }
+        }
     }
 
     /// EMA decay μ at training step `k`.
@@ -246,39 +285,76 @@ impl Default for CmConsistencyConfig {
     }
 }
 
+impl CmConsistencyConfig {
+    /// The σ sequence to drive inference with, derived from `schedule`,
+    /// `n_inference_steps`, and `skip_timesteps`.
+    pub fn inference_sigma_sequence(&self) -> Vec<f32> {
+        self.schedule
+            .timestep_sigma_sequence_with_skip(self.n_inference_steps, self.skip_timesteps)
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // ConsistencyPreconditioning
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// EDM preconditioning factors for the consistency function.
+/// EDM/Consistency-Model preconditioning factors for the consistency
+/// function.
 ///
 /// Given a noisy sample `x_t` and noise level σ, the denoised estimate is:
 ///
 /// `D(x_t, σ) = c_skip(σ) · x_t + c_out(σ) · F_θ(c_in(σ) · x_t, c_noise(σ))`
 ///
-/// where `F_θ` is the raw neural network output.
+/// where `F_θ` is the raw neural network output. `c_skip`/`c_out` are
+/// shifted by `σ_min` (Song et al., 2023, Eq. 7) so that the boundary
+/// condition `D(x, σ_min) = x` holds exactly, which is what distinguishes a
+/// *consistency* function from a plain EDM denoiser.
 #[derive(Debug, Clone)]
 pub struct ConsistencyPreconditioning {
     /// Data standard deviation σ_data (default 0.5 for latent diffusion).
     pub sigma_data: f32,
+    /// Boundary noise level σ_min at which `D(x, σ_min) = x` must hold
+    /// (default 0.002, matching [`CmNoiseSchedule::default_edm`]).
+    pub sigma_min: f32,
 }
 
 impl ConsistencyPreconditioning {
-    /// Create a new preconditioning with the given data standard deviation.
+    /// Create a new preconditioning with the given data standard deviation
+    /// and the default boundary σ_min = 0.002.
     pub fn new(sigma_data: f32) -> Self {
-        Self { sigma_data }
+        Self {
+            sigma_data,
+            sigma_min: 0.002,
+        }
     }
 
-    /// Skip coefficient: `c_skip(σ) = σ_data² / (σ² + σ_data²)`.
+    /// Create a new preconditioning with an explicit boundary σ_min.
+    pub fn with_sigma_min(sigma_data: f32, sigma_min: f32) -> Self {
+        Self {
+            sigma_data,
+            sigma_min,
+        }
+    }
+
+    /// Skip coefficient: `c_skip(σ) = σ_data² / ((σ − σ_min)² + σ_data²)`.
+    ///
+    /// Chosen so that `c_skip(σ_min) = 1`, half of the consistency boundary
+    /// condition `D(x, σ_min) = x` (Song et al., 2023, Eq. 7).
     pub fn c_skip(&self, sigma: f32) -> f32 {
         let sd2 = self.sigma_data * self.sigma_data;
-        sd2 / (sigma * sigma + sd2)
+        let d = sigma - self.sigma_min;
+        sd2 / (d * d + sd2)
     }
 
-    /// Output coefficient: `c_out(σ) = σ · σ_data / √(σ² + σ_data²)`.
+    /// Output coefficient: `c_out(σ) = σ_data · (σ − σ_min) / √(σ_data² + σ²)`.
+    ///
+    /// Chosen so that `c_out(σ_min) = 0`, the other half of the consistency
+    /// boundary condition `D(x, σ_min) = x` (Song et al., 2023, Eq. 7). Note
+    /// the denominator uses plain `σ²`, not `(σ − σ_min)²` — this
+    /// asymmetry with `c_skip` is intentional and matches the paper.
     pub fn c_out(&self, sigma: f32) -> f32 {
         let sd2 = self.sigma_data * self.sigma_data;
-        sigma * self.sigma_data / (sigma * sigma + sd2).sqrt()
+        self.sigma_data * (sigma - self.sigma_min) / (sd2 + sigma * sigma).sqrt()
     }
 
     /// Input scaling: `c_in(σ) = 1 / √(σ² + σ_data²)`.
@@ -325,7 +401,14 @@ impl ConsistencyPreconditioning {
 /// Compute the consistency distillation loss weight λ for a pair (σ, σ_next).
 ///
 /// `λ(σ, σ_next) = 1 / (σ - σ_next)` (unnormalised; clipped to avoid div/0).
-pub fn cm_loss_weight(sigma: f32, sigma_next: f32, _schedule: &CmNoiseSchedule) -> f32 {
+///
+/// This is a standalone discretization-gap weight. [`cm_weighted_loss`]
+/// intentionally does *not* use it: multiplying it by an SNR-based weight
+/// compounds two independently-unbounded functions and can blow up the
+/// effective learning rate by many orders of magnitude across a schedule
+/// (see the `cm_weighted_loss` docs). Song et al. (2023) use a constant
+/// `λ(t) = 1`.
+pub fn cm_loss_weight(sigma: f32, sigma_next: f32) -> f32 {
     let diff = (sigma - sigma_next).abs();
     if diff < 1e-8 {
         1.0
@@ -360,18 +443,14 @@ pub fn cm_single_step_inference(
     precon.apply_preconditioning(model_output, noisy, sigma_max)
 }
 
-/// Multi-step consistency model inference.
-///
-/// Iterates through `sigma_sequence` (length N+1, decreasing), applying the
-/// preconditioning and a forward Euler step between each pair of σ values.
-///
-/// `model_outputs` must have the same length as `sigma_sequence`.
-pub fn cm_multi_step_inference(
+/// Validate the common `(initial_sample, sigma_sequence, model_outputs)`
+/// shape contract shared by [`cm_multi_step_inference`] and
+/// [`cm_euler_step_inference`].
+fn validate_multi_step_inputs(
     initial_sample: &[f32],
     sigma_sequence: &[f32],
     model_outputs: &[Vec<f32>],
-    precon: &ConsistencyPreconditioning,
-) -> Result<Vec<f32>, CmConsistencyError> {
+) -> Result<(), CmConsistencyError> {
     if sigma_sequence.is_empty() {
         return Err(CmConsistencyError::InvalidParam(
             "sigma_sequence must be non-empty".into(),
@@ -384,7 +463,6 @@ pub fn cm_multi_step_inference(
         });
     }
     let n = initial_sample.len();
-    // Verify all model outputs have the right length.
     for mo in model_outputs.iter() {
         if mo.len() != n {
             return Err(CmConsistencyError::DimensionMismatch {
@@ -393,6 +471,75 @@ pub fn cm_multi_step_inference(
             });
         }
     }
+    Ok(())
+}
+
+/// Multi-step consistency model inference (stochastic; Song et al. 2023,
+/// Algorithm 1).
+///
+/// Iterates through `sigma_sequence` (length N+1, decreasing): at each step,
+/// applies the preconditioning to get the current x0 estimate, then
+/// re-noises with a *fresh* Gaussian sample scaled by
+/// `√(σ_next² − σ_min²)` before the next preconditioning call. This is what
+/// restores the trajectory diversity and self-correction behaviour that
+/// motivates multistep sampling; reusing the previous step's residual
+/// direction (deterministic Euler, see [`cm_euler_step_inference`]) instead
+/// collapses the sampler onto whatever direction the first step happened to
+/// produce, and cannot recover sample diversity across restarts.
+///
+/// `model_outputs` must have the same length as `sigma_sequence`.
+pub fn cm_multi_step_inference(
+    initial_sample: &[f32],
+    sigma_sequence: &[f32],
+    model_outputs: &[Vec<f32>],
+    precon: &ConsistencyPreconditioning,
+    state: &mut u64,
+) -> Result<Vec<f32>, CmConsistencyError> {
+    validate_multi_step_inputs(initial_sample, sigma_sequence, model_outputs)?;
+    let n = initial_sample.len();
+
+    let mut x = initial_sample.to_vec();
+    let sigma_min2 = precon.sigma_min * precon.sigma_min;
+
+    for (i, &sigma) in sigma_sequence.iter().enumerate() {
+        let x0_hat = precon.apply_preconditioning(&model_outputs[i], &x, sigma)?;
+
+        if i + 1 < sigma_sequence.len() {
+            let sigma_next = sigma_sequence[i + 1];
+            let noise_scale = (sigma_next * sigma_next - sigma_min2).max(0.0).sqrt();
+            let z = cm_sample_noise(n, state);
+            x = x0_hat
+                .iter()
+                .zip(z.iter())
+                .map(|(&x0, &zi)| x0 + noise_scale * zi)
+                .collect();
+        } else {
+            x = x0_hat;
+        }
+    }
+
+    Ok(x)
+}
+
+/// Deterministic Euler-step variant of multi-step inference (EDM/DDIM-style).
+///
+/// Unlike [`cm_multi_step_inference`], which follows the true Consistency
+/// Models multistep sampler (re-noise with fresh Gaussian noise at every
+/// step), this reuses the existing residual direction:
+/// `x_next = denoised + (σ_next / σ) · (x − denoised)`. It is fully
+/// deterministic given `initial_sample`, which is useful for reproducible
+/// tests and debugging, but lacks the self-correction / diversity
+/// properties of the stochastic sampler and should not be used to claim
+/// "Consistency Models multistep sampling" behaviour.
+///
+/// `model_outputs` must have the same length as `sigma_sequence`.
+pub fn cm_euler_step_inference(
+    initial_sample: &[f32],
+    sigma_sequence: &[f32],
+    model_outputs: &[Vec<f32>],
+    precon: &ConsistencyPreconditioning,
+) -> Result<Vec<f32>, CmConsistencyError> {
+    validate_multi_step_inputs(initial_sample, sigma_sequence, model_outputs)?;
 
     let mut x = initial_sample.to_vec();
 
@@ -463,7 +610,6 @@ pub fn cm_sample_noise(n: usize, state: &mut u64) -> Vec<f32> {
 pub fn cm_compute_target(
     x_sigma_next: &[f32],
     model_output_next: &[f32],
-    _sigma: f32,
     sigma_next: f32,
     precon: &ConsistencyPreconditioning,
 ) -> Result<Vec<f32>, CmConsistencyError> {
@@ -517,16 +663,30 @@ pub fn cm_pseudo_huber_loss(
 
 /// Weighted consistency loss combining pseudo-Huber loss and the chosen
 /// `LcmLossWeight` weighting scheme.
+///
+/// Deliberately does **not** also multiply by [`cm_loss_weight`]'s
+/// `1/|σ − σ_next|` discretization-gap factor: on the default EDM schedule
+/// adjacent σ values near σ_min differ by as little as ~3e-4, so that
+/// factor alone can reach ~3000, and multiplying it by an SNR-based `w`
+/// (which is *also* unbounded — up to ~62500 near σ_min for
+/// `LcmLossWeight::SnrPlus1`) compounds into an effective learning-rate
+/// swing of several orders of magnitude across the schedule, more than
+/// enough to make training diverge. Song et al. (2023) use a constant
+/// `λ(t) = 1`, i.e. no discretization-gap factor at all.
+///
+/// `precon.sigma_data` and `huber_c` (the pseudo-Huber constant) are taken
+/// as parameters rather than hardcoded, so callers can match whatever
+/// `ConsistencyPreconditioning` they are actually using.
 pub fn cm_weighted_loss(
     predicted: &[f32],
     target: &[f32],
     sigma: f32,
-    sigma_next: f32,
-    schedule: &CmNoiseSchedule,
+    precon: &ConsistencyPreconditioning,
     loss_weight: &LcmLossWeight,
+    huber_c: f32,
 ) -> Result<f32, CmConsistencyError> {
-    let base_loss = cm_pseudo_huber_loss(predicted, target, 0.1)?;
-    let sd2 = 0.5_f32 * 0.5; // sigma_data = 0.5 (standard for latent diffusion)
+    let base_loss = cm_pseudo_huber_loss(predicted, target, huber_c)?;
+    let sd2 = precon.sigma_data * precon.sigma_data;
     let snr = sd2 / (sigma * sigma).max(1e-10);
 
     let w = match loss_weight {
@@ -535,10 +695,7 @@ pub fn cm_weighted_loss(
         LcmLossWeight::MinSnr { gamma } => snr.min(*gamma),
     };
 
-    // Also scale by the schedule's cm_loss_weight for the step pair.
-    let step_w = cm_loss_weight(sigma, sigma_next, schedule);
-
-    Ok(base_loss * w * step_w)
+    Ok(base_loss * w)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -566,6 +723,28 @@ impl Default for LcmConfig {
             skipping_step: 20,
             n_ddim_steps: 50,
         }
+    }
+}
+
+impl LcmConfig {
+    /// The skipped-timestep sequence implied by this config's
+    /// `n_ddim_steps` and `skipping_step`, keeping at most `n_lcm_steps`.
+    ///
+    /// Thin wrapper around [`lcm_skipped_timesteps`].
+    pub fn skipped_timesteps(&self, n_lcm_steps: usize) -> Vec<usize> {
+        lcm_skipped_timesteps(self.n_ddim_steps, n_lcm_steps, self.skipping_step)
+    }
+
+    /// Apply this config's `guidance_scale` to a cond/uncond model output
+    /// pair.
+    ///
+    /// Thin wrapper around [`lcm_guided_output`].
+    pub fn guided_output(
+        &self,
+        cond: &[f32],
+        uncond: &[f32],
+    ) -> Result<Vec<f32>, CmConsistencyError> {
+        lcm_guided_output(cond, uncond, self.guidance_scale)
     }
 }
 
@@ -745,6 +924,25 @@ mod tests {
     }
 
     #[test]
+    fn test_sigma_at_step_out_of_range_clamps_to_sigma_min() {
+        // Regression test: a step beyond K-1 used to extrapolate past
+        // sigma_min and could go negative; it must now clamp to the same
+        // value as the last valid step.
+        let s = CmNoiseSchedule::default_edm();
+        let sigma_last = s.sigma_at_step(s.n_training_steps - 1);
+        let sigma_over = s.sigma_at_step(s.n_training_steps + 1000);
+        assert!(
+            sigma_over.is_finite() && sigma_over > 0.0,
+            "out-of-range step should clamp to a valid positive sigma, got {sigma_over}"
+        );
+        assert!(
+            (sigma_over - sigma_last).abs() < 1e-4,
+            "out-of-range step should clamp to the last valid step's value: \
+             {sigma_over} vs {sigma_last}"
+        );
+    }
+
+    #[test]
     fn test_mu_at_step_zero_near_0_95() {
         let s = CmNoiseSchedule::default_edm();
         let mu = s.mu_at_step(0);
@@ -803,12 +1001,59 @@ mod tests {
         assert!((seq[0] - s.sigma_max).abs() < 1e-4);
     }
 
+    // ── timestep_sigma_sequence_with_skip / ConsistencySkip::Exponential ────
+
+    #[test]
+    fn test_timestep_sigma_sequence_with_skip_uniform_matches_plain() {
+        let s = CmNoiseSchedule::default_edm();
+        let plain = s.timestep_sigma_sequence(10);
+        let via_skip = s.timestep_sigma_sequence_with_skip(10, ConsistencySkip::Uniform);
+        assert_eq!(plain, via_skip);
+    }
+
+    #[test]
+    fn test_timestep_sigma_sequence_with_skip_exponential_endpoints() {
+        let s = CmNoiseSchedule::default_edm();
+        let seq = s.timestep_sigma_sequence_with_skip(10, ConsistencySkip::Exponential);
+        assert_eq!(seq.len(), 11);
+        assert!((seq[0] - s.sigma_max).abs() < 1e-3, "got {}", seq[0]);
+        assert!(
+            (seq[seq.len() - 1] - s.sigma_min).abs() < 1e-4,
+            "got {}",
+            seq[seq.len() - 1]
+        );
+        for w in seq.windows(2) {
+            assert!(w[1] <= w[0] + 1e-6, "exponential sequence not decreasing");
+        }
+    }
+
+    #[test]
+    fn test_timestep_sigma_sequence_with_skip_exponential_zero_steps() {
+        let s = CmNoiseSchedule::default_edm();
+        let seq = s.timestep_sigma_sequence_with_skip(0, ConsistencySkip::Exponential);
+        assert_eq!(seq.len(), 1);
+        assert!((seq[0] - s.sigma_max).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_cm_consistency_config_inference_sigma_sequence() {
+        let config = CmConsistencyConfig {
+            n_inference_steps: 5,
+            skip_timesteps: ConsistencySkip::Exponential,
+            ..Default::default()
+        };
+        let seq = config.inference_sigma_sequence();
+        assert_eq!(seq.len(), 6);
+        assert!((seq[0] - config.schedule.sigma_max).abs() < 1e-3);
+    }
+
     // ── ConsistencyPreconditioning ─────────────────────────────────────────
 
     #[test]
     fn test_c_skip_sigma_equals_sigma_data() {
-        let p = ConsistencyPreconditioning::new(0.5);
-        // c_skip(σ_data) = σ_data² / (σ_data² + σ_data²) = 0.5
+        // With sigma_min=0.0 (no boundary shift), c_skip reduces to the
+        // plain EDM form: c_skip(σ_data) = σ_data² / (σ_data² + σ_data²) = 0.5
+        let p = ConsistencyPreconditioning::with_sigma_min(0.5, 0.0);
         let v = p.c_skip(0.5);
         assert!(
             (v - 0.5).abs() < 1e-6,
@@ -818,10 +1063,45 @@ mod tests {
 
     #[test]
     fn test_c_out_sigma_zero_is_zero() {
-        let p = ConsistencyPreconditioning::new(0.5);
-        // c_out(0) = 0 * σ_data / sqrt(σ_data²) = 0
+        // With sigma_min=0.0 (no boundary shift), c_out(0) = 0 * σ_data /
+        // sqrt(σ_data²) = 0.
+        let p = ConsistencyPreconditioning::with_sigma_min(0.5, 0.0);
         let v = p.c_out(0.0);
         assert!(v.abs() < 1e-6, "c_out at sigma=0 should be 0, got {v}");
+    }
+
+    #[test]
+    fn test_boundary_condition_c_skip_c_out_at_sigma_min() {
+        // The consistency boundary condition: c_skip(σ_min) = 1 and
+        // c_out(σ_min) = 0, so D(x, σ_min) = x exactly.
+        let p = ConsistencyPreconditioning::new(0.5); // sigma_min = 0.002
+        let c_skip = p.c_skip(p.sigma_min);
+        let c_out = p.c_out(p.sigma_min);
+        assert!(
+            (c_skip - 1.0).abs() < 1e-5,
+            "c_skip(sigma_min) should be 1.0, got {c_skip}"
+        );
+        assert!(
+            c_out.abs() < 1e-5,
+            "c_out(sigma_min) should be 0.0, got {c_out}"
+        );
+    }
+
+    #[test]
+    fn test_apply_preconditioning_boundary_condition_at_sigma_min() {
+        // f(x, sigma_min) ~= x for arbitrary model output F.
+        let p = ConsistencyPreconditioning::new(0.5);
+        let x = vec![1.0_f32, -2.5, 3.7, 0.0];
+        let arbitrary_f = vec![42.0_f32, -13.0, 7.5, 100.0];
+        let result = p
+            .apply_preconditioning(&arbitrary_f, &x, p.sigma_min)
+            .unwrap();
+        for (r, xi) in result.iter().zip(x.iter()) {
+            assert!(
+                (r - xi).abs() < 1e-3,
+                "boundary condition violated: f(x, sigma_min) should ~= x, got {r} vs {xi}"
+            );
+        }
     }
 
     #[test]
@@ -1006,7 +1286,9 @@ mod tests {
         let initial = vec![1.0_f32; 4];
         let sigmas = vec![80.0_f32];
         let model_outs = vec![vec![0.0_f32; 4]];
-        let result = cm_multi_step_inference(&initial, &sigmas, &model_outs, &precon).unwrap();
+        let mut state = 1_u64;
+        let result =
+            cm_multi_step_inference(&initial, &sigmas, &model_outs, &precon, &mut state).unwrap();
         assert_eq!(result.len(), 4);
     }
 
@@ -1018,7 +1300,9 @@ mod tests {
         let n = 8;
         let model_outs: Vec<Vec<f32>> = sigmas.iter().map(|_| vec![0.1_f32; n]).collect();
         let initial = vec![0.5_f32; n];
-        let result = cm_multi_step_inference(&initial, &sigmas, &model_outs, &precon).unwrap();
+        let mut state = 42_u64;
+        let result =
+            cm_multi_step_inference(&initial, &sigmas, &model_outs, &precon, &mut state).unwrap();
         assert_eq!(result.len(), n);
         for r in &result {
             assert!(r.is_finite());
@@ -1028,7 +1312,8 @@ mod tests {
     #[test]
     fn test_cm_multi_step_inference_empty_sigma_error() {
         let precon = ConsistencyPreconditioning::new(0.5);
-        let result = cm_multi_step_inference(&[0.0; 4], &[], &[], &precon);
+        let mut state = 1_u64;
+        let result = cm_multi_step_inference(&[0.0; 4], &[], &[], &precon, &mut state);
         assert!(matches!(result, Err(CmConsistencyError::InvalidParam(_))));
     }
 
@@ -1037,7 +1322,64 @@ mod tests {
         let precon = ConsistencyPreconditioning::new(0.5);
         let sigmas = vec![80.0_f32, 40.0, 20.0];
         let model_outs = vec![vec![0.0_f32; 4]; 2]; // wrong length
-        let result = cm_multi_step_inference(&[0.0; 4], &sigmas, &model_outs, &precon);
+        let mut state = 1_u64;
+        let result = cm_multi_step_inference(&[0.0; 4], &sigmas, &model_outs, &precon, &mut state);
+        assert!(matches!(
+            result,
+            Err(CmConsistencyError::DimensionMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn test_cm_multi_step_inference_uses_fresh_noise_each_call() {
+        // Regression test: two calls with different RNG states must yield
+        // different trajectories (unlike the old deterministic-Euler
+        // behaviour, and unlike the old re-seeding bug class in general).
+        let precon = ConsistencyPreconditioning::new(0.5);
+        let sched = CmNoiseSchedule::default_edm();
+        let sigmas = sched.timestep_sigma_sequence(4);
+        let n = 16;
+        let model_outs: Vec<Vec<f32>> = sigmas.iter().map(|_| vec![0.1_f32; n]).collect();
+        let initial = vec![0.5_f32; n];
+
+        let mut state_a = 1_u64;
+        let result_a =
+            cm_multi_step_inference(&initial, &sigmas, &model_outs, &precon, &mut state_a).unwrap();
+        let mut state_b = 2_u64;
+        let result_b =
+            cm_multi_step_inference(&initial, &sigmas, &model_outs, &precon, &mut state_b).unwrap();
+
+        assert_ne!(
+            result_a, result_b,
+            "different RNG states should produce different stochastic trajectories"
+        );
+    }
+
+    // ── cm_euler_step_inference ─────────────────────────────────────────────
+
+    #[test]
+    fn test_cm_euler_step_inference_deterministic() {
+        let precon = ConsistencyPreconditioning::new(0.5);
+        let sched = CmNoiseSchedule::default_edm();
+        let sigmas = sched.timestep_sigma_sequence(4);
+        let n = 8;
+        let model_outs: Vec<Vec<f32>> = sigmas.iter().map(|_| vec![0.1_f32; n]).collect();
+        let initial = vec![0.5_f32; n];
+        let r1 = cm_euler_step_inference(&initial, &sigmas, &model_outs, &precon).unwrap();
+        let r2 = cm_euler_step_inference(&initial, &sigmas, &model_outs, &precon).unwrap();
+        assert_eq!(r1, r2, "cm_euler_step_inference must be deterministic");
+        assert_eq!(r1.len(), n);
+        for v in &r1 {
+            assert!(v.is_finite());
+        }
+    }
+
+    #[test]
+    fn test_cm_euler_step_inference_length_mismatch() {
+        let precon = ConsistencyPreconditioning::new(0.5);
+        let sigmas = vec![80.0_f32, 40.0, 20.0];
+        let model_outs = vec![vec![0.0_f32; 4]; 2]; // wrong length
+        let result = cm_euler_step_inference(&[0.0; 4], &sigmas, &model_outs, &precon);
         assert!(matches!(
             result,
             Err(CmConsistencyError::DimensionMismatch { .. })
@@ -1052,9 +1394,8 @@ mod tests {
         let x_next = vec![1.0_f32; 4];
         let model_out = vec![0.0_f32; 4]; // zero model output
                                           // target = c_skip(sigma_next)*x_next + c_out(sigma_next)*model_out
-        let sigma = 2.0;
         let sigma_next = 1.0;
-        let result = cm_compute_target(&x_next, &model_out, sigma, sigma_next, &precon).unwrap();
+        let result = cm_compute_target(&x_next, &model_out, sigma_next, &precon).unwrap();
         let c_skip = precon.c_skip(sigma_next);
         let expected = c_skip; // x_next=1, model_out=0
         for r in &result {
@@ -1065,7 +1406,7 @@ mod tests {
     #[test]
     fn test_cm_compute_target_dimension_mismatch() {
         let precon = ConsistencyPreconditioning::new(0.5);
-        let result = cm_compute_target(&[0.0; 4], &[0.0; 3], 2.0, 1.0, &precon);
+        let result = cm_compute_target(&[0.0; 4], &[0.0; 3], 1.0, &precon);
         assert!(matches!(
             result,
             Err(CmConsistencyError::DimensionMismatch { .. })
@@ -1075,7 +1416,7 @@ mod tests {
     #[test]
     fn test_cm_compute_target_invalid_sigma_next() {
         let precon = ConsistencyPreconditioning::new(0.5);
-        let result = cm_compute_target(&[0.0; 4], &[0.0; 4], 2.0, 0.0, &precon);
+        let result = cm_compute_target(&[0.0; 4], &[0.0; 4], 0.0, &precon);
         assert!(matches!(result, Err(CmConsistencyError::InvalidSigma(_))));
     }
 
@@ -1137,27 +1478,27 @@ mod tests {
 
     #[test]
     fn test_cm_weighted_loss_uniform() {
-        let sched = CmNoiseSchedule::default_edm();
+        let precon = ConsistencyPreconditioning::new(0.5);
         let pred = vec![1.0_f32; 4];
         let target = vec![0.0_f32; 4];
         let loss =
-            cm_weighted_loss(&pred, &target, 2.0, 1.0, &sched, &LcmLossWeight::Uniform).unwrap();
+            cm_weighted_loss(&pred, &target, 2.0, &precon, &LcmLossWeight::Uniform, 0.1).unwrap();
         assert!(loss > 0.0);
         assert!(loss.is_finite());
     }
 
     #[test]
     fn test_cm_weighted_loss_min_snr() {
-        let sched = CmNoiseSchedule::default_edm();
+        let precon = ConsistencyPreconditioning::new(0.5);
         let pred = vec![1.0_f32; 4];
         let target = vec![0.0_f32; 4];
         let loss = cm_weighted_loss(
             &pred,
             &target,
             2.0,
-            1.0,
-            &sched,
+            &precon,
             &LcmLossWeight::MinSnr { gamma: 5.0 },
+            0.1,
         )
         .unwrap();
         assert!(loss > 0.0);
@@ -1166,28 +1507,100 @@ mod tests {
 
     #[test]
     fn test_cm_weighted_loss_snr_plus1() {
-        let sched = CmNoiseSchedule::default_edm();
+        let precon = ConsistencyPreconditioning::new(0.5);
         let pred = vec![1.0_f32; 4];
         let target = vec![0.0_f32; 4];
         let loss =
-            cm_weighted_loss(&pred, &target, 2.0, 1.0, &sched, &LcmLossWeight::SnrPlus1).unwrap();
+            cm_weighted_loss(&pred, &target, 2.0, &precon, &LcmLossWeight::SnrPlus1, 0.1).unwrap();
         assert!(loss > 0.0);
         assert!(loss.is_finite());
+    }
+
+    #[test]
+    fn test_cm_weighted_loss_uniform_independent_of_sigma() {
+        // Regression test for the ~1e10 dynamic-range bug: with Uniform
+        // weighting the loss must depend only on (predicted, target), not
+        // on where sigma sits in the schedule — the old code multiplied in
+        // `cm_loss_weight`'s 1/|sigma - sigma_next| step-gap factor even
+        // under Uniform weighting, which swung wildly across the schedule.
+        let precon = ConsistencyPreconditioning::new(0.5);
+        let sched = CmNoiseSchedule::default_edm();
+        let pred = vec![1.0_f32, -0.5, 0.25, 2.0];
+        let target = vec![0.0_f32; 4];
+        let loss_at_min = cm_weighted_loss(
+            &pred,
+            &target,
+            sched.sigma_min,
+            &precon,
+            &LcmLossWeight::Uniform,
+            0.1,
+        )
+        .unwrap();
+        let loss_at_max = cm_weighted_loss(
+            &pred,
+            &target,
+            sched.sigma_max,
+            &precon,
+            &LcmLossWeight::Uniform,
+            0.1,
+        )
+        .unwrap();
+        assert!(
+            (loss_at_min - loss_at_max).abs() < 1e-5,
+            "Uniform-weighted loss must be sigma-independent: {loss_at_min} vs {loss_at_max}"
+        );
+    }
+
+    #[test]
+    fn test_cm_weighted_loss_snr_plus1_ratio_bounded() {
+        // The SnrPlus1 weight itself still has a real (and expected) large
+        // dynamic range across a schedule spanning sigma_min=0.002 to
+        // sigma_max=80 (~6.25e4, from the SNR ratio alone) — that is
+        // inherent to SNR-based weighting, not a bug. What must no longer
+        // happen is compounding it with the step-gap factor, which used to
+        // push the ratio to ~1e8-1e10. Guard against regression with a
+        // much looser bound than the old behaviour would need.
+        let precon = ConsistencyPreconditioning::new(0.5);
+        let sched = CmNoiseSchedule::default_edm();
+        let pred = vec![1.0_f32; 4];
+        let target = vec![0.0_f32; 4];
+        let loss_at_min = cm_weighted_loss(
+            &pred,
+            &target,
+            sched.sigma_min,
+            &precon,
+            &LcmLossWeight::SnrPlus1,
+            0.1,
+        )
+        .unwrap();
+        let loss_at_max = cm_weighted_loss(
+            &pred,
+            &target,
+            sched.sigma_max,
+            &precon,
+            &LcmLossWeight::SnrPlus1,
+            0.1,
+        )
+        .unwrap();
+        let ratio = loss_at_min / loss_at_max.max(1e-20);
+        assert!(
+            ratio < 1e5,
+            "SnrPlus1 loss ratio across the schedule should stay well below \
+             the old step_w-compounded blow-up (~1e8-1e10), got {ratio}"
+        );
     }
 
     // ── cm_loss_weight ─────────────────────────────────────────────────────
 
     #[test]
     fn test_cm_loss_weight_positive() {
-        let sched = CmNoiseSchedule::default_edm();
-        let w = cm_loss_weight(2.0, 1.0, &sched);
+        let w = cm_loss_weight(2.0, 1.0);
         assert!(w > 0.0, "cm_loss_weight should be positive, got {w}");
     }
 
     #[test]
     fn test_cm_loss_weight_equal_sigmas_returns_one() {
-        let sched = CmNoiseSchedule::default_edm();
-        let w = cm_loss_weight(1.0, 1.0, &sched);
+        let w = cm_loss_weight(1.0, 1.0);
         assert_eq!(w, 1.0, "equal sigmas should return 1.0 sentinel");
     }
 
@@ -1325,7 +1738,7 @@ mod tests {
     #[test]
     fn test_cm_compute_target_empty_slices() {
         let precon = ConsistencyPreconditioning::new(0.5);
-        let result = cm_compute_target(&[], &[], 2.0, 1.0, &precon).unwrap();
+        let result = cm_compute_target(&[], &[], 1.0, &precon).unwrap();
         assert!(result.is_empty());
     }
 
@@ -1351,5 +1764,33 @@ mod tests {
         assert!((c.guidance_scale - 7.5).abs() < 1e-6);
         assert_eq!(c.skipping_step, 20);
         assert_eq!(c.n_ddim_steps, 50);
+    }
+
+    // ── LcmConfig::{skipped_timesteps, guided_output} ────────────────────────
+
+    #[test]
+    fn test_lcm_config_skipped_timesteps_matches_free_function() {
+        let c = LcmConfig::default();
+        let via_method = c.skipped_timesteps(4);
+        let via_function = lcm_skipped_timesteps(c.n_ddim_steps, 4, c.skipping_step);
+        assert_eq!(via_method, via_function);
+        assert!(!via_method.is_empty());
+    }
+
+    #[test]
+    fn test_lcm_config_guided_output_matches_free_function() {
+        let c = LcmConfig {
+            guidance_scale: 2.0,
+            ..Default::default()
+        };
+        let cond = vec![4.0_f32; 4];
+        let uncond = vec![2.0_f32; 4];
+        let via_method = c.guided_output(&cond, &uncond).unwrap();
+        let via_function = lcm_guided_output(&cond, &uncond, c.guidance_scale).unwrap();
+        assert_eq!(via_method, via_function);
+        // w=2.0: uncond + 2*(cond - uncond) = 2 + 2*2 = 6.0
+        for v in &via_method {
+            assert!((v - 6.0).abs() < 1e-6, "got {v}");
+        }
     }
 }

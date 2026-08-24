@@ -802,7 +802,8 @@ pub fn gz_blink_waveform(t_ms: f32, duration_ms: f32) -> f32 {
 ///
 /// Uses an xorshift64 PRNG with exponential inter-blink intervals to produce
 /// a realistic, variable blink cadence.  Each blink is rendered with
-/// [`gz_blink_waveform`] over a fixed 150 ms window.
+/// [`gz_blink_waveform`] over a `blink_duration_ms` window (non-positive
+/// values are treated as the documented default of 150 ms).
 ///
 /// Returns a `Vec<f32>` of length `duration_steps` with values in `[0, 1]`.
 #[must_use]
@@ -810,6 +811,7 @@ pub fn gz_synthesize_blinks(
     duration_steps: usize,
     fps: f32,
     rate_per_min: f32,
+    blink_duration_ms: f32,
     seed: u64,
 ) -> Vec<f32> {
     let mut out = vec![0.0_f32; duration_steps];
@@ -817,7 +819,11 @@ pub fn gz_synthesize_blinks(
         return out;
     }
     let mean_interval_ms = 60_000.0 / rate_per_min;
-    let blink_dur_ms = 150.0_f32;
+    let blink_dur_ms = if blink_duration_ms > 0.0 {
+        blink_duration_ms
+    } else {
+        150.0_f32
+    };
     let ms_per_step = 1000.0 / fps;
     let total_ms = duration_steps as f32 * ms_per_step;
     // Hash seed to ensure well-distributed initial state even for small values.

@@ -299,20 +299,25 @@ pub struct UncondDropoutConfig {
     pub schedule: UncondSchedule,
     /// How the null embedding is constructed.
     pub null_type: NullEmbeddingType,
-    /// If `true`, all conditioning modalities are dropped together (same mask).
-    /// If `false`, each is dropped independently.
-    pub joint_dropout: bool,
     /// Ensure at least this fraction of each batch keeps conditioning.  Default: 0.0.
     pub min_batch_cond_fraction: f32,
 }
 
+// Note: there is deliberately no `joint_dropout` field here. `UncondDropout`
+// (built from this config) handles exactly one conditioning stream, so
+// "joint vs. independent dropout" is meaningless for it — that choice only
+// makes sense once more than one modality is involved, which is exactly
+// what [`MultiModalDropout`] is for (it takes its own `joint: bool`
+// constructor argument). An earlier revision carried a `joint_dropout` field
+// here that `UncondDropout` never read; it has been removed rather than
+// wired up, since wiring it would have meant duplicating state that
+// `MultiModalDropout` already owns correctly.
 impl Default for UncondDropoutConfig {
     fn default() -> Self {
         Self {
             conditioning_dim: 256,
             schedule: UncondSchedule::Constant(0.1),
             null_type: NullEmbeddingType::Zeros,
-            joint_dropout: false,
             min_batch_cond_fraction: 0.0,
         }
     }
@@ -825,12 +830,8 @@ pub fn uncond_format_config(config: &UncondDropoutConfig) -> String {
         NullEmbeddingType::Noise(s) => format!("Noise(scale={s:.4})"),
     };
     format!(
-        "UncondDropoutConfig(dim={}, schedule={}, null={}, joint={}, min_cond_frac={:.3})",
-        config.conditioning_dim,
-        schedule_name,
-        null_name,
-        config.joint_dropout,
-        config.min_batch_cond_fraction,
+        "UncondDropoutConfig(dim={}, schedule={}, null={}, min_cond_frac={:.3})",
+        config.conditioning_dim, schedule_name, null_name, config.min_batch_cond_fraction,
     )
 }
 
@@ -1635,6 +1636,24 @@ mod tests {
         let s = uncond_format_config(&cfg);
         assert!(!s.is_empty());
         assert!(s.contains("UncondDropoutConfig"));
+    }
+
+    /// Regression test: `UncondDropoutConfig` previously carried a
+    /// `joint_dropout` field that `UncondDropout` (single conditioning
+    /// stream) never read — only `MultiModalDropout::new`'s own `joint`
+    /// argument controls that behaviour. The field was removed rather than
+    /// wired up; guard against it (or an equally decorative substitute)
+    /// silently reappearing in the config summary.
+    #[test]
+    fn test_format_config_does_not_claim_joint_dropout() {
+        let cfg = UncondDropoutConfig::default();
+        let s = uncond_format_config(&cfg);
+        assert!(
+            !s.to_lowercase().contains("joint"),
+            "UncondDropoutConfig has no way to affect joint-vs-independent \
+             dropout (that lives on MultiModalDropout::new), so its summary \
+             must not claim otherwise: {s}"
+        );
     }
 
     #[test]

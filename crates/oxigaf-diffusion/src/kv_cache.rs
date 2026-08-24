@@ -29,7 +29,8 @@
 //! ```
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::DiffusionError;
 
@@ -48,7 +49,7 @@ use crate::DiffusionError;
 ///                     + s * head_dim
 ///                     + d
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct KVEntry {
     /// Key tensor (flat, `[batch, num_heads, seq_k, head_dim]`).
     pub keys: Vec<f32>,
@@ -63,7 +64,25 @@ pub struct KVEntry {
     /// Dimension per head.
     pub head_dim: usize,
     /// Number of times this entry has been retrieved via [`KVCache::get`].
-    pub access_count: u64,
+    ///
+    /// An atomic counter (rather than a plain `u64`) so that a cache hit can
+    /// bump it through a shared `Arc<KVEntry>` without needing exclusive
+    /// (`&mut`) access to the entry — see the [`KVCache`] struct docs.
+    pub access_count: AtomicU64,
+}
+
+impl Clone for KVEntry {
+    fn clone(&self) -> Self {
+        Self {
+            keys: self.keys.clone(),
+            values: self.values.clone(),
+            batch: self.batch,
+            num_heads: self.num_heads,
+            seq_k: self.seq_k,
+            head_dim: self.head_dim,
+            access_count: AtomicU64::new(self.access_count.load(Ordering::Relaxed)),
+        }
+    }
 }
 
 impl KVEntry {
@@ -87,18 +106,30 @@ impl KVEntry {
             num_heads,
             seq_k,
             head_dim,
-            access_count: 0,
+            access_count: AtomicU64::new(0),
         }
     }
 
-    /// Total number of elements in `keys` (or `values`).
+    /// Total number of elements implied by the declared `batch * num_heads *
+    /// seq_k * head_dim` dimensions (saturating on overflow rather than
+    /// wrapping, so a corrupt/huge declared shape cannot silently alias a
+    /// small value and pass [`KVEntry::is_valid`] by accident).
     pub fn num_elements(&self) -> usize {
-        self.batch * self.num_heads * self.seq_k * self.head_dim
+        self.batch
+            .saturating_mul(self.num_heads)
+            .saturating_mul(self.seq_k)
+            .saturating_mul(self.head_dim)
     }
 
-    /// Memory footprint in bytes — keys + values, each stored as `f32` (4 bytes).
+    /// Memory footprint in bytes: the actual sizes of the stored `keys` and
+    /// `values` buffers (not the declared `batch * num_heads * seq_k *
+    /// head_dim` dimensions, which [`KVEntry::new`] does not require to
+    /// match — see [`KVEntry::is_valid`]), each element counted as `f32` (4
+    /// bytes). Using the real buffer lengths means the cache's memory
+    /// accounting always reflects the bytes actually allocated, even for an
+    /// entry whose declared dimensions disagree with its data.
     pub fn memory_bytes(&self) -> usize {
-        self.num_elements() * 2 * 4
+        (self.keys.len() + self.values.len()) * std::mem::size_of::<f32>()
     }
 
     /// Return `true` when both stored vectors have the expected length.
@@ -210,18 +241,37 @@ impl CacheStats {
 ///
 /// All public methods are safe to call concurrently from multiple threads.
 ///
+/// Cached entries are stored as `Arc<KVEntry>`, so a cache hit returns a
+/// clone of the `Arc` (a refcount bump) rather than a deep copy of the
+/// underlying `keys`/`values` tensors — see [`KVCache::get`].
+///
 /// ## Deadlock avoidance
 ///
 /// Internally the struct holds three independent `Mutex` fields:
 /// `entries`, `insertion_order`, and `stats`. They are **never held
 /// simultaneously** — each lock is acquired, used, and released before the
-/// next is taken. This prevents deadlocks regardless of call order.
+/// next is taken (every method scopes each `lock()` guard to a `{ ... }`
+/// block that ends before the next field's lock is acquired). This prevents
+/// deadlocks regardless of call order.
 pub struct KVCache {
     config: KVCacheConfig,
-    /// Map from string key → [`KVEntry`].
-    entries: Mutex<HashMap<String, KVEntry>>,
-    /// Keys in insertion order; also updated on access for LRU.
-    insertion_order: Mutex<Vec<String>>,
+    /// Map from string key → shared [`KVEntry`].
+    entries: Mutex<HashMap<String, Arc<KVEntry>>>,
+    /// Ordering sequence number per key, used for LRU/FIFO eviction: the
+    /// entry with the *smallest* value is the eviction victim. `insert`
+    /// refreshes a key's sequence number unconditionally; `get` refreshes it
+    /// too, but only under [`EvictionPolicy::LRU`] (so under FIFO a key's
+    /// number reflects insertion order only, never access order). Using a
+    /// sequence number (rather than the previous `Vec<String>`, which
+    /// required an O(n) linear search-and-remove on every LRU-touching
+    /// `get`) makes both `get` and `insert` touch this map in O(1); only
+    /// [`KVCache::evict_one`] — which runs only when the cache is actually
+    /// over capacity — scans it, in O(n).
+    insertion_order: Mutex<HashMap<String, u64>>,
+    /// Monotonic counter feeding `insertion_order`. Lock-free since it never
+    /// needs to be consistent with `entries`/`insertion_order` beyond
+    /// producing distinct, increasing values.
+    seq: AtomicU64,
     /// Cumulative statistics.
     stats: Mutex<CacheStats>,
 }
@@ -232,9 +282,16 @@ impl KVCache {
         Self {
             config,
             entries: Mutex::new(HashMap::new()),
-            insertion_order: Mutex::new(Vec::new()),
+            insertion_order: Mutex::new(HashMap::new()),
+            seq: AtomicU64::new(0),
             stats: Mutex::new(CacheStats::default()),
         }
+    }
+
+    /// Return the next value from the monotonic ordering counter.
+    #[inline]
+    fn next_seq(&self) -> u64 {
+        self.seq.fetch_add(1, Ordering::Relaxed)
     }
 
     // -----------------------------------------------------------------------
@@ -253,10 +310,17 @@ impl KVCache {
     /// Retrieve a cached entry by key.
     ///
     /// On a hit the entry's `access_count` is incremented and, for LRU caches,
-    /// the key is moved to the "most recently used" end of the ordering queue.
+    /// the key's ordering sequence number is refreshed so it becomes the
+    /// "most recently used" entry.
+    ///
+    /// Returns a shared `Arc<KVEntry>`: a hit is a `HashMap` lookup plus a
+    /// refcount bump, never a deep copy of the cached `keys`/`values`
+    /// tensors — the doc's promise that "subsequent steps can skip the
+    /// expensive projection + matmul entirely" would otherwise be paid for
+    /// with a full memcpy on every single hit.
     ///
     /// Updates [`CacheStats::hits`] / [`CacheStats::misses`] accordingly.
-    pub fn get(&self, key: &str) -> Option<KVEntry> {
+    pub fn get(&self, key: &str) -> Option<Arc<KVEntry>> {
         if !self.config.enabled {
             let mut stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
             stats.misses += 1;
@@ -265,13 +329,11 @@ impl KVCache {
 
         // --- lock entries ---
         let hit = {
-            let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(entry) = entries.get_mut(key) {
-                entry.access_count += 1;
-                Some(entry.clone())
-            } else {
-                None
-            }
+            let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+            entries.get(key).map(|entry| {
+                entry.access_count.fetch_add(1, Ordering::Relaxed);
+                Arc::clone(entry)
+            })
         };
 
         // --- update insertion_order for LRU (no entries lock held) ---
@@ -280,9 +342,8 @@ impl KVCache {
                 .insertion_order
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            if let Some(pos) = order.iter().position(|k| k == key) {
-                order.remove(pos);
-                order.push(key.to_string());
+            if let Some(seq) = order.get_mut(key) {
+                *seq = self.next_seq();
             }
         }
 
@@ -308,13 +369,37 @@ impl KVCache {
     /// If the cache is at capacity ([`KVCacheConfig::max_entries`]) or the
     /// memory limit would be exceeded, entries are evicted until space is
     /// available. Returns an error only if eviction is impossible (i.e., the
-    /// single new entry exceeds the memory limit with an empty cache).
+    /// single new entry exceeds the memory limit with an empty cache), or if
+    /// `entry` fails [`KVEntry::is_valid`] (its `keys`/`values` buffers don't
+    /// match its declared `batch * num_heads * seq_k * head_dim` shape) —
+    /// inserting such an entry anyway would corrupt the cache's memory
+    /// accounting (which trusts the declared shape nowhere else) and could
+    /// let it silently exceed `max_memory_bytes`, or trigger eviction that
+    /// isn't actually needed.
     ///
     /// If the cache is disabled ([`KVCacheConfig::enabled`] = `false`), this
     /// method is a no-op.
     pub fn insert(&self, key: String, entry: KVEntry) -> Result<(), DiffusionError> {
+        self.insert_arc(key, Arc::new(entry))
+    }
+
+    /// Shared implementation behind [`KVCache::insert`] and
+    /// [`KVCache::get_or_compute`], taking an already-`Arc`-wrapped entry so
+    /// the miss path of `get_or_compute` can insert and return the very same
+    /// allocation (an `Arc::clone` refcount bump) instead of cloning the
+    /// freshly computed tensors a second time.
+    fn insert_arc(&self, key: String, entry: Arc<KVEntry>) -> Result<(), DiffusionError> {
         if !self.config.enabled {
             return Ok(());
+        }
+
+        if !entry.is_valid() {
+            let expected = entry.num_elements();
+            return Err(DiffusionError::ShapeMismatch {
+                op: "KVCache::insert".to_string(),
+                expected: vec![expected, expected],
+                got: vec![entry.keys.len(), entry.values.len()],
+            });
         }
 
         let entry_bytes = entry.memory_bytes();
@@ -329,10 +414,13 @@ impl KVCache {
 
         // Evict until both entry count and memory constraints are satisfied.
         loop {
-            let (current_entries, current_memory) = {
+            let current_entries = {
                 let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+                entries.len()
+            };
+            let current_memory = {
                 let stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
-                (entries.len(), stats.total_memory_bytes)
+                stats.total_memory_bytes
             };
 
             let over_count = current_entries >= self.config.max_entries;
@@ -364,14 +452,14 @@ impl KVCache {
             old.map(|e| e.memory_bytes())
         };
 
-        // Update insertion_order: remove old position if present, push to end.
+        // Update insertion_order: refresh this key's sequence number.
+        let seq = self.next_seq();
         {
             let mut order = self
                 .insertion_order
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            order.retain(|k| k != &key);
-            order.push(key);
+            order.insert(key, seq);
         }
 
         // Update stats.
@@ -408,7 +496,7 @@ impl KVCache {
                     .insertion_order
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
-                order.retain(|k| k != key);
+                order.remove(key);
             }
             {
                 let mut stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
@@ -456,12 +544,22 @@ impl KVCache {
     ///
     /// `compute_fn` returns `(keys, values, batch, num_heads, seq_k, head_dim)`.
     ///
+    /// Returns a shared `Arc<KVEntry>` on both the hit and the miss path. On
+    /// a miss, the freshly computed entry is wrapped in one `Arc` that is
+    /// both inserted into the cache and returned to the caller (an
+    /// `Arc::clone` refcount bump between the two), rather than being
+    /// deep-cloned a second time on top of the hit path's own saving.
+    ///
     /// # Race condition
     ///
     /// If two threads call `get_or_compute` for the same key simultaneously,
     /// both may invoke `compute_fn` and the second result will simply overwrite
     /// the first in the cache. This is safe (idempotent) but redundant.
-    pub fn get_or_compute<F>(&self, key: String, compute_fn: F) -> Result<KVEntry, DiffusionError>
+    pub fn get_or_compute<F>(
+        &self,
+        key: String,
+        compute_fn: F,
+    ) -> Result<Arc<KVEntry>, DiffusionError>
     where
         F: FnOnce() -> Result<(Vec<f32>, Vec<f32>, usize, usize, usize, usize), DiffusionError>,
     {
@@ -472,10 +570,13 @@ impl KVCache {
 
         // Cache miss: compute without holding any lock.
         let (keys, values, batch, num_heads, seq_k, head_dim) = compute_fn()?;
-        let new_entry = KVEntry::new(keys, values, batch, num_heads, seq_k, head_dim);
+        let new_entry = Arc::new(KVEntry::new(
+            keys, values, batch, num_heads, seq_k, head_dim,
+        ));
 
-        // Insert into cache (best-effort; ignore errors from disabled cache).
-        let _ = self.insert(key, new_entry.clone());
+        // Insert into cache (best-effort; ignore errors from disabled cache
+        // or from an invalid entry — the caller still receives it below).
+        let _ = self.insert_arc(key, Arc::clone(&new_entry));
 
         Ok(new_entry)
     }
@@ -514,16 +615,21 @@ impl KVCache {
     /// Evict one entry according to the configured policy.
     fn evict_one(&self) -> Result<(), DiffusionError> {
         let victim_key = match self.config.eviction {
-            // LRU / FIFO: evict the front of `insertion_order`
+            // LRU / FIFO: evict the key with the smallest ordering sequence
+            // number (oldest insertion, or — for LRU — least recently used).
             EvictionPolicy::LRU | EvictionPolicy::FIFO => {
                 let mut order = self
                     .insertion_order
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
-                if order.is_empty() {
-                    return Ok(());
+                let victim = order
+                    .iter()
+                    .min_by_key(|(_, &seq)| seq)
+                    .map(|(k, _)| k.clone());
+                if let Some(ref k) = victim {
+                    order.remove(k);
                 }
-                Some(order.remove(0))
+                victim
             }
 
             // LFU: scan entries for minimum access_count
@@ -531,7 +637,7 @@ impl KVCache {
                 let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
                 entries
                     .iter()
-                    .min_by_key(|(_, e)| e.access_count)
+                    .min_by_key(|(_, e)| e.access_count.load(Ordering::Relaxed))
                     .map(|(k, _)| k.clone())
             }
         };
@@ -545,12 +651,13 @@ impl KVCache {
 
             if let Some(entry) = removed {
                 // For LFU the key is still in insertion_order — clean it up.
+                // (LRU/FIFO already removed it above, before releasing the lock.)
                 if self.config.eviction == EvictionPolicy::LFU {
                     let mut order = self
                         .insertion_order
                         .lock()
                         .unwrap_or_else(|e| e.into_inner());
-                    order.retain(|k| k != &key);
+                    order.remove(&key);
                 }
 
                 let mut stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
@@ -672,7 +779,7 @@ mod tests {
         assert_eq!(entry.head_dim, 2);
         assert_eq!(entry.keys, keys);
         assert_eq!(entry.values, values);
-        assert_eq!(entry.access_count, 0);
+        assert_eq!(entry.access_count.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -694,7 +801,7 @@ mod tests {
             num_heads: 2,
             seq_k: 4,
             head_dim: 8,
-            access_count: 0,
+            access_count: AtomicU64::new(0),
         };
         assert!(!bad_entry.is_valid(), "wrong keys length should be invalid");
     }
@@ -709,7 +816,7 @@ mod tests {
             num_heads: 2,
             seq_k: 4,
             head_dim: 8,
-            access_count: 0,
+            access_count: AtomicU64::new(0),
         };
         assert!(
             !bad_entry.is_valid(),
@@ -772,7 +879,72 @@ mod tests {
         let _ = cache.get("k"); // access 1
         let retrieved = cache.get("k").expect("second get"); // access 2
                                                              // After two gets, access_count is 2 (we read the clone after the 2nd get).
-        assert_eq!(retrieved.access_count, 2);
+        assert_eq!(retrieved.access_count.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn test_kvcache_get_returns_shared_arc_not_a_deep_copy() {
+        // Repeated `get()` calls on the same key must return clones of the
+        // same underlying allocation (a refcount bump), not independent deep
+        // copies of the keys/values tensors.
+        let cache = KVCache::new(KVCacheConfig::default());
+        let entry = make_entry(1, 2, 4, 8);
+        cache.insert("k".to_string(), entry).expect("insert");
+        let a = cache.get("k").expect("first get");
+        let b = cache.get("k").expect("second get");
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "get() hits should share the same Arc allocation"
+        );
+    }
+
+    #[test]
+    fn test_insert_rejects_invalid_entry() {
+        // Declared dims say 1*2*4*8 = 64 elements per tensor, but only 4 are
+        // actually provided — insert must reject this instead of corrupting
+        // the cache's memory accounting.
+        let bad_entry = KVEntry::new(vec![0.0; 4], vec![0.0; 4], 1, 2, 4, 8);
+        assert!(!bad_entry.is_valid());
+        let cache = KVCache::new(KVCacheConfig::default());
+        let result = cache.insert("bad".to_string(), bad_entry);
+        assert!(
+            result.is_err(),
+            "insert must reject an entry whose buffers don't match its declared dimensions"
+        );
+        assert!(!cache.contains("bad"));
+        assert_eq!(cache.stats().num_entries, 0);
+    }
+
+    #[test]
+    fn test_lru_eviction_prefers_least_recently_used() {
+        let cfg = KVCacheConfig {
+            max_entries: 2,
+            max_memory_bytes: 0,
+            enabled: true,
+            eviction: EvictionPolicy::LRU,
+        };
+        let cache = KVCache::new(cfg);
+        cache
+            .insert("a".to_string(), make_entry(1, 1, 2, 4))
+            .expect("insert a");
+        cache
+            .insert("b".to_string(), make_entry(1, 1, 2, 4))
+            .expect("insert b");
+        // Touch "a" so "b" becomes the least recently used.
+        let _ = cache.get("a");
+        // Inserting a third entry should evict "b", not "a".
+        cache
+            .insert("c".to_string(), make_entry(1, 1, 2, 4))
+            .expect("insert c");
+        assert!(
+            cache.contains("a"),
+            "recently-touched entry must survive eviction"
+        );
+        assert!(
+            !cache.contains("b"),
+            "least-recently-used entry must be evicted"
+        );
+        assert!(cache.contains("c"));
     }
 
     #[test]

@@ -32,6 +32,8 @@
 
 use thiserror::Error;
 
+use crate::classifier_guidance::ScoreFunction;
+
 // ---------------------------------------------------------------------------
 // Error type
 // ---------------------------------------------------------------------------
@@ -72,12 +74,17 @@ pub enum ImageVariationError {
 // VariationMode
 // ---------------------------------------------------------------------------
 
-/// Strategy used to generate each image variation.
+/// Strategy used to generate each image variation via [`generate_variations`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum VariationMode {
     /// Add Gaussian noise directly to the latent code.
     Latent,
-    /// Score-weighted perturbation scaled by `temperature`.
+    /// Add Gaussian noise scaled by `noise_scale * temperature` — i.e.
+    /// `Latent` with an extra temperature knob, *not* score-guided: this
+    /// path has no score/gradient signal available ([`ImageVariationConfig`]
+    /// carries none). For genuine score-weighted perturbation, call
+    /// [`generate_guided_variations`] directly with a `ScoreFunction` (see
+    /// `crate::classifier_guidance`).
     Guided,
     /// Linear interpolation between the base latent and a random latent.
     Interpolated,
@@ -320,6 +327,25 @@ fn box_muller(state: &mut u64) -> (f32, f32) {
     ((r * theta.cos()) as f32, (r * theta.sin()) as f32)
 }
 
+/// Decorrelate a `(base_seed, index)` pair into a well-mixed xorshift64 seed.
+///
+/// `xorshift64` has weak avalanche from seeds that are numerically close —
+/// states differing only in the low bits (as `base_seed.wrapping_add(i)`
+/// does for consecutive small `i`) stay close for the first several
+/// outputs, so naively deriving each variation's seed as `base_seed + i`
+/// produces visibly correlated low-frequency structure between adjacent
+/// variations. Passing the pair through a SplitMix64-style finalizer first
+/// breaks that correlation while staying fully deterministic.
+#[inline]
+fn mix_seed(base_seed: u64, index: u64) -> u64 {
+    let mut z = base_seed.wrapping_add(index.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    // xorshift64 requires non-zero state.
+    z.max(1)
+}
+
 /// Generate a complete Gaussian-noise latent with the same shape as `template`.
 fn gaussian_noise_latent(template: &VarLatentVector, scale: f32, seed: u64) -> VarLatentVector {
     let mut state: u64 = seed.max(1);
@@ -454,8 +480,8 @@ pub fn generate_variations(
     config.validate()?;
     let mut variations = Vec::with_capacity(config.num_variations);
     for i in 0..config.num_variations {
-        // Derive a unique seed for each variation.
-        let variation_seed = config.seed.wrapping_add(i as u64).max(1);
+        // Derive a unique, decorrelated seed for each variation.
+        let variation_seed = mix_seed(config.seed, i as u64);
         let var = match config.mode {
             VariationMode::Latent => add_latent_noise(base, config.noise_scale, variation_seed),
             VariationMode::Guided => {
@@ -473,6 +499,107 @@ pub fn generate_variations(
         variations.push(var);
     }
     Ok(variations)
+}
+
+/// Generate `config.num_variations` *genuinely* score-guided variations of
+/// `base`.
+///
+/// Each variation combines two components:
+/// 1. Isotropic Gaussian noise (same as [`VariationMode::Latent`]) for
+///    diversity, scaled by `config.noise_scale`.
+/// 2. A bias along the estimated gradient of `score_fn` (steepest local
+///    ascent, via central finite differences — no autograd is available in
+///    pure Rust), scaled so that at `temperature == 1.0` its magnitude
+///    matches the *typical* norm of the noise component
+///    (`noise_scale * sqrt(numel)`); `temperature` scales this bias
+///    linearly, and `temperature == 0.0` degenerates to plain
+///    [`VariationMode::Latent`] noise (rejected by [`ImageVariationConfig::validate`],
+///    which requires `temperature > 0.0` — call [`add_latent_noise`] directly
+///    if you want an unguided baseline).
+///
+/// This is what [`VariationMode::Guided`] is documented as, but — routed
+/// through [`generate_variations`] — cannot actually perform, because
+/// [`ImageVariationConfig`] has nowhere to carry a score function. Call this
+/// function directly whenever a concrete guidance signal is available; see
+/// `crate::classifier_guidance` for ready-made [`ScoreFunction`]s (e.g.
+/// `MeanMaximizer`, `TargetProximity`).
+///
+/// # Errors
+///
+/// - Propagates [`ImageVariationConfig::validate`] errors.
+/// - [`ImageVariationError::NumericalError`] if `score_fn` fails to evaluate.
+///
+/// # Performance
+///
+/// The gradient estimate costs `2 * base.numel()` calls to `score_fn` per
+/// variation (central differences, one dimension at a time) — for a large
+/// latent this can dominate runtime. `crate::classifier_guidance` offers a
+/// stochastic (SPSA) gradient estimator for that regime; this function
+/// always uses the exact per-dimension estimate for simplicity.
+pub fn generate_guided_variations<S: ScoreFunction>(
+    base: &VarLatentVector,
+    config: &ImageVariationConfig,
+    score_fn: &S,
+) -> Result<Vec<VarLatentVector>, ImageVariationError> {
+    config.validate()?;
+    let eps = 1e-3_f32;
+    let mut variations = Vec::with_capacity(config.num_variations);
+    for i in 0..config.num_variations {
+        let variation_seed = mix_seed(config.seed, i as u64);
+        // Isotropic noise component (diversity), same as `Latent` mode.
+        let noisy = add_latent_noise(base, config.noise_scale, variation_seed);
+        // Gradient bias component (guidance): unit-norm direction of steepest
+        // local score ascent at the noisy point, scaled so `temperature == 1`
+        // roughly matches the noise component's own typical magnitude.
+        let direction = score_gradient_direction(&noisy.data, score_fn, eps)?;
+        let grad_scale = config.temperature * config.noise_scale * (noisy.data.len() as f32).sqrt();
+        let data: Vec<f32> = noisy
+            .data
+            .iter()
+            .zip(direction.iter())
+            .map(|(&x, &g)| x + grad_scale * g)
+            .collect();
+        variations.push(VarLatentVector {
+            channels: base.channels,
+            height: base.height,
+            width: base.width,
+            data,
+        });
+    }
+    Ok(variations)
+}
+
+/// Central-difference gradient of `score_fn` at `latent`, normalised to unit
+/// L2 norm (a pure *direction*; its magnitude carries no information about
+/// the score function's own scale, by design — callers apply their own
+/// scale). Returns an all-zero vector when the gradient's norm is ~0 (a
+/// local optimum, or a constant score function).
+fn score_gradient_direction<S: ScoreFunction>(
+    latent: &[f32],
+    score_fn: &S,
+    eps: f32,
+) -> Result<Vec<f32>, ImageVariationError> {
+    let mut grad = vec![0.0f32; latent.len()];
+    let mut probe = latent.to_vec();
+    for i in 0..latent.len() {
+        probe[i] = latent[i] + eps;
+        let s_plus = score_fn
+            .score(&probe)
+            .map_err(|e| ImageVariationError::NumericalError(e.to_string()))?;
+        probe[i] = latent[i] - eps;
+        let s_minus = score_fn
+            .score(&probe)
+            .map_err(|e| ImageVariationError::NumericalError(e.to_string()))?;
+        probe[i] = latent[i];
+        grad[i] = (s_plus - s_minus) / (2.0 * eps);
+    }
+    let norm = grad.iter().fold(0.0f32, |acc, &x| acc + x * x).sqrt();
+    if norm > f32::EPSILON {
+        for g in grad.iter_mut() {
+            *g /= norm;
+        }
+    }
+    Ok(grad)
 }
 
 /// L2 distance between two latent vectors.
@@ -629,13 +756,31 @@ pub fn project_to_sphere(latent: &VarLatentVector) -> Result<VarLatentVector, Im
 ///
 /// Returns `(means, stds)` where each `Vec<f32>` has length `latent.channels`.
 /// An empty spatial extent (`H * W == 0`) returns `(vec![0.0; C], vec![0.0; C])`.
-pub fn var_channel_statistics(latent: &VarLatentVector) -> (Vec<f32>, Vec<f32>) {
+///
+/// # Errors
+///
+/// [`ImageVariationError::DimensionMismatch`] if `latent.data.len() !=
+/// latent.numel()`. `VarLatentVector`'s fields are all `pub`, so a
+/// struct-literal-constructed value (or one whose `data` was truncated in
+/// place) can desynchronize `data` from `channels`/`height`/`width`; without
+/// this check, slicing per channel below would index out of bounds instead
+/// of reporting the mismatch.
+pub fn var_channel_statistics(
+    latent: &VarLatentVector,
+) -> Result<(Vec<f32>, Vec<f32>), ImageVariationError> {
+    let expected = latent.numel();
+    if latent.data.len() != expected {
+        return Err(ImageVariationError::DimensionMismatch {
+            expected,
+            actual: latent.data.len(),
+        });
+    }
     let c = latent.channels;
     let spatial = latent.height * latent.width;
     let mut means = vec![0.0f32; c];
     let mut stds = vec![0.0f32; c];
     if spatial == 0 {
-        return (means, stds);
+        return Ok((means, stds));
     }
     for ch in 0..c {
         let offset = ch * spatial;
@@ -652,22 +797,39 @@ pub fn var_channel_statistics(latent: &VarLatentVector) -> (Vec<f32>, Vec<f32>) 
         means[ch] = mean;
         stds[ch] = var.sqrt();
     }
-    (means, stds)
+    Ok((means, stds))
 }
 
 /// Clamp all values in `latent` to `[min_val, max_val]`.
-pub fn clamp_latent(latent: &VarLatentVector, min_val: f32, max_val: f32) -> VarLatentVector {
+///
+/// # Errors
+///
+/// [`ImageVariationError::InvalidConfig`] if either bound is non-finite or
+/// `min_val > max_val` — `f32::clamp` panics on exactly this input
+/// (`"min > max, or either was NaN"`), and since this function previously
+/// returned a plain `VarLatentVector`, there was no way to report the
+/// problem instead of panicking.
+pub fn clamp_latent(
+    latent: &VarLatentVector,
+    min_val: f32,
+    max_val: f32,
+) -> Result<VarLatentVector, ImageVariationError> {
+    if !min_val.is_finite() || !max_val.is_finite() || min_val > max_val {
+        return Err(ImageVariationError::InvalidConfig(format!(
+            "clamp_latent bounds must be finite with min_val <= max_val, got min_val={min_val}, max_val={max_val}"
+        )));
+    }
     let data: Vec<f32> = latent
         .data
         .iter()
         .map(|&x| x.clamp(min_val, max_val))
         .collect();
-    VarLatentVector {
+    Ok(VarLatentVector {
         channels: latent.channels,
         height: latent.height,
         width: latent.width,
         data,
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -705,8 +867,9 @@ impl VariationExplorer {
     /// Apply one noisy perturbation step and return a reference to the new
     /// current latent.  The previous state is pushed onto the history stack.
     pub fn step(&mut self) -> Result<&VarLatentVector, ImageVariationError> {
-        // Derive a step-specific seed so each step is deterministic but unique.
-        let step_seed = self.config.seed.wrapping_add(self.step_count as u64).max(1);
+        // Derive a step-specific, decorrelated seed so each step is
+        // deterministic but unique.
+        let step_seed = mix_seed(self.config.seed, self.step_count as u64);
         let next = add_latent_noise(&self.current, self.config.noise_scale, step_seed);
         self.history.push(self.current.clone());
         self.current = next;
@@ -919,6 +1082,34 @@ mod tests {
         assert_eq!(noisy.shape(), base.shape());
     }
 
+    // ---- mix_seed ------------------------------------------------------------
+
+    #[test]
+    fn test_mix_seed_avalanche() {
+        // Consecutive indices must decorrelate: adjacent variation seeds
+        // should differ in many bits, not just the low ones.
+        let s0 = mix_seed(42, 0);
+        let s1 = mix_seed(42, 1);
+        let hamming = (s0 ^ s1).count_ones();
+        assert!(
+            hamming >= 20,
+            "consecutive-index seeds should differ in many bits (avalanche), got {hamming} of 64"
+        );
+    }
+
+    #[test]
+    fn test_mix_seed_nonzero() {
+        // xorshift64 requires non-zero state.
+        for i in 0..1000u64 {
+            assert_ne!(mix_seed(0, i), 0);
+        }
+    }
+
+    #[test]
+    fn test_mix_seed_deterministic() {
+        assert_eq!(mix_seed(7, 3), mix_seed(7, 3));
+    }
+
     // ---- interpolate_latents -----------------------------------------------
 
     #[test]
@@ -1066,6 +1257,76 @@ mod tests {
         assert!(generate_variations(&base, &cfg).is_err());
     }
 
+    // ---- generate_guided_variations -----------------------------------------
+
+    /// Toy score function: rewards latents whose mean is large (mirrors the
+    /// `MeanMaximizer` example in `classifier_guidance`), so guided
+    /// variations should trend toward a higher mean than the base latent.
+    struct SumScore;
+
+    impl ScoreFunction for SumScore {
+        fn score(
+            &self,
+            latent: &[f32],
+        ) -> Result<f32, crate::classifier_guidance::ClassifierGuidanceError> {
+            Ok(latent.iter().sum())
+        }
+
+        fn name(&self) -> &str {
+            "sum_score_test"
+        }
+    }
+
+    #[test]
+    fn test_generate_guided_variations_count_and_shape() {
+        let base = VarLatentVector::new(2, 4, 4);
+        let cfg = ImageVariationConfig {
+            mode: VariationMode::Guided,
+            num_variations: 3,
+            temperature: 1.0,
+            ..default_config()
+        };
+        let vars = generate_guided_variations(&base, &cfg, &SumScore).unwrap();
+        assert_eq!(vars.len(), 3);
+        for v in &vars {
+            assert_eq!(v.shape(), base.shape());
+        }
+    }
+
+    #[test]
+    fn test_generate_guided_variations_moves_toward_higher_score() {
+        let base = VarLatentVector::new(1, 4, 4);
+        let cfg = ImageVariationConfig {
+            mode: VariationMode::Guided,
+            num_variations: 8,
+            noise_scale: 0.05,
+            temperature: 3.0,
+            ..default_config()
+        };
+        let vars = generate_guided_variations(&base, &cfg, &SumScore).unwrap();
+        // With a strong temperature relative to noise, the gradient bias
+        // (pointing toward larger sum, i.e. all-ones direction) should
+        // dominate: every variation's sum should end up positive.
+        let base_score = SumScore.score(&base.data).unwrap();
+        for v in &vars {
+            let score = SumScore.score(&v.data).unwrap();
+            assert!(
+                score > base_score,
+                "guided variation should score higher than base: {score} vs {base_score}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_generate_guided_variations_num_zero_returns_error() {
+        let base = VarLatentVector::new(2, 4, 4);
+        let cfg = ImageVariationConfig {
+            num_variations: 0,
+            ..default_config()
+        };
+        assert!(generate_guided_variations(&base, &cfg, &SumScore).is_err());
+    }
+
     // ---- latent_distance ---------------------------------------------------
 
     #[test]
@@ -1203,7 +1464,7 @@ mod tests {
     fn test_channel_stats_single_channel_constant() {
         // All values are 3.0 → mean = 3, std = 0.
         let l = make_latent(1, 4, 4, 3.0);
-        let (means, stds) = var_channel_statistics(&l);
+        let (means, stds) = var_channel_statistics(&l).unwrap();
         assert_eq!(means.len(), 1);
         assert!((means[0] - 3.0).abs() < 1e-5);
         assert!(stds[0].abs() < 1e-5);
@@ -1218,7 +1479,7 @@ mod tests {
             d
         };
         let l = VarLatentVector::from_data(2, 2, 4, data).unwrap();
-        let (means, stds) = var_channel_statistics(&l);
+        let (means, stds) = var_channel_statistics(&l).unwrap();
         assert_eq!(means.len(), 2);
         assert!((means[0] - 1.0).abs() < 1e-5);
         assert!((means[1] - 2.0).abs() < 1e-5);
@@ -1232,16 +1493,47 @@ mod tests {
     fn test_clamp_latent_values_outside_range() {
         let data = vec![-5.0, -1.0, 0.5, 2.0, 10.0];
         let l = VarLatentVector::from_data(1, 1, 5, data).unwrap();
-        let clamped = clamp_latent(&l, -1.0, 2.0);
+        let clamped = clamp_latent(&l, -1.0, 2.0).unwrap();
         assert_eq!(clamped.data, vec![-1.0, -1.0, 0.5, 2.0, 2.0]);
     }
 
     #[test]
     fn test_clamp_latent_preserves_shape() {
         let l = make_latent(3, 4, 4, 5.0);
-        let c = clamp_latent(&l, 0.0, 3.0);
+        let c = clamp_latent(&l, 0.0, 3.0).unwrap();
         assert_eq!(c.shape(), l.shape());
         assert!(c.data.iter().all(|&x| (0.0..=3.0).contains(&x)));
+    }
+
+    #[test]
+    fn test_clamp_latent_rejects_reversed_bounds() {
+        let l = make_latent(1, 1, 4, 1.0);
+        let result = clamp_latent(&l, 2.0, -2.0);
+        assert!(matches!(result, Err(ImageVariationError::InvalidConfig(_))));
+    }
+
+    #[test]
+    fn test_clamp_latent_rejects_nan_bound() {
+        let l = make_latent(1, 1, 4, 1.0);
+        let result = clamp_latent(&l, f32::NAN, 1.0);
+        assert!(matches!(result, Err(ImageVariationError::InvalidConfig(_))));
+    }
+
+    #[test]
+    fn test_var_channel_statistics_rejects_length_mismatch() {
+        // `data` has 2 elements but the declared shape wants 12 — this must
+        // report a `DimensionMismatch`, not panic while slicing per channel.
+        let l = VarLatentVector {
+            channels: 3,
+            height: 2,
+            width: 2,
+            data: vec![1.0, 2.0],
+        };
+        let result = var_channel_statistics(&l);
+        assert!(matches!(
+            result,
+            Err(ImageVariationError::DimensionMismatch { .. })
+        ));
     }
 
     // ---- VariationExplorer -------------------------------------------------

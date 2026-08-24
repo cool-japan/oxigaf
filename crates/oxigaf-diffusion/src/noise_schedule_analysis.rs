@@ -268,9 +268,19 @@ impl NoiseSchedule {
     ///   alpha_bar_t = 1 / (1 + σ_i²)
     /// so that σ = sqrt((1-ᾱ)/ᾱ) (the standard diffusion SNR relationship).
     ///
+    /// Like every other schedule in this module (and as [`Self::from_betas`]
+    /// validates), index `0` is the *cleanest* step (ᾱ close to 1, σ close to
+    /// `sigma_min`) and the index increases toward the *noisiest* step (ᾱ
+    /// close to 0, σ close to `sigma_max`) — the standard forward-diffusion
+    /// convention `t=0` → clean, `t=T` → noise. [`karras_sigma_at`]'s raw
+    /// sampler-step order runs the opposite way (noisiest-to-cleanest, since
+    /// reverse sampling starts from pure noise), so that sequence is
+    /// reversed here before conversion.
+    ///
     /// # Errors
     /// Returns `ScheduleAnalysisError::InvalidTimesteps` if `num_timesteps < 2`.
-    /// Returns `ScheduleAnalysisError::InvalidBeta` if `sigma_min <= 0` or `sigma_max <= sigma_min`.
+    /// Returns `ScheduleAnalysisError::InvalidBeta` if `sigma_min <= 0`,
+    /// `sigma_max <= sigma_min`, or `rho <= 0`.
     pub fn karras(
         num_timesteps: usize,
         sigma_min: f32,
@@ -286,38 +296,41 @@ impl NoiseSchedule {
         if sigma_max <= sigma_min {
             return Err(ScheduleAnalysisError::InvalidBeta(sigma_max, 1));
         }
-        // Build sigmas from noisiest (i=0) to cleanest (i=N-1)
-        let sigmas: Vec<f32> = (0..num_timesteps)
+        if rho <= 0.0 || !rho.is_finite() {
+            return Err(ScheduleAnalysisError::InvalidBeta(rho, 2));
+        }
+        // Raw sampler order: noisiest (sigma_max) at i=0 down to cleanest
+        // (sigma_min) at i=N-1.
+        let mut sigmas: Vec<f32> = (0..num_timesteps)
             .map(|i| karras_sigma_at(i, num_timesteps, sigma_min, sigma_max, rho))
             .collect();
-        // Convert sigma → alpha_bar: alpha_bar = 1/(1 + sigma²)
-        let alphas_cumprod: Vec<f32> = sigmas.iter().map(|&s| 1.0 / (1.0 + s * s)).collect();
-        // alpha_t = alpha_bar_t / alpha_bar_{t-1}
-        let alphas: Vec<f32> = std::iter::once(alphas_cumprod[0])
-            .chain(alphas_cumprod.windows(2).map(|w| w[1] / w[0]))
+        // Reverse so index 0 is the cleanest step, matching the convention
+        // `from_betas` (and every other constructor here) requires.
+        sigmas.reverse();
+
+        // Convert sigma → alpha_bar: alpha_bar = 1/(1 + sigma²). With the
+        // reversed (increasing-sigma) order this is now strictly
+        // decreasing, per the standard convention.
+        let target_alphas_cumprod: Vec<f32> = sigmas.iter().map(|&s| 1.0 / (1.0 + s * s)).collect();
+
+        // Recover the per-step beta that reproduces this target
+        // cumulative-product sequence exactly: alpha_t = ᾱ_t / ᾱ_{t-1}
+        // (with ᾱ_{-1} := 1), beta_t = 1 - alpha_t. Routing these through
+        // `from_betas` (rather than building the struct directly) applies
+        // the same beta-range and monotonicity validation every other
+        // schedule constructor gets.
+        let betas: Vec<f32> = std::iter::once(1.0 - target_alphas_cumprod[0])
+            .chain(target_alphas_cumprod.windows(2).map(|w| 1.0 - w[1] / w[0]))
             .collect();
-        // beta_t = 1 - alpha_t
-        let betas: Vec<f32> = alphas.iter().map(|&a| 1.0 - a).collect();
-        let alphas_cumprod_prev: Vec<f32> = std::iter::once(1.0f32)
-            .chain(alphas_cumprod[..alphas_cumprod.len() - 1].iter().copied())
-            .collect();
-        let sqrt_alphas_cumprod: Vec<f32> = alphas_cumprod.iter().map(|x| x.sqrt()).collect();
-        let sqrt_one_minus_alphas_cumprod: Vec<f32> =
-            alphas_cumprod.iter().map(|x| (1.0 - x).sqrt()).collect();
-        Ok(NoiseSchedule {
-            schedule_type: ScheduleType::Karras {
+
+        Self::from_betas(
+            betas,
+            ScheduleType::Karras {
                 sigma_min,
                 sigma_max,
                 rho,
             },
-            num_timesteps,
-            betas,
-            alphas,
-            alphas_cumprod,
-            alphas_cumprod_prev,
-            sqrt_alphas_cumprod,
-            sqrt_one_minus_alphas_cumprod,
-        })
+        )
     }
 
     /// Signal-to-Noise Ratio at timestep t: SNR(t) = ᾱ_t / (1 - ᾱ_t)
@@ -1057,20 +1070,72 @@ mod tests {
         }
     }
 
-    // 28. alphas_cumprod from Karras schedule are monotone increasing
-    //     (because sigma decreases ↓, alpha_bar = 1/(1+σ²) increases ↑)
+    // 28. alphas_cumprod from Karras schedule are monotone DECREASING, same
+    //     as every other schedule in this module (index 0 = cleanest step,
+    //     ᾱ close to 1; index increases toward noisiest, ᾱ close to 0).
+    //     Regression test for the inverted-schedule bug: this used to assert
+    //     the opposite (increasing) direction, which is what a raw,
+    //     un-reversed Karras sampler sequence produces.
     #[test]
-    fn test_karras_alpha_bar_monotone_increasing() {
+    fn test_karras_alpha_bar_monotone_decreasing() {
         let sched = NoiseSchedule::karras(20, 0.002, 80.0, 7.0).unwrap();
         for i in 1..sched.alphas_cumprod.len() {
             assert!(
-                sched.alphas_cumprod[i] > sched.alphas_cumprod[i - 1],
-                "karras alphas_cumprod should be strictly increasing at i={}: {} <= {}",
+                sched.alphas_cumprod[i] < sched.alphas_cumprod[i - 1],
+                "karras alphas_cumprod should be strictly decreasing at i={}: {} >= {}",
                 i,
                 sched.alphas_cumprod[i],
                 sched.alphas_cumprod[i - 1]
             );
         }
+    }
+
+    // 28b. Regression test: betas must all be strictly positive (the
+    // inverted schedule produced negative betas because alphas_cumprod was
+    // increasing, making alpha_t = ᾱ_t / ᾱ_{t-1} > 1).
+    #[test]
+    fn test_karras_betas_all_positive() {
+        let sched = NoiseSchedule::karras(20, 0.002, 80.0, 7.0).unwrap();
+        for (i, &b) in sched.betas.iter().enumerate() {
+            assert!(b > 0.0 && b < 1.0, "betas[{i}] = {b} not in (0, 1)");
+        }
+    }
+
+    // 28c. Regression test: alphas_cumprod[0] should be near 1 (cleanest
+    // step, corresponding to sigma_min) and alphas_cumprod[last] should be
+    // small (noisiest step, corresponding to sigma_max) — the opposite
+    // orientation of the pre-fix bug.
+    #[test]
+    fn test_karras_alpha_bar_endpoints_match_sigma_orientation() {
+        let sched = NoiseSchedule::karras(20, 0.002, 80.0, 7.0).unwrap();
+        let first = sched.alphas_cumprod[0];
+        let last = sched.alphas_cumprod[sched.alphas_cumprod.len() - 1];
+        assert!(
+            first > 0.9,
+            "alphas_cumprod[0] should be near 1 (sigma_min is tiny), got {first}"
+        );
+        assert!(
+            last < 0.01,
+            "alphas_cumprod[last] should be near 0 (sigma_max is large), got {last}"
+        );
+    }
+
+    // 28d. Regression test: rho <= 0 is rejected (the reversal fix assumes
+    // karras_sigma_at is monotonic in i, which requires rho > 0).
+    #[test]
+    fn test_karras_invalid_rho_non_positive() {
+        let result = NoiseSchedule::karras(20, 0.002, 80.0, 0.0);
+        assert!(
+            matches!(result, Err(ScheduleAnalysisError::InvalidBeta(_, 2))),
+            "expected InvalidBeta(_, 2) for rho=0, got {:?}",
+            result
+        );
+        let result_neg = NoiseSchedule::karras(20, 0.002, 80.0, -1.0);
+        assert!(
+            matches!(result_neg, Err(ScheduleAnalysisError::InvalidBeta(_, 2))),
+            "expected InvalidBeta(_, 2) for rho=-1, got {:?}",
+            result_neg
+        );
     }
 
     // 29. All alphas_cumprod values are in (0, 1)
@@ -1164,15 +1229,16 @@ mod tests {
     }
 
     // 35. Both Karras and cosine produce strictly decreasing alpha_bars
+    // (same index convention: 0 = cleanest, increasing = noisier).
     #[test]
     fn test_karras_vs_cosine_structure() {
         let karras = NoiseSchedule::karras(100, 0.002, 80.0, 7.0).unwrap();
         let cosine = NoiseSchedule::cosine(100, 0.008).unwrap();
-        // Karras: increasing alpha_bar (sigma decreases)
+        // Karras: strictly decreasing alpha_bar (index increases -> noisier)
         for i in 1..karras.alphas_cumprod.len() {
             assert!(
-                karras.alphas_cumprod[i] > karras.alphas_cumprod[i - 1],
-                "karras alphas_cumprod not increasing at i={}",
+                karras.alphas_cumprod[i] < karras.alphas_cumprod[i - 1],
+                "karras alphas_cumprod not decreasing at i={}",
                 i
             );
         }

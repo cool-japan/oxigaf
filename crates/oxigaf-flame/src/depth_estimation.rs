@@ -10,7 +10,7 @@
 //!
 //! # fn example(mesh: &Mesh) -> Result<(), oxigaf_flame::depth_estimation::DepthError> {
 //! let config = DepthConfig::default();
-//! let camera = front_depth_camera(config.width, config.height, 0.6);
+//! let camera = front_depth_camera(config.width, config.height, 0.6, config.near_plane, config.far_plane);
 //! let depth_map = render_depth_map(mesh, &camera, &config)?;
 //! let coverage = depth_map.coverage(config.background_depth);
 //! println!("Depth map coverage: {:.1}%", coverage * 100.0);
@@ -323,8 +323,13 @@ pub fn compute_depth_stats(map: &DepthMap, background: f32) -> DepthStats {
 /// Translation = `[0, 0, distance]` so a head at world origin is at
 /// camera-space Z = distance.
 /// Focal length = `width * 1.5`.
+///
+/// `near`/`far` become the camera's own clip planes (consulted by
+/// [`project_point`]); pass the same `near_plane`/`far_plane` you use for
+/// the [`DepthConfig`] given to [`render_depth_map`] so the two clipping
+/// stages agree.
 #[must_use]
-pub fn front_depth_camera(width: u32, height: u32, distance: f32) -> Camera {
+pub fn front_depth_camera(width: u32, height: u32, distance: f32, near: f32, far: f32) -> Camera {
     let focal = width as f32 * 1.5;
     Camera {
         rotation: na::Matrix3::identity(),
@@ -335,14 +340,14 @@ pub fn front_depth_camera(width: u32, height: u32, distance: f32) -> Camera {
         cy: height as f32 / 2.0,
         width,
         height,
-        near: 0.01,
-        far: 10.0,
+        near,
+        far,
     }
 }
 
 /// Build a side-view camera looking from the subject's left (-X direction).
 ///
-/// Rotation = -90° around Y: maps +Z world → +X camera and -X world → +Z camera.
+/// Rotation = -90° around Y: maps +Z world → -X camera and +X world → +Z camera.
 /// With `t = [0, 0, distance]`, a head at world origin sits at camera Z = distance.
 ///
 /// Rotation matrix (R_y(-90°)):
@@ -353,8 +358,12 @@ pub fn front_depth_camera(width: u32, height: u32, distance: f32) -> Camera {
 /// ```
 /// Check: R * \[0,0,0\] + t = [0, 0, distance]. ✓
 /// Head at world origin → cam = R * \[0,0,0\] + \[0,0,d\] = [0, 0, d]. ✓
+/// Axis check: R * \[0,0,1\] = \[-1,0,0\] (+Z world → -X camera);
+/// R * \[1,0,0\] = \[0,0,1\] (+X world → +Z camera).
+///
+/// See [`front_depth_camera`] for the meaning of `near`/`far`.
 #[must_use]
-pub fn side_depth_camera(width: u32, height: u32, distance: f32) -> Camera {
+pub fn side_depth_camera(width: u32, height: u32, distance: f32, near: f32, far: f32) -> Camera {
     let focal = width as f32 * 1.5;
     // R_y(-90°): rotates -90 degrees around Y axis.
     // R[row][col]: col-major storage, but na::Matrix3::new is row-major input.
@@ -368,8 +377,8 @@ pub fn side_depth_camera(width: u32, height: u32, distance: f32) -> Camera {
         cy: height as f32 / 2.0,
         width,
         height,
-        near: 0.01,
-        far: 10.0,
+        near,
+        far,
     }
 }
 
@@ -383,8 +392,16 @@ pub fn side_depth_camera(width: u32, height: u32, distance: f32) -> Camera {
 /// [  sin45,  0,  cos45 ]     [ √2/2,  0,  √2/2 ]
 /// ```
 /// Check: R * \[0,0,0\] + t = \[0,0,d\]. ✓
+///
+/// See [`front_depth_camera`] for the meaning of `near`/`far`.
 #[must_use]
-pub fn three_quarter_depth_camera(width: u32, height: u32, distance: f32) -> Camera {
+pub fn three_quarter_depth_camera(
+    width: u32,
+    height: u32,
+    distance: f32,
+    near: f32,
+    far: f32,
+) -> Camera {
     let focal = width as f32 * 1.5;
     let c = std::f32::consts::FRAC_1_SQRT_2; // cos(45°) = sin(45°) = 1/√2
     let rotation = na::Matrix3::new(c, 0.0, -c, 0.0, 1.0, 0.0, c, 0.0, c);
@@ -397,8 +414,8 @@ pub fn three_quarter_depth_camera(width: u32, height: u32, distance: f32) -> Cam
         cy: height as f32 / 2.0,
         width,
         height,
-        near: 0.01,
-        far: 10.0,
+        near,
+        far,
     }
 }
 
@@ -607,8 +624,20 @@ pub fn render_conditioning_depth_maps(
     mesh: &Mesh,
     config: &DepthConfig,
 ) -> Result<(DepthMap, DepthMap), DepthError> {
-    let front_cam = front_depth_camera(config.width, config.height, 0.6);
-    let side_cam = side_depth_camera(config.width, config.height, 0.6);
+    let front_cam = front_depth_camera(
+        config.width,
+        config.height,
+        0.6,
+        config.near_plane,
+        config.far_plane,
+    );
+    let side_cam = side_depth_camera(
+        config.width,
+        config.height,
+        0.6,
+        config.near_plane,
+        config.far_plane,
+    );
 
     let front_map = render_depth_map(mesh, &front_cam, config)?;
     let side_map = render_depth_map(mesh, &side_cam, config)?;
@@ -739,9 +768,11 @@ mod tests {
         Mesh::new(vertices, faces)
     }
 
-    /// A front-facing camera at distance 1.0, 64×64 image.
+    /// A front-facing camera at distance 1.0, 64×64 image, whose clip
+    /// planes match `default_test_config()` (see `test_camera_and_config_clip_planes_agree`).
     fn test_camera() -> Camera {
-        front_depth_camera(64, 64, 1.0)
+        let cfg = default_test_config();
+        front_depth_camera(64, 64, 1.0, cfg.near_plane, cfg.far_plane)
     }
 
     fn default_test_config() -> DepthConfig {
@@ -1169,7 +1200,7 @@ mod tests {
 
     #[test]
     fn front_depth_camera_head_at_origin_projects_to_principal_point() {
-        let cam = front_depth_camera(128, 128, 0.6);
+        let cam = front_depth_camera(128, 128, 0.6, 0.01, 10.0);
         // Identity rotation, t=[0,0,0.6]: cam = [0,0,0.6] for world origin.
         let result = project_point(&cam, [0.0, 0.0, 0.0]);
         assert!(result.is_some());
@@ -1182,7 +1213,7 @@ mod tests {
     #[test]
     fn side_depth_camera_head_at_origin_in_front() {
         // With side camera, world origin should be at cam.z = distance.
-        let cam = side_depth_camera(128, 128, 0.6);
+        let cam = side_depth_camera(128, 128, 0.6, 0.01, 10.0);
         let p_cam = cam.world_to_cam(&na::Point3::origin());
         assert!(
             p_cam.z > 0.0,
@@ -1194,7 +1225,7 @@ mod tests {
 
     #[test]
     fn three_quarter_camera_head_at_origin_in_front() {
-        let cam = three_quarter_depth_camera(128, 128, 0.6);
+        let cam = three_quarter_depth_camera(128, 128, 0.6, 0.01, 10.0);
         let p_cam = cam.world_to_cam(&na::Point3::origin());
         assert!(
             p_cam.z > 0.0,
@@ -1202,6 +1233,65 @@ mod tests {
             p_cam.z
         );
         assert!((p_cam.z - 0.6).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_camera_and_config_clip_planes_agree() {
+        // Regression test: the camera helpers used to hardcode
+        // `near: 0.01, far: 10.0` regardless of the `DepthConfig` a caller
+        // validated and passed to `render_depth_map`, so `project_point`'s
+        // near clip (via `camera.near`) could silently disagree with
+        // `config.near_plane`/`config.far_plane`. The camera's clip planes
+        // must now match whatever config the caller supplies.
+        let config = DepthConfig {
+            width: 32,
+            height: 32,
+            near_plane: 0.25,
+            far_plane: 3.0,
+            background_depth: 3.0,
+        };
+        let front = front_depth_camera(
+            config.width,
+            config.height,
+            1.0,
+            config.near_plane,
+            config.far_plane,
+        );
+        let side = side_depth_camera(
+            config.width,
+            config.height,
+            1.0,
+            config.near_plane,
+            config.far_plane,
+        );
+        let three_quarter = three_quarter_depth_camera(
+            config.width,
+            config.height,
+            1.0,
+            config.near_plane,
+            config.far_plane,
+        );
+        for cam in [&front, &side, &three_quarter] {
+            assert!((cam.near - config.near_plane).abs() < 1e-6);
+            assert!((cam.far - config.far_plane).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn test_side_depth_camera_axis_mapping() {
+        // Regression test for the doc-comment sign error: the rotation must
+        // map +Z world to -X camera and +X world to +Z camera.
+        let cam = side_depth_camera(64, 64, 1.0, 0.01, 10.0);
+        let plus_z_world = cam.rotation * na::Vector3::new(0.0f32, 0.0, 1.0);
+        assert!(
+            (plus_z_world - na::Vector3::new(-1.0, 0.0, 0.0)).norm() < 1e-6,
+            "+Z world should map to -X camera, got {plus_z_world:?}"
+        );
+        let plus_x_world = cam.rotation * na::Vector3::new(1.0f32, 0.0, 0.0);
+        assert!(
+            (plus_x_world - na::Vector3::new(0.0, 0.0, 1.0)).norm() < 1e-6,
+            "+X world should map to +Z camera, got {plus_x_world:?}"
+        );
     }
 
     // ------------------------------------------------------------------

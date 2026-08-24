@@ -269,8 +269,10 @@ pub fn lerp(a: &LatentVector, b: &LatentVector, t: f32) -> Result<LatentVector, 
 
 /// Spherically interpolate between two latent vectors (SLERP).
 ///
-/// Travels along the great circle connecting the directions of `a` and `b`,
-/// while interpolating magnitude linearly between `‖a‖` and `‖b‖`.
+/// Travels along the great circle connecting the *directions* of `a` and
+/// `b`, applying the standard slerp coefficients directly to the
+/// **original, un-normalised** vectors rather than to their unit-sphere
+/// projections.
 ///
 /// ## Algorithm
 ///
@@ -280,9 +282,24 @@ pub fn lerp(a: &LatentVector, b: &LatentVector, t: f32) -> Result<LatentVector, 
 /// 4. If `|cos_θ| > 1 − 1e-6` (nearly collinear), fall back to [`lerp`] on
 ///    the originals (same magnitude blend).
 /// 5. `θ = arccos(cos_θ)`.
-/// 6. `slerp = (sin((1−t)θ) / sin θ) · a  +  (sin(tθ) / sin θ) · b`
-///    (using the **original** un-normalised vectors, so the result magnitude
-///    equals the linear blend of `‖a‖` and `‖b‖`).
+/// 6. `slerp = (sin((1−t)θ) / sin θ) · a  +  (sin(tθ) / sin θ) · b`, using
+///    the **original** un-normalised vectors `a` and `b` (not `a_n`/`b_n`).
+///
+///    This exactly reproduces `a` at `t = 0` and `b` at `t = 1`, and for
+///    `‖a‖ == ‖b‖` it stays on the sphere of that shared radius throughout
+///    (the classic slerp property). For `‖a‖ ≠ ‖b‖`, however, the
+///    magnitude in between is **not** the linear blend `(1−t)‖a‖ + t‖b‖` —
+///    writing `a = ‖a‖·a_n`, `b = ‖b‖·b_n`, the result is
+///    `p·a_n + q·b_n` with `p = ‖a‖·sin((1−t)θ)/sinθ` and
+///    `q = ‖b‖·sin(tθ)/sinθ`, whose norm is
+///    `sqrt(p² + q² + 2pq·cosθ)` — equal to the linear blend only when
+///    `‖a‖ == ‖b‖` (so `p + q` factors out), or when `a_n ⟂ b_n`
+///    (`θ = π/2`, so the cross term vanishes) does the *squared* norm
+///    happen to be a clean `p² + q²`, which still isn't `((1−t)‖a‖ +
+///    t‖b‖)²` in general. If you need the magnitude to be a true linear
+///    blend of `‖a‖` and `‖b‖`, rescale the direction explicitly (as
+///    `crate::latent_walk::spherical_walk` does) rather than relying on
+///    this function.
 pub fn slerp(a: &LatentVector, b: &LatentVector, t: f32) -> Result<LatentVector, InterpError> {
     check_same_length(a, b)?;
 

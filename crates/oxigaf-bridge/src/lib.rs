@@ -77,6 +77,16 @@
 //!   convention `candle_nn::VarBuilder::pp` expects. See
 //!   [`gaf_layer_mapper::GafLayerMapper`].
 //! - **ToRSh**: `down_blocks/0/resnets/0/conv1/weight`
+//!
+//! Note that these two "OxiGAF" forms are **not** interchangeable: the
+//! flat, double-underscore-escaped form the PyTorch bridge produces is not
+//! `candle_nn::VarBuilder`-loadable (`VarBuilder::pp` needs the dot-nested
+//! form), while the ToRSh bridge's form is. A checkpoint produced by
+//! `WeightConverter::pytorch_to_oxigaf` is therefore not, today, loadable by
+//! `oxigaf-diffusion`'s `VarBuilder`-based model code the way one produced
+//! by `WeightConverter::torsh_to_oxigaf` (behind the `torsh` feature) is --
+//! this reflects the two conversion paths having been implemented
+//! independently, not a deliberate two-format design.
 
 pub mod error;
 pub mod gaf_layer_mapper;

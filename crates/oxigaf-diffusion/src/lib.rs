@@ -7,47 +7,52 @@
 //!
 //! ## Cargo Features
 //!
-//! This crate supports the following feature flags:
+//! This crate supports the following feature flags (see `Cargo.toml`'s
+//! `[features]` section, which this list mirrors):
 //!
-//! - **`default`** = `["accelerate", "flash_attention"]`:
-//!   Default features for CPU-only inference with optimizations
+//! - **`default`** = `[]`:
+//!   No optional features on by default, keeping a plain `cargo build`
+//!   minimal (CPU-only, no flash attention).
 //!
-//! - **`accelerate`**:
-//!   Uses platform-native BLAS/LAPACK for CPU tensor operations
-//!   - macOS: Accelerate framework
-//!   - Linux: OpenBLAS or Intel MKL
-//!
-//! - **`cuda`** (platform-specific):
-//!   Enables NVIDIA GPU acceleration via CUDA
-//!   - Requires CUDA toolkit installed
-//!   - Not available on macOS
-//!
-//! - **`metal`** (platform-specific):
-//!   Enables Apple Silicon GPU acceleration via Metal
-//!   - macOS only
-//!   - Optimized for M1/M2/M3 chips
-//!
-//! - **`flash_attention`** (enabled by default):
+//! - **`flash_attention`** (off by default):
 //!   Memory-efficient attention with O(N) complexity instead of O(N²)
 //!   - Reduces memory usage by 2-4× for large images
 //!   - Tiled computation for better cache locality
+//!   - Gates the `flash_attention` module and its re-exports (`FlashAttention`,
+//!     `flash_attention`, `flash_attention_with_config`, ...); `unet.rs`
+//!     constructs a `FlashAttention` when `DiffusionConfig::use_flash_attention`
+//!     is set.
 //!
-//! - **`mixed_precision`** (planned, not yet implemented):
-//!   FP16/BF16 inference for reduced memory usage
-//!   - Faster on GPUs with Tensor Cores
-//!   - Lower memory footprint
+//! - **`mixed_precision`**:
+//!   The [`mixed_precision`] module (FP32 ↔ BF16/FP16 conversion and
+//!   simulation utilities) is unconditionally compiled either way; this flag
+//!   only changes the *default* value of `MixedPrecisionConfig::mode` (to
+//!   `BFloat16` instead of `Float32`) — see the module's own docs for
+//!   details on what is (and, as of this writing, is not) wired into the
+//!   inference path.
+//!
+//! - **`gpu_debug`**:
+//!   Enables NaN/Inf debug hooks (`DebugConfig::default()` sets `enabled =
+//!   true` when this feature is active).
+//!
+//! Platform-specific GPU/BLAS backends (`accelerate`, `metal`, `cuda`) are
+//! **not** feature flags of this crate — support for them was removed. To
+//! enable one, configure the `candle-core`/`candle-nn` dependency directly in
+//! your own `Cargo.toml`, e.g. via the COOLJAPAN `oxicandle-core` fork:
+//! ```toml
+//! candle-core = { package = "oxicandle-core", version = "0.11.0", features = ["accelerate"] }  # macOS BLAS
+//! candle-core = { package = "oxicandle-core", version = "0.11.0", features = ["metal"] }       # macOS GPU
+//! candle-core = { package = "oxicandle-core", version = "0.11.0", features = ["cuda"] }        # NVIDIA GPU
+//! ```
 //!
 //! Example usage:
 //! ```toml
 //! # In Cargo.toml
-//! # For CPU-only with flash attention
-//! oxigaf-diffusion = { version = "0.1", default-features = true }
+//! # CPU-only, minimal build (the default)
+//! oxigaf-diffusion = { version = "0.1" }
 //!
-//! # For Apple Silicon with Metal acceleration
-//! oxigaf-diffusion = { version = "0.1", features = ["metal", "flash_attention"] }
-//!
-//! # For NVIDIA GPU with CUDA
-//! oxigaf-diffusion = { version = "0.1", features = ["cuda", "flash_attention"] }
+//! # With flash attention
+//! oxigaf-diffusion = { version = "0.1", features = ["flash_attention"] }
 //! ```
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
@@ -336,7 +341,9 @@ pub use classifier_guidance::{
 };
 
 // Re-exports
-pub use clip::ClipImageEncoder;
+pub use attention::{CrossAttention, MultiViewSpatialTransformer, MultiViewTransformerBlock};
+pub use camera::{timestep_embedding, CameraEmbedding, TimestepEmbedding};
+pub use clip::{build_clip_encoder, ClipImageEncoder, ClipVisionConfig};
 pub use config::DiffusionConfig;
 pub use pipeline::{MultiViewDiffusionPipeline, MultiViewOutput};
 pub use scheduler::{DdimScheduler, PredictionType};
@@ -349,6 +356,15 @@ pub use upsampler::{LatentUpsampler, UpsamplerMode};
 pub use vae::Vae;
 
 // Sliced attention exports
+//
+// NOTE: as of this writing, nothing in `unet.rs` or `pipeline.rs` selects
+// `SlicedAttention` — there is no config switch analogous to
+// `DiffusionConfig::use_flash_attention` for it, so this memory-optimization
+// path (chunked attention scores to trade compute for peak memory) is
+// exercised only by this module's own tests. Wiring it in requires adding an
+// attention-backend selector to `DiffusionConfig` and dispatching on it in
+// `attention.rs`; consider that a prerequisite before relying on this type
+// to actually reduce memory in a real pipeline run.
 pub use sliced_attention::{SlicedAttention, SlicedAttentionConfig};
 
 // Flash attention exports (only when feature is enabled)
@@ -440,6 +456,12 @@ pub use attention_viz::{
 };
 
 // Fused attention re-exports
+//
+// NOTE: same reachability gap as `sliced_attention` above — nothing in
+// `unet.rs` or `pipeline.rs` constructs a `FusedQKV` or calls
+// `scaled_dot_product_attention` on the default inference path; this is a
+// standalone, independently-tested fused-projection utility rather than
+// something the crate's own pipeline currently exercises.
 pub use fused_attention::{
     fused_qkv_projection, scaled_dot_product_attention, softmax_over_dim, FusedAttentionConfig,
     FusedQKV,
@@ -485,6 +507,24 @@ pub use image_preprocessing::{
 };
 
 // Image editing re-exports
+//
+// NOTE: `image_editing` exposes two parallel, overlapping APIs whose
+// similarly-named functions/types are easy to conflate:
+//   - The `EditLatent`-based API (`EditConfig`, `EditStats`, `EditMask`,
+//     `ImageEditError`, `add_edit_noise`, `blend_with_mask`,
+//     `interpolate_edit_latents`, `edit_distance`, ...) from the module's
+//     top level.
+//   - The `sdedit` slice-based API (`ImageEditingConfig`, `SdeditStats`,
+//     `ImageEditingError`, `edit_add_noise`, `edit_blend_with_mask`,
+//     `edit_lerp_latents`, `edit_latent_distance`, ...) from the
+//     `image_editing::sdedit` submodule, following the standard DDPM/SDEdit
+//     alpha-bar forward-noising convention (see `edit_cosine_alpha_bars` /
+//     `edit_linear_alpha_bars`).
+// The two are **not** interchangeable, and their error types
+// (`ImageEditError` vs. `ImageEditingError`) do not convert into each other.
+// Until they are consolidated into one API, prefer the `sdedit`
+// (`edit_*`-prefixed) family for new code, and check each function's own
+// rustdoc for its exact forward-process convention before mixing the two.
 pub use image_editing::{
     add_edit_noise,
     apply_inpaint_mask,

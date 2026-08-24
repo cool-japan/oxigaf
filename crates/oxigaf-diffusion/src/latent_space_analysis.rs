@@ -140,6 +140,35 @@ pub struct InterpolationQuality {
 }
 
 // ---------------------------------------------------------------------------
+// Shared validation helpers
+// ---------------------------------------------------------------------------
+
+/// Verify every latent in `latents` has the same length as `latents[0]`,
+/// returning that common length.
+///
+/// Assumes `latents` is non-empty — callers check `EmptyDataset` themselves
+/// first (the exact error returned for an empty dataset varies by caller:
+/// some also treat dimension `0` as `EmptyLatent`).
+///
+/// Several functions below index a per-latent slot up to a `dim` derived
+/// from `latents[0].len()` alone (e.g. `row[j]` for `j in 0..dim`); without
+/// this check, a shorter row elsewhere in the slice causes a slice-index
+/// panic instead of a reported error.
+fn check_consistent_dims(latents: &[Vec<f32>]) -> Result<usize, LatentAnalysisError> {
+    let dim = latents[0].len();
+    for (idx, v) in latents.iter().enumerate() {
+        if v.len() != dim {
+            return Err(LatentAnalysisError::InconsistentDimensions {
+                expected: dim,
+                got: v.len(),
+                idx,
+            });
+        }
+    }
+    Ok(dim)
+}
+
+// ---------------------------------------------------------------------------
 // Private vector math helpers (lsa_ prefix to avoid symbol conflicts)
 // ---------------------------------------------------------------------------
 
@@ -275,18 +304,7 @@ pub fn compute_latent_dataset_stats(
         return Err(LatentAnalysisError::EmptyDataset);
     }
 
-    let dim = latents[0].len();
-
-    // Validate consistency.
-    for (idx, v) in latents.iter().enumerate() {
-        if v.len() != dim {
-            return Err(LatentAnalysisError::InconsistentDimensions {
-                expected: dim,
-                got: v.len(),
-                idx,
-            });
-        }
-    }
+    let dim = check_consistent_dims(latents)?;
 
     // Per-dimension stats.
     let dim_stats: Vec<LatentDimStats> = (0..dim)
@@ -338,12 +356,32 @@ pub fn compute_latent_dataset_stats(
 /// - `vector`: length d
 ///
 /// Returns the unnormalized d-dimensional result.
-pub fn power_iteration_step(matrix: &[Vec<f32>], vector: &[f32]) -> Vec<f32> {
+///
+/// # Errors
+///
+/// [`LatentAnalysisError::InconsistentDimensions`] if any row of `matrix`
+/// has a different length than `vector` — without this check, `row[j]` for
+/// `j in 0..vector.len()` below would panic on a shorter row instead of
+/// reporting the mismatch.
+pub fn power_iteration_step(
+    matrix: &[Vec<f32>],
+    vector: &[f32],
+) -> Result<Vec<f32>, LatentAnalysisError> {
     let n = matrix.len();
     if n == 0 || vector.is_empty() {
-        return vec![0.0; vector.len()];
+        return Ok(vec![0.0; vector.len()]);
     }
     let d = vector.len();
+
+    for (idx, row) in matrix.iter().enumerate() {
+        if row.len() != d {
+            return Err(LatentAnalysisError::InconsistentDimensions {
+                expected: d,
+                got: row.len(),
+                idx,
+            });
+        }
+    }
 
     // u[i] = dot(matrix[i], vector)
     let u: Vec<f32> = matrix.iter().map(|row| lsa_dot(row, vector)).collect();
@@ -360,7 +398,7 @@ pub fn power_iteration_step(matrix: &[Vec<f32>], vector: &[f32]) -> Vec<f32> {
     for wj in &mut w {
         *wj *= inv_n;
     }
-    w
+    Ok(w)
 }
 
 /// Compute PCA via deflation power iteration.
@@ -376,7 +414,7 @@ pub fn compute_pca(
         return Err(LatentAnalysisError::EmptyDataset);
     }
 
-    let dim = latents[0].len();
+    let dim = check_consistent_dims(latents)?;
     if dim == 0 {
         return Err(LatentAnalysisError::EmptyLatent);
     }
@@ -410,6 +448,22 @@ pub fn compute_pca(
         })
         .collect();
 
+    // True total variance = trace of the covariance matrix C = (1/n) X^T X,
+    // i.e. the sum over dimensions of the mean-centred column variances.
+    // Computed once, up front, from the (not-yet-deflated) centered data —
+    // deflation below progressively removes captured variance from
+    // `centered`, so this must not be derived from it afterwards, and must
+    // not be conflated with `explained_variance.iter().sum()` (which only
+    // covers the `n_components` components actually extracted and would
+    // make `explained_variance_ratio` sum to 1.0 by construction regardless
+    // of how much of the data's real variance those components capture).
+    let total_variance: f32 = (0..dim)
+        .map(|j| {
+            let sum_sq: f32 = centered.iter().map(|row| row[j] * row[j]).sum();
+            sum_sq * inv_n
+        })
+        .sum();
+
     let mut components = Vec::with_capacity(n_components);
     let mut explained_variance = Vec::with_capacity(n_components);
     let mut rng_state = seed;
@@ -433,7 +487,7 @@ pub fn compute_pca(
         // Power iteration.
         let mut eigenvalue = 0.0f32;
         for _ in 0..n_iter {
-            let w = power_iteration_step(&centered, &v);
+            let w = power_iteration_step(&centered, &v)?;
             let norm = lsa_l2_norm(&w);
             if norm < 1e-12 {
                 // Zero eigenvector; stop.
@@ -458,7 +512,6 @@ pub fn compute_pca(
         explained_variance.push(eigenvalue);
     }
 
-    let total_variance: f32 = explained_variance.iter().sum();
     let explained_variance_ratio: Vec<f32> = if total_variance > 1e-12 {
         explained_variance
             .iter()
@@ -556,6 +609,12 @@ pub fn assign_to_clusters(latents: &[Vec<f32>], centroids: &[Vec<f32>]) -> Vec<u
 }
 
 /// Recompute centroids as the mean of assigned points. Empty clusters keep the old centroid.
+///
+/// If `old_centroids` has fewer than `k` entries, an empty cluster beyond
+/// its length falls back to an all-zero centroid of length `dim` rather than
+/// indexing out of bounds — this can only happen when a caller passes a
+/// mismatched `old_centroids`, which [`run_kmeans`] never does (it always
+/// supplies exactly `k`).
 pub fn update_centroids(
     latents: &[Vec<f32>],
     assignments: &[usize],
@@ -579,7 +638,10 @@ pub fn update_centroids(
         .enumerate()
         .map(|(ki, sum)| {
             if counts[ki] == 0 {
-                old_centroids[ki].clone()
+                old_centroids
+                    .get(ki)
+                    .cloned()
+                    .unwrap_or_else(|| vec![0.0f32; dim])
             } else {
                 sum.iter().map(|&s| s / counts[ki] as f32).collect()
             }
@@ -617,7 +679,7 @@ pub fn run_kmeans(
         return Err(LatentAnalysisError::InvalidK { k });
     }
 
-    let dim = latents[0].len();
+    let dim = check_consistent_dims(latents)?;
     let mut rng = if seed == 0 { 1 } else { seed };
 
     let mut centroids = kmeans_init(latents, k, &mut rng);
@@ -1032,11 +1094,11 @@ mod tests {
     // --- power_iteration_step ---
 
     #[test]
-    fn test_power_iteration_step_smoke() {
+    fn test_power_iteration_step_smoke() -> Result<(), LatentAnalysisError> {
         // 2 data points, dim=2; should return a 2-element result.
         let matrix = vec![vec![1.0f32, 0.0], vec![0.0f32, 1.0]];
         let vector = vec![1.0f32, 0.0];
-        let result = power_iteration_step(&matrix, &vector);
+        let result = power_iteration_step(&matrix, &vector)?;
         assert_eq!(result.len(), 2);
         // C = I/2; C*e1 = 0.5 * e1
         assert!(
@@ -1045,15 +1107,28 @@ mod tests {
             result[0]
         );
         assert!(result[1].abs() < 1e-6);
+        Ok(())
     }
 
     #[test]
-    fn test_power_iteration_step_empty_matrix() {
+    fn test_power_iteration_step_empty_matrix() -> Result<(), LatentAnalysisError> {
         let matrix: Vec<Vec<f32>> = vec![];
         let vector = vec![1.0f32, 0.0];
-        let result = power_iteration_step(&matrix, &vector);
+        let result = power_iteration_step(&matrix, &vector)?;
         assert_eq!(result.len(), 2);
         assert!(result.iter().all(|&x| x == 0.0));
+        Ok(())
+    }
+
+    #[test]
+    fn test_power_iteration_step_ragged_row_errors() {
+        let matrix = vec![vec![1.0f32, 0.0], vec![0.0f32]]; // second row too short
+        let vector = vec![1.0f32, 0.0];
+        let result = power_iteration_step(&matrix, &vector);
+        assert!(matches!(
+            result,
+            Err(LatentAnalysisError::InconsistentDimensions { .. })
+        ));
     }
 
     // --- compute_pca ---
@@ -1118,6 +1193,77 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn test_compute_pca_total_variance_is_independent_of_k() -> Result<(), LatentAnalysisError> {
+        // Regression for: `total_variance` must be the true total variance of
+        // the data (trace of the covariance matrix), not
+        // `explained_variance.iter().sum()` over only the requested `k`
+        // components — otherwise it always equals that sum by construction
+        // and `total_variance` (and hence `explained_variance_ratio`) would
+        // silently depend on `n_components` instead of only on the data.
+        //
+        // An isotropic 4-D "cross polytope" dataset (already zero-mean):
+        // covariance is exactly `0.25 * I`, so every direction is an
+        // eigenvector with the same eigenvalue 0.25, and no single component
+        // can capture more than 1/4 of the total variance.
+        let latents: Vec<Vec<f32>> = vec![
+            vec![1.0, 0.0, 0.0, 0.0],
+            vec![-1.0, 0.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0, 0.0],
+            vec![0.0, -1.0, 0.0, 0.0],
+            vec![0.0, 0.0, 1.0, 0.0],
+            vec![0.0, 0.0, -1.0, 0.0],
+            vec![0.0, 0.0, 0.0, 1.0],
+            vec![0.0, 0.0, 0.0, -1.0],
+        ];
+        let pca_k1 = compute_pca(&latents, 1, 50, 42)?;
+        let pca_k4 = compute_pca(&latents, 4, 50, 42)?;
+        assert!(
+            (pca_k1.total_variance - pca_k4.total_variance).abs() < 1e-3,
+            "total_variance must not depend on n_components: k=1 -> {}, k=4 -> {}",
+            pca_k1.total_variance,
+            pca_k4.total_variance
+        );
+        assert!(
+            (pca_k1.total_variance - 1.0).abs() < 1e-3,
+            "trace of 0.25*I over 4 dims should be 1.0, got {}",
+            pca_k1.total_variance
+        );
+        // With only 1 of 4 equal-eigenvalue components requested, the
+        // captured ratio must be close to 1/4, not close to 1.
+        let ratio_k1 = pca_k1
+            .cumulative_variance_ratio
+            .last()
+            .copied()
+            .unwrap_or(1.0);
+        assert!(
+            (ratio_k1 - 0.25).abs() < 1e-3,
+            "k=1 of 4 equal components should explain ~25% of variance, got {ratio_k1}"
+        );
+        // Requesting all 4 components must reach (approximately) the full
+        // 100% of the variance.
+        let ratio_k4 = pca_k4
+            .cumulative_variance_ratio
+            .last()
+            .copied()
+            .unwrap_or(0.0);
+        assert!(
+            (ratio_k4 - 1.0).abs() < 1e-3,
+            "k=4 of 4 should explain ~100% of variance, got {ratio_k4}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_compute_pca_ragged_input_errors() {
+        let latents = vec![vec![1.0f32, 2.0], vec![3.0f32]]; // ragged
+        let result = compute_pca(&latents, 1, 10, 1);
+        assert!(matches!(
+            result,
+            Err(LatentAnalysisError::InconsistentDimensions { .. })
+        ));
+    }
+
     // --- assign_to_clusters ---
 
     #[test]
@@ -1162,6 +1308,19 @@ mod tests {
         assert!((new_centroids[1][0] - 99.0).abs() < 1e-6);
     }
 
+    #[test]
+    fn test_update_centroids_insufficient_old_centroids_does_not_panic() {
+        // `old_centroids` has only 1 entry but k=2; cluster 1 is empty, so it
+        // would need `old_centroids[1]`, which is out of bounds. Must fall
+        // back to a zero centroid instead of panicking.
+        let latents = vec![vec![1.0f32, 2.0]];
+        let assignments = vec![0]; // cluster 1 is empty
+        let old_centroids = vec![vec![0.0f32, 0.0]]; // length 1, but k=2
+        let new_centroids = update_centroids(&latents, &assignments, 2, 2, &old_centroids);
+        assert_eq!(new_centroids.len(), 2);
+        assert_eq!(new_centroids[1], vec![0.0f32, 0.0]);
+    }
+
     // --- compute_inertia ---
 
     #[test]
@@ -1200,6 +1359,16 @@ mod tests {
         let latents = vec![vec![1.0f32]];
         let result = run_kmeans(&latents, 0, 10, 42);
         assert!(matches!(result, Err(LatentAnalysisError::InvalidK { .. })));
+    }
+
+    #[test]
+    fn test_run_kmeans_ragged_input_errors() {
+        let latents = vec![vec![1.0f32, 2.0], vec![3.0f32]]; // ragged
+        let result = run_kmeans(&latents, 1, 5, 1);
+        assert!(matches!(
+            result,
+            Err(LatentAnalysisError::InconsistentDimensions { .. })
+        ));
     }
 
     #[test]

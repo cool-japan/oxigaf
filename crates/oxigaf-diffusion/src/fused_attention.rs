@@ -7,6 +7,27 @@
 use crate::DiffusionError;
 
 // ---------------------------------------------------------------------------
+// Private PRNG utilities (local copy; used only for attention dropout)
+// ---------------------------------------------------------------------------
+
+#[inline]
+fn xorshift64(state: &mut u64) -> u64 {
+    *state ^= *state << 13;
+    *state ^= *state >> 7;
+    *state ^= *state << 17;
+    if *state == 0 {
+        *state = 1;
+    }
+    *state
+}
+
+/// Uniform f32 in `[0, 1)`.
+#[inline]
+fn xorshift_f32(state: &mut u64) -> f32 {
+    (xorshift64(state) >> 11) as f32 / (1u64 << 53) as f32
+}
+
+// ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
 
@@ -16,7 +37,10 @@ pub struct FusedAttentionConfig {
     pub num_heads: usize,
     pub head_dim: usize,
     pub seq_len: usize,
-    /// Dropout probability (default 0.0 — no dropout in inference).
+    /// Dropout probability (default 0.0). Only consulted by
+    /// [`FusedQKV::apply_scaled_dot_product_with_dropout`]; the plain
+    /// [`FusedQKV::apply_scaled_dot_product`] inference path never applies
+    /// dropout regardless of this value.
     pub dropout_prob: f32,
     /// Attention scale factor (default: `1/sqrt(head_dim)`).
     pub scale: f32,
@@ -182,7 +206,30 @@ impl FusedQKV {
     /// Apply scaled dot-product attention and return output.
     ///
     /// Concatenates all heads → output shape `[batch * seq_len * embed_dim]`.
+    /// Honours [`FusedAttentionConfig::scale`] and
+    /// [`FusedAttentionConfig::causal`]; does not apply dropout even when
+    /// `config.dropout_prob > 0` (this is the deterministic inference path —
+    /// see [`Self::apply_scaled_dot_product_with_dropout`] for training use).
     pub fn apply_scaled_dot_product(&self) -> Result<Vec<f32>, DiffusionError> {
+        self.apply_scaled_dot_product_inner(None)
+    }
+
+    /// Same as [`Self::apply_scaled_dot_product`] but additionally applies
+    /// inverted dropout to the post-softmax attention probabilities using
+    /// [`FusedAttentionConfig::dropout_prob`] (training-time only). `rng_state`
+    /// is threaded in by the caller so runs are reproducible; it is advanced
+    /// in place.
+    pub fn apply_scaled_dot_product_with_dropout(
+        &self,
+        rng_state: &mut u64,
+    ) -> Result<Vec<f32>, DiffusionError> {
+        self.apply_scaled_dot_product_inner(Some(rng_state))
+    }
+
+    fn apply_scaled_dot_product_inner(
+        &self,
+        mut dropout_state: Option<&mut u64>,
+    ) -> Result<Vec<f32>, DiffusionError> {
         let batch_size = self.batch_size;
         let num_heads = self.config.num_heads;
         let seq_len = self.config.seq_len;
@@ -199,8 +246,19 @@ impl FusedQKV {
                 let k_slice = &self.k[head_base..head_base + seq_len * head_dim];
                 let v_slice = &self.v[head_base..head_base + seq_len * head_dim];
 
-                let head_out = scaled_dot_product_attention(
-                    q_slice, k_slice, v_slice, seq_len, seq_len, head_dim,
+                let dropout = dropout_state
+                    .as_deref_mut()
+                    .map(|state| (self.config.dropout_prob, state));
+                let head_out = scaled_dot_product_attention_with_scale(
+                    q_slice,
+                    k_slice,
+                    v_slice,
+                    seq_len,
+                    seq_len,
+                    head_dim,
+                    self.config.scale,
+                    self.config.causal,
+                    dropout,
                 )?;
 
                 // Scatter head output back to [b, s, h*head_dim..(h+1)*head_dim]
@@ -315,13 +373,26 @@ fn matmul_vec(inp: &[f32], weight: &[f32], out: &mut [f32], out_dim: usize, in_d
 
 /// Numerically stable softmax in-place over the last dimension.
 ///
-/// `data.len()` must be a multiple of `dim_size`.  Each chunk of `dim_size`
+/// `data.len()` must be a multiple of `dim_size`; each chunk of `dim_size`
 /// elements is treated as a separate probability vector.
-pub fn softmax_over_dim(data: &mut [f32], dim_size: usize) {
+///
+/// # Errors
+/// Returns [`DiffusionError::ShapeMismatch`] when `dim_size > 0` and
+/// `data.len()` is not a multiple of `dim_size` — softmaxing a partial
+/// trailing chunk on its own would silently produce a wrong probability
+/// vector rather than fail loudly.
+pub fn softmax_over_dim(data: &mut [f32], dim_size: usize) -> Result<(), DiffusionError> {
     if dim_size == 0 {
-        return;
+        return Ok(());
     }
-    for chunk in data.chunks_mut(dim_size) {
+    if !data.len().is_multiple_of(dim_size) {
+        return Err(DiffusionError::ShapeMismatch {
+            op: "softmax_over_dim".to_string(),
+            expected: vec![dim_size],
+            got: vec![data.len()],
+        });
+    }
+    for chunk in data.chunks_exact_mut(dim_size) {
         // find max for numerical stability
         let max_val = chunk.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
         let mut sum = 0.0f32;
@@ -335,9 +406,30 @@ pub fn softmax_over_dim(data: &mut [f32], dim_size: usize) {
             }
         }
     }
+    Ok(())
 }
 
-/// Scaled dot-product attention for a single head.
+/// Apply inverted dropout to post-softmax attention probabilities in place.
+///
+/// With probability `dropout_prob` each weight is zeroed; surviving weights
+/// are rescaled by `1 / (1 - dropout_prob)` so the expected output is
+/// unchanged (standard inverted dropout). A `dropout_prob <= 0.0` is a no-op.
+fn apply_attention_dropout(scores: &mut [f32], dropout_prob: f32, state: &mut u64) {
+    if dropout_prob <= 0.0 {
+        return;
+    }
+    let keep_scale = 1.0 / (1.0 - dropout_prob).max(1e-6);
+    for x in scores.iter_mut() {
+        if xorshift_f32(state) < dropout_prob {
+            *x = 0.0;
+        } else {
+            *x *= keep_scale;
+        }
+    }
+}
+
+/// Scaled dot-product attention for a single head, using the canonical
+/// `1 / sqrt(head_dim)` scale, no causal mask, and no dropout.
 ///
 /// * `q`: `[seq_q * head_dim]`
 /// * `k`: `[seq_k * head_dim]`
@@ -350,6 +442,39 @@ pub fn scaled_dot_product_attention(
     seq_q: usize,
     seq_k: usize,
     head_dim: usize,
+) -> Result<Vec<f32>, DiffusionError> {
+    let scale = if head_dim > 0 {
+        1.0 / (head_dim as f32).sqrt()
+    } else {
+        1.0
+    };
+    scaled_dot_product_attention_with_scale(q, k, v, seq_q, seq_k, head_dim, scale, false, None)
+}
+
+/// Scaled dot-product attention for a single head with an explicit scale,
+/// optional causal masking, and optional attention dropout.
+///
+/// * `scale`: multiplies `q · k` before softmax — pass
+///   [`FusedAttentionConfig::scale`] to honour a caller-configured scale
+///   instead of the canonical `1/sqrt(head_dim)` used by
+///   [`scaled_dot_product_attention`].
+/// * `causal`: when `true`, query position `qi` may only attend to key
+///   positions `ki <= qi` (later positions get `-inf` before softmax, so
+///   `qi = 0` always has at least the `ki = 0` entry unmasked).
+/// * `dropout`: `Some((prob, rng_state))` applies inverted dropout to the
+///   post-softmax attention probabilities (training-time only); `None`
+///   disables dropout, matching plain inference behaviour.
+#[allow(clippy::too_many_arguments)]
+pub fn scaled_dot_product_attention_with_scale(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    seq_q: usize,
+    seq_k: usize,
+    head_dim: usize,
+    scale: f32,
+    causal: bool,
+    dropout: Option<(f32, &mut u64)>,
 ) -> Result<Vec<f32>, DiffusionError> {
     if q.len() != seq_q * head_dim {
         return Err(DiffusionError::ShapeMismatch {
@@ -373,16 +498,15 @@ pub fn scaled_dot_product_attention(
         });
     }
 
-    let scale = if head_dim > 0 {
-        1.0 / (head_dim as f32).sqrt()
-    } else {
-        1.0
-    };
-
     // Compute attention scores: [seq_q * seq_k]
     let mut scores = vec![0.0f32; seq_q * seq_k];
     for qi in 0..seq_q {
         for ki in 0..seq_k {
+            let masked = causal && ki > qi;
+            if masked {
+                scores[qi * seq_k + ki] = f32::NEG_INFINITY;
+                continue;
+            }
             let q_row = &q[qi * head_dim..(qi + 1) * head_dim];
             let k_row = &k[ki * head_dim..(ki + 1) * head_dim];
             let mut dot = 0.0f32;
@@ -393,8 +517,14 @@ pub fn scaled_dot_product_attention(
         }
     }
 
-    // Apply softmax over key dimension (each row of [seq_q, seq_k])
-    softmax_over_dim(&mut scores, seq_k);
+    // Apply softmax over key dimension (each row of [seq_q, seq_k]).
+    // seq_q * seq_k is always an exact multiple of seq_k, so this can only
+    // fail if seq_k == 0 (dim_size == 0 is a documented no-op, not an error).
+    softmax_over_dim(&mut scores, seq_k)?;
+
+    if let Some((dropout_prob, state)) = dropout {
+        apply_attention_dropout(&mut scores, dropout_prob, state);
+    }
 
     // Multiply by V: [seq_q * head_dim]
     let mut output = vec![0.0f32; seq_q * head_dim];
@@ -628,7 +758,7 @@ mod tests {
     #[test]
     fn test_softmax_sums_to_one() {
         let mut data = vec![1.0f32, 2.0f32, 3.0f32, 0.5f32, 1.5f32, 2.5f32];
-        softmax_over_dim(&mut data, 3);
+        softmax_over_dim(&mut data, 3).expect("softmax failed");
         let sum0: f32 = data[0..3].iter().sum();
         let sum1: f32 = data[3..6].iter().sum();
         assert_abs_diff_eq!(sum0, 1.0, epsilon = 1e-6);
@@ -639,12 +769,29 @@ mod tests {
     fn test_softmax_max_stays_in_range() {
         // Even with extreme values, softmax output must be in [0, 1]
         let mut data = vec![1000.0f32, -1000.0f32, 500.0f32];
-        softmax_over_dim(&mut data, 3);
+        softmax_over_dim(&mut data, 3).expect("softmax failed");
         for v in &data {
             assert!(*v >= 0.0 && *v <= 1.0);
         }
         let sum: f32 = data.iter().sum();
         assert_abs_diff_eq!(sum, 1.0, epsilon = 1e-6);
+    }
+
+    #[test]
+    fn test_softmax_over_dim_rejects_non_multiple_length() {
+        // Regression test: a trailing partial chunk must error, not be
+        // silently softmaxed on its own.
+        let mut data = vec![1.0f32, 2.0, 3.0, 4.0, 5.0]; // len=5, dim_size=3
+        let err = softmax_over_dim(&mut data, 3).unwrap_err();
+        assert!(matches!(err, DiffusionError::ShapeMismatch { .. }));
+    }
+
+    #[test]
+    fn test_softmax_over_dim_zero_dim_size_is_noop() {
+        let mut data = vec![1.0f32, 2.0, 3.0];
+        let original = data.clone();
+        softmax_over_dim(&mut data, 0).expect("dim_size=0 must be a documented no-op");
+        assert_eq!(data, original);
     }
 
     // --- apply_scaled_dot_product tests -------------------------------------
@@ -712,5 +859,141 @@ mod tests {
         for val in &out {
             assert_abs_diff_eq!(*val, 0.0, epsilon = 1e-6);
         }
+    }
+
+    // --- scale / causal / dropout wiring regression tests -------------------
+
+    #[test]
+    fn test_scaled_dot_product_attention_with_scale_changes_result() {
+        // Regression test: FusedAttentionConfig::scale must actually affect
+        // the attention output (previously the scale was recomputed
+        // internally and any custom config.scale was silently discarded).
+        let head_dim = 2;
+        let seq_q = 1;
+        let seq_k = 2;
+        let q = vec![1.0f32, 0.0];
+        let k = vec![1.0f32, 0.0, 0.0f32, 1.0];
+        let v = vec![10.0f32, 0.0, 0.0f32, 20.0];
+
+        let out_low_scale = scaled_dot_product_attention_with_scale(
+            &q, &k, &v, seq_q, seq_k, head_dim, 0.01, false, None,
+        )
+        .expect("sdpa failed");
+        let out_high_scale = scaled_dot_product_attention_with_scale(
+            &q, &k, &v, seq_q, seq_k, head_dim, 50.0, false, None,
+        )
+        .expect("sdpa failed");
+
+        let any_diff = out_low_scale
+            .iter()
+            .zip(out_high_scale.iter())
+            .any(|(a, b)| (a - b).abs() > 1e-3);
+        assert!(
+            any_diff,
+            "different scale factors should change attention output: {:?} vs {:?}",
+            out_low_scale, out_high_scale
+        );
+    }
+
+    #[test]
+    fn test_scaled_dot_product_attention_with_scale_causal_no_leak_from_future() {
+        // Regression test: with causal=true, query 0 must attend only to
+        // key/value 0 — i.e. its output must equal V[0] exactly.
+        let head_dim = 1;
+        let seq_q = 3;
+        let seq_k = 3;
+        let q = vec![1.0f32, 1.0, 1.0];
+        let k = vec![1.0f32, 1.0, 1.0];
+        let v = vec![10.0f32, 20.0, 30.0];
+
+        let out = scaled_dot_product_attention_with_scale(
+            &q, &k, &v, seq_q, seq_k, head_dim, 1.0, true, None,
+        )
+        .expect("sdpa failed");
+
+        assert!((out[0] - 10.0).abs() < 1e-5, "out[0]={}", out[0]);
+    }
+
+    #[test]
+    fn test_apply_scaled_dot_product_causal_first_token_sees_only_itself() {
+        // End-to-end regression test: FusedAttentionConfig::causal must
+        // actually be applied by FusedQKV::apply_scaled_dot_product
+        // (previously it was declared and defaulted but never consulted).
+        let num_heads = 1;
+        let head_dim = 2;
+        let seq_len = 3;
+        let batch = 1;
+
+        // Each row packs one sequence position's Q, K, V (2 elements each).
+        let packed: Vec<f32> = vec![
+            1.0, 0.0, 1.0, 0.0, 100.0, 100.0, // s=0
+            1.0, 0.0, 0.0, 1.0, 200.0, 200.0, // s=1
+            1.0, 0.0, 1.0, 1.0, 300.0, 300.0, // s=2
+        ];
+
+        let mut cfg = FusedAttentionConfig::new(num_heads, head_dim, seq_len);
+        cfg.causal = true;
+        let fqkv = FusedQKV::from_packed(&packed, cfg, batch).expect("from_packed");
+        let out = fqkv.apply_scaled_dot_product().expect("attention failed");
+
+        // Query position 0 must attend only to key/value position 0.
+        assert!((out[0] - 100.0).abs() < 1e-4, "out[0]={}", out[0]);
+        assert!((out[1] - 100.0).abs() < 1e-4, "out[1]={}", out[1]);
+    }
+
+    #[test]
+    fn test_apply_scaled_dot_product_with_dropout_matches_plain_when_prob_zero() {
+        let batch = 1;
+        let num_heads = 2;
+        let head_dim = 4;
+        let seq_len = 3;
+        let embed_dim = num_heads * head_dim;
+
+        let packed: Vec<f32> = (0..(batch * seq_len * 3 * embed_dim))
+            .map(|i| (i as f32) * 0.07)
+            .collect();
+        let cfg = FusedAttentionConfig::new(num_heads, head_dim, seq_len); // dropout_prob = 0.0
+        let fqkv = FusedQKV::from_packed(&packed, cfg, batch).expect("from_packed");
+
+        let out_plain = fqkv.apply_scaled_dot_product().expect("attention failed");
+        let mut state = 12345u64;
+        let out_dropout = fqkv
+            .apply_scaled_dot_product_with_dropout(&mut state)
+            .expect("attention failed");
+
+        for (a, b) in out_plain.iter().zip(out_dropout.iter()) {
+            assert_abs_diff_eq!(*a, *b, epsilon = 1e-5);
+        }
+    }
+
+    #[test]
+    fn test_apply_scaled_dot_product_with_dropout_changes_output_when_prob_high() {
+        // Regression test: FusedAttentionConfig::dropout_prob must actually
+        // be applied by the dedicated training entry point (previously it
+        // was validated but never consulted by any code path at all).
+        let batch = 1;
+        let num_heads = 1;
+        let head_dim = 4;
+        let seq_len = 4;
+        let embed_dim = num_heads * head_dim;
+
+        let packed: Vec<f32> = (0..(batch * seq_len * 3 * embed_dim))
+            .map(|i| (i as f32) * 0.05)
+            .collect();
+        let mut cfg = FusedAttentionConfig::new(num_heads, head_dim, seq_len);
+        cfg.dropout_prob = 0.9;
+        let fqkv = FusedQKV::from_packed(&packed, cfg, batch).expect("from_packed");
+
+        let out_plain = fqkv.apply_scaled_dot_product().expect("attention failed");
+        let mut state = 777u64;
+        let out_dropout = fqkv
+            .apply_scaled_dot_product_with_dropout(&mut state)
+            .expect("attention failed");
+
+        let any_diff = out_plain
+            .iter()
+            .zip(out_dropout.iter())
+            .any(|(a, b)| (a - b).abs() > 1e-4);
+        assert!(any_diff, "dropout_prob=0.9 should change the output");
     }
 }

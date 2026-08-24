@@ -84,23 +84,34 @@ impl AttentionMask {
     /// Return the mask value for query position `query` attending to key
     /// position `key`.
     ///
-    /// Returns `false` for any out-of-bounds index.
+    /// Returns `false` for any out-of-bounds index, *and* for any in-range
+    /// index that still falls outside `mask`'s actual length. Both `seq_len`
+    /// and `mask` are public fields with no invariant enforced between them
+    /// outside of [`AttentionMask::new`], so a hand-built (or partially
+    /// mutated) `AttentionMask` can have `mask.len() != seq_len * seq_len`;
+    /// this never panics regardless.
     pub fn get(&self, query: usize, key: usize) -> bool {
         if query >= self.seq_len || key >= self.seq_len {
             return false;
         }
-        self.mask[query * self.seq_len + key]
+        self.mask
+            .get(query * self.seq_len + key)
+            .copied()
+            .unwrap_or(false)
     }
 
     /// Set the mask value for query position `query` attending to key
     /// position `key`.
     ///
-    /// No-op for any out-of-bounds index.
+    /// No-op for any out-of-bounds index, or any in-range index that falls
+    /// outside `mask`'s actual length (see [`AttentionMask::get`]).
     pub fn set(&mut self, query: usize, key: usize, value: bool) {
         if query >= self.seq_len || key >= self.seq_len {
             return;
         }
-        self.mask[query * self.seq_len + key] = value;
+        if let Some(slot) = self.mask.get_mut(query * self.seq_len + key) {
+            *slot = value;
+        }
     }
 
     /// Return an inverted copy of this mask (`true` ↔ `false`).
@@ -161,14 +172,24 @@ impl AttentionMask {
 
     /// Convert to an additive bias vector for use in softmax.
     ///
-    /// - `true`  → `0.0_f32`  (unmasked: no penalty)
-    /// - `false` → `-1e9_f32` (masked: effectively −∞)
+    /// - `true`  → `0.0_f32`      (unmasked: no penalty)
+    /// - `false` → `-65504.0_f32` (masked: minimum finite f16 value)
+    ///
+    /// `-65504.0` (rather than e.g. `-1e9` or `f32::NEG_INFINITY`) is chosen
+    /// deliberately: it is exactly representable in both f32 and f16, so it
+    /// never overflows when this bias is added under mixed-precision
+    /// (f16) training. It is also finite, which matters when an entire query
+    /// row happens to be fully masked (e.g. a narrow local window at a
+    /// sequence boundary) — with a finite bias, `softmax(row - max(row))`
+    /// degrades to a uniform distribution over that row instead of computing
+    /// `exp(-inf - (-inf)) = exp(NaN)`, which `f32::NEG_INFINITY` would
+    /// produce and then propagate through the rest of the network.
     ///
     /// The returned vector has length `seq_len * seq_len`.
     pub fn to_bias(&self) -> Vec<f32> {
         self.mask
             .iter()
-            .map(|&b| if b { 0.0_f32 } else { -1e9_f32 })
+            .map(|&b| if b { 0.0_f32 } else { -65504.0_f32 })
             .collect()
     }
 
@@ -391,6 +412,9 @@ pub fn cross_view_mask(
 /// A token in view `v` can attend to:
 /// - All tokens in view 0 (the reference view)
 /// - All tokens in view `v` (self-view)
+/// - Additionally, tokens in the reference view itself (view 0) attend to
+///   *all* tokens in *every* view — the reference view's query row is
+///   unrestricted, not just self+reference like the other views.
 ///
 /// # Errors
 /// Returns [`AttentionMaskError::InvalidConfig`] when `num_views == 0` or
@@ -661,9 +685,21 @@ pub struct LayerMaskConfig {
 /// (applying `self_pattern` within each block), builds the cross-view mask
 /// from `cross_pattern`, then ORs them together.
 ///
+/// `self_pattern` only accepts patterns meaningful *within* a single view's
+/// token block: [`MaskPattern::Full`], [`MaskPattern::Causal`],
+/// [`MaskPattern::Local`], or [`MaskPattern::AngularProximity`] (which
+/// degrades to `Full` at the intra-view level; the angular conditioning
+/// itself only applies across views). The multi-view-only patterns
+/// ([`MaskPattern::SelfView`], [`MaskPattern::CrossView`],
+/// [`MaskPattern::ReferenceView`], [`MaskPattern::Ring`]) describe
+/// relationships *between* views and have no meaningful definition as a
+/// `self_pattern`; use `cross_pattern` for those instead.
+///
 /// # Errors
 /// - [`AttentionMaskError::InvalidConfig`] for invalid parameters.
-/// - [`AttentionMaskError::InvalidPattern`] for pattern mismatches.
+/// - [`AttentionMaskError::InvalidPattern`] when `self_pattern` is one of the
+///   multi-view-only patterns listed above, or (for `cross_pattern`) when
+///   `AngularProximity` is requested without `view_positions`.
 pub fn build_layer_mask(
     config: &LayerMaskConfig,
     num_views: usize,
@@ -715,12 +751,25 @@ fn build_intra_view_mask(
         MaskPattern::Full => full_mask(tokens_per_view),
         MaskPattern::Causal => causal_mask(tokens_per_view)?,
         MaskPattern::Local { window } => local_mask(tokens_per_view, *window)?,
-        // For multi-view patterns used as self_pattern, treat the block as
-        // full self-attention within the view
+        // These patterns describe relationships *between* views (which view
+        // attends to which other view); they have no meaningful definition
+        // within a single view's token block, where there is no "other view"
+        // to distinguish. Silently treating them as full self-attention
+        // (the previous behavior) made them indistinguishable from
+        // `MaskPattern::Full` with no error and no warning, even though this
+        // function's caller (`build_layer_mask`) documents
+        // `AttentionMaskError::InvalidPattern` as a possible error for
+        // exactly this kind of pattern mismatch.
         MaskPattern::SelfView
         | MaskPattern::CrossView
         | MaskPattern::ReferenceView
-        | MaskPattern::Ring => full_mask(tokens_per_view),
+        | MaskPattern::Ring => {
+            return Err(AttentionMaskError::InvalidPattern(format!(
+                "{pattern:?} is a multi-view (inter-view) pattern and has no meaningful \
+                 definition as a self_pattern (intra-view); use MaskPattern::Full, Causal, \
+                 or Local instead"
+            )));
+        }
         MaskPattern::AngularProximity { .. } => {
             // Angular proximity within a single view: use full mask for the block.
             // The actual angular conditioning applies at the cross-view level.
@@ -886,7 +935,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // Test 10: to_bias — True→0.0, False→-1e9
+    // Test 10: to_bias — True→0.0, False→-65504.0 (finite, f16-safe)
     // -------------------------------------------------------------------------
     #[test]
     fn test_to_bias_values() {
@@ -895,8 +944,35 @@ mod tests {
         m.set(1, 1, true);
         let bias = m.to_bias();
         assert!((bias[0] - 0.0).abs() < 1e-7, "True should map to 0.0");
-        assert!((bias[1] - (-1e9)).abs() < 1.0, "False should map to -1e9");
+        assert!(
+            (bias[1] - (-65504.0)).abs() < 1.0,
+            "False should map to -65504.0"
+        );
         assert!((bias[3] - 0.0).abs() < 1e-7, "True should map to 0.0");
+    }
+
+    #[test]
+    fn test_to_bias_is_finite_and_f16_representable() {
+        // -65504.0 is f16::MIN (the most negative finite f16 value), so it
+        // must never overflow to infinity when narrowed to f16.
+        let m = AttentionMask::new(3, false);
+        let bias = m.to_bias();
+        assert!(bias.iter().all(|v| v.is_finite()), "bias must be finite");
+        assert!(bias.iter().all(|&v| v == -65504.0));
+    }
+
+    #[test]
+    fn test_get_set_never_panics_on_mismatched_mask_length() {
+        // Hand-built AttentionMask where mask.len() != seq_len * seq_len.
+        // get/set must degrade gracefully instead of panicking.
+        let mut m = AttentionMask {
+            seq_len: 4,
+            mask: vec![true; 3], // way shorter than 4*4=16
+        };
+        assert!(!m.get(3, 3), "out-of-buffer read should return false");
+        assert!(m.get(0, 0), "in-buffer read should still work");
+        m.set(3, 3, true); // must not panic
+        assert!(!m.get(3, 3), "out-of-buffer write is a no-op");
     }
 
     // -------------------------------------------------------------------------
@@ -1204,6 +1280,31 @@ mod tests {
     // -------------------------------------------------------------------------
     // Additional: build_layer_mask with cross-view OR'd together
     // -------------------------------------------------------------------------
+    #[test]
+    fn test_build_layer_mask_multiview_self_pattern_errors() {
+        // Ring (and SelfView/CrossView/ReferenceView) describe inter-view
+        // relationships and are meaningless as a self_pattern (intra-view);
+        // build_layer_mask must reject them rather than silently substituting
+        // a plain full_mask indistinguishable from MaskPattern::Full.
+        for pattern in [
+            MaskPattern::SelfView,
+            MaskPattern::CrossView,
+            MaskPattern::ReferenceView,
+            MaskPattern::Ring,
+        ] {
+            let config = LayerMaskConfig {
+                cross_view: false,
+                self_pattern: pattern.clone(),
+                cross_pattern: None,
+            };
+            let result = build_layer_mask(&config, 3, 4, None);
+            assert!(
+                matches!(result, Err(AttentionMaskError::InvalidPattern(_))),
+                "{pattern:?} as self_pattern should be InvalidPattern, got {result:?}"
+            );
+        }
+    }
+
     #[test]
     fn test_build_layer_mask_cross_view_or() {
         let config = LayerMaskConfig {

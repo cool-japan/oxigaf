@@ -166,37 +166,52 @@ fn gaussian_to_floats(g: &PlyGaussian) -> Vec<f32> {
     v.push(g.rot[3]);
     v
 }
-/// Parse a slice of f32 values (in property order) into a [`PlyGaussian`].
-fn floats_to_gaussian(floats: &[f32], n_rest: usize) -> Result<PlyGaussian, PlyError> {
-    let expected = n_properties_for_rest(n_rest);
-    if floats.len() < expected {
-        return Err(PlyError::DimensionMismatch {
-            expected,
+/// Parse a slice of f32 values into a [`PlyGaussian`] by looking each field
+/// up through `prop_index` (property name → column index in `floats`)
+/// rather than assuming a fixed canonical property order. This correctly
+/// handles a header that omits optional properties (e.g. normals), declares
+/// extra custom properties, or lists properties in a different order —
+/// all of which would otherwise silently desynchronise a fixed-offset
+/// reader. Every semantically load-bearing property (`x`/`y`/`z`,
+/// `opacity`, `scale_0..2`, `rot_0..3`, `f_dc_0..2`, and every `f_rest_i`
+/// implied by `n_rest`) is required: a file missing one is a parse error,
+/// not a silently zeroed value. `nx`/`ny`/`nz` are cosmetic
+/// (3DGS never uses real normals) and default to 0.0 when absent.
+fn floats_to_gaussian_indexed(
+    floats: &[f32],
+    prop_index: &std::collections::HashMap<&str, usize>,
+    n_rest: usize,
+) -> Result<PlyGaussian, PlyError> {
+    let get = |name: &str| -> Result<f32, PlyError> {
+        let idx = *prop_index
+            .get(name)
+            .ok_or_else(|| PlyError::PropertyNotFound(name.to_string()))?;
+        floats.get(idx).copied().ok_or(PlyError::DimensionMismatch {
+            expected: idx + 1,
             got: floats.len(),
-        });
+        })
+    };
+    let get_opt = |name: &str, default: f32| -> f32 {
+        prop_index
+            .get(name)
+            .and_then(|&idx| floats.get(idx).copied())
+            .unwrap_or(default)
+    };
+
+    let x = get("x")?;
+    let y = get("y")?;
+    let z = get("z")?;
+    let nx = get_opt("nx", 0.0);
+    let ny = get_opt("ny", 0.0);
+    let nz = get_opt("nz", 0.0);
+    let f_dc = [get("f_dc_0")?, get("f_dc_1")?, get("f_dc_2")?];
+    let mut f_rest = Vec::with_capacity(n_rest);
+    for i in 0..n_rest {
+        f_rest.push(get(&format!("f_rest_{i}"))?);
     }
-    let mut i = 0;
-    let x = floats[i];
-    i += 1;
-    let y = floats[i];
-    i += 1;
-    let z = floats[i];
-    i += 1;
-    let nx = floats[i];
-    i += 1;
-    let ny = floats[i];
-    i += 1;
-    let nz = floats[i];
-    i += 1;
-    let f_dc = [floats[i], floats[i + 1], floats[i + 2]];
-    i += 3;
-    let f_rest = floats[i..i + n_rest].to_vec();
-    i += n_rest;
-    let opacity = floats[i];
-    i += 1;
-    let scale = [floats[i], floats[i + 1], floats[i + 2]];
-    i += 3;
-    let rot = [floats[i], floats[i + 1], floats[i + 2], floats[i + 3]];
+    let opacity = get("opacity")?;
+    let scale = [get("scale_0")?, get("scale_1")?, get("scale_2")?];
+    let rot = [get("rot_0")?, get("rot_1")?, get("rot_2")?, get("rot_3")?];
     Ok(PlyGaussian {
         x,
         y,
@@ -215,6 +230,28 @@ fn floats_to_gaussian(floats: &[f32], n_rest: usize) -> Result<PlyGaussian, PlyE
 fn count_rest_from_properties(props: &[String]) -> usize {
     props.iter().filter(|p| p.starts_with("f_rest_")).count()
 }
+/// Validate that every Gaussian in `gaussians` has the same `f_rest` length
+/// as `gaussians[0]`, returning that shared length. `ply_write_ascii`/
+/// `ply_write_binary` derive the header's declared `f_rest_*` property
+/// count from `gaussians[0]` alone, so a mismatched Gaussian later in the
+/// slice would otherwise write a row narrower or wider than the header
+/// claims — unparseable ASCII, or silently misaligned binary data from
+/// that row onward.
+fn validate_uniform_f_rest(gaussians: &[PlyGaussian]) -> Result<usize, PlyError> {
+    let n_rest = gaussians[0].f_rest.len();
+    if let Some((idx, g)) = gaussians
+        .iter()
+        .enumerate()
+        .find(|(_, g)| g.f_rest.len() != n_rest)
+    {
+        return Err(PlyError::InvalidData(format!(
+            "gaussian {idx} has {} f_rest coefficients, expected {n_rest} (from gaussian 0); \
+             every Gaussian written to one PLY file must share the same SH degree",
+            g.f_rest.len()
+        )));
+    }
+    Ok(n_rest)
+}
 /// Write Gaussians to a PLY file using the ASCII format.
 ///
 /// Uses `{:.9e}` notation to preserve f32 precision across the round-trip.
@@ -222,7 +259,7 @@ pub fn ply_write_ascii(path: &Path, gaussians: &[PlyGaussian]) -> Result<PlyWrit
     if gaussians.is_empty() {
         return Err(PlyError::EmptyScene);
     }
-    let n_rest = gaussians[0].f_rest.len();
+    let n_rest = validate_uniform_f_rest(gaussians)?;
     let n_props = n_properties_for_rest(n_rest);
     let sh_degree = sh_degree_from_n_rest(n_rest)?;
     let header = ply_build_header(gaussians.len(), n_rest, PlyFormat::Ascii);
@@ -251,7 +288,7 @@ pub fn ply_write_binary(path: &Path, gaussians: &[PlyGaussian]) -> Result<PlyWri
     if gaussians.is_empty() {
         return Err(PlyError::EmptyScene);
     }
-    let n_rest = gaussians[0].f_rest.len();
+    let n_rest = validate_uniform_f_rest(gaussians)?;
     let n_props = n_properties_for_rest(n_rest);
     let sh_degree = sh_degree_from_n_rest(n_rest)?;
     let header = ply_build_header(gaussians.len(), n_rest, PlyFormat::BinaryLittleEndian);
@@ -292,22 +329,69 @@ pub fn ply_write(
         )),
     }
 }
+/// Scan the header for any vertex `property` line whose declared type is
+/// not `float`/`float32`. Used only to give a binary read an honest error
+/// instead of silently misaligning every row when a file uses some other
+/// scalar type for a vertex property — this reader decodes binary payloads
+/// on the assumption that every vertex property is a 4-byte float, the
+/// convention universal to 3DGS PLY files (Kerbl et al. and every major
+/// derivative writer, including this module's own [`ply_write_binary`]).
+fn header_has_non_float_vertex_property(header: &str) -> bool {
+    let mut in_vertex = false;
+    for line in header.lines() {
+        let line = line.trim();
+        if line.starts_with("element vertex") {
+            in_vertex = true;
+        } else if line.starts_with("element ") {
+            in_vertex = false;
+        } else if in_vertex && line.starts_with("property ") {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 2 && parts[1] != "float" && parts[1] != "float32" {
+                return true;
+            }
+        }
+    }
+    false
+}
 /// Read a 3DGS PLY file, returning all Gaussians and summary statistics.
 ///
 /// # Format support
 ///
-/// - ASCII: each line after `end_header` is a space-separated row of floats.
-/// - Binary little-endian: raw IEEE 754 f32 values packed sequentially.
+/// - ASCII: each line after `end_header` is a space-separated row of
+///   floats. Accepts both `\n` and `\r\n` line endings, including on the
+///   `end_header` line itself.
+/// - Binary little-endian: raw IEEE 754 f32 values packed sequentially;
+///   every vertex property must be declared `float`/`float32` (see
+///   [`header_has_non_float_vertex_property`]).
 /// - Binary big-endian: returns [`PlyError::UnsupportedFormat`].
+///
+/// Fields are looked up by property *name* via [`floats_to_gaussian_indexed`],
+/// not by a fixed column position, so a header that lists properties in a
+/// different order, omits the (cosmetic, always-zero in 3DGS) normals, or
+/// declares extra custom properties is still read correctly rather than
+/// silently misaligned.
 pub fn ply_read(path: &Path) -> Result<(Vec<PlyGaussian>, PlyReadStats), PlyError> {
     let raw = std::fs::read(path)?;
-    let end_marker = b"end_header\n";
-    let header_end_pos = raw
-        .windows(end_marker.len())
-        .position(|w| w == end_marker)
+    let marker = b"end_header";
+    let marker_pos = raw
+        .windows(marker.len())
+        .position(|w| w == marker)
         .ok_or_else(|| PlyError::InvalidHeader("missing 'end_header' line".into()))?;
-    let header_bytes = &raw[..header_end_pos + end_marker.len()];
-    let data_start = header_end_pos + end_marker.len();
+    // Accept both `end_header\n` and `end_header\r\n` — the ASCII/binary
+    // format check just below explicitly allows a `ply\r\n` first line, so
+    // the header terminator must accept CRLF too.
+    let mut data_start = marker_pos + marker.len();
+    if raw.get(data_start) == Some(&b'\r') {
+        data_start += 1;
+    }
+    if raw.get(data_start) != Some(&b'\n') {
+        return Err(PlyError::InvalidHeader(
+            "'end_header' is not terminated by a newline".into(),
+        ));
+    }
+    data_start += 1;
+
+    let header_bytes = &raw[..data_start];
     let header = std::str::from_utf8(header_bytes)
         .map_err(|_| PlyError::InvalidHeader("header is not valid UTF-8".into()))?;
     if !header.starts_with("ply\n") && !header.starts_with("ply\r\n") {
@@ -324,15 +408,31 @@ pub fn ply_read(path: &Path) -> Result<(Vec<PlyGaussian>, PlyReadStats), PlyErro
     let n_gaussians = ply_parse_element_count(header, "vertex")?;
     let props = ply_parse_properties(header)?;
     let n_rest = count_rest_from_properties(&props);
-    let n_props = n_properties_for_rest(n_rest);
     let sh_degree = sh_degree_from_n_rest(n_rest)?;
+    let prop_index: std::collections::HashMap<&str, usize> = props
+        .iter()
+        .enumerate()
+        .map(|(i, name)| (name.as_str(), i))
+        .collect();
+    // The number of properties actually declared in the header, not the
+    // canonical formula `n_properties_for_rest(n_rest)` — a file that omits
+    // normals or adds custom properties has a different row width than the
+    // canonical layout, and using the wrong one here would silently
+    // misalign every binary row (or mis-validate every ASCII row) from that
+    // point on.
+    let n_props = props.len();
     let gaussians = match format {
         PlyFormat::Ascii => {
             let data_slice = &raw[data_start..];
             let text = std::str::from_utf8(data_slice).map_err(|_| {
                 PlyError::InvalidData("ASCII data section is not valid UTF-8".into())
             })?;
-            let mut gaussians = Vec::with_capacity(n_gaussians);
+            // Bound the initial reservation by what the remaining data
+            // could possibly hold (at least 1 byte per property per row),
+            // so a header lying about `element vertex` cannot force a
+            // multi-terabyte allocation before a single row is parsed.
+            let max_possible_rows = data_slice.len() / n_props.max(1);
+            let mut gaussians = Vec::with_capacity(n_gaussians.min(max_possible_rows.max(1)));
             let mut line_no = 0usize;
             for line in text.lines() {
                 if line_no >= n_gaussians {
@@ -360,7 +460,7 @@ pub fn ply_read(path: &Path) -> Result<(Vec<PlyGaussian>, PlyReadStats), PlyErro
                         got: floats.len(),
                     });
                 }
-                gaussians.push(floats_to_gaussian(&floats, n_rest)?);
+                gaussians.push(floats_to_gaussian_indexed(&floats, &prop_index, n_rest)?);
                 line_no += 1;
             }
             if gaussians.len() != n_gaussians {
@@ -372,15 +472,33 @@ pub fn ply_read(path: &Path) -> Result<(Vec<PlyGaussian>, PlyReadStats), PlyErro
             gaussians
         }
         PlyFormat::BinaryLittleEndian => {
+            if header_has_non_float_vertex_property(header) {
+                return Err(PlyError::UnsupportedFormat(
+                    "binary vertex properties must all be declared 'float' (the \
+                     convention universal to 3DGS PLY files); this file declares \
+                     a non-float vertex property"
+                        .into(),
+                ));
+            }
             let data = &raw[data_start..];
             let bytes_per_gaussian = n_props * 4;
-            let expected_bytes = n_gaussians * bytes_per_gaussian;
+            let expected_bytes = n_gaussians.checked_mul(bytes_per_gaussian).ok_or_else(|| {
+                PlyError::InvalidHeader(
+                    "'element vertex' count overflows when multiplied by the per-vertex \
+                     byte size"
+                        .into(),
+                )
+            })?;
             if data.len() < expected_bytes {
                 return Err(PlyError::DimensionMismatch {
                     expected: expected_bytes,
                     got: data.len(),
                 });
             }
+            // `expected_bytes <= data.len()` was just checked above, so
+            // `n_gaussians` here is already bounded by the real file size,
+            // not by an unchecked value taken straight from a (possibly
+            // crafted) header.
             let mut gaussians = Vec::with_capacity(n_gaussians);
             for i in 0..n_gaussians {
                 let offset = i * bytes_per_gaussian;
@@ -395,11 +513,15 @@ pub fn ply_read(path: &Path) -> Result<(Vec<PlyGaussian>, PlyReadStats), PlyErro
                     ];
                     floats.push(f32::from_le_bytes(bytes));
                 }
-                gaussians.push(floats_to_gaussian(&floats, n_rest)?);
+                gaussians.push(floats_to_gaussian_indexed(&floats, &prop_index, n_rest)?);
             }
             gaussians
         }
-        PlyFormat::BinaryBigEndian => unreachable!("filtered above"),
+        PlyFormat::BinaryBigEndian => {
+            return Err(PlyError::UnsupportedFormat(
+                "binary_big_endian read is not supported".into(),
+            ));
+        }
     };
     let stats = PlyReadStats {
         n_gaussians,
@@ -606,4 +728,158 @@ pub fn ply_format_write_stats(stats: &PlyWriteStats) -> String {
          File size: {} bytes",
         stats.n_gaussians, stats.n_properties, stats.sh_degree, stats.format, stats.file_size_bytes,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("oxigaf_export_ply_functions_{name}.ply"));
+        p
+    }
+
+    #[test]
+    fn test_ply_read_accepts_crlf_end_header() {
+        // A PLY written with CRLF line endings throughout, including on
+        // `end_header` itself — the header check a few lines below already
+        // accepts a `ply\r\n` first line, so the terminator search must
+        // accept CRLF too, not just `end_header\n`.
+        let path = temp_path("crlf");
+        let content = "ply\r\n\
+format ascii 1.0\r\n\
+element vertex 1\r\n\
+property float x\r\n\
+property float y\r\n\
+property float z\r\n\
+property float nx\r\n\
+property float ny\r\n\
+property float nz\r\n\
+property float f_dc_0\r\n\
+property float f_dc_1\r\n\
+property float f_dc_2\r\n\
+property float opacity\r\n\
+property float scale_0\r\n\
+property float scale_1\r\n\
+property float scale_2\r\n\
+property float rot_0\r\n\
+property float rot_1\r\n\
+property float rot_2\r\n\
+property float rot_3\r\n\
+end_header\r\n\
+1.0 2.0 3.0 0.0 0.0 0.0 0.1 0.2 0.3 -1.0 -1.0 -1.0 -1.0 1.0 0.0 0.0 0.0\r\n";
+        std::fs::write(&path, content).expect("write ok");
+        let result = ply_read(&path);
+        let _ = std::fs::remove_file(&path);
+        let (gaussians, _stats) = result.expect("CRLF PLY must be readable");
+        assert_eq!(gaussians.len(), 1);
+        assert!((gaussians[0].x - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_ply_read_reorders_and_extra_property() {
+        // Header intentionally out of canonical order, plus an extra
+        // unrecognised "confidence" column and omitted normals — a
+        // fixed-position reader would misread every field, but the
+        // name-indexed reader must not.
+        let path = temp_path("reorder");
+        let content = "ply\n\
+format ascii 1.0\n\
+element vertex 1\n\
+property float confidence\n\
+property float opacity\n\
+property float x\n\
+property float y\n\
+property float z\n\
+property float scale_0\n\
+property float scale_1\n\
+property float scale_2\n\
+property float rot_0\n\
+property float rot_1\n\
+property float rot_2\n\
+property float rot_3\n\
+property float f_dc_0\n\
+property float f_dc_1\n\
+property float f_dc_2\n\
+end_header\n\
+0.9 -1.5 1.0 2.0 3.0 -2.0 -2.0 -2.0 1.0 0.0 0.0 0.0 0.1 0.2 0.3\n";
+        std::fs::write(&path, content).expect("write ok");
+        let (gaussians, _stats) = ply_read(&path).expect("read ok");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(gaussians.len(), 1);
+        let g = &gaussians[0];
+        assert!((g.x - 1.0).abs() < 1e-5, "x={}", g.x);
+        assert!((g.y - 2.0).abs() < 1e-5, "y={}", g.y);
+        assert!((g.z - 3.0).abs() < 1e-5, "z={}", g.z);
+        assert!((g.opacity - (-1.5)).abs() < 1e-5, "opacity={}", g.opacity);
+    }
+
+    #[test]
+    fn test_ply_read_binary_big_endian_returns_error_not_panic() {
+        let path = temp_path("bigendian");
+        let content =
+            "ply\nformat binary_big_endian 1.0\nelement vertex 1\nproperty float x\nend_header\n";
+        std::fs::write(&path, content).expect("write ok");
+        let result = ply_read(&path);
+        let _ = std::fs::remove_file(&path);
+        assert!(matches!(result, Err(PlyError::UnsupportedFormat(_))));
+    }
+
+    #[test]
+    fn test_ply_read_binary_overflowing_vertex_count_is_an_error() {
+        // A crafted header claiming an astronomically large vertex count
+        // must return a clean error rather than overflowing the
+        // count * bytes-per-vertex multiply (which would otherwise wrap to
+        // a small value in release mode and desynchronise every offset
+        // computed from it).
+        let path = temp_path("huge_count_binary");
+        let content = format!(
+            "ply\nformat binary_little_endian 1.0\nelement vertex {}\nproperty float x\nend_header\n",
+            usize::MAX / 2
+        );
+        std::fs::write(&path, content).expect("write ok");
+        let result = ply_read(&path);
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            result.is_err(),
+            "an unsatisfiable vertex count must be a clean error"
+        );
+    }
+
+    #[test]
+    fn test_ply_read_ascii_huge_vertex_count_with_little_data_is_an_error() {
+        // A header lying about `element vertex` must not drive an
+        // unbounded `Vec::with_capacity` before any data is parsed; the
+        // reservation is capped by the actual remaining file size.
+        let path = temp_path("huge_count_ascii");
+        let content =
+            "ply\nformat ascii 1.0\nelement vertex 100000000000\nproperty float x\nend_header\n1.0\n";
+        std::fs::write(&path, content).expect("write ok");
+        let result = ply_read(&path);
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            result.is_err(),
+            "a header lying about the vertex count must be a clean error, not a giant allocation"
+        );
+    }
+
+    #[test]
+    fn test_ply_write_rejects_non_uniform_f_rest() {
+        // ply_write_ascii/binary derive the header's f_rest_* property
+        // count from gaussians[0] alone; a later Gaussian with a different
+        // f_rest length must be rejected rather than silently written
+        // misaligned with the declared header.
+        let path = temp_path("nonuniform_rest");
+        let mut g0 = PlyGaussian::identity();
+        g0.f_rest = vec![0.0; 9]; // SH degree 1
+        let mut g1 = PlyGaussian::identity();
+        g1.f_rest = vec![0.0; 24]; // SH degree 2 — mismatched with g0
+        let result = ply_write_ascii(&path, &[g0, g1]);
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            matches!(result, Err(PlyError::InvalidData(_))),
+            "mismatched f_rest lengths must be rejected, not silently written misaligned"
+        );
+    }
 }

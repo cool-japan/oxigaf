@@ -215,12 +215,21 @@ impl FacsIntensity {
 // AuMapping
 // ---------------------------------------------------------------------------
 
-/// Maps one `ActionUnit` activation to expression parameter deltas.
+/// Maps one `ActionUnit` activation to expression parameter deltas (and,
+/// optionally, pose joint deltas).
 ///
-/// At intensity `I`, for each `(param_idx, scale)` pair:
+/// At intensity `I`, for each `(param_idx, scale)` pair in `contributions`:
 /// ```text
 /// expression[param_idx] += scale * I
 /// ```
+/// and likewise for each pair in `pose_contributions` against
+/// `FlameParams::pose` (see [`FacsToFlame::apply_aus_pose`]).
+///
+/// Most AUs are well modelled purely as expression-basis deltas. A few —
+/// notably AU26 (jaw drop) — correspond to an actual FLAME kinematic joint
+/// rotation rather than a blend-shape direction, and use
+/// `pose_contributions` for that part of their effect instead of faking it
+/// with an expression coefficient.
 #[derive(Debug, Clone)]
 pub struct AuMapping {
     /// The action unit this mapping applies to.
@@ -229,20 +238,36 @@ pub struct AuMapping {
     pub contributions: Vec<(usize, f32)>,
     /// Minimum number of expression dimensions required (i.e. `max_index + 1`).
     pub required_expr_dims: usize,
+    /// `(pose_param_index, scale_at_full_intensity)` pairs, indexing into
+    /// `FlameParams::pose` (`0..FlameParams::NUM_JOINTS * 3`). Empty for AUs
+    /// that only affect the expression basis.
+    pub pose_contributions: Vec<(usize, f32)>,
 }
 
 impl AuMapping {
-    /// Create a new `AuMapping`.
+    /// Create a new `AuMapping` with expression-basis contributions only.
     ///
     /// `required_expr_dims` is derived automatically as `max(index) + 1` over
     /// all contribution pairs, or `0` if `contributions` is empty.
     #[must_use]
     pub fn new(au: ActionUnit, contributions: Vec<(usize, f32)>) -> Self {
+        Self::with_pose(au, contributions, Vec::new())
+    }
+
+    /// Create a new `AuMapping` that also drives FLAME pose joints (e.g.
+    /// jaw opening) in addition to any expression-basis contributions.
+    #[must_use]
+    pub fn with_pose(
+        au: ActionUnit,
+        contributions: Vec<(usize, f32)>,
+        pose_contributions: Vec<(usize, f32)>,
+    ) -> Self {
         let required = contributions.iter().map(|(i, _)| i + 1).max().unwrap_or(0);
         Self {
             action_unit: au,
             contributions,
             required_expr_dims: required,
+            pose_contributions,
         }
     }
 }
@@ -301,8 +326,11 @@ impl FacsLibrary {
             AuMapping::new(ActionUnit::LipPressor, vec![(16, 0.4)]),
             // AU25 LipsPart       → expr[17] += 1.2
             AuMapping::new(ActionUnit::LipsPart, vec![(17, 1.2)]),
-            // AU26 JawDrop        → expr[17] += 0.8, expr[18] += 1.0 (jaw angle)
-            AuMapping::new(ActionUnit::JawDrop, vec![(17, 0.8), (18, 1.0)]),
+            // AU26 JawDrop        → expr[17] += 0.8 (lips separate a little
+            // as the jaw opens), pose[6] += 0.5 (jaw joint pitch — the jaw
+            // is a POSE joint in FLAME, not an expression-basis direction;
+            // see `AuMapping::pose_contributions`)
+            AuMapping::with_pose(ActionUnit::JawDrop, vec![(17, 0.8)], vec![(6, 0.5)]),
             // AU28 LipSuck        → expr[19] += 0.6
             AuMapping::new(ActionUnit::LipSuck, vec![(19, 0.6)]),
             // AU43 EyesClosed     → expr[20] += 1.0, expr[21] += 1.0
@@ -389,24 +417,61 @@ impl FacsToFlame {
         expr
     }
 
-    /// Apply AUs and return a full `FlameParams` with the computed expression.
+    /// Compute the pose-joint deltas contributed by a set of AU activations.
     ///
-    /// Shape, pose, and translation are set to neutral/zero values.
+    /// Returns a `Vec<f32>` of length `FlameParams::NUM_JOINTS * 3`, indexed
+    /// exactly like [`FlameParams::pose`]. Contributions from all activated
+    /// AUs' [`AuMapping::pose_contributions`] are accumulated, then each
+    /// joint component is clamped to `[-PI, PI]` (mirroring the expression
+    /// clamp in [`apply_aus`](Self::apply_aus)). AUs without a registered
+    /// mapping, or whose mapping has no pose contributions, leave the
+    /// corresponding joints untouched (zero).
+    #[must_use]
+    pub fn apply_aus_pose(&self, activations: &HashMap<ActionUnit, FacsIntensity>) -> Vec<f32> {
+        let mut pose = vec![0.0f32; FlameParams::NUM_JOINTS * 3];
+
+        for (au, intensity) in activations {
+            if let Some(mapping) = self.library.get_mapping(au) {
+                let i = intensity.value();
+                for &(pose_idx, scale) in &mapping.pose_contributions {
+                    if pose_idx < pose.len() {
+                        pose[pose_idx] += scale * i;
+                    }
+                }
+            }
+        }
+
+        for p in &mut pose {
+            *p = p.clamp(-std::f32::consts::PI, std::f32::consts::PI);
+        }
+
+        pose
+    }
+
+    /// Apply AUs and return a full `FlameParams` with the computed
+    /// expression and pose (e.g. jaw opening from AU26).
+    ///
+    /// Shape and translation are set to neutral/zero values.
     #[must_use]
     pub fn to_flame_params(&self, activations: &HashMap<ActionUnit, FacsIntensity>) -> FlameParams {
-        let expression = self.apply_aus(activations);
         FlameParams {
             shape: Vec::new(),
-            expression,
-            pose: vec![0.0; FlameParams::NUM_JOINTS * 3],
+            expression: self.apply_aus(activations),
+            pose: self.apply_aus_pose(activations),
             translation: [0.0; 3],
         }
     }
 
-    /// Validate AU activations against the library.
+    /// Validate AU activations against the library and this converter's
+    /// expression dimensionality.
     ///
-    /// Returns a list of AUs present in `activations` that have no registered
-    /// mapping.  An empty return value means all AUs are mapped.
+    /// Returns the AUs present in `activations` that will not be fully
+    /// applied by [`apply_aus`](Self::apply_aus): those with no registered
+    /// mapping at all, and those whose mapping needs more expression
+    /// dimensions than `expr_dims` provides (in which case `apply_aus`
+    /// silently drops their higher-indexed contributions). An empty return
+    /// value means every activated AU is both mapped and fully
+    /// representable at the configured `expr_dims`.
     #[must_use]
     pub fn validate_aus(
         &self,
@@ -414,7 +479,10 @@ impl FacsToFlame {
     ) -> Vec<ActionUnit> {
         activations
             .keys()
-            .filter(|au| self.library.get_mapping(au).is_none())
+            .filter(|au| match self.library.get_mapping(au) {
+                None => true,
+                Some(mapping) => mapping.required_expr_dims > self.expr_dims,
+            })
             .copied()
             .collect()
     }
@@ -633,6 +701,24 @@ mod tests {
         assert_eq!(m.action_unit, ActionUnit::InnerBrowRaise);
     }
 
+    #[test]
+    fn test_au_mapping_new_has_no_pose_contributions() {
+        let m = AuMapping::new(ActionUnit::InnerBrowRaise, vec![(0, 1.2)]);
+        assert!(
+            m.pose_contributions.is_empty(),
+            "plain `new` should not add pose contributions"
+        );
+    }
+
+    #[test]
+    fn test_au_mapping_with_pose_stores_pose_contributions() {
+        let m = AuMapping::with_pose(ActionUnit::JawDrop, vec![(17, 0.8)], vec![(6, 0.5)]);
+        assert_eq!(m.pose_contributions, vec![(6, 0.5)]);
+        // required_expr_dims must still be derived from `contributions`
+        // only (pose indices are a separate, fixed-size space).
+        assert_eq!(m.required_expr_dims, 18);
+    }
+
     // ---- FacsLibrary ------------------------------------------------------
 
     #[test]
@@ -764,6 +850,62 @@ mod tests {
         assert_eq!(params.expression.len(), 50);
         assert_eq!(params.pose.len(), FlameParams::NUM_JOINTS * 3);
         assert_eq!(params.translation, [0.0; 3]);
+    }
+
+    // Regression test: AU26 (JawDrop) must actually open the jaw POSE joint
+    // (pose[6], per `FlameParamsBuilder::jaw_rotation`), not just tweak
+    // unrelated expression coefficients under a false "(jaw angle)" label.
+    #[test]
+    fn test_facs_jaw_drop_opens_jaw_pose_joint() {
+        let converter = FacsToFlame::default();
+        let mut activations = HashMap::new();
+        activations.insert(ActionUnit::JawDrop, FacsIntensity::new(1.0));
+        let params = converter.to_flame_params(&activations);
+
+        assert_eq!(params.pose.len(), FlameParams::NUM_JOINTS * 3);
+        assert!(
+            params.pose[6] > 0.0,
+            "AU26 at full intensity must produce a positive jaw pitch \
+             (pose[6]), got {}",
+            params.pose[6]
+        );
+        // Only the jaw joint (pose[6..9]) should move; the other four
+        // joints are untouched by this AU.
+        for (idx, &p) in params.pose.iter().enumerate() {
+            if !(6..9).contains(&idx) {
+                assert_eq!(p, 0.0, "pose[{idx}] should be untouched by AU26, got {p}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_facs_to_flame_params_zero_pose_when_no_pose_aus_active() {
+        // Presets that only activate expression-mapped AUs must leave the
+        // pose vector at zero.
+        let converter = FacsToFlame::default();
+        let activations = FacsPresets::smile();
+        let params = converter.to_flame_params(&activations);
+        assert!(
+            params.pose.iter().all(|&p| p == 0.0),
+            "smile has no pose-mapped AUs, pose should stay zero"
+        );
+    }
+
+    // Regression test: an under-sized `expr_dims` used to silently drop
+    // higher-indexed AU contributions with no diagnostic at all.
+    // `validate_aus` must surface this.
+    #[test]
+    fn test_validate_aus_flags_undersized_expr_dims() {
+        let lib = FacsLibrary::default_flame();
+        // AU45 (Blink) needs expr_dims >= 22 (max index 21). 10 is too small.
+        let converter = FacsToFlame::new(lib, 10);
+        let mut activations = HashMap::new();
+        activations.insert(ActionUnit::Blink, FacsIntensity::new(1.0));
+        let flagged = converter.validate_aus(&activations);
+        assert!(
+            flagged.contains(&ActionUnit::Blink),
+            "Blink's contributions exceed expr_dims=10 and must be flagged"
+        );
     }
 
     #[test]

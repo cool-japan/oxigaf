@@ -37,6 +37,19 @@ pub enum ConsistencyError {
     /// After applying a mask or correspondence region, no valid pixels remain.
     #[error("No valid pixels in correspondence region")]
     EmptyCorrespondence,
+
+    /// A `ViewBundle` was constructed or used with a zero-valued dimension
+    /// (`width`, `height`, or `num_channels`), which cannot hold any pixel
+    /// data.
+    #[error(
+        "Invalid view dimensions: width={width}, height={height}, num_channels={num_channels} \
+         (all must be > 0)"
+    )]
+    InvalidDimensions {
+        width: u32,
+        height: u32,
+        num_channels: u32,
+    },
 }
 
 // ───────────────────────────────────────────────────────────────────────────────
@@ -75,9 +88,33 @@ impl ViewBundle {
         (self.width as usize) * (self.height as usize) * (self.num_channels as usize)
     }
 
+    /// Validate that this bundle's dimensions can hold pixel data: `width`,
+    /// `height`, and `num_channels` must all be non-zero.
+    ///
+    /// `add_view` / `add_view_u8` already call this before accepting any
+    /// pixel buffer, so a bundle that holds at least one view is always
+    /// valid; this is useful for checking a freshly-constructed (still
+    /// empty) bundle up front, before attempting to add views to it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConsistencyError::InvalidDimensions`] if any dimension is 0.
+    pub fn validate(&self) -> Result<(), ConsistencyError> {
+        if self.width == 0 || self.height == 0 || self.num_channels == 0 {
+            return Err(ConsistencyError::InvalidDimensions {
+                width: self.width,
+                height: self.height,
+                num_channels: self.num_channels,
+            });
+        }
+        Ok(())
+    }
+
     /// Add a pre-normalised `f32` view.  Returns an error if the buffer length
-    /// does not match `width * height * num_channels`.
+    /// does not match `width * height * num_channels`, or if the bundle's
+    /// dimensions are degenerate (see [`Self::validate`]).
     pub fn add_view(&mut self, pixels: Vec<f32>) -> Result<(), ConsistencyError> {
+        self.validate()?;
         let expected = self.expected_len();
         if pixels.len() != expected {
             return Err(ConsistencyError::SizeMismatch {
@@ -102,7 +139,10 @@ impl ViewBundle {
 
     /// Convert a `u8` RGBA/RGB buffer into the `[0, 1]` range and add it as a
     /// new view.  The byte count must equal `width * height * num_channels`.
+    /// Returns an error if the bundle's dimensions are degenerate (see
+    /// [`Self::validate`]).
     pub fn add_view_u8(&mut self, pixels: &[u8]) -> Result<(), ConsistencyError> {
+        self.validate()?;
         let expected = self.expected_len();
         if pixels.len() != expected {
             return Err(ConsistencyError::SizeMismatch {
@@ -148,7 +188,8 @@ pub struct ConsistencyStats {
     pub mean_pairwise_l1: f32,
     /// Mean L2 (MSE) distance averaged over all ordered pairs.
     pub mean_pairwise_l2: f32,
-    /// Mean SSIM approximation (luminance correlation mapped to `[0, 1]`).
+    /// Mean windowed SSIM (structural similarity) score across all pairs, in
+    /// `[0, 1]` (`1.0` = structurally identical). See [`windowed_ssim`].
     pub mean_pairwise_ssim: f32,
     /// Minimum pairwise consistency (worst pair; lower = less consistent).
     pub min_consistency: f32,
@@ -240,7 +281,9 @@ pub enum ConsistencyLossType {
     L1,
     /// Mean squared error.
     L2,
-    /// SSIM approximation (luminance correlation).
+    /// Windowed SSIM (structural similarity), converted to a distance as
+    /// `1.0 - ssim`. See [`windowed_ssim`] for the underlying computation;
+    /// the window size is [`ConsistencyConfig::patch_size`].
     Ssim,
     /// Weighted combination of L1 and SSIM.
     Combined { l1_weight: f32, ssim_weight: f32 },
@@ -252,9 +295,13 @@ pub struct ConsistencyConfig {
     pub loss_type: ConsistencyLossType,
     /// Relative weight of the consistency term vs the content term.
     pub consistency_weight: f32,
-    /// Patch side length for patch-based losses (default: 8).
+    /// Patch side length for [`ConsistencyLossType::Ssim`]'s windowed SSIM
+    /// computation (default: 8). See [`windowed_ssim`].
     pub patch_size: u32,
-    /// Compare only the luminance channel (derived from RGB) instead of all channels.
+    /// Compare only the luminance channel (derived from RGB) instead of all
+    /// channels, for the `L1`/`L2`/`Combined` distance terms. `Ssim` always
+    /// operates on luminance regardless of this flag, since windowed SSIM is
+    /// inherently a single-channel 2D computation.
     pub use_luminance_only: bool,
 }
 
@@ -263,11 +310,16 @@ impl Default for ConsistencyConfig {
         ConsistencyConfig {
             loss_type: ConsistencyLossType::L2,
             consistency_weight: 0.1,
-            patch_size: 8,
+            patch_size: DEFAULT_SSIM_WINDOW,
             use_luminance_only: false,
         }
     }
 }
+
+/// Default window side length (in pixels) for [`windowed_ssim`] when no
+/// explicit patch size is supplied by the caller (matches
+/// `ConsistencyConfig::default().patch_size`).
+const DEFAULT_SSIM_WINDOW: u32 = 8;
 
 // ───────────────────────────────────────────────────────────────────────────────
 // Internal helpers
@@ -279,7 +331,14 @@ impl Default for ConsistencyConfig {
 /// three channels).
 ///
 /// If `num_channels` is not 3 or 4 every channel is averaged uniformly instead.
+///
+/// Returns an empty `Vec` when `num_channels == 0` (there is no valid chunk
+/// size to slice by, and — per [`ViewBundle::validate`] — a bundle with a
+/// zero channel count can never hold any real pixel data anyway).
 fn to_luminance(pixels: &[f32], num_channels: u32) -> Vec<f32> {
+    if num_channels == 0 {
+        return Vec::new();
+    }
     match num_channels {
         3 => pixels
             .chunks_exact(3)
@@ -344,7 +403,14 @@ pub fn l2_distance(a: &[f32], b: &[f32]) -> Result<f32, ConsistencyError> {
     Ok(sum / n as f32)
 }
 
-/// Luminance correlation between two image arrays, used as an SSIM proxy.
+/// Global Pearson correlation between two image arrays.
+///
+/// This is a single whole-buffer correlation with no spatial windowing, no
+/// luminance/contrast decomposition, and no stabilizing constants — it is a
+/// cheap, order-invariant similarity proxy, **not** an SSIM approximation
+/// (it is insensitive to uniform brightness/contrast shifts that real SSIM
+/// penalises heavily). For an actual structural-similarity estimate, use
+/// [`windowed_ssim`] instead.
 ///
 /// Returns a value in `[-1, 1]`:
 /// - `1.0`  → identical or constant difference (including the all-zeros edge case)
@@ -375,6 +441,132 @@ pub fn luminance_correlation(a: &[f32], b: &[f32]) -> Result<f32, ConsistencyErr
         return Ok(1.0);
     }
     Ok((dot / denom).clamp(-1.0, 1.0))
+}
+
+/// Windowed structural similarity (SSIM) between two single-channel images
+/// of shape `height x width` (flat, row-major).
+///
+/// Splits the image into non-overlapping `window x window` blocks (the last
+/// row/column of blocks is clipped to the image bounds when the dimensions
+/// are not an exact multiple of `window`), computes the standard SSIM index
+/// per block —
+///
+/// ```text
+/// SSIM = (2*mu_a*mu_b + C1) * (2*cov_ab + C2)
+///        ─────────────────────────────────────
+///        (mu_a² + mu_b² + C1) * (var_a + var_b + C2)
+/// ```
+///
+/// with the usual stabilizers `C1 = (0.01*L)²`, `C2 = (0.03*L)²` (`L = 1.0`,
+/// matching this crate's `[0, 1]` pixel convention) — and returns the mean
+/// over all blocks (MSSIM).
+///
+/// This is a block-averaged simplification of the reference sliding-window
+/// SSIM (Wang et al. 2004): it reproduces the same luminance/contrast/
+/// structure decomposition and is far closer to true SSIM than a single
+/// global correlation ([`luminance_correlation`]), but uses non-overlapping
+/// blocks rather than an overlapping Gaussian-weighted window.
+///
+/// # Errors
+///
+/// Returns [`ConsistencyError::SizeMismatch`] if `a` or `b` does not have
+/// exactly `width * height` elements, and
+/// [`ConsistencyError::EmptyCorrespondence`] if `width * height == 0`.
+pub fn windowed_ssim(
+    a: &[f32],
+    b: &[f32],
+    width: u32,
+    height: u32,
+    window: u32,
+) -> Result<f32, ConsistencyError> {
+    let w = width as usize;
+    let h = height as usize;
+    let expected = w * h;
+    if a.len() != expected {
+        return Err(ConsistencyError::SizeMismatch {
+            idx: 0,
+            actual: a.len(),
+            expected,
+        });
+    }
+    if b.len() != expected {
+        return Err(ConsistencyError::SizeMismatch {
+            idx: 0,
+            actual: b.len(),
+            expected,
+        });
+    }
+    if expected == 0 {
+        return Err(ConsistencyError::EmptyCorrespondence);
+    }
+
+    // Stabilizing constants (Wang et al. 2004), dynamic range L = 1.0.
+    const K1: f64 = 0.01;
+    const K2: f64 = 0.03;
+    const L: f64 = 1.0;
+    let c1 = (K1 * L) * (K1 * L);
+    let c2 = (K2 * L) * (K2 * L);
+
+    let win = (window as usize).max(1);
+
+    let mut ssim_sum = 0.0_f64;
+    let mut block_count = 0usize;
+
+    let mut by0 = 0usize;
+    while by0 < h {
+        let by1 = (by0 + win).min(h);
+        let mut bx0 = 0usize;
+        while bx0 < w {
+            let bx1 = (bx0 + win).min(w);
+            let n = ((by1 - by0) * (bx1 - bx0)) as f64;
+
+            let mut sum_a = 0.0_f64;
+            let mut sum_b = 0.0_f64;
+            for y in by0..by1 {
+                let row = y * w;
+                for x in bx0..bx1 {
+                    sum_a += a[row + x] as f64;
+                    sum_b += b[row + x] as f64;
+                }
+            }
+            let mean_a = sum_a / n;
+            let mean_b = sum_b / n;
+
+            let mut var_a = 0.0_f64;
+            let mut var_b = 0.0_f64;
+            let mut cov_ab = 0.0_f64;
+            for y in by0..by1 {
+                let row = y * w;
+                for x in bx0..bx1 {
+                    let da = a[row + x] as f64 - mean_a;
+                    let db = b[row + x] as f64 - mean_b;
+                    var_a += da * da;
+                    var_b += db * db;
+                    cov_ab += da * db;
+                }
+            }
+            var_a /= n;
+            var_b /= n;
+            cov_ab /= n;
+
+            let numerator = (2.0 * mean_a * mean_b + c1) * (2.0 * cov_ab + c2);
+            let denominator = (mean_a * mean_a + mean_b * mean_b + c1) * (var_a + var_b + c2);
+            let block_ssim = if denominator.abs() < 1e-12 {
+                1.0
+            } else {
+                numerator / denominator
+            };
+            ssim_sum += block_ssim;
+            block_count += 1;
+
+            bx0 += win;
+        }
+        by0 += win;
+    }
+
+    // block_count > 0 is guaranteed here: expected == w * h > 0 (checked
+    // above) implies w > 0 and h > 0, so the while loops each run at least once.
+    Ok(((ssim_sum / block_count as f64) as f32).clamp(-1.0, 1.0))
 }
 
 // ───────────────────────────────────────────────────────────────────────────────
@@ -424,14 +616,24 @@ pub fn compute_consistency_stats(
 
             let d1 = l1_distance(vi, vj)?;
             let d2 = l2_distance(vi, vj)?;
-            let corr = luminance_correlation(vi, vj)?;
-            // Map luminance correlation from [-1,1] to [0,1]
-            let ssim_approx = (corr + 1.0) * 0.5;
+            // Real windowed SSIM requires a single-channel 2D image, so
+            // reduce both views to luminance first (previously this called
+            // `luminance_correlation` directly on the raw interleaved
+            // multi-channel buffers, which was neither luminance nor SSIM).
+            let lum_i = to_luminance(vi, bundle.num_channels);
+            let lum_j = to_luminance(vj, bundle.num_channels);
+            let ssim_val = windowed_ssim(
+                &lum_i,
+                &lum_j,
+                bundle.width,
+                bundle.height,
+                DEFAULT_SSIM_WINDOW,
+            )?;
             let consistency = (1.0_f32 - d2).clamp(0.0, 1.0);
 
             total_l1 += d1;
             total_l2 += d2;
-            total_ssim += ssim_approx;
+            total_ssim += ssim_val;
 
             if consistency < min_cons {
                 min_cons = consistency;
@@ -497,9 +699,11 @@ pub fn compute_cross_view_correlation(
 /// Per-pixel standard deviation across views — a measure of inconsistency.
 ///
 /// Returns a flat `f32` array of length `width * height * num_channels`.  Each
-/// element is the normalised standard deviation (divided by `sqrt(3)` so that
-/// the range for `[0, 1]` valued inputs is `[0, 1]`) for that channel position
-/// across all views.
+/// element is the standard deviation across views at that channel position,
+/// normalised by the maximum possible population standard deviation for
+/// `[0, 1]`-valued inputs (`0.5`, attained when half the views are at `0.0`
+/// and half at `1.0`), so the range for `[0, 1]` valued inputs is genuinely
+/// `[0, 1]`.
 pub fn consistency_map(bundle: &ViewBundle) -> Result<Vec<f32>, ConsistencyError> {
     require_two_views(bundle)?;
     let pixel_len = bundle.expected_len();
@@ -525,11 +729,15 @@ pub fn consistency_map(bundle: &ViewBundle) -> Result<Vec<f32>, ConsistencyError
         }
     }
 
-    // Normalise to [0, 1] by dividing std by sqrt(3).
-    let normaliser = 1.0_f32 / 3.0_f32.sqrt();
+    // Normalise to [0, 1] by dividing std by its maximum possible value for
+    // [0, 1]-valued inputs. The population std of a value confined to
+    // [0, 1] is maximised (at 0.5) when half the samples sit at each
+    // extreme — sqrt(3) is not a reachable bound and previously left the
+    // output saturating at ~0.289 instead of 1.0.
+    const MAX_STD_UNIT_RANGE: f32 = 0.5;
     let map: Vec<f32> = variance
         .iter()
-        .map(|&var| ((var / n).sqrt() * normaliser).clamp(0.0, 1.0))
+        .map(|&var| ((var / n).sqrt() / MAX_STD_UNIT_RANGE).clamp(0.0, 1.0))
         .collect();
 
     Ok(map)
@@ -620,11 +828,32 @@ pub fn median_view(bundle: &ViewBundle) -> Result<Vec<f32>, ConsistencyError> {
 // Consistency loss
 // ───────────────────────────────────────────────────────────────────────────────
 
+/// Windowed-SSIM distance (`1.0 - ssim`) between `prediction` and `reference`
+/// — both raw buffers using `bundle`'s interleaved channel layout — after
+/// reducing each to luminance (windowed SSIM is inherently a single-channel
+/// 2D computation, so this conversion happens unconditionally, independent
+/// of [`ConsistencyConfig::use_luminance_only`]).
+fn ssim_distance(
+    prediction: &[f32],
+    reference: &[f32],
+    bundle: &ViewBundle,
+    patch_size: u32,
+) -> Result<f32, ConsistencyError> {
+    let lum_pred = to_luminance(prediction, bundle.num_channels);
+    let lum_ref = to_luminance(reference, bundle.num_channels);
+    let ssim = windowed_ssim(&lum_pred, &lum_ref, bundle.width, bundle.height, patch_size)?;
+    Ok(1.0 - ssim)
+}
+
 /// Consistency loss between a prediction and a set of reference views.
 ///
 /// The prediction is compared to every view in `references` using the metric
 /// specified by `config.loss_type`.  The result is the mean distance across all
 /// reference views, further multiplied by `config.consistency_weight`.
+///
+/// When `config.use_luminance_only` is set, the `L1`/`L2`/`Combined` distance
+/// terms are computed on luminance-reduced buffers instead of the raw
+/// interleaved channels (see [`ConsistencyConfig::use_luminance_only`]).
 pub fn consistency_loss(
     prediction: &[f32],
     references: &ViewBundle,
@@ -634,6 +863,16 @@ pub fn consistency_loss(
     if n == 0 {
         return Err(ConsistencyError::TooFewViews);
     }
+
+    let l1_term = |reference: &[f32]| -> Result<f32, ConsistencyError> {
+        if config.use_luminance_only {
+            let lum_pred = to_luminance(prediction, references.num_channels);
+            let lum_ref = to_luminance(reference, references.num_channels);
+            l1_distance(&lum_pred, &lum_ref)
+        } else {
+            l1_distance(prediction, reference)
+        }
+    };
 
     let mut total = 0.0_f32;
     for (idx, ref_view) in references.views.iter().enumerate() {
@@ -647,20 +886,25 @@ pub fn consistency_loss(
         }
 
         let dist = match &config.loss_type {
-            ConsistencyLossType::L1 => l1_distance(prediction, ref_view)?,
-            ConsistencyLossType::L2 => l2_distance(prediction, ref_view)?,
+            ConsistencyLossType::L1 => l1_term(ref_view)?,
+            ConsistencyLossType::L2 => {
+                if config.use_luminance_only {
+                    let lum_pred = to_luminance(prediction, references.num_channels);
+                    let lum_ref = to_luminance(ref_view, references.num_channels);
+                    l2_distance(&lum_pred, &lum_ref)?
+                } else {
+                    l2_distance(prediction, ref_view)?
+                }
+            }
             ConsistencyLossType::Ssim => {
-                // Convert from correlation (higher = better) to a distance (lower = better).
-                let corr = luminance_correlation(prediction, ref_view)?;
-                1.0 - (corr + 1.0) * 0.5
+                ssim_distance(prediction, ref_view, references, config.patch_size)?
             }
             ConsistencyLossType::Combined {
                 l1_weight,
                 ssim_weight,
             } => {
-                let d_l1 = l1_distance(prediction, ref_view)?;
-                let corr = luminance_correlation(prediction, ref_view)?;
-                let d_ssim = 1.0 - (corr + 1.0) * 0.5;
+                let d_l1 = l1_term(ref_view)?;
+                let d_ssim = ssim_distance(prediction, ref_view, references, config.patch_size)?;
                 l1_weight * d_l1 + ssim_weight * d_ssim
             }
         };
@@ -1358,5 +1602,188 @@ mod tests {
         assert!(report.contains("mean_l1"));
         assert!(report.contains("consistency_score"));
         assert!(report.contains('3'.to_string().as_str()));
+    }
+
+    // ─── ViewBundle dimension validation (regression: chunks_exact(0) panic) ─
+
+    #[test]
+    fn test_view_bundle_add_view_rejects_zero_num_channels() {
+        let mut b = ViewBundle::new(2, 2, 0);
+        let err = b.add_view(vec![]);
+        assert!(matches!(
+            err,
+            Err(ConsistencyError::InvalidDimensions { .. })
+        ));
+    }
+
+    #[test]
+    fn test_view_bundle_add_view_rejects_zero_width_or_height() {
+        let mut b = ViewBundle::new(0, 2, 3);
+        assert!(matches!(
+            b.add_view(vec![]),
+            Err(ConsistencyError::InvalidDimensions { .. })
+        ));
+        let mut b2 = ViewBundle::new(2, 0, 3);
+        assert!(matches!(
+            b2.add_view(vec![]),
+            Err(ConsistencyError::InvalidDimensions { .. })
+        ));
+    }
+
+    #[test]
+    fn test_view_bundle_add_view_u8_rejects_zero_num_channels() {
+        let mut b = ViewBundle::new(2, 2, 0);
+        assert!(matches!(
+            b.add_view_u8(&[]),
+            Err(ConsistencyError::InvalidDimensions { .. })
+        ));
+    }
+
+    #[test]
+    fn test_view_bundle_validate_ok_for_positive_dims() {
+        let b = ViewBundle::new(4, 4, 3);
+        assert!(b.validate().is_ok());
+    }
+
+    #[test]
+    fn test_to_luminance_zero_channels_does_not_panic() {
+        // Regression test: `chunks_exact(0)` previously panicked here,
+        // reachable if a `ViewBundle`'s public `views` field is populated
+        // directly (bypassing `add_view`'s validation).
+        let out = to_luminance(&[1.0, 2.0, 3.0], 0);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn test_cross_view_correlation_zero_channels_bundle_does_not_panic() {
+        // Bypass `add_view`'s validation via the public `views` field, as a
+        // malicious/careless caller could.
+        let mut b = ViewBundle::new(2, 2, 0);
+        b.views.push(vec![]);
+        b.views.push(vec![]);
+        // Must return a typed error, not panic.
+        let result = compute_cross_view_correlation(&b);
+        assert!(result.is_err());
+    }
+
+    // ─── windowed_ssim ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_windowed_ssim_identical_images() {
+        let a = ramp(16);
+        let ssim = windowed_ssim(&a, &a, 4, 4, 8).unwrap();
+        assert!(
+            (ssim - 1.0).abs() < 1e-4,
+            "identical images should score ~1.0, got {ssim}"
+        );
+    }
+
+    #[test]
+    fn test_windowed_ssim_size_mismatch() {
+        let a = vec![0.0_f32; 8];
+        let b = vec![0.0_f32; 9];
+        assert!(matches!(
+            windowed_ssim(&a, &b, 4, 2, 8),
+            Err(ConsistencyError::SizeMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn test_windowed_ssim_empty_dims() {
+        assert!(matches!(
+            windowed_ssim(&[], &[], 0, 0, 8),
+            Err(ConsistencyError::EmptyCorrespondence)
+        ));
+    }
+
+    #[test]
+    fn test_windowed_ssim_detects_brightness_shift_that_correlation_misses() {
+        // A ramp and the same ramp shifted up by a constant are perfectly
+        // (Pearson) correlated — correlation ignores absolute level — but
+        // real SSIM's luminance term must penalise the shift. This is the
+        // core regression test for the "Ssim was actually a global
+        // correlation" bug.
+        let a = ramp(16);
+        let b: Vec<f32> = a.iter().map(|&v| v + 0.4).collect();
+
+        let corr = luminance_correlation(&a, &b).unwrap();
+        assert!(
+            (corr - 1.0).abs() < 1e-4,
+            "pure shift should be perfectly correlated, got {corr}"
+        );
+
+        let ssim = windowed_ssim(&a, &b, 16, 1, 8).unwrap();
+        assert!(
+            ssim < 0.9,
+            "SSIM should penalise the luminance/brightness shift, got {ssim}"
+        );
+    }
+
+    #[test]
+    fn test_consistency_loss_ssim_penalises_brightness_shift() {
+        let a = ramp(16);
+        let shifted: Vec<f32> = a.iter().map(|&v| v + 0.4).collect();
+        let b = make_bundle(16, 1, 1, vec![shifted]);
+        let cfg = ConsistencyConfig {
+            loss_type: ConsistencyLossType::Ssim,
+            consistency_weight: 1.0,
+            ..Default::default()
+        };
+        let loss = consistency_loss(&a, &b, &cfg).unwrap();
+        assert!(
+            loss > 0.1,
+            "SSIM-based consistency_loss should detect the brightness shift, got {loss}"
+        );
+    }
+
+    // ─── ConsistencyConfig::use_luminance_only wiring ────────────────────────
+
+    #[test]
+    fn test_consistency_loss_use_luminance_only_ignores_channel_differences() {
+        // pred = pure red, reference = pure green scaled to the same
+        // luminance. Raw per-channel L1 sees a large difference; luminance-only
+        // L1 should see essentially none.
+        let r_g = 0.299_f32 / 0.587_f32;
+        let b = make_bundle(1, 1, 3, vec![vec![0.0, r_g, 0.0]]);
+        let pred = vec![1.0_f32, 0.0, 0.0];
+
+        let cfg_raw = ConsistencyConfig {
+            loss_type: ConsistencyLossType::L1,
+            consistency_weight: 1.0,
+            use_luminance_only: false,
+            ..Default::default()
+        };
+        let loss_raw = consistency_loss(&pred, &b, &cfg_raw).unwrap();
+        assert!(
+            loss_raw > 0.3,
+            "raw per-channel L1 should see a large difference, got {loss_raw}"
+        );
+
+        let cfg_lum = ConsistencyConfig {
+            loss_type: ConsistencyLossType::L1,
+            consistency_weight: 1.0,
+            use_luminance_only: true,
+            ..Default::default()
+        };
+        let loss_lum = consistency_loss(&pred, &b, &cfg_lum).unwrap();
+        assert!(
+            loss_lum < 1e-4,
+            "luminance-only L1 should see ~no difference, got {loss_lum}"
+        );
+    }
+
+    // ─── consistency_map normalisation (regression: unreachable sqrt(3) max) ─
+
+    #[test]
+    fn test_consistency_map_reaches_full_scale_at_max_inconsistency() {
+        // Two views at the opposite extremes of [0, 1] should now genuinely
+        // reach 1.0 (previously capped at ~0.289 due to the sqrt(3) bug).
+        let b = make_bundle(1, 1, 1, vec![vec![0.0], vec![1.0]]);
+        let map = consistency_map(&b).unwrap();
+        assert!(
+            (map[0] - 1.0).abs() < 1e-5,
+            "expected max-scale std of 1.0, got {}",
+            map[0]
+        );
     }
 }

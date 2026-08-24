@@ -233,7 +233,13 @@ pub struct SceneMergeConfig {
     pub remove_duplicates: bool,
     /// Distance threshold for duplicate detection.
     pub duplicate_threshold: f32,
-    /// Re-normalize opacities after merge so `mean_opacity == target_opacity`.
+    /// Re-normalize opacities after merge by scaling every opacity so the
+    /// mean approaches `target_opacity`.
+    ///
+    /// The achieved mean can fall short of `target_opacity` when the scale
+    /// factor would push some Gaussians' opacity above `1.0`: each opacity
+    /// is clamped to `[0, 1]` after scaling (opacity cannot exceed 1), which
+    /// pulls the resulting mean back down whenever any Gaussian saturates.
     pub normalize_opacities: bool,
     /// Target mean opacity when `normalize_opacities` is `true`.
     pub target_opacity: f32,
@@ -456,10 +462,21 @@ fn normalize3_safe(v: [f32; 3]) -> [f32; 3] {
 // Duplicate removal
 // ---------------------------------------------------------------------------
 
-/// Find duplicate Gaussians using a grid-based approach.
+/// Find duplicate Gaussians using a spatial-hash approach.
 ///
-/// Groups Gaussians into cells of size `threshold × threshold × threshold`.
-/// For each cell, only the highest-opacity Gaussian is kept.
+/// Two Gaussians are considered duplicates when the true Euclidean distance
+/// between their positions is strictly less than `threshold`. Gaussians are
+/// visited in descending-opacity order and accepted greedily: a Gaussian is
+/// kept unless some higher- (or equal-) opacity Gaussian already accepted is
+/// within `threshold` of it, so within any cluster of mutually-nearby
+/// Gaussians the highest-opacity one is the one kept.
+///
+/// Internally this buckets accepted Gaussians into cells sized
+/// `threshold × threshold × threshold` and, for each candidate, only checks
+/// the 27-cell (3×3×3) neighbourhood around its own cell — since the cell
+/// size equals the query radius, any point within `threshold` of another
+/// must fall in that point's cell or one of its 26 neighbours, so this
+/// covers every true duplicate while staying near-linear instead of O(n²).
 ///
 /// Returns a mask where `true` means "keep" and `false` means "duplicate to remove".
 #[must_use]
@@ -469,33 +486,73 @@ pub fn find_duplicates(gaussians: &[GaussianEntry], threshold: f32) -> Vec<bool>
         return Vec::new();
     }
 
+    // A non-positive (or non-finite) threshold can never be satisfied by a
+    // real squared distance (which is always >= 0), so nothing is a
+    // duplicate; short-circuit rather than dividing by a non-positive
+    // threshold below. (Written without a negated `>` comparison — `f32` is
+    // only `PartialOrd`, and clippy's `neg_cmp_op_on_partial_ord` flags
+    // `!(x > y)` there since it is not equivalent to `x <= y` for NaN.)
+    if threshold <= 0.0 || !threshold.is_finite() {
+        return vec![true; n];
+    }
+
+    // Process indices in descending-opacity order so the highest-opacity
+    // member of any spatial cluster is considered — and accepted — first.
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| {
+        gaussians[b]
+            .opacity
+            .partial_cmp(&gaussians[a].opacity)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
     // cell index for a coordinate component: floor(pos / threshold) as i64
-    let cell_of = |pos: f32| -> i64 { (pos / threshold).floor() as i64 };
+    let cell_of = |pos: [f32; 3]| -> (i64, i64, i64) {
+        (
+            (pos[0] / threshold).floor() as i64,
+            (pos[1] / threshold).floor() as i64,
+            (pos[2] / threshold).floor() as i64,
+        )
+    };
+    let threshold_sq = threshold * threshold;
 
-    // Map: cell_key → index of the best (highest opacity) Gaussian in that cell.
-    let mut best: HashMap<(i64, i64, i64), usize> = HashMap::new();
+    // Cell → indices of Gaussians already accepted into that cell.
+    let mut cell_map: HashMap<(i64, i64, i64), Vec<usize>> = HashMap::new();
+    let mut keep = vec![false; n];
 
-    for (idx, g) in gaussians.iter().enumerate() {
-        let key = (
-            cell_of(g.position[0]),
-            cell_of(g.position[1]),
-            cell_of(g.position[2]),
-        );
-        match best.get(&key) {
-            None => {
-                best.insert(key, idx);
-            }
-            Some(&prev_idx) => {
-                if g.opacity > gaussians[prev_idx].opacity {
-                    best.insert(key, idx);
+    for idx in order {
+        let pos = gaussians[idx].position;
+        let (cx, cy, cz) = cell_of(pos);
+
+        let mut is_duplicate = false;
+        'search: for dx in -1i64..=1 {
+            for dy in -1i64..=1 {
+                for dz in -1i64..=1 {
+                    let Some(neighbors) = cell_map.get(&(cx + dx, cy + dy, cz + dz)) else {
+                        continue;
+                    };
+                    for &other in neighbors {
+                        let op = gaussians[other].position;
+                        let ddx = pos[0] - op[0];
+                        let ddy = pos[1] - op[1];
+                        let ddz = pos[2] - op[2];
+                        let dist_sq = ddx * ddx + ddy * ddy + ddz * ddz;
+                        if dist_sq < threshold_sq {
+                            is_duplicate = true;
+                            break 'search;
+                        }
+                    }
                 }
             }
         }
+
+        if !is_duplicate {
+            keep[idx] = true;
+            cell_map.entry((cx, cy, cz)).or_default().push(idx);
+        }
     }
 
-    // Build mask: only the winner per cell is kept.
-    let winners: std::collections::HashSet<usize> = best.into_values().collect();
-    (0..n).map(|i| winners.contains(&i)).collect()
+    keep
 }
 
 // ---------------------------------------------------------------------------
@@ -571,7 +628,15 @@ pub fn merge_scenes(
     if config.normalize_opacities && !merged.is_empty() {
         let mean: f32 = merged.iter().map(|g| g.opacity).sum::<f32>() / (merged.len() as f32);
         if mean > 1e-10 {
-            let scale = (config.target_opacity / mean).min(1.0 / mean);
+            // `config.validate()` guarantees `target_opacity <= 1.0` whenever
+            // `normalize_opacities` is set, so `target_opacity / mean` is
+            // always <= `1.0 / mean`; no extra cap is needed here. What this
+            // scale factor does *not* guarantee is that every scaled opacity
+            // stays <= 1.0 — the per-Gaussian `.clamp` below handles that,
+            // at the cost of the achieved mean falling short of
+            // `target_opacity` when any Gaussian saturates (see the
+            // `normalize_opacities` doc comment).
+            let scale = config.target_opacity / mean;
             for g in &mut merged {
                 g.opacity = (g.opacity * scale).clamp(0.0, 1.0);
             }
@@ -745,8 +810,12 @@ pub fn merge_scenes_with_stats(
     let input_gaussians: Vec<usize> = scenes.iter().map(|s| s.len()).collect();
     let total_input: usize = input_gaussians.iter().sum();
 
-    // Step-by-step filtering to track counts.
-    let mut after_opacity: Vec<GaussianEntry> = Vec::new();
+    // Step-by-step filtering to track counts. Only `after_scale` needs to
+    // retain the actual (transformed) entries — `after_opacity_filter` is
+    // reported purely as a count, so it's tracked with a plain counter
+    // rather than cloning every surviving Gaussian (each clone allocates its
+    // `sh_coeffs` Vec) into a throwaway `Vec` just to call `.len()` on it.
+    let mut after_opacity_filter = 0usize;
     let mut after_scale: Vec<GaussianEntry> = Vec::new();
 
     for scene in scenes {
@@ -758,7 +827,7 @@ pub fn merge_scenes_with_stats(
             if g.opacity < config.min_opacity {
                 continue;
             }
-            after_opacity.push(g.clone());
+            after_opacity_filter += 1;
 
             // Scale filter.
             if config.max_scale > 0.0 && g.max_scale() > config.max_scale {
@@ -776,7 +845,6 @@ pub fn merge_scenes_with_stats(
         }
     }
 
-    let after_opacity_filter = after_opacity.len();
     let after_scale_filter = after_scale.len();
 
     let mut merged = after_scale;
@@ -800,7 +868,15 @@ pub fn merge_scenes_with_stats(
     if config.normalize_opacities && !merged.is_empty() {
         let mean: f32 = merged.iter().map(|g| g.opacity).sum::<f32>() / (merged.len() as f32);
         if mean > 1e-10 {
-            let scale = (config.target_opacity / mean).min(1.0 / mean);
+            // `config.validate()` guarantees `target_opacity <= 1.0` whenever
+            // `normalize_opacities` is set, so `target_opacity / mean` is
+            // always <= `1.0 / mean`; no extra cap is needed here. What this
+            // scale factor does *not* guarantee is that every scaled opacity
+            // stays <= 1.0 — the per-Gaussian `.clamp` below handles that,
+            // at the cost of the achieved mean falling short of
+            // `target_opacity` when any Gaussian saturates (see the
+            // `normalize_opacities` doc comment).
+            let scale = config.target_opacity / mean;
             for g in &mut merged {
                 g.opacity = (g.opacity * scale).clamp(0.0, 1.0);
             }
@@ -1062,6 +1138,44 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Test 13b: normalize_opacities documented saturation caveat
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_merge_scenes_normalize_opacities_can_undershoot_target_when_saturated() {
+        // Regression test for the `normalize_opacities` doc comment: when
+        // scaling toward `target_opacity` would push some Gaussian's opacity
+        // above 1.0, the per-Gaussian `.clamp(0.0, 1.0)` caps it at 1.0,
+        // which pulls the achieved mean below `target_opacity`. This also
+        // covers the now-removed dead `.min(1.0 / mean)` — it never changed
+        // `scale`, so removing it must not change this outcome.
+        let gaussians = vec![
+            make_gaussian([0.0; 3], 0.05),
+            make_gaussian([1.0; 3], 0.05),
+            make_gaussian([2.0; 3], 0.95), // scaling toward target pushes this well past 1.0
+        ];
+        let scene = make_scene(gaussians);
+        let config = SceneMergeConfig {
+            normalize_opacities: true,
+            target_opacity: 0.9, // mean=0.35 → scale≈2.57 → 0.95*2.57≈2.44 → saturates
+            min_opacity: 0.0,
+            ..Default::default()
+        };
+        let merged = merge_scenes(&[scene], &config).expect("merge failed");
+        let mean: f32 = merged.gaussians.iter().map(|g| g.opacity).sum::<f32>()
+            / (merged.gaussians.len() as f32);
+
+        for g in &merged.gaussians {
+            assert!(g.opacity >= 0.0 && g.opacity <= 1.0);
+        }
+        assert!(
+            mean < config.target_opacity,
+            "mean {mean} should undershoot target {} once the highest-opacity \
+             Gaussian saturates at 1.0",
+            config.target_opacity
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Test 14: merge_scenes apply_transforms moves positions
     // -----------------------------------------------------------------------
     #[test]
@@ -1115,6 +1229,58 @@ mod tests {
         let mask = find_duplicates(&gaussians, 0.01);
         let kept_count = mask.iter().filter(|&&k| k).count();
         assert_eq!(kept_count, 3, "all should be kept");
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 15b: find_duplicates — same grid cell but genuinely far apart
+    // (further apart than `threshold`) must NOT be merged. A pure
+    // cell-bucketing scheme (bucket by floor(pos/threshold), one winner per
+    // cell) would incorrectly merge these since a cell spans up to
+    // `threshold * sqrt(3)` corner-to-corner.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_find_duplicates_same_cell_but_beyond_threshold_both_kept() {
+        let threshold = 1.0;
+        // Both map to grid cell (0,0,0) under floor(pos/threshold), but their
+        // true distance is 0.8*sqrt(3) ≈ 1.386, which is > threshold.
+        let g1 = make_gaussian([0.1, 0.1, 0.1], 0.5);
+        let g2 = make_gaussian([0.9, 0.9, 0.9], 0.5);
+        let gaussians = vec![g1, g2];
+        let mask = find_duplicates(&gaussians, threshold);
+        assert_eq!(
+            mask,
+            vec![true, true],
+            "points in the same grid cell but farther apart than the \
+             threshold must both be kept"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 15c: find_duplicates — genuinely near points that straddle a grid
+    // cell boundary must still be merged. A pure cell-bucketing scheme with
+    // no neighbour-cell check would miss this pair entirely.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_find_duplicates_across_cell_boundary_merged() {
+        let threshold = 1.0;
+        // floor(0.999/1.0) = 0, floor(1.001/1.0) = 1 — adjacent cells — yet
+        // the true distance is only 0.002, far inside the threshold.
+        let g1 = make_gaussian([0.999, 0.0, 0.0], 0.3);
+        let g2 = make_gaussian([1.001, 0.0, 0.0], 0.9);
+        let gaussians = vec![g1, g2];
+        let mask = find_duplicates(&gaussians, threshold);
+        let kept: Vec<usize> = mask
+            .iter()
+            .enumerate()
+            .filter(|(_, &k)| k)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            kept,
+            vec![1],
+            "points straddling a cell boundary but within the threshold \
+             must be merged, keeping the higher-opacity one"
+        );
     }
 
     // -----------------------------------------------------------------------

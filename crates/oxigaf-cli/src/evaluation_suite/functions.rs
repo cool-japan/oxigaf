@@ -2,6 +2,8 @@
 //!
 //! 🤖 Generated with [SplitRS](https://github.com/cool-japan/splitrs)
 
+use rayon::prelude::*;
+
 use super::types::{
     EvalComparison, EvalConfig, EvalError, EvalSuiteResult, EvalTestItem, ViewEvalResult,
 };
@@ -28,6 +30,13 @@ pub fn eval_gaussian_kernel_11() -> [f32; 121] {
 /// Apply a 2-D convolution with a square `k_size × k_size` kernel to a
 /// single-channel image.  Zero-padding is used at the borders so the output
 /// has the same length as the input (`width * height`).
+///
+/// `image` and `kernel` are read with bounds-checked accessors: a caller
+/// that supplies a buffer shorter than `width * height` (or `k_size *
+/// k_size`) gets 0.0 for the missing samples instead of an index-out-of-
+/// bounds panic. This function is `pub` and re-exported, so it must stay
+/// well-defined for any external caller's dimensions rather than trusting
+/// them.
 pub fn eval_convolve(
     image: &[f32],
     width: usize,
@@ -52,7 +61,9 @@ pub fn eval_convolve(
                     }
                     let ki = ky * k_size + kx;
                     let pi = iy as usize * width + ix as usize;
-                    acc += kernel[ki] * image[pi];
+                    let k = kernel.get(ki).copied().unwrap_or(0.0);
+                    let p = image.get(pi).copied().unwrap_or(0.0);
+                    acc += k * p;
                 }
             }
             out[row * width + col] = acc;
@@ -123,13 +134,17 @@ pub fn eval_downsample_2x(image: &[f32], width: usize, height: usize) -> (Vec<f3
 /// Compute Sobel edge magnitude map.  Input is an interleaved RGB image
 /// ([0, 1] range); output is a single-channel grayscale magnitude map of the
 /// same spatial dimensions.
+///
+/// Reads `image` with a bounds-checked accessor: a caller-supplied buffer
+/// shorter than `width * height * 3` yields 0.0 for the missing channels
+/// instead of panicking (see [`eval_convolve`] for the same policy).
 pub fn eval_sobel(image: &[f32], width: usize, height: usize) -> Vec<f32> {
     let n = width * height;
     let mut gray = vec![0.0_f32; n];
     for i in 0..n {
-        let r = image[i * 3];
-        let g = image[i * 3 + 1];
-        let b = image[i * 3 + 2];
+        let r = image.get(i * 3).copied().unwrap_or(0.0);
+        let g = image.get(i * 3 + 1).copied().unwrap_or(0.0);
+        let b = image.get(i * 3 + 2).copied().unwrap_or(0.0);
         gray[i] = 0.299 * r + 0.587 * g + 0.114 * b;
     }
     let gx_kernel: [f32; 9] = [-1.0, 0.0, 1.0, -2.0, 0.0, 2.0, -1.0, 0.0, 1.0];
@@ -142,11 +157,95 @@ pub fn eval_sobel(image: &[f32], width: usize, height: usize) -> Vec<f32> {
     }
     mag
 }
-/// Internal: compute SSIM on a single-channel image of length `width × height`.
-fn ssim_single_channel(chan: &[f32], ref_chan: &[f32], width: usize, height: usize) -> f32 {
-    let k11 = eval_gaussian_kernel_11();
-    let mu_x = eval_convolve(chan, width, height, &k11, 11);
-    let mu_y = eval_convolve(ref_chan, width, height, &k11, 11);
+
+// ---------------------------------------------------------------------------
+// SSIM internals
+// ---------------------------------------------------------------------------
+
+/// The 1-D Gaussian kernel (11 taps, σ = 1.5) whose outer product forms
+/// [`eval_gaussian_kernel_11`]'s 2-D kernel — used to blur the SSIM window
+/// as two cheap 1-D passes instead of one dense 2-D convolution.
+fn gaussian_kernel_11_1d() -> [f32; 11] {
+    let sigma = 1.5_f32;
+    let half = 5_i32;
+    let mut kernel = [0.0_f32; 11];
+    let mut total = 0.0_f32;
+    for x in -half..=half {
+        let v = (-(x * x) as f32 / (2.0 * sigma * sigma)).exp();
+        kernel[(x + half) as usize] = v;
+        total += v;
+    }
+    for v in kernel.iter_mut() {
+        *v /= total;
+    }
+    kernel
+}
+
+/// Separable 11×11 Gaussian blur (σ = 1.5): an 11-tap horizontal pass
+/// followed by an 11-tap vertical pass, each zero-padded at the borders
+/// exactly like [`eval_convolve`]. Because a Gaussian kernel is separable
+/// (`G(x,y) = G(x)·G(y)`), this is numerically identical to
+/// `eval_convolve(image, width, height, &eval_gaussian_kernel_11(), 11)` at
+/// every position whose window does not touch the border — which is all
+/// [`ssim_components`] ever samples once it crops the border ring away —
+/// but costs O(22) multiply-adds per pixel instead of O(121).
+fn gaussian_blur_11_separable(image: &[f32], width: usize, height: usize) -> Vec<f32> {
+    let k1d = gaussian_kernel_11_1d();
+    let half = 5_i32;
+
+    let mut tmp = vec![0.0_f32; width * height];
+    for row in 0..height {
+        for col in 0..width {
+            let mut acc = 0.0_f32;
+            for (kx, &kw) in k1d.iter().enumerate() {
+                let ix = col as i32 + kx as i32 - half;
+                if ix < 0 || ix >= width as i32 {
+                    continue;
+                }
+                acc += kw * image[row * width + ix as usize];
+            }
+            tmp[row * width + col] = acc;
+        }
+    }
+
+    let mut out = vec![0.0_f32; width * height];
+    for row in 0..height {
+        for col in 0..width {
+            let mut acc = 0.0_f32;
+            for (ky, &kw) in k1d.iter().enumerate() {
+                let iy = row as i32 + ky as i32 - half;
+                if iy < 0 || iy >= height as i32 {
+                    continue;
+                }
+                acc += kw * tmp[iy as usize * width + col];
+            }
+            out[row * width + col] = acc;
+        }
+    }
+    out
+}
+
+/// Internal: compute the mean SSIM luminance term and mean contrast-
+/// structure term for a single-channel image pair, using an 11×11 Gaussian
+/// window (σ = 1.5). The full per-pixel SSIM is `luminance × contrast ×
+/// structure`; multi-scale SSIM needs the contrast-structure term on its
+/// own, so both are returned separately.
+///
+/// For images at least 11×11 in both dimensions, the average is restricted
+/// to the region where the window is fully contained in the image (a
+/// 5-pixel ring is excluded on every side), matching the "valid"
+/// convolution mode used by reference SSIM implementations (skimage, the
+/// original Wang et al. code) instead of biasing the result toward the
+/// window's implicit zero-padding at the border. Images smaller than 11×11
+/// in either dimension have no such interior region, so the average falls
+/// back to the full (zero-padded) frame — this keeps the metric defined for
+/// tiny images (thumbnails, unit tests) at the cost of some border bias,
+/// which only matters below the window size and never affects any
+/// realistic evaluation view.
+fn ssim_components(chan: &[f32], ref_chan: &[f32], width: usize, height: usize) -> (f32, f32) {
+    const HALF: usize = 5; // (11 / 2)
+    let mu_x = gaussian_blur_11_separable(chan, width, height);
+    let mu_y = gaussian_blur_11_separable(ref_chan, width, height);
     let n = width * height;
     let mut xx = vec![0.0_f32; n];
     let mut yy = vec![0.0_f32; n];
@@ -156,24 +255,103 @@ fn ssim_single_channel(chan: &[f32], ref_chan: &[f32], width: usize, height: usi
         yy[i] = ref_chan[i] * ref_chan[i];
         xy[i] = chan[i] * ref_chan[i];
     }
-    let mu_xx = eval_convolve(&xx, width, height, &k11, 11);
-    let mu_yy = eval_convolve(&yy, width, height, &k11, 11);
-    let mu_xy = eval_convolve(&xy, width, height, &k11, 11);
+    let mu_xx = gaussian_blur_11_separable(&xx, width, height);
+    let mu_yy = gaussian_blur_11_separable(&yy, width, height);
+    let mu_xy = gaussian_blur_11_separable(&xy, width, height);
+
     const C1: f32 = 0.0001;
     const C2: f32 = 0.0009;
-    let mut ssim_sum = 0.0_f64;
-    for i in 0..n {
-        let mux = mu_x[i];
-        let muy = mu_y[i];
-        let sig_x = mu_xx[i] - mux * mux;
-        let sig_y = mu_yy[i] - muy * muy;
-        let sig_xy = mu_xy[i] - mux * muy;
-        let num = (2.0 * mux * muy + C1) * (2.0 * sig_xy + C2);
-        let den = (mux * mux + muy * muy + C1) * (sig_x + sig_y + C2);
-        ssim_sum += (num / den) as f64;
+
+    let valid = width > 2 * HALF && height > 2 * HALF;
+    let (row_lo, row_hi) = if valid {
+        (HALF, height - HALF)
+    } else {
+        (0, height)
+    };
+    let (col_lo, col_hi) = if valid {
+        (HALF, width - HALF)
+    } else {
+        (0, width)
+    };
+
+    let mut l_sum = 0.0_f64;
+    let mut cs_sum = 0.0_f64;
+    let mut count = 0usize;
+    for row in row_lo..row_hi {
+        for col in col_lo..col_hi {
+            let i = row * width + col;
+            let mux = mu_x[i];
+            let muy = mu_y[i];
+            let sig_x = mu_xx[i] - mux * mux;
+            let sig_y = mu_yy[i] - muy * muy;
+            let sig_xy = mu_xy[i] - mux * muy;
+            let l = (2.0 * mux * muy + C1) / (mux * mux + muy * muy + C1);
+            let cs = (2.0 * sig_xy + C2) / (sig_x + sig_y + C2);
+            l_sum += l as f64;
+            cs_sum += cs as f64;
+            count += 1;
+        }
     }
-    (ssim_sum / n as f64) as f32
+    let count = count.max(1) as f64;
+    ((l_sum / count) as f32, (cs_sum / count) as f32)
 }
+
+/// Average the SSIM luminance term and the contrast-structure term across
+/// the three RGB channels of a pair of same-sized images. Returns
+/// `(luminance_mean, contrast_structure_mean)`; the full SSIM value is
+/// their product. `pred`/`gt` must already be validated as
+/// `width * height * 3` interleaved RGB buffers (see [`validate_rgb_pair`]).
+fn ssim_and_cs(pred: &[f32], gt: &[f32], width: usize, height: usize) -> (f32, f32) {
+    let n = width * height;
+    let mut l_total = 0.0_f32;
+    let mut cs_total = 0.0_f32;
+    for c in 0..3 {
+        let mut pred_c = vec![0.0_f32; n];
+        let mut gt_c = vec![0.0_f32; n];
+        for i in 0..n {
+            pred_c[i] = pred[i * 3 + c];
+            gt_c[i] = gt[i * 3 + c];
+        }
+        let (l, cs) = ssim_components(&pred_c, &gt_c, width, height);
+        l_total += l;
+        cs_total += cs;
+    }
+    (l_total / 3.0, cs_total / 3.0)
+}
+
+/// Validate that `pred`/`gt` are equal-length flat interleaved RGB buffers
+/// of exactly `width * height * 3` elements, returning a descriptive
+/// [`EvalError`] otherwise. `label` identifies which metric rejected the
+/// input, for a clearer error message.
+fn validate_rgb_pair(
+    pred: &[f32],
+    gt: &[f32],
+    width: usize,
+    height: usize,
+    label: &str,
+) -> Result<(), EvalError> {
+    if pred.len() != gt.len() {
+        return Err(EvalError::DimensionMismatch {
+            pred: pred.len(),
+            gt: gt.len(),
+        });
+    }
+    let expected = width * height * 3;
+    if pred.len() != expected {
+        return Err(EvalError::MetricFailed(format!(
+            "{label}: buffer length {} does not match {}×{}×3={}",
+            pred.len(),
+            width,
+            height,
+            expected
+        )));
+    }
+    if pred.is_empty() {
+        return Err(EvalError::MetricFailed(format!("{label}: empty image")));
+    }
+    Ok(())
+}
+
 /// PSNR between prediction and ground truth (flat interleaved RGB, \[0,1\]).
 ///
 /// Returns `f32::INFINITY` when images are identical (MSE = 0).
@@ -243,99 +421,100 @@ pub fn eval_rmse(pred: &[f32], gt: &[f32]) -> Result<f32, EvalError> {
 }
 /// SSIM with an 11×11 Gaussian window (σ=1.5), averaged over RGB channels.
 ///
-/// Both `pred` and `gt` must have length `width * height * 3`.
+/// Both `pred` and `gt` must have length `width * height * 3`. For images
+/// at least 11×11 the average excludes the border ring the window cannot
+/// fully cover without zero-padding (see [`ssim_components`]); smaller
+/// images fall back to averaging the full padded frame.
 pub fn eval_ssim(pred: &[f32], gt: &[f32], width: usize, height: usize) -> Result<f32, EvalError> {
-    if pred.len() != gt.len() {
-        return Err(EvalError::DimensionMismatch {
-            pred: pred.len(),
-            gt: gt.len(),
-        });
-    }
-    let expected = width * height * 3;
-    if pred.len() != expected {
-        return Err(EvalError::MetricFailed(format!(
-            "SSIM: buffer length {} does not match {}×{}×3={}",
-            pred.len(),
-            width,
-            height,
-            expected
-        )));
-    }
-    if pred.is_empty() {
-        return Err(EvalError::MetricFailed("SSIM: empty image".to_string()));
-    }
-    let n = width * height;
-    let mut ssim_total = 0.0_f32;
-    for c in 0..3 {
-        let mut pred_c = vec![0.0_f32; n];
-        let mut gt_c = vec![0.0_f32; n];
-        for i in 0..n {
-            pred_c[i] = pred[i * 3 + c];
-            gt_c[i] = gt[i * 3 + c];
-        }
-        ssim_total += ssim_single_channel(&pred_c, &gt_c, width, height);
-    }
-    Ok(ssim_total / 3.0)
+    validate_rgb_pair(pred, gt, width, height, "SSIM")?;
+    let (l_mean, cs_mean) = ssim_and_cs(pred, gt, width, height);
+    Ok(l_mean * cs_mean)
 }
-/// Multi-scale SSIM with 3 scales.
+
+/// Core multi-scale SSIM computation (Wang, Simoncelli & Bovik, 2003): the
+/// standard multiplicative combination `MS-SSIM = [l_M]^αM · Π[cs_j]^βj`,
+/// with contrast-structure only at every scale but the last, and luminance
+/// included solely at the coarsest scale actually used.
 ///
-/// Weights before normalisation: `[0.0448, 0.2856, 0.3001]`.
-/// Images are progressively downsampled by 2× between scales.
-pub fn eval_ssim_ms(
+/// Uses as many of the 5 canonical scales (weights
+/// `[0.0448, 0.2856, 0.3001, 0.2363, 0.1333]`, renormalised to the subset
+/// used) as the image supports: each extra scale halves the resolution,
+/// and every scale's SSIM window needs at least an 11×11 image to avoid
+/// degenerating into mostly zero-padding, so smaller images transparently
+/// fall back to fewer scales (a plain single-scale SSIM in the smallest
+/// case) rather than erroring or reporting a meaningless coarse-scale term.
+/// This makes the metric resolution-dependent — the same pair of images
+/// yields a different MS-SSIM value at 48×48 (3 scales) than at 512×512
+/// (5 scales) — which matches how every reference MS-SSIM implementation
+/// behaves (real implementations simply require a minimum input size).
+///
+/// `scale0` lets a caller that has already computed the full-resolution
+/// SSIM components (e.g. [`eval_single_view`], which also needs plain
+/// SSIM) pass them in directly instead of recomputing the identical
+/// convolutions for the first scale.
+fn eval_ssim_ms_impl(
     pred: &[f32],
     gt: &[f32],
     width: usize,
     height: usize,
-) -> Result<f32, EvalError> {
-    if pred.len() != gt.len() {
-        return Err(EvalError::DimensionMismatch {
-            pred: pred.len(),
-            gt: gt.len(),
-        });
+    scale0: Option<(f32, f32)>,
+) -> f32 {
+    const WEIGHTS: [f32; 5] = [0.0448, 0.2856, 0.3001, 0.2363, 0.1333];
+    let min_dim = width.min(height);
+    let mut n_scales = WEIGHTS.len();
+    while n_scales > 1 && (min_dim >> (n_scales - 1)) < 11 {
+        n_scales -= 1;
     }
-    let expected = width * height * 3;
-    if pred.len() != expected {
-        return Err(EvalError::MetricFailed(format!(
-            "MS-SSIM: buffer length {} does not match {}×{}×3={}",
-            pred.len(),
-            width,
-            height,
-            expected
-        )));
-    }
-    if pred.is_empty() {
-        return Err(EvalError::MetricFailed("MS-SSIM: empty image".to_string()));
-    }
-    const RAW_WEIGHTS: [f32; 3] = [0.0448, 0.2856, 0.3001];
-    let weight_sum: f32 = RAW_WEIGHTS.iter().sum();
-    let weights: [f32; 3] = [
-        RAW_WEIGHTS[0] / weight_sum,
-        RAW_WEIGHTS[1] / weight_sum,
-        RAW_WEIGHTS[2] / weight_sum,
-    ];
+    let weight_sum: f32 = WEIGHTS[..n_scales].iter().sum();
+
     let mut p_cur = pred.to_vec();
     let mut g_cur = gt.to_vec();
     let mut w_cur = width;
     let mut h_cur = height;
-    let mut ms_ssim = 0.0_f32;
-    for (scale, &weight) in weights.iter().enumerate() {
-        let s = eval_ssim(&p_cur, &g_cur, w_cur, h_cur)?;
-        ms_ssim += weight * s;
-        if scale < 2 {
+    let mut ms_ssim = 1.0_f32;
+
+    for (scale, &raw_weight) in WEIGHTS[..n_scales].iter().enumerate() {
+        let weight = raw_weight / weight_sum;
+        let (l_mean, cs_mean) = if scale == 0 {
+            scale0.unwrap_or_else(|| ssim_and_cs(&p_cur, &g_cur, w_cur, h_cur))
+        } else {
+            ssim_and_cs(&p_cur, &g_cur, w_cur, h_cur)
+        };
+        // Clamp before raising to a fractional power: SSIM/CS terms can be
+        // (rarely) negative for anti-correlated patches, and a negative
+        // base with a non-integer exponent is NaN in IEEE 754.
+        let term = if scale == n_scales - 1 {
+            (l_mean * cs_mean).max(0.0)
+        } else {
+            cs_mean.max(0.0)
+        };
+        ms_ssim *= term.powf(weight);
+        if scale < n_scales - 1 {
+            // `eval_downsample_2x` is a pure function of (width, height), so
+            // calling it with the same w_cur/h_cur for both images always
+            // produces matching output dimensions — no mismatch to guard.
             let (pd, pw, ph) = eval_downsample_2x(&p_cur, w_cur, h_cur);
-            let (gd, gw, gh) = eval_downsample_2x(&g_cur, w_cur, h_cur);
-            if pw != gw || ph != gh {
-                return Err(EvalError::MetricFailed(
-                    "MS-SSIM: downsampled dimensions mismatch".to_string(),
-                ));
-            }
+            let (gd, _, _) = eval_downsample_2x(&g_cur, w_cur, h_cur);
             p_cur = pd;
             g_cur = gd;
             w_cur = pw;
             h_cur = ph;
         }
     }
-    Ok(ms_ssim)
+    ms_ssim
+}
+
+/// Multi-scale SSIM (Wang, Simoncelli & Bovik, 2003). See
+/// [`eval_ssim_ms_impl`] for the exact formulation and its resolution-
+/// dependent scale count.
+pub fn eval_ssim_ms(
+    pred: &[f32],
+    gt: &[f32],
+    width: usize,
+    height: usize,
+) -> Result<f32, EvalError> {
+    validate_rgb_pair(pred, gt, width, height, "MS-SSIM")?;
+    Ok(eval_ssim_ms_impl(pred, gt, width, height, None))
 }
 /// LPIPS approximation using Sobel gradient features.
 ///
@@ -378,6 +557,10 @@ pub fn eval_lpips_approx(
     Ok(l1 as f32)
 }
 /// Compute all metrics for a single view pair.
+///
+/// SSIM is computed once via the shared internal helper and its
+/// full-resolution components are reused as MS-SSIM's first scale, rather
+/// than recomputing the identical convolutions twice.
 pub fn eval_single_view(
     pred: &[f32],
     gt: &[f32],
@@ -385,18 +568,14 @@ pub fn eval_single_view(
     height: usize,
     view_id: &str,
 ) -> Result<ViewEvalResult, EvalError> {
-    if pred.len() != gt.len() {
-        return Err(EvalError::DimensionMismatch {
-            pred: pred.len(),
-            gt: gt.len(),
-        });
-    }
+    validate_rgb_pair(pred, gt, width, height, "eval_single_view")?;
     let psnr = eval_psnr(pred, gt)?;
-    let ssim = eval_ssim(pred, gt, width, height)?;
+    let (ssim_l, ssim_cs) = ssim_and_cs(pred, gt, width, height);
+    let ssim = ssim_l * ssim_cs;
     let lpips_approx = eval_lpips_approx(pred, gt, width, height)?;
     let mae = eval_mae(pred, gt)?;
     let rmse = eval_rmse(pred, gt)?;
-    let ssim_ms = eval_ssim_ms(pred, gt, width, height)?;
+    let ssim_ms = eval_ssim_ms_impl(pred, gt, width, height, Some((ssim_l, ssim_cs)));
     Ok(ViewEvalResult {
         view_id: view_id.to_string(),
         psnr,
@@ -412,6 +591,11 @@ pub fn eval_single_view(
     })
 }
 /// Run evaluation on a batch of test items, returning aggregate statistics.
+///
+/// Per-view evaluation is parallelised with `rayon`: [`std::slice::Iter`]
+/// via `par_iter` is an indexed parallel iterator, so
+/// `collect::<Result<Vec<_>, _>>()` preserves input order and `per_view`
+/// stays aligned with `items`.
 pub fn eval_suite(
     items: &[EvalTestItem],
     config: &EvalConfig,
@@ -419,52 +603,61 @@ pub fn eval_suite(
     if items.is_empty() {
         return Err(EvalError::EmptyTestSet);
     }
-    let mut per_view: Vec<ViewEvalResult> = Vec::with_capacity(items.len());
-    for item in items {
-        let result =
-            eval_single_view(&item.pred, &item.gt, item.width, item.height, &item.view_id)?;
-        per_view.push(result);
-    }
+    let per_view: Vec<ViewEvalResult> = items
+        .par_iter()
+        .map(|item| eval_single_view(&item.pred, &item.gt, item.width, item.height, &item.view_id))
+        .collect::<Result<Vec<_>, _>>()?;
     let n = per_view.len();
     let mean_psnr = aggregate_mean_psnr(&per_view);
     let mean_ssim: f32 = per_view.iter().map(|v| v.ssim).sum::<f32>() / n as f32;
     let mean_lpips: f32 = per_view.iter().map(|v| v.lpips_approx).sum::<f32>() / n as f32;
     let mean_mae: f32 = per_view.iter().map(|v| v.mae).sum::<f32>() / n as f32;
+
+    // Min/max/std are computed over only the finite (non-perfect) views, for
+    // the same reason as `aggregate_mean_psnr` below: folding a fabricated
+    // finite stand-in for "infinite" into these statistics would let a
+    // single pixel-perfect view dominate the spread.
     let finite_psnrs: Vec<f32> = per_view
         .iter()
-        .map(|v| {
-            if v.psnr.is_infinite() {
-                999.0_f32
-            } else {
-                v.psnr
-            }
-        })
+        .map(|v| v.psnr)
+        .filter(|p| p.is_finite())
         .collect();
-    let min_psnr = finite_psnrs.iter().cloned().fold(f32::INFINITY, f32::min);
-    let max_psnr = finite_psnrs
-        .iter()
-        .cloned()
-        .fold(f32::NEG_INFINITY, f32::max);
-    let variance: f32 = if n > 1 {
-        let mu = finite_psnrs.iter().sum::<f32>() / n as f32;
-        finite_psnrs
-            .iter()
-            .map(|p| {
-                let d = p - mu;
-                d * d
-            })
-            .sum::<f32>()
-            / (n - 1) as f32
+    let (min_psnr, max_psnr, std_psnr) = if finite_psnrs.is_empty() {
+        // Every view is a pixel-perfect match.
+        (f32::INFINITY, f32::INFINITY, 0.0_f32)
     } else {
-        0.0
+        let min_psnr = finite_psnrs.iter().cloned().fold(f32::INFINITY, f32::min);
+        let max_psnr = finite_psnrs
+            .iter()
+            .cloned()
+            .fold(f32::NEG_INFINITY, f32::max);
+        let variance: f32 = if finite_psnrs.len() > 1 {
+            let mu = finite_psnrs.iter().sum::<f32>() / finite_psnrs.len() as f32;
+            finite_psnrs
+                .iter()
+                .map(|p| {
+                    let d = p - mu;
+                    d * d
+                })
+                .sum::<f32>()
+                / (finite_psnrs.len() - 1) as f32
+        } else {
+            0.0
+        };
+        (min_psnr, max_psnr, variance.sqrt())
     };
-    let std_psnr = variance.sqrt();
+
     let n_worst = config.n_worst_views.min(n);
     let n_best = config.n_best_views.min(n);
     let mut indices: Vec<usize> = (0..n).collect();
+    // Rank by raw PSNR, not the finite-only subset above (whose length no
+    // longer matches `n`): `f32::INFINITY` compares greater than any finite
+    // value under `partial_cmp`, so perfect views sort correctly to the top
+    // with no magic-number stand-in needed.
     indices.sort_by(|&a, &b| {
-        finite_psnrs[a]
-            .partial_cmp(&finite_psnrs[b])
+        per_view[a]
+            .psnr
+            .partial_cmp(&per_view[b].psnr)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     let worst_views: Vec<String> = indices[..n_worst]
@@ -498,47 +691,51 @@ pub fn eval_suite(
         best_views,
     })
 }
-/// Compute mean PSNR, handling infinite values (identical images) correctly.
+/// Compute mean PSNR, excluding pixel-perfect (infinite) views from the
+/// average so a single perfect match cannot dominate the aggregate via a
+/// fabricated finite stand-in. If *every* view is a perfect match the mean
+/// is `f32::INFINITY`.
 fn aggregate_mean_psnr(views: &[ViewEvalResult]) -> f32 {
     if views.is_empty() {
         return 0.0;
     }
-    if views.iter().all(|v| v.psnr.is_infinite()) {
+    let finite: Vec<f32> = views
+        .iter()
+        .map(|v| v.psnr)
+        .filter(|p| p.is_finite())
+        .collect();
+    if finite.is_empty() {
         return f32::INFINITY;
     }
-    let sum: f32 = views
-        .iter()
-        .map(|v| {
-            if v.psnr.is_infinite() {
-                999.0_f32
-            } else {
-                v.psnr
-            }
-        })
-        .sum();
-    sum / views.len() as f32
+    finite.iter().sum::<f32>() / finite.len() as f32
 }
 /// Compare two evaluation suite results.
 ///
 /// If the two results have different numbers of views, the per-view comparison
 /// is skipped (only aggregate statistics are compared).
+///
+/// Infinite mean PSNR (every view a pixel-perfect match) is handled by
+/// ordinary `f32` arithmetic: `∞ − finite = ∞`. The one case ordinary
+/// arithmetic cannot resolve, `∞ − ∞ = NaN` (both sides all-perfect), is
+/// special-cased to a `0.0` delta (a tie) rather than propagating `NaN`.
 pub fn eval_compare(
     baseline: &EvalSuiteResult,
     candidate: &EvalSuiteResult,
 ) -> Result<EvalComparison, EvalError> {
-    let norm_psnr = |v: f32| if v.is_infinite() { 999.0_f32 } else { v };
-    let delta_psnr = norm_psnr(candidate.mean_psnr) - norm_psnr(baseline.mean_psnr);
+    let delta_psnr = if baseline.mean_psnr.is_infinite() && candidate.mean_psnr.is_infinite() {
+        0.0_f32
+    } else {
+        candidate.mean_psnr - baseline.mean_psnr
+    };
     let delta_ssim = candidate.mean_ssim - baseline.mean_ssim;
     let delta_lpips = candidate.mean_lpips - baseline.mean_lpips;
     let (n_views_improved, n_views_degraded) = if baseline.n_views == candidate.n_views {
         let mut improved = 0usize;
         let mut degraded = 0usize;
         for (b, c) in baseline.per_view.iter().zip(candidate.per_view.iter()) {
-            let bp = norm_psnr(b.psnr);
-            let cp = norm_psnr(c.psnr);
-            if cp > bp {
+            if c.psnr > b.psnr {
                 improved += 1;
-            } else if cp < bp {
+            } else if c.psnr < b.psnr {
                 degraded += 1;
             }
         }
@@ -560,36 +757,49 @@ pub fn eval_compare(
 }
 /// Compute a histogram of PSNR values across the test views.
 ///
-/// Returns `(bin_edges, counts)` where `bin_edges` has `n_bins + 1` entries.
-/// Infinite PSNR values are mapped to the maximum finite bin.
+/// Returns `(bin_edges, counts)` where `bin_edges` has `n_bins + 1` entries,
+/// derived from the range of the *finite* PSNR values only (a fabricated
+/// finite stand-in for "infinite" would otherwise skew the bin range and
+/// crowd every real view into a single low bin). Infinite (pixel-perfect)
+/// views are placed in the last (best) bin directly, so `counts` still sums
+/// to `results.per_view.len()`.
 pub fn eval_psnr_histogram(results: &EvalSuiteResult, n_bins: usize) -> (Vec<f32>, Vec<usize>) {
     if n_bins == 0 || results.per_view.is_empty() {
         return (vec![], vec![]);
     }
-    let psnrs: Vec<f32> = results
+    let finite_psnrs: Vec<f32> = results
         .per_view
         .iter()
-        .map(|v| {
-            if v.psnr.is_infinite() {
-                999.0_f32
-            } else {
-                v.psnr
-            }
-        })
+        .map(|v| v.psnr)
+        .filter(|p| p.is_finite())
         .collect();
-    let min_val = psnrs.iter().cloned().fold(f32::INFINITY, f32::min);
-    let max_val = psnrs.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let (min_val, max_val) = if finite_psnrs.is_empty() {
+        // Every view is a pixel-perfect match: there is no finite range to
+        // bin against, so every view collapses into bin 0 via `range==0.0`
+        // below (the loop still routes infinities to the last bin).
+        (0.0_f32, 0.0_f32)
+    } else {
+        (
+            finite_psnrs.iter().cloned().fold(f32::INFINITY, f32::min),
+            finite_psnrs
+                .iter()
+                .cloned()
+                .fold(f32::NEG_INFINITY, f32::max),
+        )
+    };
     let mut edges = vec![0.0_f32; n_bins + 1];
     let range = max_val - min_val;
     for (i, edge_val) in edges.iter_mut().enumerate().take(n_bins + 1) {
         *edge_val = min_val + (i as f32 / n_bins as f32) * range;
     }
     let mut counts = vec![0usize; n_bins];
-    for &p in &psnrs {
-        let idx = if range == 0.0 {
+    for v in &results.per_view {
+        let idx = if v.psnr.is_infinite() {
+            n_bins - 1
+        } else if range == 0.0 {
             0
         } else {
-            let raw = ((p - min_val) / range * n_bins as f32) as usize;
+            let raw = ((v.psnr - min_val) / range * n_bins as f32) as usize;
             raw.min(n_bins - 1)
         };
         counts[idx] += 1;
@@ -598,19 +808,11 @@ pub fn eval_psnr_histogram(results: &EvalSuiteResult, n_bins: usize) -> (Vec<f32
 }
 /// Compute percentiles [P5, P25, P50, P75, P95] of the PSNR distribution.
 ///
-/// Infinite PSNR values are treated as 999.0 for ordering purposes.
+/// Infinite (pixel-perfect) PSNR values sort correctly to the top of the
+/// distribution under ordinary `f32` comparison — no finite stand-in value
+/// is needed.
 pub fn eval_psnr_percentiles(results: &EvalSuiteResult) -> [f32; 5] {
-    let mut psnrs: Vec<f32> = results
-        .per_view
-        .iter()
-        .map(|v| {
-            if v.psnr.is_infinite() {
-                999.0_f32
-            } else {
-                v.psnr
-            }
-        })
-        .collect();
+    let mut psnrs: Vec<f32> = results.per_view.iter().map(|v| v.psnr).collect();
     if psnrs.is_empty() {
         return [0.0; 5];
     }
@@ -710,4 +912,227 @@ pub fn eval_format_comparison(comparison: &EvalComparison) -> String {
         comparison.n_views_degraded,
         verdict,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ssim_uniform_images_match_closed_form_regardless_of_size() {
+        // For two spatially-uniform images the SSIM window average has a
+        // closed form: l = (2·v1·v2 + C1) / (v1² + v2² + C1), cs = 1 (zero
+        // variance everywhere, since the image never varies). Because the
+        // border ring is now cropped out of the average instead of being
+        // zero-padded into it, this closed form must hold *exactly* for any
+        // size >= 11x11 — a border-biased implementation would instead give
+        // a result that drifts with image size, since a smaller image has
+        // proportionally more border pixels pulled toward zero.
+        const C1: f32 = 0.0001;
+        let v1 = 0.2_f32;
+        let v2 = 0.6_f32;
+        let expected = (2.0 * v1 * v2 + C1) / (v1 * v1 + v2 * v2 + C1);
+        for &size in &[11usize, 16, 21, 40] {
+            let pred = vec![v1; size * size * 3];
+            let gt = vec![v2; size * size * 3];
+            let ssim = eval_ssim(&pred, &gt, size, size).expect("ssim ok");
+            assert!(
+                (ssim - expected).abs() < 1e-4,
+                "size {size}: expected {expected}, got {ssim}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_ssim_tiny_image_still_defined() {
+        // Below the 11×11 window, SSIM falls back to the full padded frame
+        // rather than erroring, so tiny images (thumbnails, tests) remain
+        // usable.
+        let pred = vec![0.3_f32; 4 * 4 * 3];
+        let gt = vec![0.7_f32; 4 * 4 * 3];
+        let ssim = eval_ssim(&pred, &gt, 4, 4).expect("ssim ok");
+        assert!((-1.0..=1.0).contains(&ssim));
+    }
+
+    #[test]
+    fn test_eval_single_view_ssim_ms_matches_direct_call() {
+        // eval_single_view reuses its own SSIM computation as MS-SSIM's
+        // first scale instead of recomputing it; the result must be
+        // identical to calling eval_ssim_ms directly.
+        let pred: Vec<f32> = (0..48 * 48 * 3).map(|i| (i % 7) as f32 / 7.0).collect();
+        let gt: Vec<f32> = (0..48 * 48 * 3).map(|i| (i % 5) as f32 / 5.0).collect();
+        let direct = eval_ssim_ms(&pred, &gt, 48, 48).expect("ms-ssim ok");
+        let via_single_view = eval_single_view(&pred, &gt, 48, 48, "v").expect("ok");
+        assert!(
+            (direct - via_single_view.ssim_ms).abs() < 1e-5,
+            "direct={direct}, via_single_view={}",
+            via_single_view.ssim_ms
+        );
+    }
+
+    #[test]
+    fn test_ssim_ms_adaptive_scale_count_stays_bounded() {
+        // A 5-scale image (>=176px) and a 3-scale image (48px) must both
+        // produce a well-defined value in the valid SSIM-like range; the
+        // AM-GM bound `cs<=1, l<=1` on non-negative clamped terms keeps the
+        // multiplicative product from ever exceeding 1.0.
+        for &size in &[48usize, 176] {
+            let pred: Vec<f32> = (0..size * size * 3)
+                .map(|i| (i % 11) as f32 / 11.0)
+                .collect();
+            let gt: Vec<f32> = (0..size * size * 3)
+                .map(|i| (i % 13) as f32 / 13.0)
+                .collect();
+            let ssim_ms = eval_ssim_ms(&pred, &gt, size, size).expect("ms-ssim ok");
+            assert!(
+                ssim_ms.is_finite() && ssim_ms <= 1.0001,
+                "size {size}: ssim_ms={ssim_ms}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_eval_convolve_short_image_does_not_panic() {
+        // A caller-supplied image shorter than width*height must not
+        // panic; out-of-bounds samples are treated as 0.0.
+        let short_image = vec![0.5_f32; 4];
+        let k = eval_gaussian_kernel_11();
+        let out = eval_convolve(&short_image, 6, 4, &k, 11);
+        assert_eq!(out.len(), 24);
+    }
+
+    #[test]
+    fn test_eval_sobel_short_image_does_not_panic() {
+        let short_image = vec![0.5_f32; 3];
+        let mag = eval_sobel(&short_image, 8, 8);
+        assert_eq!(mag.len(), 64);
+    }
+
+    #[test]
+    fn test_aggregate_mean_psnr_excludes_perfect_view_from_mean() {
+        let cfg = EvalConfig::default();
+        // One perfect (identical) view and one clearly-imperfect view: the
+        // mean must reflect only the imperfect view's real PSNR, not a
+        // 999.0 stand-in for the perfect one dragging the average up.
+        let identical = vec![0.5_f32; 16 * 16 * 3];
+        let pred_bad = vec![0.0_f32; 16 * 16 * 3];
+        let gt_bad = vec![0.1_f32; 16 * 16 * 3];
+        let items = vec![
+            EvalTestItem {
+                view_id: "perfect".to_string(),
+                pred: identical.clone(),
+                gt: identical,
+                width: 16,
+                height: 16,
+            },
+            EvalTestItem {
+                view_id: "imperfect".to_string(),
+                pred: pred_bad.clone(),
+                gt: gt_bad.clone(),
+                width: 16,
+                height: 16,
+            },
+        ];
+        let result = eval_suite(&items, &cfg).expect("ok");
+        let expected = eval_psnr(&pred_bad, &gt_bad).expect("psnr ok");
+        assert!(
+            (result.mean_psnr - expected).abs() < 0.01,
+            "mean_psnr should equal the sole finite view's PSNR ({expected}), got {}",
+            result.mean_psnr
+        );
+        assert!(
+            result.max_psnr.is_infinite(),
+            "max_psnr should reflect the perfect view"
+        );
+        assert!((result.min_psnr - expected).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_eval_compare_handles_one_sided_infinite_mean() {
+        let cfg = EvalConfig::default();
+        let identical = vec![0.5_f32; 16 * 16 * 3];
+        let perfect_item = EvalTestItem {
+            view_id: "v".to_string(),
+            pred: identical.clone(),
+            gt: identical,
+            width: 16,
+            height: 16,
+        };
+        let imperfect_item = EvalTestItem {
+            view_id: "v".to_string(),
+            pred: vec![0.0_f32; 16 * 16 * 3],
+            gt: vec![0.1_f32; 16 * 16 * 3],
+            width: 16,
+            height: 16,
+        };
+        let perfect_result = eval_suite(&[perfect_item], &cfg).expect("ok");
+        let imperfect_result = eval_suite(&[imperfect_item], &cfg).expect("ok");
+        let cmp = eval_compare(&imperfect_result, &perfect_result).expect("compare ok");
+        assert!(
+            cmp.delta_psnr.is_infinite() && cmp.delta_psnr > 0.0,
+            "delta should be +infinity, got {}",
+            cmp.delta_psnr
+        );
+        assert!(cmp.is_candidate_better);
+
+        // Both sides all-perfect must resolve to a tie (0.0), not NaN.
+        let tie = eval_compare(&perfect_result_clone(&cfg), &perfect_result_clone(&cfg))
+            .expect("compare ok");
+        assert_eq!(tie.delta_psnr, 0.0);
+        assert!(!tie.delta_psnr.is_nan());
+    }
+
+    /// Helper for `test_eval_compare_handles_one_sided_infinite_mean`: build
+    /// a fresh all-perfect single-view suite result.
+    fn perfect_result_clone(cfg: &EvalConfig) -> EvalSuiteResult {
+        let identical = vec![0.5_f32; 16 * 16 * 3];
+        let item = EvalTestItem {
+            view_id: "v".to_string(),
+            pred: identical.clone(),
+            gt: identical,
+            width: 16,
+            height: 16,
+        };
+        eval_suite(&[item], cfg).expect("ok")
+    }
+
+    #[test]
+    fn test_psnr_histogram_places_infinite_psnr_in_last_bin() {
+        let cfg = EvalConfig::default();
+        let identical = vec![0.5_f32; 16 * 16 * 3];
+        let items = vec![
+            EvalTestItem {
+                view_id: "perfect".to_string(),
+                pred: identical.clone(),
+                gt: identical,
+                width: 16,
+                height: 16,
+            },
+            EvalTestItem {
+                view_id: "mid1".to_string(),
+                pred: vec![0.0_f32; 16 * 16 * 3],
+                gt: vec![0.1_f32; 16 * 16 * 3],
+                width: 16,
+                height: 16,
+            },
+            EvalTestItem {
+                view_id: "mid2".to_string(),
+                pred: vec![0.0_f32; 16 * 16 * 3],
+                gt: vec![0.2_f32; 16 * 16 * 3],
+                width: 16,
+                height: 16,
+            },
+        ];
+        let result = eval_suite(&items, &cfg).expect("ok");
+        let (_, counts) = eval_psnr_histogram(&result, 4);
+        assert_eq!(
+            counts.iter().sum::<usize>(),
+            3,
+            "counts must sum to n_views even with an infinite view"
+        );
+        assert!(
+            counts[3] >= 1,
+            "the perfect view must land in the last (best) bin, got counts={counts:?}"
+        );
+    }
 }

@@ -596,6 +596,10 @@ pub fn ident_mean_embedding(
 ///
 /// Returns a flat `Vec<f32>` of length `n * n` (row-major), where entry
 /// `[i * n + j]` is `cosine_similarity(embeddings[i], embeddings[j])`.
+///
+/// Each embedding's L2 norm is computed once (not twice per pair) and only
+/// the upper triangle is evaluated and mirrored into the lower triangle,
+/// since cosine similarity is symmetric.
 pub fn ident_similarity_matrix(
     embeddings: &[Vec<f32>],
 ) -> Result<Vec<f32>, IdentityConditioningError> {
@@ -603,11 +607,36 @@ pub fn ident_similarity_matrix(
         return Err(IdentityConditioningError::EmptyInput);
     }
     let n = embeddings.len();
+    let dim = embeddings[0].len();
+    for e in embeddings {
+        if e.len() != dim {
+            return Err(IdentityConditioningError::DimensionMismatch {
+                expected: dim,
+                got: e.len(),
+            });
+        }
+    }
+
+    let norms: Vec<f32> = embeddings.iter().map(|e| l2_norm_f32(e)).collect();
+
     let mut matrix = vec![0.0f32; n * n];
     for i in 0..n {
-        for j in 0..n {
-            let sim = ident_cosine_similarity(&embeddings[i], &embeddings[j])?;
+        // Matches ident_cosine_similarity's own zero-norm convention: a
+        // zero-norm embedding's self-similarity is defined as 0.0, not 1.0.
+        matrix[i * n + i] = if norms[i] < f32::EPSILON { 0.0 } else { 1.0 };
+        for j in (i + 1)..n {
+            let dot: f32 = embeddings[i]
+                .iter()
+                .zip(embeddings[j].iter())
+                .map(|(x, y)| x * y)
+                .sum();
+            let sim = if norms[i] < f32::EPSILON || norms[j] < f32::EPSILON {
+                0.0
+            } else {
+                (dot / (norms[i] * norms[j])).clamp(-1.0, 1.0)
+            };
             matrix[i * n + j] = sim;
+            matrix[j * n + i] = sim;
         }
     }
     Ok(matrix)
@@ -632,6 +661,10 @@ pub struct IdentityCache {
 
 impl IdentityCache {
     /// Create a new empty cache with the given capacity.
+    ///
+    /// `capacity == 0` disables caching entirely: [`Self::insert`] becomes a
+    /// no-op and [`Self::get`] always returns `None`, rather than growing
+    /// without bound.
     pub fn new(capacity: usize) -> Self {
         Self {
             capacity,
@@ -654,8 +687,12 @@ impl IdentityCache {
     }
 
     /// Insert an embedding.  If the cache is full, the least-recently-used
-    /// entry is evicted first.
+    /// entry is evicted first. A cache created with `capacity == 0` has
+    /// caching disabled: `insert` is a no-op and `get` always returns `None`.
     pub fn insert(&mut self, key: u64, embedding: Vec<f32>) {
+        if self.capacity == 0 {
+            return;
+        }
         // If key already exists, update it
         if let Some(entry_idx) = self.entries.iter().position(|(k, _)| *k == key) {
             self.entries[entry_idx].1 = embedding;
@@ -765,9 +802,9 @@ pub fn ident_compute_stats(
         return Err(IdentityConditioningError::EmptyInput);
     }
 
-    // Mean L2 norm
-    let mean_norm =
-        embeddings.iter().map(|e| l2_norm_f32(e)).sum::<f32>() / embeddings.len() as f32;
+    // Norms are computed once per embedding (not twice per pair below).
+    let norms: Vec<f32> = embeddings.iter().map(|e| l2_norm_f32(e)).collect();
+    let mean_norm = norms.iter().sum::<f32>() / embeddings.len() as f32;
 
     if embeddings.len() == 1 {
         return Ok(IdentityStats {
@@ -778,15 +815,35 @@ pub fn ident_compute_stats(
         });
     }
 
-    // Collect all off-diagonal pairs
     let n = embeddings.len();
-    let mut sims: Vec<f32> = Vec::with_capacity(n * (n - 1));
+    let dim = embeddings[0].len();
+    for e in embeddings {
+        if e.len() != dim {
+            return Err(IdentityConditioningError::DimensionMismatch {
+                expected: dim,
+                got: e.len(),
+            });
+        }
+    }
+
+    // Cosine similarity is symmetric, so the mean/min/max over all n*(n-1)
+    // ordered off-diagonal pairs equals the mean/min/max computed over the
+    // n*(n-1)/2 unordered pairs once each — duplicating each value would
+    // not change the mean (same average) nor the min/max.
+    let mut sims: Vec<f32> = Vec::with_capacity(n * (n - 1) / 2);
     for i in 0..n {
-        for j in 0..n {
-            if i != j {
-                let s = ident_cosine_similarity(&embeddings[i], &embeddings[j])?;
-                sims.push(s);
-            }
+        for j in (i + 1)..n {
+            let dot: f32 = embeddings[i]
+                .iter()
+                .zip(embeddings[j].iter())
+                .map(|(x, y)| x * y)
+                .sum();
+            let sim = if norms[i] < f32::EPSILON || norms[j] < f32::EPSILON {
+                0.0
+            } else {
+                (dot / (norms[i] * norms[j])).clamp(-1.0, 1.0)
+            };
+            sims.push(sim);
         }
     }
 
@@ -1526,6 +1583,47 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_similarity_matrix_matches_naive_pairwise() {
+        // Cross-check the upper-triangle-only fast path against the
+        // straightforward pairwise definition (via ident_cosine_similarity
+        // itself), including a zero-norm embedding to exercise the diagonal
+        // special case.
+        let embs = vec![
+            vec![1.0f32, 0.0, 0.0],
+            vec![0.0f32, 1.0, 0.0],
+            vec![0.0f32, 0.0, 0.0], // zero-norm
+            vec![1.0f32, 1.0, 0.0],
+        ];
+        let n = embs.len();
+        let mat = ident_similarity_matrix(&embs).expect("matrix ok");
+        for i in 0..n {
+            for j in 0..n {
+                let expected = ident_cosine_similarity(&embs[i], &embs[j]).unwrap();
+                assert!(
+                    (mat[i * n + j] - expected).abs() < 1e-5,
+                    "mismatch at ({},{}): {} vs {}",
+                    i,
+                    j,
+                    mat[i * n + j],
+                    expected
+                );
+            }
+        }
+        // The zero-norm embedding's self-similarity must be 0.0, not 1.0.
+        assert!((mat[2 * n + 2] - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_similarity_matrix_dimension_mismatch_errors() {
+        let embs = vec![vec![1.0f32, 0.0], vec![1.0f32, 0.0, 0.0]];
+        let result = ident_similarity_matrix(&embs);
+        assert!(matches!(
+            result,
+            Err(IdentityConditioningError::DimensionMismatch { .. })
+        ));
+    }
+
     // ── IdentityCache ──────────────────────────────────────────────────────
 
     #[test]
@@ -1583,6 +1681,21 @@ mod tests {
         assert!(cache.get(3).is_some(), "key 3 should be present");
     }
 
+    #[test]
+    fn test_cache_zero_capacity_never_grows() {
+        // Regression test: capacity=0 previously skipped eviction entirely
+        // (the eviction guard required `capacity > 0`) and fell through to
+        // the unconditional append, growing without bound.
+        let mut cache = IdentityCache::new(0);
+        for i in 0..100u64 {
+            cache.insert(i, vec![i as f32]);
+        }
+        assert_eq!(cache.len(), 0, "capacity=0 cache must stay empty");
+        assert!(cache.is_empty());
+        assert!(cache.get(0).is_none());
+        assert!(cache.get(99).is_none());
+    }
+
     // ── ident_hash_feature ─────────────────────────────────────────────────
 
     #[test]
@@ -1636,6 +1749,45 @@ mod tests {
         // All pairwise cosines are 0
         assert!(stats.mean_similarity.abs() < 1e-5);
         assert!((stats.embedding_norm - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_compute_stats_matches_naive_all_ordered_pairs() {
+        // Cross-check the unordered-pairs-once fast path against the
+        // straightforward "all ordered off-diagonal pairs" definition.
+        let embs = vec![
+            vec![1.0f32, 0.2, 0.0],
+            vec![0.3f32, 1.0, 0.1],
+            vec![0.0f32, 0.5, 1.0],
+            vec![1.0f32, 1.0, 1.0],
+        ];
+        let n = embs.len();
+        let mut naive_sims = Vec::with_capacity(n * (n - 1));
+        for i in 0..n {
+            for j in 0..n {
+                if i != j {
+                    naive_sims.push(ident_cosine_similarity(&embs[i], &embs[j]).unwrap());
+                }
+            }
+        }
+        let naive_mean = naive_sims.iter().sum::<f32>() / naive_sims.len() as f32;
+        let naive_min = naive_sims.iter().cloned().fold(f32::INFINITY, f32::min);
+        let naive_max = naive_sims.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+
+        let stats = ident_compute_stats(&embs).expect("stats ok");
+        assert!((stats.mean_similarity - naive_mean).abs() < 1e-4);
+        assert!((stats.min_similarity - naive_min).abs() < 1e-4);
+        assert!((stats.max_similarity - naive_max).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_compute_stats_dimension_mismatch_errors() {
+        let embs = vec![vec![1.0f32, 0.0], vec![1.0f32, 0.0, 0.0]];
+        let result = ident_compute_stats(&embs);
+        assert!(matches!(
+            result,
+            Err(IdentityConditioningError::DimensionMismatch { .. })
+        ));
     }
 
     #[test]

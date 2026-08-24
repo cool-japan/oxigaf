@@ -144,62 +144,140 @@ pub fn export_gltf(model: &GaussianModel, output_path: &Path) -> Result<(), CliE
     })?;
 
     // ----- Build glTF JSON -----
-    // Single bufferView covering the entire binary buffer.
-    let buffer_view = json!({
-        "buffer": 0,
-        "byteOffset": 0,
-        "byteLength": total_bin_length
-    });
-
-    // Accessors — each references the single bufferView with its own byteOffset.
-    let accessor_positions = build_accessor(0, pos_byte_offset, n, "VEC3", COMPONENT_TYPE_FLOAT);
-    let accessor_rotations = build_accessor(0, rot_byte_offset, n, "VEC4", COMPONENT_TYPE_FLOAT);
-    let accessor_scales = build_accessor(0, scale_byte_offset, n, "VEC3", COMPONENT_TYPE_FLOAT);
-    let accessor_opacities =
-        build_accessor(0, opacity_byte_offset, n, "SCALAR", COMPONENT_TYPE_FLOAT);
-    let accessor_sh = if n == 0 || sh_channels == 0 {
-        build_accessor(0, sh_byte_offset, 0, "SCALAR", COMPONENT_TYPE_FLOAT)
-    } else {
-        build_accessor(
-            0,
-            sh_byte_offset,
-            n * sh_channels,
-            "SCALAR",
-            COMPONENT_TYPE_FLOAT,
-        )
-    };
-
-    // Accessor indices.
-    let acc_pos_idx = 0usize;
-    let acc_rot_idx = 1usize;
-    let acc_scale_idx = 2usize;
-    let acc_opacity_idx = 3usize;
-    let acc_sh_idx = 4usize;
-
-    // Custom Gaussian extension on the node.
-    let gaussian_extension = json!({
-        "gaussianCount": n,
-        "shDegree": model.sh_degree,
-        "positionsAccessor": acc_pos_idx,
-        "rotationsAccessor": acc_rot_idx,
-        "scalesAccessor": acc_scale_idx,
-        "opacitiesAccessor": acc_opacity_idx,
-        "shCoefficientsAccessor": acc_sh_idx
-    });
-
-    // Top-level extension metadata.
+    // Top-level extension metadata (always present — it is custom OXIGAF
+    // data, not a standard glTF construct subject to the accessor/
+    // bufferView minimum-size rules below).
     let top_ext = json!({
         "gaussianCount": n,
         "shDegree": model.sh_degree
     });
 
-    // glTF mesh primitive uses POSITION so viewers can show a point cloud.
-    let primitive = json!({
-        "attributes": {
-            "POSITION": acc_pos_idx
-        },
-        "mode": 0  // POINTS
-    });
+    // For `n == 0` there is nothing to put in a mesh: the glTF 2.0 schema
+    // requires `accessor.count >= 1` and `bufferView.byteLength >= 1`, so a
+    // zero-count accessor / zero-length bufferView (what this used to
+    // emit) is not a valid document, and every conforming loader rejects
+    // it. An empty scene with no nodes/meshes/accessors/bufferViews/
+    // buffers, by contrast, *is* valid — so that is what an empty model
+    // gets instead.
+    let (nodes, meshes, accessors, buffer_views, buffers, root_nodes) = if n == 0 {
+        (
+            Vec::<Value>::new(),
+            Vec::<Value>::new(),
+            Vec::<Value>::new(),
+            Vec::<Value>::new(),
+            Vec::<Value>::new(),
+            Vec::<usize>::new(),
+        )
+    } else {
+        // Single bufferView covering the entire binary buffer.
+        let buffer_view = json!({
+            "buffer": 0,
+            "byteOffset": 0,
+            "byteLength": total_bin_length
+        });
+
+        // Componentwise bounding box for the POSITION accessor — the glTF
+        // 2.0 schema REQUIRES `min`/`max` on any accessor referenced by a
+        // POSITION attribute (used by conforming loaders for frustum
+        // culling / auto-framing); every other accessor here is optional.
+        let mut pos_min = [f32::INFINITY; 3];
+        let mut pos_max = [f32::NEG_INFINITY; 3];
+        for chunk in positions.chunks_exact(3) {
+            for k in 0..3 {
+                pos_min[k] = pos_min[k].min(chunk[k]);
+                pos_max[k] = pos_max[k].max(chunk[k]);
+            }
+        }
+
+        // Accessors — each references the single bufferView with its own byteOffset.
+        let accessor_positions = build_accessor(
+            0,
+            pos_byte_offset,
+            n,
+            "VEC3",
+            COMPONENT_TYPE_FLOAT,
+            Some((&pos_min, &pos_max)),
+        );
+        let accessor_rotations =
+            build_accessor(0, rot_byte_offset, n, "VEC4", COMPONENT_TYPE_FLOAT, None);
+        let accessor_scales =
+            build_accessor(0, scale_byte_offset, n, "VEC3", COMPONENT_TYPE_FLOAT, None);
+        let accessor_opacities = build_accessor(
+            0,
+            opacity_byte_offset,
+            n,
+            "SCALAR",
+            COMPONENT_TYPE_FLOAT,
+            None,
+        );
+        // sh_channels is always >= 3 (it is `(sh_degree+1)^2 * 3` with
+        // `sh_degree: u32`), so `n * sh_channels >= n >= 1` here.
+        let accessor_sh = build_accessor(
+            0,
+            sh_byte_offset,
+            n * sh_channels,
+            "SCALAR",
+            COMPONENT_TYPE_FLOAT,
+            None,
+        );
+
+        // Accessor indices.
+        let acc_pos_idx = 0usize;
+        let acc_rot_idx = 1usize;
+        let acc_scale_idx = 2usize;
+        let acc_opacity_idx = 3usize;
+        let acc_sh_idx = 4usize;
+
+        // Custom Gaussian extension on the node.
+        let gaussian_extension = json!({
+            "gaussianCount": n,
+            "shDegree": model.sh_degree,
+            "positionsAccessor": acc_pos_idx,
+            "rotationsAccessor": acc_rot_idx,
+            "scalesAccessor": acc_scale_idx,
+            "opacitiesAccessor": acc_opacity_idx,
+            "shCoefficientsAccessor": acc_sh_idx
+        });
+
+        // glTF mesh primitive uses POSITION so viewers can show a point cloud.
+        let primitive = json!({
+            "attributes": {
+                "POSITION": acc_pos_idx
+            },
+            "mode": 0  // POINTS
+        });
+
+        let node = json!({
+            "name": "GaussianSplat",
+            "mesh": 0,
+            "extensions": {
+                "OXIGAF_gaussian_splat": gaussian_extension
+            }
+        });
+        let mesh = json!({
+            "name": "GaussianMesh",
+            "primitives": [primitive]
+        });
+        let buffer = json!({
+            "uri": bin_filename,
+            "byteLength": total_bin_length
+        });
+
+        (
+            vec![node],
+            vec![mesh],
+            vec![
+                accessor_positions,
+                accessor_rotations,
+                accessor_scales,
+                accessor_opacities,
+                accessor_sh,
+            ],
+            vec![buffer_view],
+            vec![buffer],
+            vec![0usize],
+        )
+    };
 
     let document = json!({
         "asset": {
@@ -208,30 +286,12 @@ pub fn export_gltf(model: &GaussianModel, output_path: &Path) -> Result<(), CliE
         },
         "extensionsUsed": ["OXIGAF_gaussian_splat"],
         "scene": 0,
-        "scenes": [{ "name": "GaussianScene", "nodes": [0] }],
-        "nodes": [{
-            "name": "GaussianSplat",
-            "mesh": 0,
-            "extensions": {
-                "OXIGAF_gaussian_splat": gaussian_extension
-            }
-        }],
-        "meshes": [{
-            "name": "GaussianMesh",
-            "primitives": [primitive]
-        }],
-        "buffers": [{
-            "uri": bin_filename,
-            "byteLength": total_bin_length
-        }],
-        "bufferViews": [buffer_view],
-        "accessors": [
-            accessor_positions,
-            accessor_rotations,
-            accessor_scales,
-            accessor_opacities,
-            accessor_sh
-        ],
+        "scenes": [{ "name": "GaussianScene", "nodes": root_nodes }],
+        "nodes": nodes,
+        "meshes": meshes,
+        "buffers": buffers,
+        "bufferViews": buffer_views,
+        "accessors": accessors,
         "extensions": {
             "OXIGAF_gaussian_splat": top_ext
         }
@@ -280,20 +340,29 @@ pub fn export_gltf(model: &GaussianModel, output_path: &Path) -> Result<(), CliE
 ///
 /// `buffer_view_idx` is the index into the `bufferViews` array.
 /// `byte_offset` is the byte offset within that bufferView.
+/// `min_max`, when given, populates the accessor's `min`/`max` fields —
+/// REQUIRED by the glTF 2.0 schema for any accessor used as a POSITION
+/// attribute, optional (and omitted here) for every other accessor.
 fn build_accessor(
     buffer_view_idx: usize,
     byte_offset: usize,
     count: usize,
     accessor_type: &str,
     component_type: u32,
+    min_max: Option<(&[f32; 3], &[f32; 3])>,
 ) -> Value {
-    json!({
+    let mut accessor = json!({
         "bufferView": buffer_view_idx,
         "byteOffset": byte_offset,
         "componentType": component_type,
         "count": count,
         "type": accessor_type
-    })
+    });
+    if let Some((min, max)) = min_max {
+        accessor["min"] = json!(min);
+        accessor["max"] = json!(max);
+    }
+    accessor
 }
 
 // ---------------------------------------------------------------------------
@@ -497,6 +566,77 @@ mod tests {
         // Verify .bin is empty (0 gaussians → 0 bytes)
         let bin_meta = std::fs::metadata(dir.join("empty.bin")).expect("bin file exists");
         assert_eq!(bin_meta.len(), 0, "empty model bin must have 0 bytes");
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 7b: empty model produces a *valid* document, not zero-count
+    // accessors / a zero-length bufferView (both forbidden by the glTF 2.0
+    // schema, which every conforming loader would reject).
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_empty_model_has_no_accessors_or_buffer_views() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let out = dir.join("empty2.gltf");
+        let model = make_model(0, 1);
+
+        export_gltf(&model, &out).expect("export should succeed");
+
+        let raw = std::fs::read_to_string(dir.join("empty2.gltf")).expect("read gltf file");
+        let doc: Value = serde_json::from_str(&raw).expect("parse JSON");
+
+        assert!(
+            doc["accessors"].as_array().expect("array").is_empty(),
+            "an empty model must emit zero accessors, not count:0 ones"
+        );
+        assert!(
+            doc["bufferViews"].as_array().expect("array").is_empty(),
+            "an empty model must emit zero bufferViews, not a byteLength:0 one"
+        );
+        assert!(
+            doc["buffers"].as_array().expect("array").is_empty(),
+            "an empty model must emit zero buffers, not a byteLength:0 one"
+        );
+        assert!(doc["meshes"].as_array().expect("array").is_empty());
+        assert!(doc["nodes"].as_array().expect("array").is_empty());
+        assert!(doc["scenes"][0]["nodes"]
+            .as_array()
+            .expect("array")
+            .is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 5b: POSITION accessor carries min/max, required by the glTF 2.0
+    // schema on any accessor referenced by a POSITION attribute.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_position_accessor_has_min_max() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let out = dir.join("model.gltf");
+        let model = make_model(5, 1);
+
+        export_gltf(&model, &out).expect("export should succeed");
+
+        let raw = std::fs::read_to_string(dir.join("model.gltf")).expect("read gltf file");
+        let doc: Value = serde_json::from_str(&raw).expect("parse JSON");
+
+        // make_model positions are [i, i+0.1, i+0.2] for i in 0..5, so the
+        // known bounding box is min=[0,0.1,0.2], max=[4,4.1,4.2].
+        let min = doc["accessors"][0]["min"]
+            .as_array()
+            .expect("POSITION accessor must have a min array");
+        let max = doc["accessors"][0]["max"]
+            .as_array()
+            .expect("POSITION accessor must have a max array");
+        assert_eq!(min.len(), 3);
+        assert_eq!(max.len(), 3);
+        assert!((min[0].as_f64().unwrap() - 0.0).abs() < 1e-4);
+        assert!((max[0].as_f64().unwrap() - 4.0).abs() < 1e-4);
+
+        // Non-POSITION accessors (e.g. rotations, index 1) must not carry
+        // min/max — the schema only requires it for POSITION.
+        assert!(doc["accessors"][1].get("min").is_none());
     }
 
     // -----------------------------------------------------------------------

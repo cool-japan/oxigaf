@@ -216,7 +216,11 @@ fn config_default_values_work() {
             // Uses default config (oxigaf.toml) which won't exist
         ])
         .assert()
-        .failure();
+        .failure()
+        // Must fail because the input footage doesn't exist (i.e. config
+        // loading succeeded and the pipeline actually ran), not because an
+        // argument was rejected by clap.
+        .stderr(predicate::str::contains("/nonexistent/input.mp4"));
 
     // Clean up
     let _ = fs::remove_dir_all(&output_dir);
@@ -248,7 +252,11 @@ image_size = 256
             config_path.to_str().expect("valid path"),
         ])
         .assert()
-        .failure();
+        .failure()
+        // Must fail because the input footage doesn't exist (i.e. the
+        // custom config parsed and the pipeline actually ran), not because
+        // an argument was rejected by clap.
+        .stderr(predicate::str::contains("/nonexistent/input.mp4"));
 
     // Clean up
     cleanup_temp_file(&config_path);
@@ -612,7 +620,12 @@ fn train_patience_option_accepted() {
             "100",
         ])
         .assert()
-        .failure(); // Expected to fail due to missing files, not due to invalid args
+        .failure() // Expected to fail due to missing files, not due to invalid args
+        // If `--patience` had been removed/renamed, clap would reject the
+        // argument before the pipeline ever validates `--input`, so this
+        // message (from the *first* pipeline validation step) would never
+        // appear.
+        .stderr(predicate::str::contains("/nonexistent/input.mp4"));
 }
 
 #[test]
@@ -632,7 +645,11 @@ fn train_min_delta_option_accepted() {
             "0.001",
         ])
         .assert()
-        .failure(); // Expected to fail due to missing files
+        .failure() // Expected to fail due to missing files
+        // Proves `--min-delta` was accepted by clap and the pipeline ran
+        // far enough to hit its first validation step, rather than clap
+        // rejecting the flag before any business logic executes.
+        .stderr(predicate::str::contains("/nonexistent/input.mp4"));
 }
 
 // ---------------------------------------------------------------------------
@@ -664,7 +681,14 @@ fn render_quality_ultra_accepted() {
             "ultra",
         ])
         .assert()
-        .failure(); // Expected to fail due to missing model
+        .failure() // Expected to fail due to missing model
+        // Model loading is the *first* thing `render` does, before
+        // `--quality` is even read, so this message proves `--quality
+        // ultra` was accepted by clap rather than rejected before reaching
+        // that point.
+        .stderr(predicate::str::contains(
+            "Failed to load model: /nonexistent/model.ply",
+        ));
 }
 
 #[test]
@@ -682,7 +706,10 @@ fn render_quality_low_accepted() {
             "low",
         ])
         .assert()
-        .failure();
+        .failure()
+        .stderr(predicate::str::contains(
+            "Failed to load model: /nonexistent/model.ply",
+        ));
 }
 
 #[test]
@@ -700,7 +727,10 @@ fn render_quality_medium_accepted() {
             "medium",
         ])
         .assert()
-        .failure();
+        .failure()
+        .stderr(predicate::str::contains(
+            "Failed to load model: /nonexistent/model.ply",
+        ));
 }
 
 #[test]
@@ -718,7 +748,10 @@ fn render_quality_high_accepted() {
             "high",
         ])
         .assert()
-        .failure();
+        .failure()
+        .stderr(predicate::str::contains(
+            "Failed to load model: /nonexistent/model.ply",
+        ));
 }
 
 #[test]
@@ -768,7 +801,12 @@ fn render_exr_format_accepted() {
             "exr",
         ])
         .assert()
-        .failure(); // Expected to fail due to missing model
+        .failure() // Expected to fail due to missing model
+        // Model loading happens before `--format` is read, so this proves
+        // `--format exr` was accepted by clap.
+        .stderr(predicate::str::contains(
+            "Failed to load model: /nonexistent/model.ply",
+        ));
 }
 
 #[test]
@@ -786,7 +824,10 @@ fn render_png_format_accepted() {
             "png",
         ])
         .assert()
-        .failure();
+        .failure()
+        .stderr(predicate::str::contains(
+            "Failed to load model: /nonexistent/model.ply",
+        ));
 }
 
 #[test]
@@ -804,7 +845,10 @@ fn render_jpeg_format_accepted() {
             "jpeg",
         ])
         .assert()
-        .failure();
+        .failure()
+        .stderr(predicate::str::contains(
+            "Failed to load model: /nonexistent/model.ply",
+        ));
 }
 
 // ---------------------------------------------------------------------------
@@ -836,7 +880,13 @@ fn export_gltf_with_metadata_accepted() {
             "--include-metadata",
         ])
         .assert()
-        .failure(); // Expected to fail due to missing model
+        .failure() // Expected to fail due to missing model
+        // Model loading is the first thing `export` does, before
+        // `--format`/`--include-metadata` are read, so this proves both
+        // flags were accepted by clap.
+        .stderr(predicate::str::contains(
+            "Failed to load model: /nonexistent/model.ply",
+        ));
 }
 
 #[test]
@@ -854,7 +904,10 @@ fn export_gltf_without_metadata_accepted() {
             "gltf",
         ])
         .assert()
-        .failure();
+        .failure()
+        .stderr(predicate::str::contains(
+            "Failed to load model: /nonexistent/model.ply",
+        ));
 }
 
 #[test]
@@ -891,7 +944,12 @@ fn train_with_all_early_stopping_options() {
             "0.01",
         ])
         .assert()
-        .failure();
+        .failure()
+        // Proves `--patience`, `--min-delta`, and `--early-stop-loss` were
+        // all accepted by clap and the pipeline reached its first
+        // validation step, rather than any one of them being rejected
+        // before business logic ever runs.
+        .stderr(predicate::str::contains("/nonexistent/input.mp4"));
 }
 
 #[test]
@@ -911,7 +969,13 @@ fn render_with_ultra_quality_and_exr() {
             "exr",
         ])
         .assert()
-        .failure();
+        .failure()
+        // Proves `--quality ultra` and `--format exr` were both accepted
+        // by clap, since model loading (and thus this message) happens
+        // before either is read.
+        .stderr(predicate::str::contains(
+            "Failed to load model: /nonexistent/model.ply",
+        ));
 }
 
 // ---------------------------------------------------------------------------

@@ -2,7 +2,7 @@
 //!
 //! 🤖 Generated with [SplitRS](https://github.com/cool-japan/splitrs)
 
-use super::functions::{retar_compute_variance, retar_solve_ridge};
+use super::functions::retar_compute_variance;
 
 /// Per-dimension variance statistics for a set of expression states.
 #[derive(Debug, Clone)]
@@ -43,11 +43,15 @@ pub enum RetargetError {
 ///
 /// `M = argmin ||Source · M − Target||_F² + λ ||M||_F²`
 ///
-/// The mapping matrix `M` is stored row-major as `[target_dim × source_dim]`.
+/// The mapping matrix `M` is stored row-major as `[source_dim × target_dim]`
+/// (row = source feature, column = target feature): `retarget` computes
+/// `out = (src − source_mean) · M + target_mean`.
 #[derive(Debug, Clone)]
 pub struct LinearExpressionRetargeter {
     pub(super) config: RetargetConfig,
-    /// Retargeting matrix stored row-major: `[feat_dim × feat_dim]`.
+    /// Retargeting matrix stored row-major: `[feat_dim × feat_dim]`
+    /// (row = source feature, column = target feature — see the type-level
+    /// doc; `source_dim == target_dim == feat_dim` for this retargeter).
     pub(super) mapping: Vec<f32>,
     /// Feature-space mean of source training data.
     source_mean: Vec<f32>,
@@ -58,6 +62,137 @@ pub struct LinearExpressionRetargeter {
     /// Optional variance statistics of source expression space.
     pub source_variance: Option<ExpressionVarianceStats>,
 }
+/// Per-feature-dimension scale divisor derived from `variance_stats`: the
+/// per-dimension standard deviation where available and not too close to
+/// zero, `1.0` otherwise.
+///
+/// The `1.0` fallback covers three cases: no variance stats at all
+/// (`variance_stats` is `None`), a near-zero-variance dimension (dividing
+/// by it would blow up), and any dimension beyond
+/// `variance_stats.per_dim_variance.len()` — i.e. the jaw-pose dimensions
+/// appended to the feature vector when `include_jaw` is set, which are not
+/// expression PCA coefficients and are intentionally left unscaled.
+fn variance_scale(variance_stats: Option<&ExpressionVarianceStats>, dim: usize) -> Vec<f32> {
+    let mut scale = vec![1.0_f32; dim];
+    if let Some(stats) = variance_stats {
+        for (s, &var) in scale.iter_mut().zip(stats.per_dim_variance.iter()) {
+            let std = var.sqrt();
+            if std > 1e-8_f32 {
+                *s = std;
+            }
+        }
+    }
+    scale
+}
+
+/// Solve the ridge regression system `(AᵀA + λI) X = AᵀB` for every column
+/// of `b_matrix` (`[n_samples × n_cols]`, row-major) against the shared
+/// `[n_samples × dim]` design matrix `a`, in one pass.
+///
+/// This is the multi-right-hand-side counterpart of
+/// `super::functions::retar_solve_ridge`: naively calling that function once
+/// per output column (as an earlier version of [`LinearExpressionRetargeter::fit`]
+/// did) redundantly rebuilds and re-Cholesky-factorises the identical
+/// `AᵀA + λI` system — `O(n·dim² + dim³)` — once per column, for a total of
+/// `O(n·dim³ + dim⁴)`. Since `a` and `λ` are the same for every column, this
+/// factorises once (`O(n·dim² + dim³)` total) and reuses that factorisation
+/// for each of the `n_cols` forward/back substitutions (`O(dim²)` each),
+/// bringing the total down to `O(n·dim² + dim³ + n_cols·dim²)`.
+///
+/// Returns the solution, row-major `[dim × n_cols]` (row = input feature,
+/// column = output dimension) — directly usable as
+/// [`LinearExpressionRetargeter::mapping`] when `b_matrix` is the centred
+/// target data and `n_cols == dim`.
+///
+/// # Errors
+///
+/// Returns [`RetargetError::Singular`] if any Cholesky pivot is non-positive.
+fn retar_solve_ridge_multi_rhs(
+    a: &[f32],
+    b_matrix: &[f32],
+    n_samples: usize,
+    dim: usize,
+    n_cols: usize,
+    lambda: f32,
+) -> Result<Vec<f32>, RetargetError> {
+    // A^T A (+ lambda on the diagonal) — identical for every column, so
+    // this (and the factorisation below) is computed only once.
+    let mut ata = vec![0.0_f32; dim * dim];
+    for row_idx in 0..n_samples {
+        for col in 0..dim {
+            let ai_c = a[row_idx * dim + col];
+            if ai_c == 0.0_f32 {
+                continue;
+            }
+            for row in 0..dim {
+                ata[row * dim + col] += a[row_idx * dim + row] * ai_c;
+            }
+        }
+    }
+    for diag in 0..dim {
+        ata[diag * dim + diag] += lambda;
+    }
+
+    // Cholesky factorisation of (A^T A + lambda I), computed once.
+    let mut chol_l = vec![0.0_f32; dim * dim];
+    for ii in 0..dim {
+        for jj in 0..=ii {
+            let mut sum_val = ata[ii * dim + jj];
+            for kk in 0..jj {
+                sum_val -= chol_l[ii * dim + kk] * chol_l[jj * dim + kk];
+            }
+            if ii == jj {
+                if sum_val <= 0.0_f32 {
+                    return Err(RetargetError::Singular);
+                }
+                chol_l[ii * dim + ii] = sum_val.sqrt();
+            } else {
+                chol_l[ii * dim + jj] = sum_val / chol_l[jj * dim + jj];
+            }
+        }
+    }
+
+    // A^T B for every column at once: [dim x n_cols], row-major.
+    let mut atb = vec![0.0_f32; dim * n_cols];
+    for row_idx in 0..n_samples {
+        for diag in 0..dim {
+            let ai_c = a[row_idx * dim + diag];
+            if ai_c == 0.0_f32 {
+                continue;
+            }
+            for col in 0..n_cols {
+                atb[diag * n_cols + col] += ai_c * b_matrix[row_idx * n_cols + col];
+            }
+        }
+    }
+
+    // Forward/back substitution per column, reusing the shared factorization.
+    let mut result = vec![0.0_f32; dim * n_cols];
+    let mut fwd_y = vec![0.0_f32; dim];
+    let mut sol_x = vec![0.0_f32; dim];
+    for col in 0..n_cols {
+        for ii in 0..dim {
+            let mut sum_val = atb[ii * n_cols + col];
+            for jj in 0..ii {
+                sum_val -= chol_l[ii * dim + jj] * fwd_y[jj];
+            }
+            fwd_y[ii] = sum_val / chol_l[ii * dim + ii];
+        }
+        for ii in (0..dim).rev() {
+            let mut sum_val = fwd_y[ii];
+            for jj in (ii + 1)..dim {
+                sum_val -= chol_l[jj * dim + ii] * sol_x[jj];
+            }
+            sol_x[ii] = sum_val / chol_l[ii * dim + ii];
+        }
+        for (row, &v) in sol_x.iter().enumerate() {
+            result[row * n_cols + col] = v;
+        }
+    }
+
+    Ok(result)
+}
+
 impl LinearExpressionRetargeter {
     /// Effective feature dimension (`expr_dim` or `expr_dim+3` if `include_jaw`).
     pub(super) fn feat_dim(&self) -> usize {
@@ -162,15 +297,30 @@ impl LinearExpressionRetargeter {
                 tgt_centered[i * dim + d] = tgt_vecs[i][d] - target_mean[d];
             }
         }
-        let lambda = config.regularization * n_f;
-        let mut mapping = vec![0.0_f32; dim * dim];
-        for col in 0..dim {
-            let b_col: Vec<f32> = (0..n).map(|i| tgt_centered[i * dim + col]).collect();
-            let x = retar_solve_ridge(&src_centered, &b_col, n, dim, lambda)?;
-            for row in 0..dim {
-                mapping[row * dim + col] = x[row];
+        if config.scale_by_variance {
+            // Standardize the *source* features by their per-dimension
+            // standard deviation before the ridge solve, as documented on
+            // `RetargetConfig::scale_by_variance`. `retarget` applies the
+            // same per-dimension scale to new source features before
+            // multiplying by `mapping`, so fit and inference stay
+            // consistent; the target side is left in its natural units.
+            let scale = variance_scale(source_variance.as_ref(), dim);
+            for i in 0..n {
+                for (d, &s) in scale.iter().enumerate() {
+                    src_centered[i * dim + d] /= s;
+                }
             }
         }
+        let lambda = config.regularization * n_f;
+        // One shared ridge solve for all `dim` output columns at once
+        // (factorising `AᵀA + λI` only once), instead of calling
+        // `retar_solve_ridge` per column and redundantly rebuilding +
+        // re-factorising the identical system `dim` times — see
+        // `retar_solve_ridge_multi_rhs`. The result is already laid out
+        // row-major `[dim × dim]` = `[source feature × target feature]`,
+        // exactly `mapping`'s documented layout.
+        let mapping =
+            retar_solve_ridge_multi_rhs(&src_centered, &tgt_centered, n, dim, dim, lambda)?;
         Ok(Self {
             config,
             mapping,
@@ -198,11 +348,19 @@ impl LinearExpressionRetargeter {
         } else {
             source.expression_params.clone()
         };
-        let centered: Vec<f32> = src_vec
+        let mut centered: Vec<f32> = src_vec
             .iter()
             .zip(self.source_mean.iter())
             .map(|(sv, mu)| sv - mu)
             .collect();
+        if self.config.scale_by_variance {
+            // Mirror `fit`'s source standardization: divide by the same
+            // per-dimension scale that was applied to the training data.
+            let scale = variance_scale(self.source_variance.as_ref(), dim);
+            for (c, &s) in centered.iter_mut().zip(scale.iter()) {
+                *c /= s;
+            }
+        }
         let mut out = vec![0.0_f32; dim];
         for (row, &cen_val) in centered.iter().enumerate() {
             let row_start = row * dim;
@@ -390,8 +548,13 @@ pub struct RetargetConfig {
     pub expr_dim: usize,
     /// L2 (Tikhonov) regularization strength for the ridge-regression solve. Default: `1e-4`.
     pub regularization: f32,
-    /// When `true`, expression features are normalized by their per-dimension standard deviation
-    /// before learning the mapping. Default: `true`.
+    /// When `true`, *source* expression features are normalized by their
+    /// per-dimension standard deviation (computed once at [`LinearExpressionRetargeter::fit`]
+    /// time) before learning the mapping, and the same per-dimension scale
+    /// is applied to new source features at [`LinearExpressionRetargeter::retarget`]
+    /// time. Target features are not scaled. Jaw-pose dimensions (appended
+    /// when `include_jaw` is set) are never scaled, since they are not
+    /// expression PCA coefficients. Default: `true`.
     pub scale_by_variance: bool,
     /// When `true`, the jaw pose is included in the joint feature vector. Default: `true`.
     pub include_jaw: bool,

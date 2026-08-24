@@ -41,7 +41,8 @@ pub use sdedit::{
     edit_cosine_similarity, edit_expand_mask_to_channels, edit_latent_distance, edit_lerp_latents,
     edit_linear_alpha_bars, edit_mean_latent, edit_normalize_latent, edit_project_out,
     edit_sample_noise, edit_slerp_latents, edit_start_timestep, edit_variance_map,
-    format_sdedit_stats, sdedit_perturb, EditConfig, ImageEditError, SdeditStats,
+    format_sdedit_stats, sdedit_perturb, sdedit_perturb_with_mask, EditConfig, ImageEditError,
+    SdeditStats,
 };
 
 use thiserror::Error;
@@ -365,13 +366,25 @@ impl EditMask {
     ///
     /// Builds a 1-D Gaussian kernel of size `2*ceil(3*sigma)+1`, applies it
     /// separably (horizontal then vertical pass), and thresholds the result
-    /// to produce a binary mask.
+    /// to produce a binary mask. When `sigma` is non-finite (e.g. NaN) or
+    /// `<= 0.0`, the Gaussian pass is skipped but the 0.5 threshold is still
+    /// applied to the original data, so the result is always a proper
+    /// binary mask as documented.
     pub fn smooth(&self, sigma: f32) -> Self {
         let h = self.height;
         let w = self.width;
 
-        if h == 0 || w == 0 || sigma <= 0.0 {
-            return self.clone();
+        if h == 0 || w == 0 || !sigma.is_finite() || sigma <= 0.0 {
+            let data = self
+                .data
+                .iter()
+                .map(|&v| if v >= 0.5 { 1.0 } else { 0.0 })
+                .collect();
+            return Self {
+                height: h,
+                width: w,
+                data,
+            };
         }
 
         // Build 1-D kernel.
@@ -442,7 +455,9 @@ impl EditMask {
     }
 
     /// Create a mask of the given size filled entirely with 1.0.
-    pub fn all_ones(width: usize, height: usize) -> Self {
+    ///
+    /// Takes `(height, width)`, matching [`Self::new`] and [`Self::from_data`].
+    pub fn all_ones(height: usize, width: usize) -> Self {
         let n = height * width;
         Self {
             height,
@@ -482,7 +497,12 @@ pub struct ImageEditingConfig {
     pub noise_level: f32,
     /// Edit strength for [`EditMode::Interpolate`] (`0` = source, `1` = target).
     pub strength: f32,
-    /// Number of denoising steps to run after noising (used by [`EditMode::SdEdit`]).
+    /// Number of denoising steps the caller should run after noising.
+    ///
+    /// This module (see the module docs) only prepares the noised/edited
+    /// input latent; it never runs denoising steps itself. This value is
+    /// therefore **advisory only** — it is range-checked by [`Self::validate`]
+    /// but the caller's own sampling loop is responsible for honouring it.
     pub num_denoise_steps: usize,
     /// Base seed for the PRNG.
     pub seed: u64,
@@ -578,11 +598,22 @@ impl ImageEditingConfig {
 // Core free functions
 // ---------------------------------------------------------------------------
 
-/// Add isotropic Gaussian noise at level `noise_level` to a latent.
+/// Add noise to a latent following the DDPM/SDEdit forward marginal.
 ///
-/// The noise scale is `sqrt(noise_level)` — a simple approximation of the
-/// DDPM forward process marginal at diffusion time `t`.  For `noise_level = 0`
-/// the output equals the input up to floating-point rounding.
+/// `noise_level ∈ [0, 1]` is mapped onto a 1000-step cosine noise schedule
+/// ([`sdedit::edit_cosine_alpha_bars`], Nichol & Dhariwal 2021) to obtain
+/// `alpha_bar`, then:
+///
+/// ```text
+/// x_t = sqrt(alpha_bar) * x + sqrt(1 - alpha_bar) * noise
+/// ```
+///
+/// This keeps `Var(x_t)` bounded and attenuates the original signal toward
+/// zero as `noise_level -> 1`, matching what a denoiser trained on this
+/// marginal expects. (A naive `x + sqrt(noise_level) * noise` — this
+/// function's previous implementation — leaves the signal at full strength
+/// regardless of `noise_level`, so the "fully noised" output at
+/// `noise_level = 1` would still be dominated by the original latent.)
 ///
 /// Uses xorshift64 + Box-Muller PRNG (no `rand` crate).
 pub fn add_edit_noise(
@@ -600,16 +631,18 @@ pub fn add_edit_noise(
         });
     }
 
-    let noise_scale = noise_level.sqrt();
-    let n = latent.numel();
-    let noise = gaussian_noise_vec(n, noise_scale, seed);
+    const SCHEDULE_LEN: usize = 1000;
+    let alpha_bars = sdedit::edit_cosine_alpha_bars(SCHEDULE_LEN);
+    let timestep = (noise_level * (SCHEDULE_LEN - 1) as f32)
+        .round()
+        .clamp(0.0, (SCHEDULE_LEN - 1) as f32) as usize;
 
-    let data: Vec<f32> = latent
-        .data
-        .iter()
-        .zip(noise.iter())
-        .map(|(&x, &z)| x + z)
-        .collect();
+    let n = latent.numel();
+    // Raw N(0,1) noise: edit_add_noise applies the alpha-bar scaling itself.
+    let noise = gaussian_noise_vec(n, 1.0, seed);
+
+    let data = sdedit::edit_add_noise(&latent.data, &noise, timestep, &alpha_bars)
+        .map_err(|e| ImageEditingError::NumericalError(format!("add_edit_noise: {e}")))?;
 
     Ok(EditLatent {
         channels: latent.channels,
@@ -1233,16 +1266,39 @@ mod tests {
     }
 
     #[test]
-    fn add_noise_level_zero_near_identity() {
+    fn add_noise_level_zero_stays_close_to_input() {
+        // With the corrected DDPM/SDEdit forward marginal, noise_level=0
+        // maps to alpha_bar close to (but not exactly) 1.0 — the cosine
+        // schedule's s=0.008 offset keeps a small noise floor even at the
+        // very first timestep — so the output correlates strongly with the
+        // input without being bit-identical to it.
         let lat = make_latent(2, 4, 4, 1.0);
         let out = add_edit_noise(&lat, 0.0, 42).unwrap();
-        // noise_scale = sqrt(0) = 0 → output identical to input
         for (&a, &b) in lat.data.iter().zip(out.data.iter()) {
             assert!(
-                (a - b).abs() < 1e-6,
-                "noise_level=0 should be near-identity"
+                (a - b).abs() < 0.5,
+                "noise_level=0 should stay close to input: {} vs {}",
+                a,
+                b
             );
         }
+    }
+
+    #[test]
+    fn add_noise_high_level_attenuates_large_signal() {
+        // Regression test for the SDEdit forward-marginal bug: the old
+        // `x + sqrt(noise_level) * z` formula left the signal at full
+        // strength regardless of noise_level, so a large-magnitude latent
+        // stayed large even at noise_level=1.0 ("pure noise"). The correct
+        // marginal sqrt(alpha_bar)*x + sqrt(1-alpha_bar)*z must shrink it.
+        let lat = make_latent(2, 8, 8, 1000.0);
+        let out = add_edit_noise(&lat, 1.0, 7).unwrap();
+        let max_abs = out.data.iter().cloned().fold(0.0f32, |m, v| m.max(v.abs()));
+        assert!(
+            max_abs < 200.0,
+            "noise_level=1.0 should mostly destroy a large-magnitude signal, got max_abs={}",
+            max_abs
+        );
     }
 
     #[test]

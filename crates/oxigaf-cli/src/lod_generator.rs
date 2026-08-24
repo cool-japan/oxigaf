@@ -64,6 +64,20 @@ pub enum LodError {
     /// Not enough Gaussians to satisfy the request.
     #[error("Requested {k} Gaussians but cloud only has {n}")]
     InsufficientGaussians { k: usize, n: usize },
+
+    /// A row index passed to a selection/extraction function is out of range.
+    #[error("Index {index} out of range: cloud has only {n_gaussians} Gaussians")]
+    IndexOutOfRange { index: usize, n_gaussians: usize },
+
+    /// No reduction-ratio chain fits the requested memory budget.
+    #[error(
+        "No LOD ratio chain fits within {target_bytes} bytes \
+         (minimum achievable is {minimum_bytes} bytes)"
+    )]
+    MemoryBudgetExceeded {
+        minimum_bytes: usize,
+        target_bytes: usize,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -96,7 +110,15 @@ pub struct LodConfig {
     pub reduction_ratios: Vec<f32>,
     /// Selection strategy for lower-quality levels.
     pub strategy: LodStrategy,
-    /// Sort Gaussians by opacity before selection.
+    /// Rank Gaussians by descending opacity before selection.
+    ///
+    /// Only affects [`LodStrategy::Uniform`] and [`LodStrategy::Random`],
+    /// which otherwise pick evenly-spaced/random *storage* indices; when
+    /// set, they instead pick evenly-spaced/random *opacity ranks*, so
+    /// `Uniform` in particular favors more-visible Gaussians instead of an
+    /// arbitrary storage order. [`LodStrategy::TopOpacity`] already ranks by
+    /// opacity directly and [`LodStrategy::SpatialGrid`] ranks by 3D
+    /// position, so this has no effect on either.
     pub sort_by_opacity: bool,
 }
 
@@ -228,6 +250,18 @@ pub struct LodChain {
 }
 
 impl LodChain {
+    /// Get a LOD level directly by its index (0 = highest quality).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LodError::InvalidLodLevel`] if `level >= self.levels.len()`.
+    pub fn get_level(&self, level: usize) -> Result<&LodLevel, LodError> {
+        self.levels.get(level).ok_or(LodError::InvalidLodLevel {
+            level,
+            n_levels: self.levels.len(),
+        })
+    }
+
     /// Select the appropriate LOD level based on viewing distance.
     ///
     /// - If `distance < thresholds[0]`: level 0 (highest quality)
@@ -375,11 +409,16 @@ pub fn select_uniform_indices(n_gaussians: usize, k: usize) -> Vec<usize> {
 // select_spatial_grid_indices
 // ---------------------------------------------------------------------------
 
-/// Select at most k Gaussians distributed across a 3D spatial grid.
+/// Select exactly `min(k, n_gaussians)` Gaussians distributed across a 3D
+/// spatial grid.
 ///
 /// Divides the bounding box into ceil(k^(1/3)) cells per axis. For each
-/// non-empty cell the first encountered Gaussian is selected. Returns at most
-/// k indices in ascending order.
+/// non-empty cell the first encountered Gaussian is selected. Real point
+/// clouds rarely occupy every cell of the bounding grid, so this first pass
+/// alone typically yields fewer than `k` picks; a second pass tops up the
+/// remainder from the unpicked Gaussians (in storage order) so the caller
+/// reliably gets the count it asked for instead of an unreported shortfall.
+/// Returns indices in ascending order.
 pub fn select_spatial_grid_indices(positions: &[f32], k: usize) -> Result<Vec<usize>, LodError> {
     if positions.is_empty() {
         return Err(LodError::EmptyCloud);
@@ -430,6 +469,7 @@ pub fn select_spatial_grid_indices(positions: &[f32], k: usize) -> Result<Vec<us
     let cells_per_axis = ((k as f64).cbrt().ceil() as usize).max(1);
     let total_cells = cells_per_axis * cells_per_axis * cells_per_axis;
     let mut cell_occupied: Vec<bool> = vec![false; total_cells];
+    let mut picked: Vec<bool> = vec![false; n_gaussians];
     let mut selected: Vec<usize> = Vec::with_capacity(k);
 
     let range_x = (max_x - min_x).max(f32::EPSILON);
@@ -452,7 +492,27 @@ pub fn select_spatial_grid_indices(positions: &[f32], k: usize) -> Result<Vec<us
 
         if !cell_occupied[cell_id] {
             cell_occupied[cell_id] = true;
+            picked[i] = true;
             selected.push(i);
+        }
+    }
+
+    // Top up: the grid pass alone almost always undershoots `k` because
+    // real clouds only occupy a fraction of the bounding grid's cells.
+    // Without this, callers silently got far fewer Gaussians than
+    // requested (e.g. k=50 on a 4×4×4=64-cell grid with ~25-30 occupied
+    // cells), and the achieved ratio was reported as if it had been asked
+    // for. `k < n_gaussians` is guaranteed by the early return above, so
+    // there are always enough unpicked Gaussians to reach exactly `k`.
+    if selected.len() < k {
+        for i in 0..n_gaussians {
+            if selected.len() >= k {
+                break;
+            }
+            if !picked[i] {
+                picked[i] = true;
+                selected.push(i);
+            }
         }
     }
 
@@ -484,25 +544,95 @@ pub fn select_random_indices(n_gaussians: usize, k: usize, seed: u64) -> Vec<usi
 }
 
 // ---------------------------------------------------------------------------
+// opacity_descending_permutation / select_indices_by_rank
+// ---------------------------------------------------------------------------
+
+/// Permutation of `0..opacities.len()` ordered by descending sigmoid-opacity
+/// (most opaque first).
+///
+/// Used to let rank-based selectors ([`select_uniform_indices`],
+/// [`select_random_indices`]) operate on opacity rank instead of raw
+/// storage order when [`LodConfig::sort_by_opacity`] is set.
+fn opacity_descending_permutation(opacities: &[f32]) -> Vec<usize> {
+    let probs = compute_opacity_values(opacities);
+    let mut perm: Vec<usize> = (0..opacities.len()).collect();
+    perm.sort_by(|&a, &b| {
+        probs[b]
+            .partial_cmp(&probs[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    perm
+}
+
+/// Reinterpret `ranks` (indices in `0..n_gaussians`, as produced by a
+/// rank-based selector such as [`select_uniform_indices`] or
+/// [`select_random_indices`]) as opacity ranks when `sort_by_opacity` is
+/// set, mapping each rank back to the original Gaussian index via
+/// [`opacity_descending_permutation`]. When `sort_by_opacity` is false,
+/// `ranks` is returned unchanged (the "rank" already *is* the storage
+/// index). Re-sorts ascending afterward to match every other `select_*`
+/// function's convention of returning ascending original indices.
+fn select_indices_by_rank(
+    ranks: Vec<usize>,
+    sort_by_opacity: bool,
+    opacities: &[f32],
+) -> Vec<usize> {
+    if !sort_by_opacity {
+        return ranks;
+    }
+    let perm = opacity_descending_permutation(opacities);
+    let mut indices: Vec<usize> = ranks.into_iter().map(|r| perm[r]).collect();
+    indices.sort_unstable();
+    indices
+}
+
+// ---------------------------------------------------------------------------
 // extract_subset
 // ---------------------------------------------------------------------------
 
 /// Extract rows from a flat N×M array using the given row indices.
 ///
-/// The stride M is inferred as `source.len() / n_gaussians`.
+/// The stride M is inferred as `source.len() / n_gaussians`. `source.len()`
+/// must be an exact multiple of `n_gaussians` and every index must be
+/// `< n_gaussians`, or this returns an error rather than silently
+/// extracting misaligned rows (a mismatched but non-zero stride) or
+/// panicking on an out-of-range slice (`idx * stride` past `source.len()`).
 /// Returns `indices.len() × M` elements.
-pub fn extract_subset(source: &[f32], n_gaussians: usize, indices: &[usize]) -> Vec<f32> {
+///
+/// # Errors
+///
+/// Returns [`LodError::ArrayLengthMismatch`] if `source.len()` is not a
+/// multiple of `n_gaussians`, or [`LodError::IndexOutOfRange`] if any index
+/// is `>= n_gaussians`.
+pub fn extract_subset(
+    source: &[f32],
+    n_gaussians: usize,
+    indices: &[usize],
+) -> Result<Vec<f32>, LodError> {
     if n_gaussians == 0 || source.is_empty() || indices.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
+    }
+    if !source.len().is_multiple_of(n_gaussians) {
+        return Err(LodError::ArrayLengthMismatch {
+            n_gaussians,
+            field: "source".to_string(),
+            actual: source.len(),
+        });
     }
     let stride = source.len() / n_gaussians;
     let mut out = Vec::with_capacity(indices.len() * stride);
     for &idx in indices {
+        if idx >= n_gaussians {
+            return Err(LodError::IndexOutOfRange {
+                index: idx,
+                n_gaussians,
+            });
+        }
         let start = idx * stride;
         let end = start + stride;
-        out.extend_from_slice(&source[start..end.min(source.len())]);
+        out.extend_from_slice(&source[start..end]);
     }
-    out
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -510,6 +640,7 @@ pub fn extract_subset(source: &[f32], n_gaussians: usize, indices: &[usize]) -> 
 // ---------------------------------------------------------------------------
 
 /// Flat scene attribute slices for [`generate_lod_level`].
+#[derive(Debug, Clone, Copy)]
 pub struct LodInputSlices<'a> {
     /// Total number of Gaussians.
     pub n_gaussians: usize,
@@ -525,13 +656,67 @@ pub struct LodInputSlices<'a> {
     pub sh_coefficients: &'a [f32],
 }
 
+/// Validate that every flat array in `input` matches `input.n_gaussians`.
+///
+/// Called by both [`generate_lod_chain`] (eagerly, before any level is
+/// generated) and [`generate_lod_level`] (so the latter is also safe to
+/// call directly, bypassing the chain, instead of panicking or silently
+/// extracting misaligned rows when a caller-supplied array disagrees with
+/// `n_gaussians`).
+fn validate_input_slices(input: &LodInputSlices<'_>) -> Result<(), LodError> {
+    let n_gaussians = input.n_gaussians;
+    if input.positions.len() != n_gaussians * 3 {
+        return Err(LodError::ArrayLengthMismatch {
+            n_gaussians,
+            field: "positions".to_string(),
+            actual: input.positions.len(),
+        });
+    }
+    if input.rotations.len() != n_gaussians * 4 {
+        return Err(LodError::ArrayLengthMismatch {
+            n_gaussians,
+            field: "rotations".to_string(),
+            actual: input.rotations.len(),
+        });
+    }
+    if input.scales.len() != n_gaussians * 3 {
+        return Err(LodError::ArrayLengthMismatch {
+            n_gaussians,
+            field: "scales".to_string(),
+            actual: input.scales.len(),
+        });
+    }
+    if input.opacities.len() != n_gaussians {
+        return Err(LodError::ArrayLengthMismatch {
+            n_gaussians,
+            field: "opacities".to_string(),
+            actual: input.opacities.len(),
+        });
+    }
+    if n_gaussians > 0 && !input.sh_coefficients.len().is_multiple_of(n_gaussians) {
+        return Err(LodError::ArrayLengthMismatch {
+            n_gaussians,
+            field: "sh_coefficients".to_string(),
+            actual: input.sh_coefficients.len(),
+        });
+    }
+    Ok(())
+}
+
 /// Generate a single LOD level by selecting `target_n` Gaussians from the cloud.
+///
+/// # Errors
+///
+/// Returns [`LodError::ArrayLengthMismatch`] if any array in `input`
+/// disagrees with `input.n_gaussians`, or [`LodError::InsufficientGaussians`]
+/// if `target_n > input.n_gaussians`.
 pub fn generate_lod_level(
     input: LodInputSlices<'_>,
     target_n: usize,
     config: &LodConfig,
     level: usize,
 ) -> Result<LodLevel, LodError> {
+    validate_input_slices(&input)?;
     let LodInputSlices {
         n_gaussians,
         positions,
@@ -549,16 +734,32 @@ pub fn generate_lod_level(
 
     let indices = match config.strategy {
         LodStrategy::TopOpacity => select_top_opacity_indices(n_gaussians, opacities, target_n),
-        LodStrategy::Uniform => select_uniform_indices(n_gaussians, target_n),
+        LodStrategy::Uniform => select_indices_by_rank(
+            select_uniform_indices(n_gaussians, target_n),
+            config.sort_by_opacity,
+            opacities,
+        ),
         LodStrategy::SpatialGrid => select_spatial_grid_indices(positions, target_n)?,
         LodStrategy::Random => {
             // Deterministic seed derived from level index.
             let seed = (level as u64 + 1).wrapping_mul(6_364_136_223_846_793_005u64);
-            select_random_indices(n_gaussians, target_n, seed)
+            select_indices_by_rank(
+                select_random_indices(n_gaussians, target_n, seed),
+                config.sort_by_opacity,
+                opacities,
+            )
         }
     };
 
     let actual_n = indices.len();
+    if actual_n != target_n {
+        tracing::warn!(
+            target_n,
+            actual_n,
+            strategy = ?config.strategy,
+            "LOD level selection did not return the requested Gaussian count"
+        );
+    }
     let reduction_factor = if n_gaussians > 0 {
         actual_n as f32 / n_gaussians as f32
     } else {
@@ -575,11 +776,11 @@ pub fn generate_lod_level(
         level,
         n_gaussians: actual_n,
         reduction_factor,
-        positions: extract_subset(positions, n_gaussians, &indices),
-        rotations: extract_subset(rotations, n_gaussians, &indices),
-        scales: extract_subset(scales, n_gaussians, &indices),
+        positions: extract_subset(positions, n_gaussians, &indices)?,
+        rotations: extract_subset(rotations, n_gaussians, &indices)?,
+        scales: extract_subset(scales, n_gaussians, &indices)?,
         opacities: selected_opacities,
-        sh_coefficients: extract_subset(sh_coefficients, n_gaussians, &indices),
+        sh_coefficients: extract_subset(sh_coefficients, n_gaussians, &indices)?,
     })
 }
 
@@ -606,35 +807,20 @@ pub fn generate_lod_chain(
     }
     let n_gaussians = positions.len() / 3;
 
-    // Validate all array lengths.
-    if rotations.len() != n_gaussians * 4 {
-        return Err(LodError::ArrayLengthMismatch {
-            n_gaussians,
-            field: "rotations".to_string(),
-            actual: rotations.len(),
-        });
-    }
-    if scales.len() != n_gaussians * 3 {
-        return Err(LodError::ArrayLengthMismatch {
-            n_gaussians,
-            field: "scales".to_string(),
-            actual: scales.len(),
-        });
-    }
-    if opacities.len() != n_gaussians {
-        return Err(LodError::ArrayLengthMismatch {
-            n_gaussians,
-            field: "opacities".to_string(),
-            actual: opacities.len(),
-        });
-    }
-    if !sh_coefficients.is_empty() && !sh_coefficients.len().is_multiple_of(n_gaussians) {
-        return Err(LodError::ArrayLengthMismatch {
-            n_gaussians,
-            field: "sh_coefficients".to_string(),
-            actual: sh_coefficients.len(),
-        });
-    }
+    // Validate all array lengths eagerly (before generating any level) using
+    // the same check `generate_lod_level` runs on every call, so a bad
+    // rotations/scales/opacities/sh_coefficients array is reported up front
+    // even for an `n_levels == 0` config that would otherwise never touch
+    // `generate_lod_level` at all.
+    let input = LodInputSlices {
+        n_gaussians,
+        positions,
+        rotations,
+        scales,
+        opacities,
+        sh_coefficients,
+    };
+    validate_input_slices(&input)?;
 
     config.validate()?;
 
@@ -643,19 +829,7 @@ pub fn generate_lod_chain(
         let target_n = ((n_gaussians as f32 * ratio).ceil() as usize)
             .max(1)
             .min(n_gaussians);
-        let lod_level = generate_lod_level(
-            LodInputSlices {
-                n_gaussians,
-                positions,
-                rotations,
-                scales,
-                opacities,
-                sh_coefficients,
-            },
-            target_n,
-            config,
-            lvl,
-        )?;
+        let lod_level = generate_lod_level(input, target_n, config, lvl)?;
         levels.push(lod_level);
     }
 
@@ -700,13 +874,66 @@ pub fn compute_lod_stats(chain: &LodChain) -> LodStats {
 // merge_lod_levels
 // ---------------------------------------------------------------------------
 
+/// Per-quaternion normalized-LERP of two flat N×4 quaternion arrays.
+///
+/// A naive component-wise LERP of two *unit* quaternions is not itself a
+/// unit quaternion (the renderer's quaternion → rotation-matrix conversion
+/// would then produce a scaled/skewed rotation), and blending along the
+/// "long way around" the hypersphere when `dot(a, b) < 0` passes
+/// arbitrarily close to the zero quaternion at `t = 0.5`, producing a
+/// degenerate rotation. This corrects both: negate `b` when the dot product
+/// is negative (shortest-path interpolation), LERP component-wise, then
+/// renormalize.
+///
+/// Assumes `a.len() == b.len()` and both are a multiple of 4 (guaranteed by
+/// [`merge_lod_levels`] via [`LodLevel::validate`] before this is called).
+fn nlerp_quaternions(a: &[f32], b: &[f32], t: f32) -> Vec<f32> {
+    let mut out = Vec::with_capacity(a.len());
+    for (qa, qb) in a.chunks_exact(4).zip(b.chunks_exact(4)) {
+        let dot = qa[0] * qb[0] + qa[1] * qb[1] + qa[2] * qb[2] + qa[3] * qb[3];
+        let sign = if dot < 0.0 { -1.0 } else { 1.0 };
+        let mut lerped = [0.0f32; 4];
+        for i in 0..4 {
+            lerped[i] = qa[i] + (sign * qb[i] - qa[i]) * t;
+        }
+        let norm_sq = lerped[0] * lerped[0]
+            + lerped[1] * lerped[1]
+            + lerped[2] * lerped[2]
+            + lerped[3] * lerped[3];
+        if norm_sq > f32::EPSILON {
+            let inv_norm = 1.0 / norm_sq.sqrt();
+            for v in &mut lerped {
+                *v *= inv_norm;
+            }
+        } else {
+            // Degenerate (both inputs ~zero): fall back to `a` rather than
+            // emit a zero/NaN quaternion.
+            lerped.copy_from_slice(qa);
+        }
+        out.extend_from_slice(&lerped);
+    }
+    out
+}
+
 /// Blend two LOD levels of equal size via linear interpolation.
 ///
-/// `weight_a = 0.0` → pure `level_a`; `weight_a = 1.0` → pure `level_b`.
+/// `weight_b = 0.0` → pure `level_a`; `weight_b = 1.0` → pure `level_b`.
+/// Positions, scales, opacities and SH coefficients use plain per-element
+/// LERP; rotations use quaternion NLERP ([`nlerp_quaternions`]) since a
+/// component-wise LERP of two unit quaternions is not itself a unit
+/// quaternion.
+///
+/// # Errors
+///
+/// Returns [`LodError::ArrayLengthMismatch`] if `level_a` and `level_b`
+/// disagree on `n_gaussians`, if either level's own arrays are internally
+/// inconsistent (see [`LodLevel::validate`]), or if their `sh_coefficients`
+/// lengths differ (e.g. two levels generated with different SH degrees) —
+/// the last case cannot be inferred from `n_gaussians` alone.
 pub fn merge_lod_levels(
     level_a: &LodLevel,
     level_b: &LodLevel,
-    weight_a: f32,
+    weight_b: f32,
 ) -> Result<LodLevel, LodError> {
     if level_a.n_gaussians != level_b.n_gaussians {
         return Err(LodError::ArrayLengthMismatch {
@@ -715,7 +942,25 @@ pub fn merge_lod_levels(
             actual: level_b.n_gaussians,
         });
     }
-    let t = weight_a; // 0 = pure a, 1 = pure b
+    // `n_gaussians` matching alone is not sufficient: `level_a.validate()`
+    // and `level_b.validate()` additionally guarantee positions/rotations/
+    // scales/opacities each match their own `n_gaussians` (so those four
+    // are then pairwise-equal for free), but `sh_coefficients` can still
+    // independently satisfy "multiple of n_gaussians" on each side while
+    // disagreeing with the other (e.g. differing SH degrees), which a plain
+    // `zip`-based lerp would otherwise silently truncate to the shorter
+    // side instead of reporting.
+    level_a.validate()?;
+    level_b.validate()?;
+    if level_a.sh_coefficients.len() != level_b.sh_coefficients.len() {
+        return Err(LodError::ArrayLengthMismatch {
+            n_gaussians: level_a.n_gaussians,
+            field: "sh_coefficients".to_string(),
+            actual: level_b.sh_coefficients.len(),
+        });
+    }
+
+    let t = weight_b; // 0 = pure a, 1 = pure b
     let lerp_vec = |a: &[f32], b: &[f32]| -> Vec<f32> {
         a.iter()
             .zip(b.iter())
@@ -730,7 +975,7 @@ pub fn merge_lod_levels(
         n_gaussians: level_a.n_gaussians,
         reduction_factor: new_reduction,
         positions: lerp_vec(&level_a.positions, &level_b.positions),
-        rotations: lerp_vec(&level_a.rotations, &level_b.rotations),
+        rotations: nlerp_quaternions(&level_a.rotations, &level_b.rotations, t),
         scales: lerp_vec(&level_a.scales, &level_b.scales),
         opacities: lerp_vec(&level_a.opacities, &level_b.opacities),
         sh_coefficients: lerp_vec(&level_a.sh_coefficients, &level_b.sh_coefficients),
@@ -772,17 +1017,25 @@ pub fn estimate_lod_memory(n_gaussians: usize, sh_coefficients_len: usize) -> us
 /// memory across all levels fits within `target_memory_bytes`.
 ///
 /// Uses binary search for `r` in [0.1, 1.0].
+///
+/// # Errors
+///
+/// Returns [`LodError::MemoryBudgetExceeded`] if even the smallest ratio
+/// considered by the search (`r = 0.1`) does not fit within
+/// `target_memory_bytes` — level 0 is always pinned to `1.0` regardless of
+/// `r`, so no chain in the search space can do better than
+/// `total_memory_for_r(0.1)`, which is reported as the achievable minimum.
 pub fn find_optimal_reduction_ratios(
     n_gaussians: usize,
     target_memory_bytes: usize,
     n_levels: usize,
     sh_per_gaussian: usize,
-) -> Vec<f32> {
+) -> Result<Vec<f32>, LodError> {
     if n_levels == 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     if n_levels == 1 {
-        return vec![1.0_f32];
+        return Ok(vec![1.0_f32]);
     }
 
     let bytes_per_gaussian = 4 * (3 + 4 + 3 + 1 + sh_per_gaussian);
@@ -809,6 +1062,20 @@ pub fn find_optimal_reduction_ratios(
         }
     }
 
+    // If `lo` never advanced past its initial 0.1, either r=0.1 fits (in
+    // which case this is simply the tightest chain found) or nothing in
+    // the search space fits and `lo` stayed at 0.1 because
+    // `total_memory_for_r` is non-decreasing in `r`. Distinguish the two by
+    // checking the achieved total directly, rather than silently returning
+    // a chain that overshoots the budget with no indication.
+    let achieved_bytes = total_memory_for_r(lo);
+    if achieved_bytes > target_memory_bytes as f64 {
+        return Err(LodError::MemoryBudgetExceeded {
+            minimum_bytes: achieved_bytes as usize,
+            target_bytes: target_memory_bytes,
+        });
+    }
+
     let r = lo as f32;
     let mut ratios = Vec::with_capacity(n_levels);
     for lv in 0..n_levels {
@@ -818,7 +1085,7 @@ pub fn find_optimal_reduction_ratios(
     if let Some(first) = ratios.first_mut() {
         *first = 1.0_f32;
     }
-    ratios
+    Ok(ratios)
 }
 
 // ---------------------------------------------------------------------------
@@ -1107,8 +1374,45 @@ mod tests {
         let n = 1000usize;
         let positions: Vec<f32> = (0..n * 3).map(|i| (i as f32).sin()).collect();
         let indices = select_spatial_grid_indices(&positions, 50).expect("grid selection failed");
-        assert!(indices.len() <= 50);
-        assert!(!indices.is_empty());
+        // Regression: the grid pass alone (occupied-cell-only) used to
+        // undershoot k for real point clouds (e.g. only ~25-30 of a 4×4×4
+        // grid's 64 cells occupied); the top-up pass must reach exactly k.
+        assert_eq!(
+            indices.len(),
+            50,
+            "expected exactly the requested count, not a grid-occupancy-limited undershoot"
+        );
+    }
+
+    #[test]
+    fn test_select_spatial_grid_indices_top_up_reaches_k_when_grid_sparse() {
+        // All Gaussians share one point: every one of them falls in the
+        // same grid cell, so the grid pass alone can select only 1. The
+        // top-up pass must still reach the full k=20.
+        let n = 100usize;
+        let mut positions: Vec<f32> = Vec::with_capacity(n * 3);
+        for _ in 0..n {
+            positions.extend_from_slice(&[1.0f32, 2.0, 3.0]);
+        }
+        let indices = select_spatial_grid_indices(&positions, 20).expect("grid selection failed");
+        assert_eq!(indices.len(), 20);
+        // No duplicate indices.
+        let mut sorted = indices.clone();
+        sorted.dedup();
+        assert_eq!(sorted.len(), indices.len());
+    }
+
+    #[test]
+    fn test_select_spatial_grid_indices_no_duplicates_general() {
+        let n = 200usize;
+        let positions: Vec<f32> = (0..n * 3).map(|i| (i as f32 * 0.7).cos()).collect();
+        let indices = select_spatial_grid_indices(&positions, 77).expect("grid selection failed");
+        assert_eq!(indices.len(), 77);
+        let mut sorted = indices.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), indices.len(), "indices must be unique");
+        assert!(indices.iter().all(|&i| i < n));
     }
 
     #[test]
@@ -1139,7 +1443,7 @@ mod tests {
     fn test_extract_subset_stride_3_positions() {
         // n=4 Gaussians, stride=3. Source rows: [0,1,2], [3,4,5], [6,7,8], [9,10,11].
         let source: Vec<f32> = (0..12).map(|i| i as f32).collect();
-        let out = extract_subset(&source, 4, &[0, 2]);
+        let out = extract_subset(&source, 4, &[0, 2]).expect("extract failed");
         assert_eq!(out.len(), 6);
         assert_eq!(out[0], 0.0);
         assert_eq!(out[1], 1.0);
@@ -1153,7 +1457,7 @@ mod tests {
     fn test_extract_subset_stride_4_rotations() {
         // n=3 Gaussians, stride=4. Row 1 = [4,5,6,7].
         let source: Vec<f32> = (0..12).map(|i| i as f32).collect();
-        let out = extract_subset(&source, 3, &[1]);
+        let out = extract_subset(&source, 3, &[1]).expect("extract failed");
         assert_eq!(out.len(), 4);
         assert_eq!(out[0], 4.0);
         assert_eq!(out[3], 7.0);
@@ -1162,7 +1466,30 @@ mod tests {
     #[test]
     fn test_extract_subset_empty_indices() {
         let source = vec![1.0f32, 2.0, 3.0];
-        assert!(extract_subset(&source, 1, &[]).is_empty());
+        assert!(extract_subset(&source, 1, &[])
+            .expect("extract failed")
+            .is_empty());
+    }
+
+    #[test]
+    fn test_extract_subset_index_out_of_range_errors_instead_of_panicking() {
+        // Regression: n_gaussians=4 but an index of 10 used to compute
+        // `start = 10 * stride` past `source.len()`, producing a `start >
+        // end` range that panics after the old `.min(source.len())` clamp
+        // only clamped the end, not the start.
+        let source: Vec<f32> = (0..12).map(|i| i as f32).collect(); // n=4, stride=3
+        let result = extract_subset(&source, 4, &[0, 10]);
+        assert!(matches!(
+            result,
+            Err(LodError::IndexOutOfRange { index: 10, .. })
+        ));
+    }
+
+    #[test]
+    fn test_extract_subset_not_multiple_of_n_gaussians_errors() {
+        let source = vec![0.0f32; 10];
+        let result = extract_subset(&source, 3, &[0]);
+        assert!(matches!(result, Err(LodError::ArrayLengthMismatch { .. })));
     }
 
     // ------------------------------------------------------------------
@@ -1283,6 +1610,186 @@ mod tests {
             result,
             Err(LodError::InsufficientGaussians { .. })
         ));
+    }
+
+    #[test]
+    fn test_generate_lod_level_direct_call_rejects_mismatched_positions() {
+        // Regression: calling `generate_lod_level` directly (bypassing
+        // `generate_lod_chain`, which used to be the only validated entry
+        // point) with n_gaussians=100 but a 200-element positions array
+        // (a multiple of 100, but the wrong stride: 2 instead of 3) must
+        // error instead of silently extracting misaligned rows.
+        let n = 100usize;
+        let positions = vec![0.0f32; n * 2]; // wrong: should be n * 3
+        let rotations = vec![0.0f32; n * 4];
+        let scales = vec![0.0f32; n * 3];
+        let opacities = vec![0.0f32; n];
+        let sh = vec![0.0f32; n * 9];
+        let config = LodConfig::default();
+        let result = generate_lod_level(
+            LodInputSlices {
+                n_gaussians: n,
+                positions: &positions,
+                rotations: &rotations,
+                scales: &scales,
+                opacities: &opacities,
+                sh_coefficients: &sh,
+            },
+            50,
+            &config,
+            0,
+        );
+        assert!(matches!(result, Err(LodError::ArrayLengthMismatch { .. })));
+    }
+
+    #[test]
+    fn test_generate_lod_level_direct_call_rejects_short_rotations() {
+        // Regression: a rotations array shorter than n_gaussians*4 used to
+        // reach `extract_subset` unchecked and could panic (or, before that
+        // fix, `idx * stride` could exceed the array and slice out of
+        // bounds). It must now be rejected up front.
+        let n = 20usize;
+        let positions = vec![0.0f32; n * 3];
+        let rotations = vec![0.0f32; n * 4 - 1]; // one short
+        let scales = vec![0.0f32; n * 3];
+        let opacities = vec![0.0f32; n];
+        let sh: Vec<f32> = Vec::new();
+        let config = LodConfig::default();
+        let result = generate_lod_level(
+            LodInputSlices {
+                n_gaussians: n,
+                positions: &positions,
+                rotations: &rotations,
+                scales: &scales,
+                opacities: &opacities,
+                sh_coefficients: &sh,
+            },
+            10,
+            &config,
+            0,
+        );
+        assert!(matches!(result, Err(LodError::ArrayLengthMismatch { .. })));
+    }
+
+    #[test]
+    fn test_generate_lod_level_uniform_sort_by_opacity_changes_selection() {
+        // n=10, opacity strictly increasing with index → descending-opacity
+        // permutation is exactly the reverse index order (perm[r] = 9 - r).
+        let n = 10usize;
+        let positions: Vec<f32> = (0..n * 3).map(|i| i as f32).collect();
+        let rotations: Vec<f32> = (0..n * 4)
+            .map(|i| if i % 4 == 3 { 1.0 } else { 0.0 })
+            .collect();
+        let scales = vec![-1.0f32; n * 3];
+        let opacities: Vec<f32> = (0..n).map(|i| i as f32).collect();
+        let sh = vec![0.0f32; n];
+
+        let unsorted_config = LodConfig {
+            n_levels: 2,
+            reduction_ratios: vec![1.0, 0.5],
+            strategy: LodStrategy::Uniform,
+            sort_by_opacity: false,
+        };
+        let sorted_config = LodConfig {
+            sort_by_opacity: true,
+            ..unsorted_config.clone()
+        };
+
+        let unsorted = generate_lod_level(
+            LodInputSlices {
+                n_gaussians: n,
+                positions: &positions,
+                rotations: &rotations,
+                scales: &scales,
+                opacities: &opacities,
+                sh_coefficients: &sh,
+            },
+            5,
+            &unsorted_config,
+            1,
+        )
+        .expect("unsorted level");
+        let sorted = generate_lod_level(
+            LodInputSlices {
+                n_gaussians: n,
+                positions: &positions,
+                rotations: &rotations,
+                scales: &scales,
+                opacities: &opacities,
+                sh_coefficients: &sh,
+            },
+            5,
+            &sorted_config,
+            1,
+        )
+        .expect("sorted level");
+
+        // Recover which original indices were kept: positions[i] == i*3.
+        let kept = |level: &LodLevel| -> Vec<usize> {
+            level
+                .positions
+                .chunks_exact(3)
+                .map(|p| (p[0] / 3.0).round() as usize)
+                .collect()
+        };
+        // select_uniform_indices(10, 5) picks ranks [0, 2, 4, 6, 9].
+        assert_eq!(kept(&unsorted), vec![0, 2, 4, 6, 9]);
+        // Mapped through the descending-opacity permutation (perm[r]=9-r)
+        // and re-sorted ascending: {9,7,5,3,0} -> [0,3,5,7,9].
+        assert_eq!(kept(&sorted), vec![0, 3, 5, 7, 9]);
+    }
+
+    #[test]
+    fn test_generate_lod_level_random_sort_by_opacity_still_returns_target_n() {
+        let (pos, rot, sc, op, sh) = make_cloud(50, 9);
+        let config = LodConfig {
+            n_levels: 2,
+            reduction_ratios: vec![1.0, 0.4],
+            strategy: LodStrategy::Random,
+            sort_by_opacity: true,
+        };
+        let level = generate_lod_level(
+            LodInputSlices {
+                n_gaussians: 50,
+                positions: &pos,
+                rotations: &rot,
+                scales: &sc,
+                opacities: &op,
+                sh_coefficients: &sh,
+            },
+            20,
+            &config,
+            1,
+        )
+        .expect("random+sort_by_opacity level");
+        assert_eq!(level.n_gaussians, 20);
+    }
+
+    // ------------------------------------------------------------------
+    // opacity_descending_permutation / select_indices_by_rank tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_opacity_descending_permutation_orders_highest_first() {
+        let opacities: Vec<f32> = (0..10).map(|i| i as f32).collect();
+        let perm = opacity_descending_permutation(&opacities);
+        assert_eq!(perm, vec![9, 8, 7, 6, 5, 4, 3, 2, 1, 0]);
+    }
+
+    #[test]
+    fn test_select_indices_by_rank_passthrough_when_disabled() {
+        let opacities = vec![0.0f32; 5];
+        let ranks = vec![0, 2, 4];
+        let out = select_indices_by_rank(ranks.clone(), false, &opacities);
+        assert_eq!(out, ranks);
+    }
+
+    #[test]
+    fn test_select_indices_by_rank_maps_through_opacity_permutation() {
+        let opacities: Vec<f32> = (0..10).map(|i| i as f32).collect();
+        let ranks = vec![0, 2, 4, 6, 9];
+        let out = select_indices_by_rank(ranks, true, &opacities);
+        assert_eq!(out, vec![0, 3, 5, 7, 9]);
     }
 
     // ------------------------------------------------------------------
@@ -1451,6 +1958,73 @@ mod tests {
         assert_eq!(merged.level, 3);
     }
 
+    #[test]
+    fn test_merge_lod_levels_sh_length_mismatch_error() {
+        // Same n_gaussians on both sides, but a different SH degree, so the
+        // mismatch is invisible to the n_gaussians check alone.
+        let mut a = make_level(5, 1.0, 0);
+        let mut b = make_level(5, 2.0, 0);
+        a.sh_coefficients = vec![1.0; 5 * 9];
+        b.sh_coefficients = vec![2.0; 5 * 3];
+        let result = merge_lod_levels(&a, &b, 0.5);
+        assert!(matches!(result, Err(LodError::ArrayLengthMismatch { .. })));
+    }
+
+    #[test]
+    fn test_merge_lod_levels_rotations_are_unit_length() {
+        let mut a = make_level(2, 0.0, 0);
+        let mut b = make_level(2, 0.0, 0);
+        // Two already-unit quaternions per Gaussian.
+        a.rotations = vec![0.0, 0.0, 0.0, 1.0, 0.6, 0.0, 0.0, 0.8];
+        b.rotations = vec![0.0, 0.0, 0.707_106_8, 0.707_106_8, 0.0, 0.6, 0.0, 0.8];
+        let merged = merge_lod_levels(&a, &b, 0.5).expect("merge failed");
+        for q in merged.rotations.chunks_exact(4) {
+            let norm = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
+            assert!(
+                (norm - 1.0).abs() < 1e-4,
+                "quaternion not unit length: {q:?} (norm={norm})"
+            );
+        }
+    }
+
+    #[test]
+    fn test_merge_lod_levels_rotation_shortest_path_avoids_zero_quaternion() {
+        // `b`'s quaternion is the negation of `a`'s: same rotation, opposite
+        // sign (dot(a,b) = -1 < 0). A naive component-wise LERP at t=0.5
+        // would average to the zero quaternion (a degenerate rotation);
+        // NLERP's sign correction must instead recognize these as the same
+        // rotation and return a unit quaternion equal (up to sign) to `a`.
+        let mut a = make_level(1, 0.0, 0);
+        let mut b = make_level(1, 0.0, 0);
+        a.rotations = vec![0.0, 0.0, 0.0, 1.0];
+        b.rotations = vec![0.0, 0.0, 0.0, -1.0];
+        let merged = merge_lod_levels(&a, &b, 0.5).expect("merge failed");
+        let q = &merged.rotations;
+        let norm = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
+        assert!(
+            (norm - 1.0).abs() < 1e-4,
+            "expected a unit quaternion, got {q:?} (norm={norm})"
+        );
+        assert!(
+            q[3].abs() > 0.99,
+            "expected the w component to dominate (same rotation as input), got {q:?}"
+        );
+    }
+
+    #[test]
+    fn test_merge_lod_levels_rotation_weight_extremes_match_inputs() {
+        let mut a = make_level(1, 0.0, 0);
+        let mut b = make_level(1, 0.0, 0);
+        a.rotations = vec![0.6, 0.0, 0.0, 0.8];
+        b.rotations = vec![0.0, 0.6, 0.0, 0.8];
+        let at_a = merge_lod_levels(&a, &b, 0.0).expect("merge failed");
+        assert!((at_a.rotations[0] - 0.6).abs() < 1e-5);
+        assert!((at_a.rotations[3] - 0.8).abs() < 1e-5);
+        let at_b = merge_lod_levels(&a, &b, 1.0).expect("merge failed");
+        assert!((at_b.rotations[1] - 0.6).abs() < 1e-5);
+        assert!((at_b.rotations[3] - 0.8).abs() < 1e-5);
+    }
+
     // ------------------------------------------------------------------
     // LodChain::select tests
     // ------------------------------------------------------------------
@@ -1484,6 +2058,34 @@ mod tests {
         let sel = LodSelector::new(vec![1.0, 3.0, 7.0]);
         let level = chain.select(2.0, &sel).expect("select failed");
         assert_eq!(level.level, 1);
+    }
+
+    // ------------------------------------------------------------------
+    // LodChain::get_level tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_lod_chain_get_level_in_range() {
+        let (pos, rot, sc, op, sh) = make_cloud(100, 9);
+        let chain = generate_lod_chain(&pos, &rot, &sc, &op, &sh, &LodConfig::default())
+            .expect("chain failed");
+        let level = chain.get_level(2).expect("level 2 should exist");
+        assert_eq!(level.level, 2);
+    }
+
+    #[test]
+    fn test_lod_chain_get_level_out_of_range_errors() {
+        let (pos, rot, sc, op, sh) = make_cloud(100, 9);
+        let chain = generate_lod_chain(&pos, &rot, &sc, &op, &sh, &LodConfig::default())
+            .expect("chain failed");
+        let result = chain.get_level(999);
+        assert!(matches!(
+            result,
+            Err(LodError::InvalidLodLevel {
+                level: 999,
+                n_levels: 4
+            })
+        ));
     }
 
     // ------------------------------------------------------------------
@@ -1548,13 +2150,13 @@ mod tests {
 
     #[test]
     fn test_find_optimal_reduction_ratios_returns_n_levels() {
-        let ratios = find_optimal_reduction_ratios(1000, 1_000_000, 4, 9);
+        let ratios = find_optimal_reduction_ratios(1000, 1_000_000, 4, 9).expect("search failed");
         assert_eq!(ratios.len(), 4);
     }
 
     #[test]
     fn test_find_optimal_reduction_ratios_first_is_one() {
-        let ratios = find_optimal_reduction_ratios(1000, 1_000_000, 4, 9);
+        let ratios = find_optimal_reduction_ratios(1000, 1_000_000, 4, 9).expect("search failed");
         assert!(
             (ratios[0] - 1.0).abs() < 1e-6,
             "first ratio must be 1.0, got {}",
@@ -1564,7 +2166,7 @@ mod tests {
 
     #[test]
     fn test_find_optimal_reduction_ratios_non_ascending() {
-        let ratios = find_optimal_reduction_ratios(500, 500_000, 4, 9);
+        let ratios = find_optimal_reduction_ratios(500, 500_000, 4, 9).expect("search failed");
         for i in 1..ratios.len() {
             assert!(
                 ratios[i] <= ratios[i - 1] + 1e-5,
@@ -1575,14 +2177,43 @@ mod tests {
 
     #[test]
     fn test_find_optimal_reduction_ratios_n_levels_one() {
-        let ratios = find_optimal_reduction_ratios(100, 100_000, 1, 9);
+        let ratios = find_optimal_reduction_ratios(100, 100_000, 1, 9).expect("search failed");
         assert_eq!(ratios.len(), 1);
         assert!((ratios[0] - 1.0).abs() < 1e-6);
     }
 
     #[test]
     fn test_find_optimal_reduction_ratios_n_levels_zero() {
-        assert!(find_optimal_reduction_ratios(100, 100_000, 0, 9).is_empty());
+        assert!(find_optimal_reduction_ratios(100, 100_000, 0, 9)
+            .expect("search failed")
+            .is_empty());
+    }
+
+    #[test]
+    fn test_find_optimal_reduction_ratios_infeasible_budget_errors() {
+        // Even at r=0.1, level 0 alone (pinned to ratio 1.0) already costs
+        // 1,000,000 * 80 = 80,000,000 bytes, vastly more than a 1-byte
+        // budget. The old implementation returned a chain overshooting the
+        // budget with no indication; it must now report the shortfall.
+        let result = find_optimal_reduction_ratios(1_000_000, 1, 4, 9);
+        match result {
+            Err(LodError::MemoryBudgetExceeded {
+                minimum_bytes,
+                target_bytes,
+            }) => {
+                assert_eq!(target_bytes, 1);
+                assert!(minimum_bytes > target_bytes);
+            }
+            other => panic!("expected MemoryBudgetExceeded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_find_optimal_reduction_ratios_feasible_budget_does_not_error() {
+        // Sanity check alongside the infeasible case above: a generous
+        // budget must still succeed.
+        let result = find_optimal_reduction_ratios(1000, 1_000_000, 4, 9);
+        assert!(result.is_ok());
     }
 
     // ------------------------------------------------------------------

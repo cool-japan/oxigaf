@@ -501,6 +501,58 @@ pub fn random_walk(
     Ok(path)
 }
 
+/// Run a latent walk according to a [`WalkConfig`], dispatching on
+/// [`WalkConfig::mode`] to the corresponding walk function.
+///
+/// - [`WalkMode::Linear`] → [`linear_walk`] (`end` required).
+/// - [`WalkMode::Spherical`] → [`spherical_walk`] (`end` required).
+/// - [`WalkMode::RandomWalk`] → [`random_walk`] using `config.step_size` and
+///   `config.seed` (`end` ignored — a random walk has no target).
+/// - [`WalkMode::Circular`] is **not reachable** through this function: a
+///   circular walk needs a center, radius, and a 2-D axis pair, none of
+///   which `WalkConfig` has fields for. Call [`circular_walk`] directly for
+///   that mode; this returns [`LatentWalkError::InvalidConfig`] instead of
+///   fabricating axes that were never provided.
+///
+/// # Errors
+///
+/// - [`LatentWalkError::InvalidConfig`] if `config` fails
+///   [`WalkConfig::validate`], if `end` is `None` for [`WalkMode::Linear`] or
+///   [`WalkMode::Spherical`] (both require an endpoint), or if
+///   `config.mode` is [`WalkMode::Circular`].
+/// - Propagates errors from the dispatched walk function.
+pub fn run_walk(
+    start: &[f32],
+    end: Option<&[f32]>,
+    config: &WalkConfig,
+) -> Result<Vec<Vec<f32>>, LatentWalkError> {
+    config.validate()?;
+    match config.mode {
+        WalkMode::Linear => {
+            let end = end.ok_or_else(|| {
+                LatentWalkError::InvalidConfig(
+                    "WalkMode::Linear requires `end`, got None".to_string(),
+                )
+            })?;
+            linear_walk(start, end, config.num_steps)
+        }
+        WalkMode::Spherical => {
+            let end = end.ok_or_else(|| {
+                LatentWalkError::InvalidConfig(
+                    "WalkMode::Spherical requires `end`, got None".to_string(),
+                )
+            })?;
+            spherical_walk(start, end, config.num_steps)
+        }
+        WalkMode::RandomWalk => random_walk(start, config.num_steps, config.step_size, config.seed),
+        WalkMode::Circular => Err(LatentWalkError::InvalidConfig(
+            "WalkMode::Circular cannot be run via `run_walk`: it needs a center, radius, \
+             and axis pair that WalkConfig has no fields for — call `circular_walk` directly"
+                .to_string(),
+        )),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Directed walk (semantic editing)
 // ---------------------------------------------------------------------------
@@ -590,10 +642,25 @@ pub struct WalkPathStats {
     pub mean_step_distance: f32,
     /// Deviation from a straight line (0.0 = perfectly straight, higher = more curved).
     ///
-    /// Computed as the variance of cosine-similarity values between consecutive
-    /// step vectors.  When there are fewer than 3 points (fewer than 2 step vectors),
-    /// this is 0.0 (undefined curvature treated as straight).
+    /// Computed as the mean turning angle (in radians) between consecutive
+    /// step *directions*: `mean(acos(clamp(cos_i, -1, 1)))`. A straight line
+    /// has all turning angles equal to 0, giving `curvature == 0.0`; a
+    /// regular n-gon (e.g. [`circular_walk`]'s output) turns by a constant
+    /// `2*pi/n` at every vertex, giving `curvature == 2*pi/n` — nonzero, as
+    /// it should be for a path that is not straight. When there are fewer
+    /// than 3 points (fewer than 2 step vectors), this is 0.0 (undefined
+    /// curvature treated as straight).
     pub curvature: f32,
+    /// Variance of the cosine-similarity values between consecutive step
+    /// *directions* — how *consistent* the turning is from vertex to vertex,
+    /// as opposed to [`WalkPathStats::curvature`]'s measure of *how much*
+    /// turning there is on average. `0.0` for both a straight line (every
+    /// cosine is 1) and a path with perfectly constant turning (e.g.
+    /// [`circular_walk`]'s output, where every vertex turns by the same
+    /// angle) — a high value means the path alternates between sharper and
+    /// gentler turns rather than curving steadily. `0.0` when there are
+    /// fewer than 3 points, same convention as `curvature`.
+    pub curvature_variability: f32,
     /// L2 distance from path start to path end.
     pub start_to_end_distance: f32,
     /// Ratio `total_distance / start_to_end_distance`.  A value near 1.0 indicates
@@ -643,9 +710,9 @@ pub fn analyze_walk_path(path: &[Vec<f32>]) -> Result<WalkPathStats, LatentWalkE
         })
         .collect();
 
-    let curvature = if step_vectors.len() < 2 {
+    let (curvature, curvature_variability) = if step_vectors.len() < 2 {
         // 2-point path: only 1 step vector → 0 direction changes → curvature = 0
-        0.0
+        (0.0, 0.0)
     } else {
         // Compute dot products between consecutive step vector *directions*
         let dot_products: Vec<f32> = step_vectors
@@ -662,16 +729,31 @@ pub fn analyze_walk_path(path: &[Vec<f32>]) -> Result<WalkPathStats, LatentWalkE
             .collect();
 
         if dot_products.is_empty() {
-            0.0
+            (0.0, 0.0)
         } else {
-            // Variance of the dot products
+            // Curvature: mean turning angle. A straight line has every
+            // cosine == 1 → acos == 0 → curvature == 0; a path with
+            // *constant* nonzero turning (e.g. a circle sampled at equal
+            // angles, whose consecutive cosines are all equal) gets that
+            // constant angle, not 0 — unlike the variance of the cosines,
+            // which is 0 for both cases and so cannot distinguish a
+            // straight line from a circle.
+            let turning_angles: Vec<f32> = dot_products
+                .iter()
+                .map(|&c| c.clamp(-1.0, 1.0).acos())
+                .collect();
+            let curvature = turning_angles.iter().sum::<f32>() / turning_angles.len() as f32;
+
+            // Variability: variance of the raw cosines — how *consistent*
+            // the turning is, independent of how much of it there is.
             let mean = dot_products.iter().sum::<f32>() / dot_products.len() as f32;
-            let variance = dot_products
+            let variability = dot_products
                 .iter()
                 .map(|x| (x - mean) * (x - mean))
                 .sum::<f32>()
                 / dot_products.len() as f32;
-            variance
+
+            (curvature, variability)
         }
     };
 
@@ -688,21 +770,27 @@ pub fn analyze_walk_path(path: &[Vec<f32>]) -> Result<WalkPathStats, LatentWalkE
         total_distance,
         mean_step_distance,
         curvature,
+        curvature_variability,
         start_to_end_distance,
         tortuosity,
     })
 }
 
-/// Sample a point along a multi-waypoint path at fractional position `t ∈ [0, 1]`.
+/// Validate that consecutive points in `path` all share the same dimension,
+/// then compute the cumulative arc-length prefix sum: `cum_lengths[0] ==
+/// 0.0`, and `cum_lengths[i]` is the total length of the first `i` segments
+/// (so `cum_lengths.len() == path.len()`).
 ///
-/// Uses arc-length parameterization: `t` is the fraction of total path length.
-/// The returned point is linearly interpolated within the appropriate segment.
+/// Shared by [`sample_path`] and [`resample_path`] so that resampling a path
+/// to `n` output points does this `O(path.len())` validation-and-prefix-sum
+/// work once, rather than once per output point (which made `resample_path`
+/// O(path.len() * n) overall).
 ///
 /// # Errors
 ///
 /// - [`LatentWalkError::EmptyPath`] if `path` has fewer than 2 points.
 /// - [`LatentWalkError::DimensionMismatch`] if consecutive points differ in length.
-pub fn sample_path(path: &[Vec<f32>], t: f32) -> Result<Vec<f32>, LatentWalkError> {
+fn validate_and_cum_lengths(path: &[Vec<f32>]) -> Result<Vec<f32>, LatentWalkError> {
     if path.len() < 2 {
         return Err(LatentWalkError::EmptyPath);
     }
@@ -716,23 +804,30 @@ pub fn sample_path(path: &[Vec<f32>], t: f32) -> Result<Vec<f32>, LatentWalkErro
         }
     }
 
-    // Clamp t to [0, 1]
-    let t = t.clamp(0.0, 1.0);
-
-    // Compute cumulative arc lengths.
-    // cum_lengths always has at least one element (initialized below), so
-    // tracking `prev` via a mutable variable avoids any fallible indexing.
     let mut cum_lengths = vec![0.0f32];
     let mut running = 0.0f32;
     for w in path.windows(2) {
         running += l2_dist(&w[0], &w[1]);
         cum_lengths.push(running);
     }
-    let total = running;
+    Ok(cum_lengths)
+}
+
+/// Sample a point along `path` at fractional arc-length position `t ∈ [0,
+/// 1]`, given `path`'s precomputed cumulative segment lengths `cum_lengths`
+/// (as returned by [`validate_and_cum_lengths`]) and `total ==
+/// *cum_lengths.last().unwrap_or(&0.0)`.
+///
+/// Pulled out of [`sample_path`] so [`resample_path`] can reuse one
+/// `cum_lengths` computation across all of its output points instead of
+/// recomputing it on every call.
+fn sample_at_arclength(path: &[Vec<f32>], cum_lengths: &[f32], total: f32, t: f32) -> Vec<f32> {
+    // Clamp t to [0, 1]
+    let t = t.clamp(0.0, 1.0);
 
     // Handle degenerate case: all points coincide
     if total < 1e-12 {
-        return Ok(path[0].clone());
+        return path[0].clone();
     }
 
     let target = t * total;
@@ -761,11 +856,25 @@ pub fn sample_path(path: &[Vec<f32>], t: f32) -> Result<Vec<f32>, LatentWalkErro
 
     let p0 = &path[seg_idx];
     let p1 = &path[seg_idx + 1];
-    Ok(p0
-        .iter()
+    p0.iter()
         .zip(p1.iter())
         .map(|(a, b)| a + local_t * (b - a))
-        .collect())
+        .collect()
+}
+
+/// Sample a point along a multi-waypoint path at fractional position `t ∈ [0, 1]`.
+///
+/// Uses arc-length parameterization: `t` is the fraction of total path length.
+/// The returned point is linearly interpolated within the appropriate segment.
+///
+/// # Errors
+///
+/// - [`LatentWalkError::EmptyPath`] if `path` has fewer than 2 points.
+/// - [`LatentWalkError::DimensionMismatch`] if consecutive points differ in length.
+pub fn sample_path(path: &[Vec<f32>], t: f32) -> Result<Vec<f32>, LatentWalkError> {
+    let cum_lengths = validate_and_cum_lengths(path)?;
+    let total = *cum_lengths.last().unwrap_or(&0.0);
+    Ok(sample_at_arclength(path, &cum_lengths, total, t))
 }
 
 /// Resample a latent path to exactly `n_points` points evenly spaced by arc length.
@@ -785,13 +894,18 @@ pub fn resample_path(path: &[Vec<f32>], n_points: usize) -> Result<Vec<Vec<f32>>
         )));
     }
 
+    // Validate and build the arc-length prefix sum once, rather than once
+    // per output point — see `validate_and_cum_lengths`.
+    let cum_lengths = validate_and_cum_lengths(path)?;
+    let total = *cum_lengths.last().unwrap_or(&0.0);
+
     let n = n_points - 1;
-    (0..n_points)
+    Ok((0..n_points)
         .map(|i| {
             let t = i as f32 / n as f32;
-            sample_path(path, t)
+            sample_at_arclength(path, &cum_lengths, total, t)
         })
-        .collect()
+        .collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -995,6 +1109,82 @@ mod tests {
             ..Default::default()
         };
         assert!(cfg.validate().is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // run_walk tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_run_walk_linear_matches_linear_walk() {
+        let cfg = WalkConfig {
+            mode: WalkMode::Linear,
+            num_steps: 5,
+            ..Default::default()
+        };
+        let start = [0.0, 0.0];
+        let end = [4.0, 0.0];
+        let via_config = run_walk(&start, Some(&end), &cfg).unwrap();
+        let direct = linear_walk(&start, &end, cfg.num_steps).unwrap();
+        assert_eq!(via_config, direct);
+    }
+
+    #[test]
+    fn test_run_walk_spherical_matches_spherical_walk() {
+        let cfg = WalkConfig {
+            mode: WalkMode::Spherical,
+            num_steps: 4,
+            ..Default::default()
+        };
+        let start = [1.0, 0.0];
+        let end = [0.0, 1.0];
+        let via_config = run_walk(&start, Some(&end), &cfg).unwrap();
+        let direct = spherical_walk(&start, &end, cfg.num_steps).unwrap();
+        assert_eq!(via_config, direct);
+    }
+
+    #[test]
+    fn test_run_walk_random_matches_random_walk() {
+        let cfg = WalkConfig {
+            mode: WalkMode::RandomWalk,
+            num_steps: 6,
+            step_size: 0.3,
+            seed: 99,
+        };
+        let start = [0.0, 0.0, 0.0];
+        let via_config = run_walk(&start, None, &cfg).unwrap();
+        let direct = random_walk(&start, cfg.num_steps, cfg.step_size, cfg.seed).unwrap();
+        assert_eq!(via_config, direct);
+    }
+
+    #[test]
+    fn test_run_walk_linear_without_end_errors() {
+        let cfg = WalkConfig {
+            mode: WalkMode::Linear,
+            ..Default::default()
+        };
+        let result = run_walk(&[0.0, 0.0], None, &cfg);
+        assert!(matches!(result, Err(LatentWalkError::InvalidConfig(_))));
+    }
+
+    #[test]
+    fn test_run_walk_circular_mode_errors() {
+        let cfg = WalkConfig {
+            mode: WalkMode::Circular,
+            ..Default::default()
+        };
+        let result = run_walk(&[0.0, 0.0], None, &cfg);
+        assert!(matches!(result, Err(LatentWalkError::InvalidConfig(_))));
+    }
+
+    #[test]
+    fn test_run_walk_invalid_config_rejected() {
+        let cfg = WalkConfig {
+            num_steps: 1, // < 2, invalid
+            ..Default::default()
+        };
+        let result = run_walk(&[0.0, 0.0], Some(&[1.0, 1.0]), &cfg);
+        assert!(matches!(result, Err(LatentWalkError::InvalidConfig(_))));
     }
 
     // -----------------------------------------------------------------------
@@ -1235,6 +1425,31 @@ mod tests {
         let path = vec![vec![0.0, 0.0], vec![1.0, 1.0]];
         let stats = analyze_walk_path(&path).unwrap();
         assert_relative_eq!(stats.curvature, 0.0, epsilon = 1e-6);
+    }
+
+    #[test]
+    fn test_analyze_walk_path_circular_walk_has_nonzero_curvature() {
+        // Regression: a circular path has *constant* turning, so the old
+        // variance-of-cosines metric reported 0.0 ("perfectly straight") for
+        // it. The mean-turning-angle metric must report the true, nonzero
+        // per-vertex turning angle instead.
+        let center = vec![0.0, 0.0];
+        let axis1 = vec![1.0, 0.0];
+        let axis2 = vec![0.0, 1.0];
+        let num_steps = 12;
+        let path = circular_walk(&center, 1.0, &axis1, &axis2, num_steps).unwrap();
+        let stats = analyze_walk_path(&path).unwrap();
+        assert!(
+            stats.curvature > 0.1,
+            "circular_walk must not be reported as (near-)straight, got curvature = {}",
+            stats.curvature
+        );
+        // Constant turning also means low variability in that turning.
+        assert!(
+            stats.curvature_variability < 1e-3,
+            "a regular polygon's turning should be nearly constant, got variability = {}",
+            stats.curvature_variability
+        );
     }
 
     // -----------------------------------------------------------------------

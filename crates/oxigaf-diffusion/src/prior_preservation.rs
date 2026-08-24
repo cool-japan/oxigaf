@@ -19,7 +19,7 @@
 //! };
 //!
 //! let config = PriorPreservationConfig::default();
-//! let mut tracker = PriorPreservationTracker::new(config);
+//! let mut tracker = PriorPreservationTracker::new(config).unwrap();
 //!
 //! // Push precomputed class latents into the buffer.
 //! let latent = vec![0.0f32; 512];
@@ -32,6 +32,7 @@
 //! println!("prior loss: {loss}");
 //! ```
 
+use std::collections::VecDeque;
 use thiserror::Error;
 
 // ---------------------------------------------------------------------------
@@ -162,9 +163,13 @@ pub struct ClassPriorBuffer {
 impl ClassPriorBuffer {
     /// Create a new, empty buffer.
     ///
+    /// `capacity == 0` is accepted here (construction itself never panics or
+    /// errors), but such a buffer can never hold any entries: every call to
+    /// [`Self::push`] on it returns [`PriorError::InvalidConfig`].
+    ///
     /// # Panics
     ///
-    /// Will not panic; errors are surfaced through the `push` / `sample` API.
+    /// Never panics.
     pub fn new(capacity: usize, latent_dim: usize) -> Self {
         Self {
             capacity,
@@ -181,8 +186,15 @@ impl ClassPriorBuffer {
     ///
     /// # Errors
     ///
-    /// Returns [`PriorError::DimensionMismatch`] when `latent.len() != latent_dim`.
+    /// - [`PriorError::InvalidConfig`] when `capacity == 0` (there is no
+    ///   slot to write into).
+    /// - [`PriorError::DimensionMismatch`] when `latent.len() != latent_dim`.
     pub fn push(&mut self, latent: Vec<f32>) -> Result<(), PriorError> {
+        if self.capacity == 0 {
+            return Err(PriorError::InvalidConfig(
+                "buffer capacity is 0; cannot store any entries".into(),
+            ));
+        }
         if latent.len() != self.latent_dim {
             return Err(PriorError::DimensionMismatch {
                 expected: self.latent_dim,
@@ -370,9 +382,15 @@ pub fn prior_soft_loss(
 
 /// Combined hard (MSE) + soft (KL) prior loss.
 ///
-/// `loss = alpha * hard_mse + (1 - alpha) * soft_kl`
+/// `loss = eff_weight * (alpha * mse + (1 - alpha) * kl)`
 ///
-/// `alpha = 1.0` gives pure MSE; `alpha = 0.0` gives pure soft KL.
+/// `alpha = 1.0` gives pure (weighted) MSE; `alpha = 0.0` gives pure
+/// (weighted) soft KL. Both terms are gated by the same
+/// [`prior_effective_weight`] warmup schedule — during warmup (`step <
+/// warmup_steps`) this returns `0.0` immediately regardless of `alpha`,
+/// matching [`prior_preservation_loss`]'s own warmup behaviour. Previously
+/// only the hard term was gated, so the soft term leaked through unweighted
+/// during warmup whenever `alpha < 1.0`.
 ///
 /// # Errors
 ///
@@ -384,8 +402,12 @@ pub fn prior_combined_loss(
     config: &PriorPreservationConfig,
     step: usize,
 ) -> Result<f32, PriorError> {
+    let eff_weight = prior_effective_weight(config, step);
+    if eff_weight == 0.0 {
+        return Ok(0.0);
+    }
     let hard = prior_preservation_loss(pred, target, config, step)?;
-    let soft = prior_soft_loss(pred, target, config)?;
+    let soft = eff_weight * prior_soft_loss(pred, target, config)?;
     Ok(alpha * hard + (1.0 - alpha) * soft)
 }
 
@@ -672,22 +694,34 @@ pub struct PriorPreservationTracker {
     config: PriorPreservationConfig,
     buffer: ClassPriorBuffer,
     stats: PriorStats,
-    /// Per-step losses, capped at the last 1 000 entries.
-    loss_history: Vec<f32>,
+    /// Per-step losses, capped at the last 1 000 entries. A `VecDeque` gives
+    /// O(1) eviction of the oldest entry once the cap is reached, instead of
+    /// the O(n) shift a `Vec::remove(0)` would need on every step past 1 000.
+    loss_history: VecDeque<f32>,
     current_step: usize,
 }
 
 impl PriorPreservationTracker {
+    /// Maximum number of entries retained in [`Self::loss_history`].
+    const LOSS_HISTORY_CAP: usize = 1000;
+
     /// Create a new tracker from a configuration.
-    pub fn new(config: PriorPreservationConfig) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever [`PriorPreservationConfig::validate`] returns if
+    /// `config` is invalid (for example `buffer_capacity == 0`, which would
+    /// otherwise make every later [`Self::add_class_latent`] call fail).
+    pub fn new(config: PriorPreservationConfig) -> Result<Self, PriorError> {
+        config.validate()?;
         let buffer = ClassPriorBuffer::new(config.buffer_capacity, config.latent_dim);
-        Self {
+        Ok(Self {
             config,
             buffer,
             stats: PriorStats::default(),
-            loss_history: Vec::new(),
+            loss_history: VecDeque::new(),
             current_step: 0,
-        }
+        })
     }
 
     /// Push a new class latent into the internal buffer.
@@ -715,11 +749,11 @@ impl PriorPreservationTracker {
         let loss = prior_preservation_loss(pred, target, &self.config, self.current_step)?;
         let decay = self.config.ema_decay;
         prior_update_stats(&mut self.stats, loss, &self.buffer, decay);
-        // Cap history at 1 000 entries.
-        if self.loss_history.len() >= 1000 {
-            self.loss_history.remove(0);
+        // Cap history at LOSS_HISTORY_CAP entries, evicting the oldest.
+        if self.loss_history.len() >= Self::LOSS_HISTORY_CAP {
+            self.loss_history.pop_front();
         }
-        self.loss_history.push(loss);
+        self.loss_history.push_back(loss);
         Ok(loss)
     }
 
@@ -741,10 +775,15 @@ impl PriorPreservationTracker {
         &self.stats
     }
 
-    /// Borrow the loss history (up to the last 1 000 entries).
+    /// Snapshot the loss history (up to the last 1 000 entries), oldest
+    /// first.
+    ///
+    /// Returns an owned `Vec` (rather than a borrowed slice) since the
+    /// underlying storage is a [`VecDeque`], which cannot always expose a
+    /// contiguous slice through a shared reference.
     #[inline]
-    pub fn loss_history(&self) -> &[f32] {
-        &self.loss_history
+    pub fn loss_history(&self) -> Vec<f32> {
+        self.loss_history.iter().copied().collect()
     }
 
     /// Whether the prior loss is currently active.
@@ -884,6 +923,18 @@ mod tests {
         let mut buf = ClassPriorBuffer::new(4, 3);
         let res = buf.push(vec![1.0, 2.0]); // dim 2, expected 3
         assert!(matches!(res, Err(PriorError::DimensionMismatch { .. })));
+    }
+
+    // Regression test: `ClassPriorBuffer::push` used to panic (modulo/index
+    // by zero) when `capacity == 0`; it must now return a typed error.
+    #[test]
+    fn test_buffer_push_zero_capacity_errors_not_panics() {
+        let mut buf = ClassPriorBuffer::new(0, 3);
+        let res = buf.push(vec![1.0, 2.0, 3.0]);
+        assert!(matches!(res, Err(PriorError::InvalidConfig(_))));
+        // A second push must also error cleanly, not just the first.
+        let res2 = buf.push(vec![4.0, 5.0, 6.0]);
+        assert!(matches!(res2, Err(PriorError::InvalidConfig(_))));
     }
 
     #[test]
@@ -1363,6 +1414,32 @@ mod tests {
         Ok(())
     }
 
+    // Regression test: previously only the hard (MSE) term was gated by the
+    // warmup schedule, so `prior_combined_loss` leaked a non-zero soft (KL)
+    // contribution during warmup whenever `alpha < 1.0`.
+    #[test]
+    fn test_combined_loss_zero_during_warmup_for_any_alpha() -> Result<(), PriorError> {
+        let cfg = PriorPreservationConfig {
+            warmup_steps: 1000,
+            weight: 5.0,
+            ..Default::default()
+        };
+        let pred = vec![1.0, 0.5, -0.5];
+        let target = vec![0.0, 0.0, 0.0];
+        // step=0 << warmup_steps=1000, so every alpha must give exactly 0.0,
+        // including alpha=0.0 (pure soft/KL), which is the case that was
+        // broken (the KL term does not naturally evaluate to 0 the way MSE
+        // of non-equal vectors would happen to for some inputs).
+        for alpha in [0.0, 0.25, 0.5, 0.75, 1.0] {
+            let combined = prior_combined_loss(&pred, &target, alpha, &cfg, 0)?;
+            assert_eq!(
+                combined, 0.0,
+                "combined loss during warmup should be exactly 0.0 at alpha={alpha}, got {combined}"
+            );
+        }
+        Ok(())
+    }
+
     // -----------------------------------------------------------------------
     // prior_per_sample_losses
     // -----------------------------------------------------------------------
@@ -1544,10 +1621,24 @@ mod tests {
     // PriorPreservationTracker — full lifecycle
     // -----------------------------------------------------------------------
 
+    // Regression test: `PriorPreservationTracker::new` used to build a
+    // `ClassPriorBuffer` from an unvalidated config, so `buffer_capacity: 0`
+    // would construct successfully and only panic later, on the first
+    // `add_class_latent` call. It must now be rejected up front.
+    #[test]
+    fn test_tracker_new_rejects_invalid_config() {
+        let cfg = PriorPreservationConfig {
+            buffer_capacity: 0,
+            ..Default::default()
+        };
+        let result = PriorPreservationTracker::new(cfg);
+        assert!(matches!(result, Err(PriorError::InvalidConfig(_))));
+    }
+
     #[test]
     fn test_tracker_initial_state() -> Result<(), PriorError> {
         let cfg = PriorPreservationConfig::default();
-        let tracker = PriorPreservationTracker::new(cfg);
+        let tracker = PriorPreservationTracker::new(cfg)?;
         assert_eq!(tracker.step(), 0);
         assert!(tracker.loss_history().is_empty());
         assert!(!tracker.is_active()); // buffer is empty
@@ -1560,7 +1651,7 @@ mod tests {
             warmup_steps: 0,
             ..Default::default()
         };
-        let mut tracker = PriorPreservationTracker::new(cfg);
+        let mut tracker = PriorPreservationTracker::new(cfg)?;
         tracker.add_class_latent(vec![0.0; 512])?;
         assert!(!tracker.buffer().is_empty());
         assert!(tracker.is_active());
@@ -1573,7 +1664,7 @@ mod tests {
             warmup_steps: 100,
             ..Default::default()
         };
-        let mut tracker = PriorPreservationTracker::new(cfg);
+        let mut tracker = PriorPreservationTracker::new(cfg)?;
         tracker.add_class_latent(vec![0.0; 512])?;
         // Step is 0 < warmup_steps=100 → not active.
         assert!(!tracker.is_active());
@@ -1586,7 +1677,7 @@ mod tests {
             warmup_steps: 5,
             ..Default::default()
         };
-        let mut tracker = PriorPreservationTracker::new(cfg);
+        let mut tracker = PriorPreservationTracker::new(cfg)?;
         tracker.add_class_latent(vec![0.0; 512])?;
         for _ in 0..5 {
             tracker.advance_step();
@@ -1604,7 +1695,7 @@ mod tests {
             buffer_capacity: 8,
             ..Default::default()
         };
-        let mut tracker = PriorPreservationTracker::new(cfg);
+        let mut tracker = PriorPreservationTracker::new(cfg)?;
         tracker.add_class_latent(vec![0.0; 4])?;
         let pred = vec![1.0, 0.0, 0.0, 0.0];
         let mut rng = 42u64;
@@ -1619,7 +1710,7 @@ mod tests {
     #[test]
     fn test_tracker_advance_step() -> Result<(), PriorError> {
         let cfg = PriorPreservationConfig::default();
-        let mut tracker = PriorPreservationTracker::new(cfg);
+        let mut tracker = PriorPreservationTracker::new(cfg)?;
         tracker.advance_step();
         tracker.advance_step();
         assert_eq!(tracker.step(), 2);
@@ -1634,7 +1725,7 @@ mod tests {
             buffer_capacity: 4,
             ..Default::default()
         };
-        let mut tracker = PriorPreservationTracker::new(cfg);
+        let mut tracker = PriorPreservationTracker::new(cfg)?;
         tracker.add_class_latent(vec![0.0; 2])?;
         let pred = vec![0.0f32; 2];
         let mut rng = 1u64;
@@ -1655,7 +1746,7 @@ mod tests {
             warmup_steps: 0,
             ..Default::default()
         };
-        let mut tracker = PriorPreservationTracker::new(cfg);
+        let mut tracker = PriorPreservationTracker::new(cfg).expect("valid config");
         let pred = vec![0.0f32; 512];
         let mut rng = 1u64;
         let res = tracker.compute_loss(&pred, &mut rng);
@@ -1671,7 +1762,7 @@ mod tests {
             buffer_capacity: 8,
             ..Default::default()
         };
-        let mut tracker = PriorPreservationTracker::new(cfg);
+        let mut tracker = PriorPreservationTracker::new(cfg)?;
         tracker.add_class_latent(vec![0.0; 4])?;
         let pred = vec![9.9f32; 4];
         let mut rng = 42u64;
@@ -1691,7 +1782,7 @@ mod tests {
             ema_decay: 0.0, // instant EMA for easy testing
             ..Default::default()
         };
-        let mut tracker = PriorPreservationTracker::new(cfg);
+        let mut tracker = PriorPreservationTracker::new(cfg)?;
         tracker.add_class_latent(vec![0.0; 2])?;
         // pred = [1,0], target = [0,0] → MSE = 0.5
         let pred = vec![1.0f32, 0.0];

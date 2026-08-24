@@ -16,7 +16,7 @@
 //!
 //! | Path                 | Interpolant                                    |
 //! |----------------------|------------------------------------------------|
-//! | `Linear`             | `x_t = (1-t)*x_0 + t*x_1`                     |
+//! | `Linear`             | `x_t = (1-(1-σ_min)*t)*x_0 + t*x_1`           |
 //! | `CosineAnnealing`    | `x_t = cos(t*π/2)*x_0 + sin(t*π/2)*x_1`      |
 //! | `VarianceExploding`  | `x_t = x_0 + σ_max·t·x_1`                    |
 //! | `VariancePreserving` | `x_t = sqrt(ᾱ)*x_0 + sqrt(1-ᾱ)*x_1`         |
@@ -82,6 +82,47 @@ fn fm_box_muller(u1: f32, u2: f32) -> (f32, f32) {
     (r * theta.cos(), r * theta.sin())
 }
 
+/// Sample a single standard-normal deviate (discards the Box-Muller pair partner).
+#[inline]
+fn fm_sample_standard_normal(state: &mut u64) -> f32 {
+    let u1 = xorshift_f32(state);
+    let u2 = xorshift_f32(state);
+    fm_box_muller(u1, u2).0
+}
+
+/// Sample from `Gamma(shape, 1)` via the Marsaglia & Tsang (2000) method.
+///
+/// Valid for any `shape > 0`. For `shape < 1` it uses the standard boosting
+/// identity `Gamma(shape) = Gamma(shape + 1) * U^(1/shape)` (`U ~ Uniform(0,1)`).
+/// Unlike Johnk's algorithm, the acceptance rate here does not collapse for
+/// large shape parameters.
+fn fm_sample_gamma(shape: f32, state: &mut u64) -> f32 {
+    if shape < 1.0 {
+        let boosted = fm_sample_gamma(shape + 1.0, state);
+        let u = xorshift_f32(state).max(1e-12);
+        return boosted * u.powf(1.0 / shape);
+    }
+    let d = shape - 1.0 / 3.0;
+    let c = 1.0 / (9.0 * d).sqrt();
+    for _ in 0..1000 {
+        let x = fm_sample_standard_normal(state);
+        let v_lin = 1.0 + c * x;
+        if v_lin <= 0.0 {
+            continue;
+        }
+        let v = v_lin * v_lin * v_lin;
+        let u = xorshift_f32(state).max(1e-12);
+        if u < 1.0 - 0.0331 * x.powi(4) {
+            return d * v;
+        }
+        if u.ln() < 0.5 * x * x + d * (1.0 - v + v.ln()) {
+            return d * v;
+        }
+    }
+    // Astronomically unlikely fallback: return the distribution's mean.
+    shape.max(1e-6)
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Flow path types
 // ─────────────────────────────────────────────────────────────────────────────
@@ -92,9 +133,12 @@ fn fm_box_muller(u1: f32, u2: f32) -> (f32, f32) {
 /// where `t = 0` corresponds to clean data and `t = 1` corresponds to noise.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FlowPath {
-    /// Linear optimal-transport path: `x_t = (1-t)·x_0 + t·x_1`.
+    /// Linear optimal-transport path with a `sigma_min` noise floor:
+    /// `x_t = (1-(1-σ_min)·t)·x_0 + t·x_1`.
     ///
-    /// Target velocity is constant: `u_t = x_1 - x_0`.
+    /// Target velocity is constant: `u_t = x_1 - (1-σ_min)·x_0`.
+    /// When `σ_min = 0` this reduces to the classic `x_t = (1-t)·x_0 + t·x_1`
+    /// / `u_t = x_1 - x_0` optimal-transport path.
     Linear,
 
     /// Cosine-annealed path: `x_t = cos(t·π/2)·x_0 + sin(t·π/2)·x_1`.
@@ -194,7 +238,10 @@ pub enum FlowLossWeight {
 
 /// Compute the scalar loss weight for a given time and weighting scheme.
 ///
-/// All returned values are positive.
+/// All returned values are non-negative. Two variants can reach exactly
+/// `0.0`: [`FlowLossWeight::TimeTDependant`] vanishes at `t = 0` and `t = 1`
+/// (by construction — see its own docs), and [`FlowLossWeight::SnrLike`]
+/// approaches `0.0` as `sigma_min -> 0` for any `t > 0`.
 pub fn fm_loss_weight(t: f32, weight_fn: &FlowLossWeight) -> f32 {
     match weight_fn {
         FlowLossWeight::Uniform => 1.0,
@@ -232,26 +279,19 @@ pub fn fm_sample_time(schedule: &TimeSchedule, state: &mut u64) -> f32 {
         }
 
         TimeSchedule::Beta { alpha, beta } => {
-            // Generate Beta(alpha, beta) via the ratio of power-transformed uniforms.
-            // For shape parameter a > 0: X = U^(1/a) is a suitable basis.
-            // This approximation is exact for integer shapes and good elsewhere.
-            // Clamp to (0.001, 0.999) for numerical stability.
-            let a = *alpha;
-            let b = *beta;
-            // Rejection sampling with max 100 iterations.
-            for _ in 0..100 {
-                let u = xorshift_f32(state).max(1e-9);
-                let v = xorshift_f32(state).max(1e-9);
-                let x = u.powf(1.0 / a);
-                let y = v.powf(1.0 / b);
-                let denom = x + y;
-                if denom > 0.0 {
-                    let sample = x / denom;
-                    return sample.clamp(0.001, 0.999);
-                }
-            }
-            // Fallback to uniform if rejection loop exhausted (should be extremely rare).
-            xorshift_f32(state)
+            // Gamma-ratio method: X ~ Gamma(a,1), Y ~ Gamma(b,1) independent
+            // => X / (X+Y) ~ Beta(a,b) exactly (for any a,b > 0). This is
+            // exact for all shape parameters, unlike Johnk's algorithm
+            // (X=U^(1/a), Y=V^(1/b), accept if X+Y<=1) whose acceptance rate
+            // collapses as a or b grow. Clamp to (0.001, 0.999) for the same
+            // numerical-stability reason `t` is clamped elsewhere in this module.
+            let a = alpha.max(1e-3);
+            let b = beta.max(1e-3);
+            let x = fm_sample_gamma(a, state);
+            let y = fm_sample_gamma(b, state);
+            let denom = x + y;
+            let sample = if denom > 0.0 { x / denom } else { 0.5 };
+            sample.clamp(0.001, 0.999)
         }
 
         TimeSchedule::Cosine => {
@@ -296,7 +336,11 @@ fn alpha_bar_cosine(t: f32) -> f32 {
 ///
 /// - `x_0`: clean data sample (target distribution)
 /// - `x_1`: noise sample (source distribution, typically N(0, I))
-/// - `t = 0` → returns `x_0`; `t = 1` → returns `x_1`
+/// - `t = 0` → returns `x_0` exactly.
+/// - `t = 1` → returns `x_1` when `config.sigma_min == 0`; for the `Linear`
+///   path with `sigma_min > 0` it instead returns `sigma_min * x_0 + x_1`,
+///   the standard Conditional Flow Matching noise floor (Lipman et al.
+///   2022) that keeps the marginal at `t = 1` non-degenerate.
 pub fn fm_interpolate(
     x_0: &[f32],
     x_1: &[f32],
@@ -309,8 +353,11 @@ pub fn fm_interpolate(
 
     match &config.path {
         FlowPath::Linear => {
+            // Conditional Flow Matching linear path (Lipman et al. 2022):
+            // x_t = (1 - (1 - sigma_min)*t) * x_0 + t * x_1
+            let coeff_0 = 1.0 - (1.0 - config.sigma_min) * t;
             for i in 0..n {
-                out.push((1.0 - t) * x_0[i] + t * x_1[i]);
+                out.push(coeff_0 * x_0[i] + t * x_1[i]);
             }
         }
         FlowPath::CosineAnnealing => {
@@ -355,9 +402,10 @@ pub fn fm_target_velocity(
 
     match &config.path {
         FlowPath::Linear => {
-            // dx_t/dt = x_1 - x_0  (constant for all t)
+            // dx_t/dt = x_1 - (1 - sigma_min) * x_0  (constant for all t)
+            let coeff_0 = 1.0 - config.sigma_min;
             for i in 0..n {
-                out.push(x_1[i] - x_0[i]);
+                out.push(x_1[i] - coeff_0 * x_0[i]);
             }
         }
         FlowPath::CosineAnnealing => {
@@ -421,10 +469,11 @@ pub fn fm_reconstruct_x0(
 
     match &config.path {
         FlowPath::Linear => {
-            // x_t = (1-t)*x_0 + t*x_1, v_t = x_1 - x_0
-            // Substituting x_1 = x_0 + v_t:
-            //   x_t = (1-t)*x_0 + t*(x_0 + v_t) = x_0 + t*v_t
-            // => x_0 = x_t - t*v_t
+            // x_t = (1-(1-sigma_min)t)*x_0 + t*x_1, v_t = x_1 - (1-sigma_min)*x_0
+            // Substituting x_1 = v_t + (1-sigma_min)*x_0:
+            //   x_t = (1-(1-sigma_min)t)*x_0 + t*(v_t + (1-sigma_min)*x_0)
+            //       = x_0 + t*v_t
+            // => x_0 = x_t - t*v_t   (independent of sigma_min)
             for i in 0..n {
                 out.push(x_t[i] - t * v_t[i]);
             }
@@ -533,8 +582,14 @@ pub fn fm_heun_step(
 /// Generate an evenly-spaced sequence of timesteps for inference.
 ///
 /// Returns `n_steps + 1` values from `1.0` (noise) down to `0.0` (data):
-/// `[1.0, 1.0 - 1/n_steps, …, 0.0]`.
+/// `[1.0, 1.0 - 1/n_steps, …, 0.0]`. For `n_steps == 0` there is no step
+/// size to divide by, so the single-element trajectory `[1.0]` is returned
+/// (still `n_steps + 1 = 1` values, per the contract above) instead of
+/// dividing by zero.
 pub fn fm_inference_timesteps(n_steps: usize) -> Vec<f32> {
+    if n_steps == 0 {
+        return vec![1.0];
+    }
     let n = n_steps + 1;
     (0..n).map(|i| 1.0 - i as f32 / n_steps as f32).collect()
 }
@@ -604,7 +659,9 @@ pub fn fm_sample_noise(n: usize, state: &mut u64) -> Vec<f32> {
 ///
 /// `x_t = alpha(t)*x_0 + beta(t)*x_1 + gamma * sqrt(alpha(t)*beta(t)) * noise`
 ///
-/// When `gamma = 0` the result is identical to [`fm_interpolate`].
+/// When `gamma = 0` the result is identical to [`fm_interpolate`] on the
+/// `Linear` path with `sigma_min = 0` (this function always uses the pure
+/// `alpha = 1-t`, `beta = t` interpolant and has no `sigma_min` of its own).
 pub fn fm_stochastic_interpolant(
     x_0: &[f32],
     x_1: &[f32],
@@ -731,8 +788,15 @@ pub struct FlowStats {
     pub mean_velocity_norm: f32,
     /// Maximum Euclidean norm across the batch.
     pub max_velocity_norm: f32,
-    /// Approximate divergence: mean of sum(v_i²) over the batch.
-    pub divergence_estimate: f32,
+    /// Mean of `sum(v_i²)` over the batch (i.e. the mean squared L2 norm).
+    ///
+    /// This is *not* an estimate of the velocity field's divergence
+    /// (`div v = sum_i dv_i/dx_i`, the trace of its Jacobian) — computing
+    /// that would require evaluating the velocity function at perturbed
+    /// inputs (see `score_matching::sm_hutchinson_trace_estimate` for a
+    /// genuine Hutchinson trace estimator). This field is a magnitude
+    /// diagnostic only.
+    pub mean_squared_norm: f32,
     /// Smoothness indicator: `1 − std(norms) / (mean(norms) + ε)`.
     pub smoothness: f32,
 }
@@ -762,8 +826,8 @@ pub fn compute_flow_stats(velocities: &[Vec<f32>]) -> Result<FlowStats, FlowMatc
     let mean_norm = norms.iter().sum::<f32>() / n;
     let max_norm = norms.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
 
-    // divergence_estimate: mean of sum(v_i²)
-    let div_est: f32 = velocities
+    // mean_squared_norm: mean of sum(v_i²)
+    let mean_sq_norm: f32 = velocities
         .iter()
         .map(|v| v.iter().map(|x| x * x).sum::<f32>())
         .sum::<f32>()
@@ -777,7 +841,7 @@ pub fn compute_flow_stats(velocities: &[Vec<f32>]) -> Result<FlowStats, FlowMatc
     Ok(FlowStats {
         mean_velocity_norm: mean_norm,
         max_velocity_norm: max_norm,
-        divergence_estimate: div_est,
+        mean_squared_norm: mean_sq_norm,
         smoothness,
     })
 }
@@ -821,10 +885,10 @@ pub fn format_flow_config(config: &FlowMatchingConfig) -> String {
 /// Format [`FlowStats`] as a human-readable string.
 pub fn format_flow_stats(stats: &FlowStats) -> String {
     format!(
-        "FlowStats {{ mean_norm: {:.6}, max_norm: {:.6}, divergence: {:.6}, smoothness: {:.6} }}",
+        "FlowStats {{ mean_norm: {:.6}, max_norm: {:.6}, mean_sq_norm: {:.6}, smoothness: {:.6} }}",
         stats.mean_velocity_norm,
         stats.max_velocity_norm,
-        stats.divergence_estimate,
+        stats.mean_squared_norm,
         stats.smoothness,
     )
 }
@@ -948,6 +1012,57 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_sample_time_beta_1_1_is_uniform() {
+        // Beta(1,1) is exactly Uniform[0,1]. Johnk's algorithm *without* the
+        // rejection test (the original bug) instead returns U/(U+V), a
+        // distribution that is symmetric around 0.5 with the SAME mean
+        // (0.5) but is bell-shaped rather than flat — so a mean-only check
+        // cannot catch the bug. Check flatness too: P(T < 0.25) should be
+        // ~0.25 for a true Uniform, but only ~0.167 for U/(U+V).
+        let mut state = test_state();
+        let sched = TimeSchedule::Beta {
+            alpha: 1.0,
+            beta: 1.0,
+        };
+        let n = 20_000;
+        let mut sum = 0.0f32;
+        let mut below_quarter = 0u32;
+        for _ in 0..n {
+            let t = fm_sample_time(&sched, &mut state);
+            sum += t;
+            if t < 0.25 {
+                below_quarter += 1;
+            }
+        }
+        let mean = sum / n as f32;
+        assert!((mean - 0.5).abs() < 0.02, "Beta(1,1) mean={} != 0.5", mean);
+        let frac_below_quarter = below_quarter as f32 / n as f32;
+        assert!(
+            (frac_below_quarter - 0.25).abs() < 0.03,
+            "Beta(1,1) should be flat/uniform: P(t<0.25)={} (expected ~0.25)",
+            frac_below_quarter
+        );
+    }
+
+    #[test]
+    fn test_sample_time_beta_shape_below_one_in_range() {
+        // Exercises the shape < 1 boosting branch of the gamma sampler.
+        let mut state = test_state();
+        let sched = TimeSchedule::Beta {
+            alpha: 0.5,
+            beta: 0.5,
+        };
+        for _ in 0..2000 {
+            let t = fm_sample_time(&sched, &mut state);
+            assert!(
+                (0.0..=1.0).contains(&t),
+                "Beta(0.5,0.5) t={} out of [0,1]",
+                t
+            );
+        }
+    }
+
     // ── fm_interpolate ────────────────────────────────────────────────────────
 
     #[test]
@@ -962,13 +1077,41 @@ mod tests {
     }
 
     #[test]
-    fn test_interpolate_linear_t1_returns_x1() {
-        let cfg = FlowMatchingConfig::default();
+    fn test_interpolate_linear_t1_returns_x1_when_sigma_min_zero() {
+        // The exact "t=1 -> x_1" boundary only holds for sigma_min = 0.
+        let cfg = FlowMatchingConfig {
+            sigma_min: 0.0,
+            ..Default::default()
+        };
         let x_0 = vec![1.0, 2.0, 3.0];
         let x_1 = vec![4.0, 5.0, 6.0];
         let out = fm_interpolate(&x_0, &x_1, 1.0, &cfg).unwrap();
         for (a, b) in out.iter().zip(x_1.iter()) {
             assert!((a - b).abs() < 1e-6, "t=1 interpolate != x_1");
+        }
+    }
+
+    #[test]
+    fn test_interpolate_linear_sigma_min_leaves_floor_at_t1() {
+        // Regression test: FlowMatchingConfig::sigma_min must actually be
+        // consulted by fm_interpolate. At t=1 the Linear path should equal
+        // sigma_min * x_0 + x_1 (Lipman et al. 2022 CFM noise floor), not
+        // exactly x_1.
+        let cfg = FlowMatchingConfig {
+            sigma_min: 0.1,
+            ..Default::default()
+        };
+        let x_0 = vec![1.0, 2.0, 3.0];
+        let x_1 = vec![4.0, 5.0, 6.0];
+        let out = fm_interpolate(&x_0, &x_1, 1.0, &cfg).unwrap();
+        for i in 0..3 {
+            let expected = 0.1 * x_0[i] + x_1[i];
+            assert!(
+                (out[i] - expected).abs() < 1e-5,
+                "sigma_min floor not applied: {} vs {}",
+                out[i],
+                expected
+            );
         }
     }
 
@@ -1058,8 +1201,13 @@ mod tests {
     // ── fm_target_velocity ────────────────────────────────────────────────────
 
     #[test]
-    fn test_target_velocity_linear_is_x1_minus_x0() {
-        let cfg = FlowMatchingConfig::default();
+    fn test_target_velocity_linear_is_x1_minus_x0_when_sigma_min_zero() {
+        // v_t = x_1 - (1 - sigma_min) * x_0 reduces to x_1 - x_0 only when
+        // sigma_min = 0.
+        let cfg = FlowMatchingConfig {
+            sigma_min: 0.0,
+            ..Default::default()
+        };
         let x_0 = vec![1.0, 2.0, 3.0];
         let x_1 = vec![4.0, 5.0, 6.0];
         for t in [0.0, 0.3, 0.7, 1.0] {
@@ -1067,6 +1215,28 @@ mod tests {
             assert!((v[0] - 3.0).abs() < 1e-6);
             assert!((v[1] - 3.0).abs() < 1e-6);
             assert!((v[2] - 3.0).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn test_target_velocity_linear_sigma_min_shifts_velocity() {
+        // Regression test: FlowMatchingConfig::sigma_min must actually be
+        // consulted by fm_target_velocity: v_t = x_1 - (1-sigma_min)*x_0.
+        let cfg = FlowMatchingConfig {
+            sigma_min: 0.1,
+            ..Default::default()
+        };
+        let x_0 = vec![1.0, 2.0, 3.0];
+        let x_1 = vec![4.0, 5.0, 6.0];
+        let v = fm_target_velocity(&x_0, &x_1, 0.5, &cfg).unwrap();
+        for i in 0..3 {
+            let expected = x_1[i] - 0.9 * x_0[i];
+            assert!(
+                (v[i] - expected).abs() < 1e-5,
+                "sigma_min not applied to target velocity: {} vs {}",
+                v[i],
+                expected
+            );
         }
     }
 
@@ -1278,6 +1448,15 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_inference_timesteps_zero_steps_no_nan() {
+        // Regression test: n_steps=0 previously computed 0.0/0.0 = NaN.
+        let ts = fm_inference_timesteps(0);
+        assert_eq!(ts.len(), 1, "n_steps+1 = 1 value expected");
+        assert!(ts.iter().all(|v| v.is_finite()), "got NaN: {:?}", ts);
+        assert!((ts[0] - 1.0).abs() < 1e-9);
+    }
+
     // ── fm_loss ───────────────────────────────────────────────────────────────
 
     #[test]
@@ -1480,7 +1659,7 @@ mod tests {
         let stats = compute_flow_stats(&velocities).unwrap();
         assert!(stats.mean_velocity_norm.abs() < 1e-9);
         assert!(stats.max_velocity_norm.abs() < 1e-9);
-        assert!(stats.divergence_estimate.abs() < 1e-9);
+        assert!(stats.mean_squared_norm.abs() < 1e-9);
     }
 
     #[test]

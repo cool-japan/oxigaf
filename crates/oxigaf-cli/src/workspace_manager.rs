@@ -6,6 +6,8 @@
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 // ---------------------------------------------------------------------------
@@ -34,9 +36,11 @@ pub enum WorkspaceError {
 // ---------------------------------------------------------------------------
 
 /// The lifecycle status of a training workspace.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum WorkspaceStatus {
     /// Created but no training run has started yet.
+    #[default]
     NotStarted,
     /// Has a lock file indicating active training.
     Running,
@@ -77,23 +81,54 @@ impl WorkspaceStatus {
 // WorkspaceConfig
 // ---------------------------------------------------------------------------
 
-/// Metadata configuration stored in `workspace.cfg` as plain key=value text.
-#[derive(Debug, Clone)]
+/// Metadata configuration stored in `workspace.cfg` as TOML text.
+///
+/// Serialized/parsed via `toml` + `serde` (both already workspace
+/// dependencies) rather than hand-rolled `key=value` lines: a naive
+/// `key=value`-per-line format has no escaping, so a `description` (or
+/// custom field) containing a literal newline would either be silently
+/// dropped or, worse, have its continuation lines reinterpreted as other
+/// keys (e.g. a description ending with `"\nstatus=archived"` could rewrite
+/// the workspace status on the next load). TOML strings handle embedded
+/// newlines correctly, and `deny_unknown_fields` rejects unrecognized keys
+/// instead of silently ignoring them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkspaceConfig {
     pub name: String,
+    #[serde(default)]
     pub description: String,
+    #[serde(default)]
     pub tags: Vec<String>,
     /// Unix timestamp (seconds) when workspace was created.
+    #[serde(default = "ws_current_timestamp")]
     pub created_at: u64,
     /// Unix timestamp (seconds) of most recent modification.
+    #[serde(default = "ws_current_timestamp")]
     pub modified_at: u64,
+    #[serde(default)]
     pub status: WorkspaceStatus,
     /// Model type, e.g. `"3dgs_avatar"`.
+    #[serde(default = "ws_default_model_type")]
     pub model_type: String,
     /// Maximum number of checkpoints to retain.
+    #[serde(default = "ws_default_max_checkpoints_to_keep")]
     pub max_checkpoints_to_keep: usize,
     /// Extra arbitrary key-value metadata.
+    #[serde(default)]
     pub custom_fields: Vec<(String, String)>,
+}
+
+/// Default `model_type` for a config missing that field. Kept as a
+/// standalone `fn` (rather than a closure) since `#[serde(default = "...")]`
+/// requires a path to a zero-argument function.
+fn ws_default_model_type() -> String {
+    "3dgs_avatar".to_owned()
+}
+
+/// Default `max_checkpoints_to_keep` for a config missing that field.
+fn ws_default_max_checkpoints_to_keep() -> usize {
+    5
 }
 
 impl WorkspaceConfig {
@@ -108,110 +143,31 @@ impl WorkspaceConfig {
             created_at: now,
             modified_at: now,
             status: WorkspaceStatus::NotStarted,
-            model_type: "3dgs_avatar".to_owned(),
-            max_checkpoints_to_keep: 5,
+            model_type: ws_default_model_type(),
+            max_checkpoints_to_keep: ws_default_max_checkpoints_to_keep(),
             custom_fields: Vec::new(),
         })
     }
 
-    /// Serialize the config to a `key=value` text format.
+    /// Serialize the config to TOML text.
     #[allow(clippy::inherent_to_string)]
     pub fn to_string(&self) -> String {
-        let mut lines = Vec::new();
-        lines.push(format!("name={}", self.name));
-        lines.push(format!("description={}", self.description));
-        lines.push(format!("tags={}", self.tags.join(",")));
-        lines.push(format!("created_at={}", self.created_at));
-        lines.push(format!("modified_at={}", self.modified_at));
-        lines.push(format!("status={}", self.status.as_str()));
-        lines.push(format!("model_type={}", self.model_type));
-        lines.push(format!(
-            "max_checkpoints_to_keep={}",
-            self.max_checkpoints_to_keep
-        ));
-        for (k, v) in &self.custom_fields {
-            lines.push(format!("custom.{}={}", k, v));
-        }
-        lines.join("\n")
+        // `toml::to_string_pretty` can only fail for value types TOML
+        // cannot represent (e.g. NaN floats, non-string map keys); every
+        // field here is a plain string/number/enum/array, so this cannot
+        // realistically fail. Fall back to an empty string rather than
+        // panicking if it ever does.
+        toml::to_string_pretty(self).unwrap_or_default()
     }
 
-    /// Parse a config from a `key=value` text representation.
+    /// Parse a config from its TOML text representation.
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Result<Self, WorkspaceError> {
-        let mut name: Option<String> = None;
-        let mut description = String::new();
-        let mut tags: Vec<String> = Vec::new();
-        let mut created_at: Option<u64> = None;
-        let mut modified_at: Option<u64> = None;
-        let mut status = WorkspaceStatus::NotStarted;
-        let mut model_type = "3dgs_avatar".to_owned();
-        let mut max_checkpoints_to_keep: usize = 5;
-        let mut custom_fields: Vec<(String, String)> = Vec::new();
-
-        for line in s.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            let mut parts = line.splitn(2, '=');
-            let key = parts.next().unwrap_or("").trim();
-            let val = parts.next().unwrap_or("").trim();
-
-            if key.starts_with("custom.") {
-                let field_name = key.trim_start_matches("custom.").to_owned();
-                if !field_name.is_empty() {
-                    custom_fields.push((field_name, val.to_owned()));
-                }
-                continue;
-            }
-
-            match key {
-                "name" => name = Some(val.to_owned()),
-                "description" => description = val.to_owned(),
-                "tags" => {
-                    if val.is_empty() {
-                        tags = Vec::new();
-                    } else {
-                        tags = val.split(',').map(|t| t.trim().to_owned()).collect();
-                    }
-                }
-                "created_at" => {
-                    created_at = val.parse::<u64>().ok();
-                }
-                "modified_at" => {
-                    modified_at = val.parse::<u64>().ok();
-                }
-                "status" => {
-                    if let Some(s) = WorkspaceStatus::parse_status(val) {
-                        status = s;
-                    }
-                }
-                "model_type" => model_type = val.to_owned(),
-                "max_checkpoints_to_keep" => {
-                    if let Ok(n) = val.parse::<usize>() {
-                        max_checkpoints_to_keep = n;
-                    }
-                }
-                _ => {} // unknown keys are silently ignored
-            }
-        }
-
-        let name =
-            name.ok_or_else(|| WorkspaceError::InvalidConfig("missing 'name' field".into()))?;
-        ws_validate_name(&name)?;
-
-        let now = ws_current_timestamp();
-        Ok(WorkspaceConfig {
-            name,
-            description,
-            tags,
-            created_at: created_at.unwrap_or(now),
-            modified_at: modified_at.unwrap_or(now),
-            status,
-            model_type,
-            max_checkpoints_to_keep,
-            custom_fields,
-        })
+        let config: WorkspaceConfig = toml::from_str(s).map_err(|e| {
+            WorkspaceError::InvalidConfig(format!("failed to parse workspace config: {e}"))
+        })?;
+        ws_validate_name(&config.name)?;
+        Ok(config)
     }
 }
 
@@ -332,6 +288,33 @@ impl Workspace {
             return WorkspaceStatus::Running;
         }
         WorkspaceStatus::NotStarted
+    }
+
+    /// Reconcile the persisted `config.status` with the live status derived
+    /// from marker files on disk (see [`Workspace::detect_status`]).
+    ///
+    /// The persisted status and the marker-derived status can disagree —
+    /// e.g. a crash that leaves a stale `.training.lock` behind without
+    /// ever updating `workspace.cfg`, or an out-of-band marker change —
+    /// which previously made `list --status running`
+    /// ([`WorkspaceManager::list_by_status`]) disagree with what
+    /// [`ws_format_summary`]/[`ws_format_table`] display for the very same
+    /// workspace (those call `detect_status()` directly).
+    ///
+    /// If they differ, updates `self.config.status` in memory and persists
+    /// the correction to `workspace.cfg` so future reads stay consistent.
+    /// Returns `true` if a correction was made. The in-memory `config`
+    /// reflects the live status even if persisting the correction fails
+    /// (e.g. a read-only directory) — that failure is returned as `Err`
+    /// but does not undo the in-memory fix.
+    pub fn reconcile_status(&mut self) -> Result<bool, WorkspaceError> {
+        let live = self.detect_status();
+        if live == self.config.status {
+            return Ok(false);
+        }
+        self.config.status = live;
+        self.save_config()?;
+        Ok(true)
     }
 
     /// Update the workspace status by managing marker files.
@@ -459,10 +442,18 @@ impl WorkspaceManager {
         }
         let text = std::fs::read_to_string(&cfg_path)?;
         let config = WorkspaceConfig::from_str(&text)?;
-        Ok(Workspace {
+        let mut workspace = Workspace {
             root: ws_root,
             config,
-        })
+        };
+        // Best-effort: reconcile the persisted status with marker files so
+        // callers never see a stale `config.status` (see
+        // `Workspace::reconcile_status`). The in-memory status is always
+        // corrected even if persisting the correction fails, so a
+        // read-only workspace directory does not turn `load()` into a hard
+        // error over a status display detail.
+        let _ = workspace.reconcile_status();
+        Ok(workspace)
     }
 
     /// List all workspaces, sorted by `modified_at` descending (newest first).
@@ -485,7 +476,9 @@ impl WorkspaceManager {
             }
             if let Ok(text) = std::fs::read_to_string(&cfg) {
                 if let Ok(config) = WorkspaceConfig::from_str(&text) {
-                    workspaces.push(Workspace { root: path, config });
+                    let mut workspace = Workspace { root: path, config };
+                    let _ = workspace.reconcile_status();
+                    workspaces.push(workspace);
                 }
             }
         }
@@ -1085,8 +1078,9 @@ mod tests {
 
     #[test]
     fn test_config_from_str_missing_optional_fields_get_defaults() {
-        // Only provide name; everything else should be default.
-        let s = "name=minimal-run\n";
+        // Only provide name; everything else should be default. (The
+        // config format is TOML; string values must be quoted.)
+        let s = "name = \"minimal-run\"\n";
         let cfg = WorkspaceConfig::from_str(s).expect("parse minimal config");
         assert_eq!(cfg.name, "minimal-run");
         assert_eq!(cfg.model_type, "3dgs_avatar");
@@ -1097,22 +1091,54 @@ mod tests {
 
     #[test]
     fn test_config_from_str_missing_name_is_error() {
-        let s = "description=no name here\n";
+        let s = "description = \"no name here\"\n";
         assert!(WorkspaceConfig::from_str(s).is_err());
     }
 
     #[test]
     fn test_config_from_str_ignores_comments() {
-        let s = "# comment line\nname=commented-ws\n# another comment\n";
+        let s = "# comment line\nname = \"commented-ws\"\n# another comment\n";
         let cfg = WorkspaceConfig::from_str(s).expect("parse config with comments");
         assert_eq!(cfg.name, "commented-ws");
     }
 
     #[test]
     fn test_config_from_str_empty_tags() {
-        let s = "name=empty-tags\ntags=\n";
+        let s = "name = \"empty-tags\"\ntags = []\n";
         let cfg = WorkspaceConfig::from_str(s).expect("parse config");
         assert!(cfg.tags.is_empty());
+    }
+
+    #[test]
+    fn test_config_from_str_unknown_key_is_rejected() {
+        // Regression test: the old hand-rolled parser silently ignored any
+        // key it didn't recognize (`_ => {} // unknown keys are silently
+        // ignored`). A typo'd or stale field should now be a hard error
+        // rather than silently vanishing.
+        let s = "name = \"strict-ws\"\nbogus_field = \"surprise\"\n";
+        assert!(WorkspaceConfig::from_str(s).is_err());
+    }
+
+    #[test]
+    fn test_config_from_str_embedded_newline_does_not_corrupt_other_fields() {
+        // Regression test for the core bug: a `description` (or custom
+        // field) containing a literal newline used to either get dropped
+        // or have its continuation reinterpreted as other `key=value`
+        // lines on the next line — e.g. a description ending with
+        // `"\nstatus=archived"` could silently flip the persisted status.
+        let mut cfg = WorkspaceConfig::new("newline-ws").expect("new config");
+        cfg.description = "first line\nstatus=archived\nthird line".to_owned();
+        cfg.status = WorkspaceStatus::Running;
+
+        let s = cfg.to_string();
+        let parsed = WorkspaceConfig::from_str(&s).expect("parse config with embedded newline");
+
+        assert_eq!(parsed.description, cfg.description);
+        assert_eq!(
+            parsed.status,
+            WorkspaceStatus::Running,
+            "a newline embedded in `description` must not be reinterpreted as a `status=` line"
+        );
     }
 
     #[test]
@@ -1221,6 +1247,52 @@ mod tests {
             .expect("list");
         assert_eq!(not_started.len(), 1);
         assert_eq!(not_started[0].config.name, "ws-not-started");
+    }
+
+    #[test]
+    fn test_list_by_status_reflects_live_marker_after_crash() {
+        // Regression test for two competing sources of truth: before the
+        // fix, `list_by_status`/`status_counts` filtered on the persisted
+        // `config.status`, while `ws_format_summary`/`ws_format_table` (and
+        // `delete()`'s safety check) used the live, marker-derived
+        // `detect_status()`. Simulate a crash that leaves a stale
+        // `.training.lock` marker behind without ever updating
+        // `workspace.cfg` (bypassing `set_status()`, which normally keeps
+        // them in sync).
+        let td = TempDir::new("reconcile");
+        let mgr = WorkspaceManager::new(td.path());
+        let ws = mgr.create("crashed-ws").expect("create");
+        assert_eq!(ws.config.status, WorkspaceStatus::NotStarted);
+        fs::write(ws.root.join(Workspace::LOCK_FILE), b"").expect("write stale lock marker");
+
+        // load() must reconcile config.status to match the live marker.
+        let loaded = mgr.load("crashed-ws").expect("load");
+        assert_eq!(loaded.config.status, WorkspaceStatus::Running);
+        assert_eq!(loaded.detect_status(), WorkspaceStatus::Running);
+
+        // The correction must be persisted so subsequent reads (including
+        // ones that don't go through reconciliation, e.g. a hand-rolled
+        // reader) stay consistent.
+        let text = fs::read_to_string(loaded.config_path()).expect("read config");
+        let reparsed = WorkspaceConfig::from_str(&text).expect("parse config");
+        assert_eq!(reparsed.status, WorkspaceStatus::Running);
+
+        // list_by_status / status_counts must now agree with the live
+        // status instead of the stale persisted NotStarted.
+        let running = mgr
+            .list_by_status(&WorkspaceStatus::Running)
+            .expect("list by status");
+        assert_eq!(running.len(), 1);
+        assert_eq!(running[0].config.name, "crashed-ws");
+
+        let not_started = mgr
+            .list_by_status(&WorkspaceStatus::NotStarted)
+            .expect("list by status");
+        assert!(not_started.is_empty());
+
+        let counts = mgr.status_counts().expect("status counts");
+        assert_eq!(counts.running, 1);
+        assert_eq!(counts.not_started, 0);
     }
 
     // -----------------------------------------------------------------------

@@ -103,7 +103,7 @@ impl TrainingSummary {
                 println!("  • View in 3D viewer:");
                 println!(
                     "    {}",
-                    format!("oxigaf render --model {}", ply).bright_cyan()
+                    format!("oxigaf render --model {} --output renders/", ply).bright_cyan()
                 );
             }
 
@@ -111,7 +111,11 @@ impl TrainingSummary {
                 println!("  • Continue training:");
                 println!(
                     "    {}",
-                    format!("oxigaf train --resume {}", checkpoint).bright_cyan()
+                    format!(
+                        "oxigaf train --resume {} --input <video> --output <dir> --flame-model <dir>",
+                        checkpoint
+                    )
+                    .bright_cyan()
                 );
             }
 
@@ -119,7 +123,11 @@ impl TrainingSummary {
             if let Some(ref ply) = self.ply_path {
                 println!(
                     "    {}",
-                    format!("oxigaf export --input {} --output model.gltf", ply).bright_cyan()
+                    format!(
+                        "oxigaf export --model {} --output model.gltf --format gltf",
+                        ply
+                    )
+                    .bright_cyan()
                 );
             }
 
@@ -169,17 +177,23 @@ impl TrainingSummary {
 
             if let Some(ref ply) = self.ply_path {
                 println!("  • View in 3D viewer:");
-                println!("    oxigaf render --model {}", ply);
+                println!("    oxigaf render --model {} --output renders/", ply);
             }
 
             if let Some(ref checkpoint) = self.checkpoint_path {
                 println!("  • Continue training:");
-                println!("    oxigaf train --resume {}", checkpoint);
+                println!(
+                    "    oxigaf train --resume {} --input <video> --output <dir> --flame-model <dir>",
+                    checkpoint
+                );
             }
 
             println!("  • Export to glTF:");
             if let Some(ref ply) = self.ply_path {
-                println!("    oxigaf export --input {} --output model.gltf", ply);
+                println!(
+                    "    oxigaf export --model {} --output model.gltf --format gltf",
+                    ply
+                );
             }
 
             println!("\n{}", separator);
@@ -324,8 +338,8 @@ impl ExportSummary {
                 format!("{}", self.num_gaussians).bright_white()
             );
             println!(
-                "  File Size    : {:.1} MB",
-                format!("{:.1}", self.file_size_mb).bright_white()
+                "  File Size    : {} MB",
+                format_file_size_mb(self.file_size_mb).bright_white()
             );
             println!(
                 "  Duration     : {}",
@@ -341,20 +355,8 @@ impl ExportSummary {
 
             println!("\n{}", "Usage:".bright_yellow().bold());
 
-            match self.format.to_lowercase().as_str() {
-                "gltf" | "glb" => {
-                    println!("  • View in Blender, Three.js, or other 3D tools");
-                    println!("  • Compatible with web viewers");
-                }
-                "ply" => {
-                    println!("  • View with MeshLab or CloudCompare");
-                    println!("  • Use for further processing");
-                }
-                "safetensors" => {
-                    println!("  • Load in Python with safetensors library");
-                    println!("  • Resume training or fine-tuning");
-                }
-                _ => {}
+            for line in export_usage_lines(&self.format) {
+                println!("{line}");
             }
 
             println!("\n{}", separator.bright_cyan());
@@ -367,7 +369,10 @@ impl ExportSummary {
             println!("Export Details:");
             println!("  Format       : {}", self.format.to_uppercase());
             println!("  Gaussians    : {}", self.num_gaussians);
-            println!("  File Size    : {:.1} MB", self.file_size_mb);
+            println!(
+                "  File Size    : {} MB",
+                format_file_size_mb(self.file_size_mb)
+            );
             println!("  Duration     : {}", format_duration(self.elapsed));
 
             println!("\nOutput:");
@@ -375,20 +380,8 @@ impl ExportSummary {
 
             println!("\nUsage:");
 
-            match self.format.to_lowercase().as_str() {
-                "gltf" | "glb" => {
-                    println!("  • View in Blender, Three.js, or other 3D tools");
-                    println!("  • Compatible with web viewers");
-                }
-                "ply" => {
-                    println!("  • View with MeshLab or CloudCompare");
-                    println!("  • Use for further processing");
-                }
-                "safetensors" => {
-                    println!("  • Load in Python with safetensors library");
-                    println!("  • Resume training or fine-tuning");
-                }
-                _ => {}
+            for line in export_usage_lines(&self.format) {
+                println!("{line}");
             }
 
             println!("\n{}", separator);
@@ -418,6 +411,64 @@ fn format_duration(duration: Duration) -> String {
         format!("{}m {}s", minutes, seconds)
     } else {
         format!("{}s", seconds)
+    }
+}
+
+/// Format a file size in megabytes to one decimal place, e.g. `42.5`.
+///
+/// Kept as a standalone helper (rather than inlined at each call site) so
+/// the numeric formatting can be unit-tested independently of whether it is
+/// subsequently wrapped in `owo_colors` styling — applying a second `{:.1}`
+/// precision specifier to an already-colorized `String` truncates it as text
+/// (precision on `String`/`Display` means "max characters", not "decimal
+/// places"), so callers must format the number first and print the result
+/// with a plain `{}`.
+fn format_file_size_mb(mb: f64) -> String {
+    format!("{:.1}", mb)
+}
+
+/// Return the "Usage" hint lines to show for a given export format string.
+///
+/// `format` may be a short slug (`"ply"`, `"gltf"`) or one of the
+/// human-readable descriptions produced by the export command (e.g.
+/// `"glTF 2.0"`, `"point cloud PLY"`, `"surface mesh PLY"`, `"JSON
+/// checkpoint"`). Matching is case-insensitive and substring-based so any
+/// of those forms resolve to the right advice; returns an empty slice for
+/// unrecognized formats.
+fn export_usage_lines(format: &str) -> &'static [&'static str] {
+    let fmt_lower = format.to_lowercase();
+    if fmt_lower.contains("gltf") || fmt_lower.contains("glb") {
+        &[
+            "  • View in Blender, Three.js, or other 3D tools",
+            "  • Compatible with web viewers",
+        ]
+    } else if fmt_lower.contains("safetensors") {
+        &[
+            "  • Load in Python with safetensors library",
+            "  • Resume training or fine-tuning",
+        ]
+    } else if fmt_lower.contains("json") {
+        &[
+            "  • Inspect with any JSON tool or text editor",
+            "  • Resume training with `oxigaf train --resume`",
+        ]
+    } else if fmt_lower.contains("mesh") {
+        &[
+            "  • View with MeshLab, Blender, or CloudCompare",
+            "  • Use for physical simulation or 3D printing",
+        ]
+    } else if fmt_lower.contains("point cloud") || fmt_lower.contains("pointcloud") {
+        &[
+            "  • View with MeshLab or CloudCompare",
+            "  • Use for point-cloud processing pipelines",
+        ]
+    } else if fmt_lower.contains("ply") {
+        &[
+            "  • View with MeshLab or CloudCompare",
+            "  • Use for further processing",
+        ]
+    } else {
+        &[]
     }
 }
 
@@ -533,5 +584,141 @@ mod tests {
     fn test_count_files_in_nonexistent_dir() {
         let result = count_files_in_dir("/nonexistent/directory/path");
         assert_eq!(result, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // format_file_size_mb
+    //
+    // Regression test for a bug where the colored branch applied a second
+    // `{:.1}` precision specifier to the already-formatted size string,
+    // which truncates the string to 1 *character* instead of formatting a
+    // number, turning "42.5 MB" into "4 MB".
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_format_file_size_mb_one_decimal() {
+        assert_eq!(format_file_size_mb(42.5), "42.5");
+    }
+
+    #[test]
+    fn test_format_file_size_mb_rounds() {
+        assert_eq!(format_file_size_mb(42.549), "42.5");
+        assert_eq!(format_file_size_mb(42.96), "43.0");
+    }
+
+    #[test]
+    fn test_format_file_size_mb_not_truncated_to_one_char() {
+        // The historical bug produced "4" (String precision = max chars)
+        // instead of "42.5" (numeric precision = decimal places).
+        let formatted = format_file_size_mb(42.5);
+        assert_ne!(formatted, "4");
+        assert_eq!(formatted.len(), 4);
+    }
+
+    // -----------------------------------------------------------------------
+    // export_usage_lines
+    //
+    // Regression tests: main.rs (export subcommand) passes human-readable
+    // strings like "glTF 2.0", "point cloud PLY", "surface mesh PLY", and
+    // "JSON checkpoint" into ExportSummary.format, not the bare format
+    // slugs. Every one of them must resolve to non-empty usage advice.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_export_usage_lines_gltf_human_readable() {
+        assert!(!export_usage_lines("glTF 2.0").is_empty());
+    }
+
+    #[test]
+    fn test_export_usage_lines_ply_exact() {
+        assert!(!export_usage_lines("PLY").is_empty());
+    }
+
+    #[test]
+    fn test_export_usage_lines_safetensors() {
+        assert!(!export_usage_lines("safetensors").is_empty());
+    }
+
+    #[test]
+    fn test_export_usage_lines_json_checkpoint() {
+        assert!(!export_usage_lines("JSON checkpoint").is_empty());
+    }
+
+    #[test]
+    fn test_export_usage_lines_point_cloud_ply() {
+        assert!(!export_usage_lines("point cloud PLY").is_empty());
+    }
+
+    #[test]
+    fn test_export_usage_lines_surface_mesh_ply() {
+        assert!(!export_usage_lines("surface mesh PLY").is_empty());
+    }
+
+    #[test]
+    fn test_export_usage_lines_unknown_format_is_empty() {
+        assert!(export_usage_lines("totally-unknown-format").is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Next-step command suggestions must actually parse.
+    //
+    // Regression tests for suggested commands that referenced a nonexistent
+    // `--input` flag on `export` (the flag is `--model`) and omitted
+    // required flags on `render`/`train --resume`.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_suggested_export_command_parses() {
+        // Note: this crate's binary target (`main.rs`, which is where this
+        // `summary` module lives) sets `#![deny(clippy::expect_used)]`
+        // crate-wide with no `clippy.toml` exemption for tests, so this
+        // uses `assert!` rather than `.expect()`/`.unwrap()`.
+        use crate::cli::Cli;
+        use clap::Parser;
+
+        let ply = "/path/to/model.ply";
+        let cmd = format!(
+            "oxigaf export --model {} --output model.gltf --format gltf",
+            ply
+        );
+        let args: Vec<&str> = cmd.split_whitespace().collect();
+        let result = Cli::try_parse_from(args);
+        assert!(
+            result.is_ok(),
+            "suggested `oxigaf export` next-step command must parse, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_suggested_render_command_parses() {
+        use crate::cli::Cli;
+        use clap::Parser;
+
+        let ply = "/path/to/model.ply";
+        let cmd = format!("oxigaf render --model {} --output renders/", ply);
+        let args: Vec<&str> = cmd.split_whitespace().collect();
+        let result = Cli::try_parse_from(args);
+        assert!(
+            result.is_ok(),
+            "suggested `oxigaf render` next-step command must parse, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_suggested_train_resume_command_parses() {
+        use crate::cli::Cli;
+        use clap::Parser;
+
+        let checkpoint = "/path/to/checkpoint.json";
+        let cmd = format!(
+            "oxigaf train --resume {} --input <video> --output <dir> --flame-model <dir>",
+            checkpoint
+        );
+        let args: Vec<&str> = cmd.split_whitespace().collect();
+        let result = Cli::try_parse_from(args);
+        assert!(
+            result.is_ok(),
+            "suggested `oxigaf train --resume` next-step command must parse, got: {result:?}"
+        );
     }
 }
