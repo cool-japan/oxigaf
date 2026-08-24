@@ -13,13 +13,12 @@ categories = ["science", "multimedia", "algorithms"]
 [dependencies]
 candle-core = { workspace = true }
 candle-nn = { workspace = true }
-candle-transformers = { workspace = true }
 safetensors = { workspace = true }
 image = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
-oxigaf-flame = { version = "0.1.1", path = "../oxigaf-flame" }
+oxigaf-flame = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
@@ -47,7 +46,7 @@ mixed_precision = []
 # Enable NaN/Inf debug hooks (DebugConfig::default() sets enabled=true when active)
 gpu_debug = []
 # NOTE: Platform-specific GPU/BLAS backends (accelerate, metal, cuda) have been
-# removed from this crate. To enable them, configure candle-core directly:
-#   candle-core = { version = "0.9", features = ["accelerate"] }  # macOS BLAS
-#   candle-core = { version = "0.9", features = ["metal"] }       # macOS GPU
-#   candle-core = { version = "0.9", features = ["cuda"] }        # NVIDIA GPU
+# removed from this crate. To enable them, configure the candle fork directly:
+#   candle-core = { package = "oxicandle-core", version = "0.11.0", features = ["accelerate"] }  # macOS BLAS
+#   candle-core = { package = "oxicandle-core", version = "0.11.0", features = ["metal"] }       # macOS GPU
+#   candle-core = { package = "oxicandle-core", version = "0.11.0", features = ["cuda"] }        # NVIDIA GPU

@@ -23,10 +23,12 @@ nalgebra = "0.35"
 glam = "0.33"
 
 # AI / Deep Learning (Pure Rust)
-# Note: default-features = false to avoid CUDA dependencies on macOS
-candle-core = { version = "0.11", default-features = false }
-candle-nn = { version = "0.11", default-features = false }
-candle-transformers = { version = "0.11", default-features = false }
+# oxicandle-* is the COOLJAPAN fork of huggingface/candle 0.11.0: it selects
+# fancy-regex instead of the C Oniguruma (onig/onig_sys) that upstream pulls
+# in through tokenizers. Dependency keys stay `candle-core`/`candle-nn`, so
+# source code is unchanged. default-features = false avoids CUDA on macOS.
+candle-core = { package = "oxicandle-core", version = "0.11.0", default-features = false }
+candle-nn = { package = "oxicandle-nn", version = "0.11.0", default-features = false }
 safetensors = "0.8"
 
 # GPU Graphics & Compute
@@ -75,7 +77,9 @@ dirs = "6"
 crossterm = "0.29"
 
 # HuggingFace Hub Integration
-hf-hub = "0.5"
+# default-features = false drops native-tls (C OpenSSL); only the sync ureq
+# API is used (oxigaf-cli/src/assets.rs).
+hf-hub = { version = "0.5", default-features = false, features = ["ureq"] }
 
 # Cryptography
 sha2 = "0.11"

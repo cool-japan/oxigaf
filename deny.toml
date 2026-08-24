@@ -1,0 +1,122 @@
+# deny.toml — COOLJAPAN Pure-Rust policy enforcement for OxiGAF
+# Verify with: cargo deny check bans
+
+[graph]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+
+[licenses]
+version = 2
+allow = [
+    "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "MIT",
+    "BSD-2-Clause", "BSD-3-Clause", "ISC", "Zlib",
+    "Unicode-3.0", "MPL-2.0", "CC0-1.0", "BSL-1.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+deny = [
+    # --- compression: use oxiarc-* ---
+    { name = "zip",                 reason = "COOLJAPAN: use oxiarc-archive" },
+    { name = "flate2",              reason = "COOLJAPAN: use oxiarc-deflate" },
+    { name = "miniz_oxide",         reason = "COOLJAPAN: use oxiarc-deflate" },
+    { name = "zstd",                reason = "COOLJAPAN: use oxiarc-zstd" },
+    { name = "zstd-safe",           reason = "C wrapper; use oxiarc-zstd" },
+    { name = "zstd-sys",            reason = "C libzstd; use oxiarc-zstd" },
+    { name = "bzip2",               reason = "COOLJAPAN: use oxiarc-bzip2" },
+    { name = "bzip2-sys",           reason = "C libbz2; use oxiarc-bzip2" },
+    { name = "lz4",                 reason = "COOLJAPAN: use oxiarc-lz4" },
+    { name = "lz4-sys",             reason = "C liblz4; use oxiarc-lz4" },
+    { name = "lz4_flex",            reason = "COOLJAPAN: use oxiarc-lz4" },
+    { name = "tar",                 reason = "COOLJAPAN: use oxiarc-archive" },
+    { name = "snap",                reason = "COOLJAPAN: use oxiarc-snappy" },
+    { name = "brotli",              reason = "COOLJAPAN: use oxiarc-brotli" },
+    { name = "brotli-decompressor", reason = "COOLJAPAN: use oxiarc-brotli" },
+    { name = "xz2",                 reason = "C liblzma; use oxiarc-lzma" },
+    { name = "lzma-sys",            reason = "C liblzma; use oxiarc-lzma" },
+    { name = "libz-sys",            reason = "C zlib" },
+    { name = "libz-ng-sys",         reason = "C zlib-ng" },
+
+    # --- serialization / numerics / solvers ---
+    { name = "bincode",             reason = "COOLJAPAN: use oxicode" },
+    { name = "rustfft",             reason = "COOLJAPAN: use oxifft" },
+    { name = "realfft",             reason = "COOLJAPAN: use oxifft" },
+    { name = "z3",                  reason = "COOLJAPAN: use oxiz" },
+    { name = "z3-sys",              reason = "C++ Z3; use oxiz" },
+    { name = "rusqlite",            reason = "COOLJAPAN: use oxisql-sqlite-compat" },
+    { name = "libsqlite3-sys",      reason = "C SQLite; use oxisql-sqlite-compat" },
+
+    # --- BLAS / LAPACK / Fortran ---
+    { name = "openblas-src",        reason = "C/Fortran; use oxiblas" },
+    { name = "openblas-build",      reason = "C/Fortran; use oxiblas" },
+    { name = "blas-src",            reason = "FFI shim; use oxiblas" },
+    { name = "lapack-src",          reason = "FFI shim; use oxiblas" },
+    { name = "netlib-src",          reason = "Fortran; use oxiblas" },
+    { name = "intel-mkl-src",       reason = "C/Fortran; use oxiblas" },
+    { name = "accelerate-src",      reason = "Apple C framework; use oxiblas" },
+    { name = "cblas-sys",           reason = "C; use oxiblas" },
+    { name = "blas",                reason = "FFI shim; use oxiblas" },
+    { name = "lapack",              reason = "FFI shim; use oxiblas" },
+
+    # --- regex / tokenizer C backends ---
+    { name = "onig",                reason = "C Oniguruma; use oxicandle-* (fancy-regex)" },
+    { name = "onig_sys",            reason = "C Oniguruma; use oxicandle-* (fancy-regex)" },
+    { name = "esaxx-rs",            reason = "optional C++ suffix-array backend" },
+
+    # --- TLS / crypto native code ---
+    { name = "openssl",             reason = "C OpenSSL; use rustls" },
+    { name = "openssl-sys",         reason = "C OpenSSL; use rustls" },
+    { name = "native-tls",          reason = "pulls C OpenSSL / SChannel; use rustls" },
+    { name = "aws-lc-sys",          reason = "C/asm crypto" },
+    { name = "aws-lc-rs",           reason = "wraps aws-lc-sys (C)" },
+    { name = "ring",                reason = "C + hand-written asm" },
+
+    # --- misc native shims ---
+    { name = "alloca",              reason = "compiles alloca.c through cc" },
+    { name = "libfuzzer-sys",       reason = "C++ libFuzzer" },
+]
+
+# ---------------------------------------------------------------------------
+# Phase-1 exceptions. Every entry is a TODO with a named prerequisite; delete
+# the entry as soon as its migration lands. Do not add entries without a TODO.
+# ---------------------------------------------------------------------------
+skip-tree = [
+    # TODO(pure-rust): image -> png/tiff/exr -> flate2 -> miniz_oxide.
+    # Prerequisite: oxiarc-deflate backend for png/tiff/exr. EXR output is a
+    # live feature (oxigaf-cli/src/main.rs:524), so `exr` cannot just be dropped.
+    { name = "image", version = "0.25", depth = 4 },
+
+    # TODO(pure-rust): ndarray-npy `npz` feature -> zip 6.x.
+    # Prerequisite: oxiarc-archive-backed .npz reader in oxigaf-flame::sequence.
+    { name = "ndarray-npy", version = "0.10", depth = 3 },
+
+    # TODO(pure-rust): oxicandle-core still declares zip 8.6 for .pth/pickle
+    # loading. Prerequisite: upstream oxicandle swap to oxiarc-archive.
+    { name = "candle-core", version = "0.11", depth = 2 },
+
+    # TODO(pure-rust): hf-hub -> ureq -> rustls(ring) + flate2 (ureq `gzip`
+    # default, not disableable from here because hf-hub does not set
+    # default-features = false on ureq). Prerequisite: hf-hub patch or a
+    # pure-Rust HF client.
+    { name = "hf-hub", version = "0.5", depth = 4 },
+
+    # TODO(pure-rust, dev-only): criterion -> alloca (compiles alloca.c).
+    # Prerequisite: criterion dropping alloca, or a different bench harness.
+    { name = "criterion", version = "0.8", depth = 2 },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
