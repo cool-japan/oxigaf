@@ -41,8 +41,7 @@ pub use sdedit::{
     edit_cosine_similarity, edit_expand_mask_to_channels, edit_latent_distance, edit_lerp_latents,
     edit_linear_alpha_bars, edit_mean_latent, edit_normalize_latent, edit_project_out,
     edit_sample_noise, edit_slerp_latents, edit_start_timestep, edit_variance_map,
-    format_sdedit_stats, sdedit_perturb, sdedit_perturb_with_mask, EditConfig, ImageEditError,
-    SdeditStats,
+    format_sdedit_stats, sdedit_perturb, sdedit_perturb_with_mask, EditConfig, SdeditStats,
 };
 
 use thiserror::Error;
@@ -641,8 +640,10 @@ pub fn add_edit_noise(
     // Raw N(0,1) noise: edit_add_noise applies the alpha-bar scaling itself.
     let noise = gaussian_noise_vec(n, 1.0, seed);
 
-    let data = sdedit::edit_add_noise(&latent.data, &noise, timestep, &alpha_bars)
-        .map_err(|e| ImageEditingError::NumericalError(format!("add_edit_noise: {e}")))?;
+    // `sdedit::edit_add_noise` shares this module's `ImageEditingError`, so its
+    // specific variant (e.g. `NoiseLevelOutOfRange`) now propagates directly
+    // instead of being collapsed into a generic `NumericalError` string.
+    let data = sdedit::edit_add_noise(&latent.data, &noise, timestep, &alpha_bars)?;
 
     Ok(EditLatent {
         channels: latent.channels,
@@ -1649,5 +1650,139 @@ mod tests {
         let lat = make_latent(1, 1, 1, 1.0);
         history.push(lat, zero_stats(0.0));
         assert!(history.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // ImageEditError / ImageEditingError collapse
+    //
+    // `sdedit` used to declare its own `ImageEditError`, bridged into this
+    // module's `ImageEditingError` via a `From` impl so a caller mixing both
+    // APIs could use `?` throughout. The two error enums are now one type
+    // (`ImageEditingError`, declared here and used directly by `sdedit`), so
+    // these tests call `sdedit`'s functions directly and check that each
+    // failure mode still produces the same shape the old `From` mapping
+    // documented, and that mixing both APIs needs no conversion at all.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sdedit_dimension_mismatch_is_directly_this_modules_error() {
+        let err = sdedit::edit_lerp_latents(&[1.0, 2.0, 3.0], &[1.0, 2.0], 0.5)
+            .expect_err("mismatched lengths must fail");
+        match err {
+            ImageEditingError::DimensionMismatch { expected, actual } => {
+                assert_eq!(expected, 3);
+                assert_eq!(actual, 2);
+            }
+            other => panic!("Expected DimensionMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sdedit_empty_input_is_directly_this_modules_error() {
+        let err = sdedit::edit_latent_distance(&[], &[]).expect_err("empty input must fail");
+        assert!(matches!(err, ImageEditingError::EmptyInput));
+    }
+
+    #[test]
+    fn sdedit_invalid_strength_and_param_widen_to_invalid_config() {
+        let strength =
+            sdedit::edit_start_timestep(1.5, 1000).expect_err("strength outside (0, 1] must fail");
+        match strength {
+            ImageEditingError::InvalidConfig(msg) => {
+                assert!(msg.contains("1.5"), "value must survive: {msg}");
+            }
+            other => panic!("Expected InvalidConfig, got {other:?}"),
+        }
+
+        let param = EditConfig {
+            guidance_scale: f32::NAN,
+            ..Default::default()
+        }
+        .validate()
+        .expect_err("non-finite guidance_scale must fail");
+        assert!(matches!(param, ImageEditingError::InvalidConfig(_)));
+    }
+
+    #[test]
+    fn sdedit_timestep_out_of_range_widens_to_noise_level_out_of_range() {
+        let ab = sdedit::edit_cosine_alpha_bars(10);
+        let err = sdedit::edit_add_noise(&[0.0; 4], &[0.0; 4], 20, &ab)
+            .expect_err("timestep past the schedule length must fail");
+        match err {
+            ImageEditingError::NoiseLevelOutOfRange { t, max_t } => {
+                assert!((t - 20.0).abs() < f32::EPSILON);
+                assert!((max_t - 9.0).abs() < f32::EPSILON);
+            }
+            other => panic!("Expected NoiseLevelOutOfRange, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sdedit_invalid_mask_becomes_invalid_image_not_empty_mask() {
+        // `EmptyMask` means specifically all-zero/zero-size; a structurally
+        // invalid (missing) mask is a different failure and must not be
+        // conflated.
+        let config = EditConfig {
+            use_mask: true,
+            ..Default::default()
+        };
+        let ab = sdedit::edit_cosine_alpha_bars(config.n_timesteps);
+        let mut state = 7u64;
+        let err = sdedit::sdedit_perturb_with_mask(&[0.5, 0.5], &config, &ab, &mut state, None)
+            .expect_err("use_mask without a mask must fail");
+        match err {
+            ImageEditingError::InvalidImage(msg) => assert!(msg.contains("mask"), "{msg}"),
+            other => panic!("Expected InvalidImage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mixed_api_caller_needs_no_error_conversion() {
+        // Proves the merge is complete: a function calling both the
+        // slice-based `sdedit` API and this module's `EditLatent`-based API
+        // needs only `?` at every fallible call site, with no
+        // `.into()`/`map_err` bridging the two error types.
+        fn mixed(a: &EditLatent, b: &EditLatent, mask: &EditMask) -> Result<(), ImageEditingError> {
+            let ab = sdedit::edit_cosine_alpha_bars(10);
+            let noise = vec![0.0f32; a.numel()];
+            let _ = sdedit::edit_add_noise(&a.data, &noise, 0, &ab)?;
+            let _ = blend_with_mask(a, b, mask)?;
+            Ok(())
+        }
+
+        let a = EditLatent::new(1, 2, 2);
+        let b = EditLatent::new(1, 2, 2);
+        let mask = EditMask::new(2, 2, 1.0);
+        assert!(mixed(&a, &b, &mask).is_ok());
+    }
+
+    #[test]
+    fn add_edit_noise_propagates_sdedits_dimension_mismatch_directly() {
+        // `EditLatent`'s fields are all `pub`, so a caller can build one
+        // whose `data` length disagrees with `numel()` — bypassing
+        // `EditLatent::new` / `from_data`'s own validation.
+        // `add_edit_noise` only checks `numel() == 0` and the noise level
+        // itself before delegating to `sdedit::edit_add_noise`, so this is
+        // the case that used to reach the (now-removed)
+        // `.map_err(|e| NumericalError(format!("add_edit_noise: {e}")))`
+        // wrapper. Now that both APIs share `ImageEditingError`, it must
+        // surface `sdedit`'s own `DimensionMismatch` unchanged instead of a
+        // collapsed `NumericalError` string.
+        let malformed = EditLatent {
+            channels: 1,
+            height: 2,
+            width: 2,
+            data: vec![0.0f32; 3], // one short of numel() == 4
+        };
+        let err = add_edit_noise(&malformed, 0.5, 42).expect_err("data/numel mismatch must fail");
+        match err {
+            ImageEditingError::DimensionMismatch { expected, actual } => {
+                assert_eq!(expected, 3, "expected == latent.data.len()");
+                assert_eq!(actual, 4, "actual == the numel()-sized noise buffer");
+            }
+            other => {
+                panic!("Expected DimensionMismatch, not a collapsed NumericalError: {other:?}")
+            }
+        }
     }
 }

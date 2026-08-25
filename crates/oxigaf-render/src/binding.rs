@@ -748,13 +748,27 @@ impl FlameBindingBuffers {
         encoder: &mut wgpu::CommandEncoder,
         pipeline: &wgpu::ComputePipeline,
     ) {
+        self.record_backward_with_timestamps(encoder, pipeline, None);
+    }
+
+    /// [`record_backward`](Self::record_backward) with GPU timestamp writes.
+    ///
+    /// `timestamp_writes` comes from
+    /// [`GpuTimestampProfiler::pass_writes`](crate::profiler::GpuTimestampProfiler::pass_writes);
+    /// passing `None` records the pass untimed.
+    pub fn record_backward_with_timestamps(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        pipeline: &wgpu::ComputePipeline,
+        timestamp_writes: Option<wgpu::ComputePassTimestampWrites<'_>>,
+    ) {
         if self.num_gaussians == 0 {
             return;
         }
         let n = u32::try_from(self.num_gaussians).unwrap_or(u32::MAX);
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("flame_binding_bwd"),
-            timestamp_writes: None,
+            timestamp_writes,
         });
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
@@ -1131,6 +1145,104 @@ mod tests {
         let err = offset_gradients_cpu(&[[1.0, 0.0, 0.0]], &[99], &frames)
             .expect_err("out-of-range vertex id must error");
         assert!(matches!(err, RenderError::InvalidGaussian { index: 0, .. }));
+    }
+
+    /// Regression (F138): the offset gradient the backward pass produces must
+    /// be the true adjoint of [`apply_binding`], i.e. `∂position/∂offset`
+    /// evaluated in the **face** frame the forward pass used. Without it
+    /// `∂L/∂offset` is identically zero and the offset parameter group never
+    /// trains.
+    ///
+    /// Checked against central differences of `apply_binding` itself, so a
+    /// change to either side that breaks the pairing fails here.
+    #[test]
+    fn test_offset_gradients_are_the_adjoint_of_apply_binding() {
+        // A tilted, non-axis-aligned triangle so none of the three frame axes
+        // is a coordinate axis and a wrong frame cannot pass by accident.
+        let mesh = Mesh::new(
+            vec![
+                na::Point3::new(0.1, -0.2, 0.3),
+                na::Point3::new(1.3, 0.4, -0.2),
+                na::Point3::new(-0.4, 1.1, 0.7),
+            ],
+            vec![[0, 1, 2]],
+        );
+        let frames = build_face_frames(&mesh);
+
+        let mut model = model_with_gaussians(1);
+        model.face_indices = vec![0];
+        model.barycentric = vec![[0.25, 0.35, 0.4]];
+        model.local_offsets = vec![[0.13, -0.07, 0.21]];
+
+        // An arbitrary, non-symmetric upstream gradient ∂L/∂position.
+        let grad_pos = [0.7_f32, -1.3, 0.45];
+        let analytic = offset_gradients_cpu(&[grad_pos], &model.face_indices, &frames)
+            .expect("projection onto the bound face frame");
+
+        // Central differences of L(offset) = dot(grad_pos, position(offset)),
+        // whose exact gradient is the adjoint under test.
+        let loss = |offset: [f32; 3]| -> f32 {
+            let mut probe = model.clone();
+            probe.local_offsets = vec![offset];
+            let p = apply_binding(&probe, &mesh).expect("binding").positions[0];
+            grad_pos[0] * p[0] + grad_pos[1] * p[1] + grad_pos[2] * p[2]
+        };
+
+        let h = 1e-3_f32;
+        for axis in 0..3 {
+            let mut plus = model.local_offsets[0];
+            let mut minus = model.local_offsets[0];
+            plus[axis] += h;
+            minus[axis] -= h;
+            let numeric = (loss(plus) - loss(minus)) / (2.0 * h);
+            assert!(
+                (analytic[0][axis] - numeric).abs() < 1e-3,
+                "axis {axis}: analytic {} vs numeric {numeric}",
+                analytic[0][axis]
+            );
+        }
+
+        // ...and the whole gradient must be non-trivial, so the test cannot
+        // pass by both sides being zero.
+        assert!(
+            analytic[0].iter().any(|v| v.abs() > 1e-3),
+            "{:?}",
+            analytic[0]
+        );
+    }
+
+    /// The per-*vertex* table is an approximation; the per-*face* table is
+    /// the exact adjoint. Confirm they really differ on a mesh where the
+    /// vertex normals are averaged, so passing the wrong one is detectable.
+    #[test]
+    fn test_face_and_vertex_frame_tables_are_not_interchangeable() {
+        // Two faces meeting at an angle → averaged vertex normals differ from
+        // either face normal.
+        let mesh = Mesh::new(
+            vec![
+                na::Point3::new(0.0, 0.0, 0.0),
+                na::Point3::new(1.0, 0.0, 0.0),
+                na::Point3::new(0.0, 1.0, 0.0),
+                na::Point3::new(1.0, 1.0, 1.0),
+            ],
+            vec![[0, 1, 2], [1, 3, 2]],
+        );
+        let face_frames = build_face_frames(&mesh);
+        let vertex_frames = build_vertex_frames(&mesh);
+        assert_eq!(face_frames.len(), 2);
+        assert_eq!(vertex_frames.len(), 4);
+
+        let grads = vec![[0.0_f32, 0.0, 1.0]];
+        let by_face = offset_gradients_cpu(&grads, &[1], &face_frames).expect("face projection");
+        let by_vertex =
+            offset_gradients_cpu(&grads, &[1], &vertex_frames).expect("vertex projection");
+        let delta: f32 = (0..3)
+            .map(|i| (by_face[0][i] - by_vertex[0][i]).abs())
+            .sum();
+        assert!(
+            delta > 1e-4,
+            "the two frame tables must not be silently interchangeable: {by_face:?} vs {by_vertex:?}"
+        );
     }
 
     #[test]

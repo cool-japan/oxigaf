@@ -38,6 +38,262 @@
 //! # For development/debugging (slow, extensive validation)
 //! oxigaf-render = { version = "0.1", features = ["gpu_debug"] }
 //! ```
+//!
+//! ## Examples
+//!
+//! These mirror the examples in this crate's `README.md`, but as real
+//! doctests so `cargo test --doc` catches API drift instead of letting the
+//! README quietly rot. The GPU-touching ones are `no_run`: they are compiled
+//! and type-checked on every test run, but not executed (creating a wgpu
+//! device and writing PNGs is not something a doctest should do).
+//!
+//! The examples use [`pollster`](https://docs.rs/pollster) to block on the
+//! async GPU setup from a plain `fn main`; add `pollster = "1"` to your own
+//! `[dependencies]` to run them as-is (any other async executor works too).
+//!
+//! ### Basic Gaussian rendering
+//!
+//! ```no_run
+//! use oxigaf_render::{
+//!     keyframe_to_render_camera, CameraKeyframe, GaussianAttributes, GaussianModel,
+//!     RasterConfig, Rasterizer, RenderError,
+//! };
+//!
+//! // `Rasterizer::new` is async because wgpu device creation is async.
+//! fn main() -> Result<(), RenderError> {
+//!     pollster::block_on(run())
+//! }
+//!
+//! async fn run() -> Result<(), RenderError> {
+//!     // A single Gaussian at the origin, SH degree 0.
+//!     let gaussians = vec![GaussianAttributes {
+//!         position: [0.0, 0.0, 0.0],
+//!         _pad0: 0.0,
+//!         rotation: [0.0, 0.0, 0.0, 1.0], // identity quaternion (x, y, z, w)
+//!         scale: [-4.0, -4.0, -4.0],      // log-scale: exp(-4) ≈ 0.018
+//!         opacity: 2.0,                   // inverse-sigmoid: sigmoid(2.0) ≈ 0.88
+//!     }];
+//!
+//!     // DC-only SH colour. The DC term is scaled by the Y_0^0 basis constant
+//!     // (≈ 0.2821) when evaluated, so pre-dividing by it gives ≈ [1.0, 0.5, 0.5].
+//!     let sh_coeffs = vec![3.545, 1.772, 1.772];
+//!
+//!     let model = GaussianModel {
+//!         gaussians,
+//!         sh_coeffs,
+//!         sh_degree: 0,
+//!         // Only meaningful for FLAME-bound avatars; unused here.
+//!         face_indices: vec![0],
+//!         barycentric: vec![[1.0, 0.0, 0.0]],
+//!         local_offsets: vec![[0.0, 0.0, 0.0]],
+//!         is_rigid: vec![true],
+//!     };
+//!
+//!     let config = RasterConfig::new().with_resolution(512, 512).with_sh_degree(0);
+//!     let mut rasterizer = Rasterizer::new(config.clone()).await?;
+//!
+//!     let camera = keyframe_to_render_camera(
+//!         &CameraKeyframe::look_from_to(0.0, [0.0, 0.0, 2.0], [0.0, 0.0, 0.0]),
+//!         config.image_width as usize,
+//!         config.image_height as usize,
+//!     );
+//!
+//!     rasterizer.upload_gaussians(&model);
+//!     let output = rasterizer.forward(&model, &camera)?;
+//!
+//!     let image = rasterizer.download_image(&output);
+//!     image
+//!         .save("output.png")
+//!         .map_err(|e| RenderError::ImageSaveFailed(e.to_string()))?;
+//!
+//!     println!("Rendered {} Gaussians", model.len());
+//!     Ok(())
+//! }
+//! ```
+//!
+//! ### Differentiable rendering with gradients
+//!
+//! ```no_run
+//! use oxigaf_render::{
+//!     keyframe_to_render_camera, CameraKeyframe, GaussianGradients, GaussianModel,
+//!     RasterConfig, RenderCamera, Rasterizer, RenderError,
+//! };
+//! # use oxigaf_render::GaussianAttributes;
+//! # fn demo_model() -> GaussianModel {
+//! #     GaussianModel {
+//! #         gaussians: vec![GaussianAttributes {
+//! #             position: [0.0, 0.0, 0.0],
+//! #             _pad0: 0.0,
+//! #             rotation: [0.0, 0.0, 0.0, 1.0],
+//! #             scale: [-4.0, -4.0, -4.0],
+//! #             opacity: 2.0,
+//! #         }],
+//! #         sh_coeffs: vec![3.545, 1.772, 1.772],
+//! #         sh_degree: 0,
+//! #         face_indices: vec![0],
+//! #         barycentric: vec![[1.0, 0.0, 0.0]],
+//! #         local_offsets: vec![[0.0, 0.0, 0.0]],
+//! #         is_rigid: vec![true],
+//! #     }
+//! # }
+//!
+//! fn main() -> Result<(), RenderError> {
+//!     pollster::block_on(run())
+//! }
+//!
+//! async fn run() -> Result<(), RenderError> {
+//!     let config = RasterConfig::default();
+//!     let mut rasterizer = Rasterizer::new(config.clone()).await?;
+//!     let mut model = demo_model(); // swap in your own model
+//!     let camera = create_camera(config.image_width, config.image_height);
+//!
+//!     // Forward pass.
+//!     rasterizer.upload_gaussians(&model);
+//!     let output = rasterizer.forward(&model, &camera)?;
+//!
+//!     // Per-pixel loss gradient against a target (e.g. L1).
+//!     let target = vec![0.0_f32; output.color_data.len()];
+//!     let grad_image = l1_gradient(&output.color_data, &target);
+//!
+//!     // Backward pass: chains the image-space gradient back to per-Gaussian gradients.
+//!     let gradients = rasterizer.backward(&model, &grad_image)?;
+//!
+//!     println!("Position gradients: {} values", gradients.grad_positions.len());
+//!     println!("Rotation gradients: {} values", gradients.grad_rotations.len());
+//!     println!("Scale gradients:    {} values", gradients.grad_scales.len());
+//!     println!("Opacity gradients:  {} values", gradients.grad_opacities.len());
+//!     println!("SH gradients:       {} values", gradients.grad_sh_coeffs.len());
+//!
+//!     // Apply gradients with a plain SGD step (swap in Adam etc. for real training).
+//!     apply_gradients(&mut model, &gradients, 0.001);
+//!     Ok(())
+//! }
+//!
+//! fn create_camera(width: u32, height: u32) -> RenderCamera {
+//!     keyframe_to_render_camera(
+//!         &CameraKeyframe::look_from_to(0.0, [0.0, 0.0, 2.0], [0.0, 0.0, 0.0]),
+//!         width as usize,
+//!         height as usize,
+//!     )
+//! }
+//!
+//! /// L1 loss gradient: sign(rendered - target).
+//! fn l1_gradient(rendered: &[f32], target: &[f32]) -> Vec<f32> {
+//!     rendered.iter().zip(target).map(|(r, t)| (r - t).signum()).collect()
+//! }
+//!
+//! fn apply_gradients(model: &mut GaussianModel, gradients: &GaussianGradients, lr: f32) {
+//!     for (g, grad) in model.gaussians.iter_mut().zip(gradients.grad_positions.iter()) {
+//!         g.position[0] -= lr * grad[0];
+//!         g.position[1] -= lr * grad[1];
+//!         g.position[2] -= lr * grad[2];
+//!     }
+//! }
+//! ```
+//!
+//! ### Custom camera trajectories
+//!
+//! ```no_run
+//! use oxigaf_render::{turntable_path, GaussianModel, RasterConfig, Rasterizer, RenderError};
+//! use std::f32::consts::FRAC_PI_4;
+//! # use oxigaf_render::GaussianAttributes;
+//! # fn load_avatar_model() -> GaussianModel {
+//! #     GaussianModel {
+//! #         gaussians: vec![GaussianAttributes {
+//! #             position: [0.0, 0.0, 0.0],
+//! #             _pad0: 0.0,
+//! #             rotation: [0.0, 0.0, 0.0, 1.0],
+//! #             scale: [-4.0, -4.0, -4.0],
+//! #             opacity: 2.0,
+//! #         }],
+//! #         sh_coeffs: vec![3.545, 1.772, 1.772],
+//! #         sh_degree: 0,
+//! #         face_indices: vec![0],
+//! #         barycentric: vec![[1.0, 0.0, 0.0]],
+//! #         local_offsets: vec![[0.0, 0.0, 0.0]],
+//! #         is_rigid: vec![true],
+//! #     }
+//! # }
+//!
+//! fn main() -> Result<(), RenderError> {
+//!     pollster::block_on(run())
+//! }
+//!
+//! async fn run() -> Result<(), RenderError> {
+//!     let config = RasterConfig::new().with_resolution(512, 512);
+//!     let mut rasterizer = Rasterizer::new(config.clone()).await?;
+//!     let model = load_avatar_model(); // e.g. GaussianModel::load_ply(...)
+//!
+//!     // A 360-frame turntable orbit around the origin.
+//!     let num_frames: usize = 360;
+//!     let path = turntable_path(
+//!         [0.0, 0.0, 0.0], // center
+//!         2.0,             // radius
+//!         0.0,             // elevation
+//!         num_frames,      // keyframes
+//!         FRAC_PI_4,       // vertical FOV
+//!     );
+//!     let cameras = path.to_render_cameras(
+//!         num_frames,
+//!         config.image_width as usize,
+//!         config.image_height as usize,
+//!     );
+//!
+//!     rasterizer.upload_gaussians(&model);
+//!     for (frame, camera) in cameras.iter().enumerate() {
+//!         let output = rasterizer.forward(&model, camera)?;
+//!         let image = rasterizer.download_image(&output);
+//!         image.save(format!("frame_{frame:04}.png")).map_err(|e| {
+//!             RenderError::ImageSaveFailed(format!("Failed to save frame {frame}: {e}"))
+//!         })?;
+//!     }
+//!
+//!     println!("Rendered {} frames", cameras.len());
+//!     Ok(())
+//! }
+//! ```
+//!
+//! ### High-quality rendering configuration
+//!
+//! ```no_run
+//! use oxigaf_render::{RasterConfig, Rasterizer, RenderError};
+//!
+//! fn main() -> Result<(), RenderError> {
+//!     let config = RasterConfig::new()
+//!         .with_resolution(1920, 1080) // Full HD
+//!         .with_sh_degree(3)           // maximum spherical harmonics degree
+//!         .with_depth_output(true);    // enable depth buffer output
+//!
+//!     println!("Resolution: {}x{}", config.image_width, config.image_height);
+//!     println!("Tile size:  {}x{}", config.tile_size, config.tile_size);
+//!     println!("Max SH degree: {}", config.sh_degree);
+//!
+//!     // `Rasterizer::new` is async because wgpu device creation is async.
+//!     let _rasterizer = pollster::block_on(Rasterizer::new(config))?;
+//!     Ok(())
+//! }
+//! ```
+//!
+//! ### Buffer pool for memory efficiency
+//!
+//! This one touches no GPU state, so it really runs:
+//!
+//! ```
+//! use oxigaf_render::BufferPool;
+//!
+//! // A buffer pool for efficient GPU memory reuse (10 MB budget).
+//! let pool = BufferPool::new(10 * 1024 * 1024);
+//!
+//! let stats = pool.stats();
+//! assert_eq!(stats.total_allocations, 0);
+//! assert_eq!(stats.total_acquisitions, 0);
+//! assert_eq!(stats.in_use_count, 0);
+//! assert_eq!(stats.available_count, 0);
+//! assert_eq!(stats.total_allocated_bytes, 0);
+//! println!("Hit rate: {:.1}%", stats.hit_rate * 100.0);
+//!
+//! // Buffers are automatically returned to the pool when dropped.
+//! ```
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 #![cfg_attr(not(test), deny(clippy::expect_used))]
@@ -74,12 +330,14 @@ pub mod film_grain;
 pub mod gaussian;
 pub mod gaussian_culling;
 pub mod gaussian_stats;
+pub mod gltf;
 pub mod hdr_tone_mapping;
 pub mod image_compositor;
 pub mod image_resize;
 pub mod init;
 pub mod lens_distortion;
 pub mod lens_effects;
+pub mod light_probe;
 pub mod lod;
 pub mod mb_pipeline;
 pub mod mip_splatting;
@@ -133,6 +391,8 @@ pub use hdr_tone_mapping::{
     filmic,
     format_tone_config,
     gamma_correct,
+    // Generalised Reinhard curve (previously mislabelled `lottes_approx`)
+    generalized_reinhard,
     hable,
     hdr_image_stats,
     // New linear↔sRGB (prefixed to avoid conflict with colorspace::*)
@@ -141,7 +401,8 @@ pub use hdr_tone_mapping::{
     hdr_white_balance,
     image_hdr_linear_to_srgb,
     inverse_srgb_gamma,
-    lottes_approx,
+    // Real Lottes (GDC 2016) tone mapper
+    lottes,
     // New analysis
     luminance_histogram,
     preset_aces,
@@ -161,6 +422,7 @@ pub use hdr_tone_mapping::{
     tone_map_rgba_image,
     HdrImageStats,
     HdrStats,
+    LottesParams,
     ToneMapConfig,
     // New types and operators
     ToneMapOperator,
@@ -181,10 +443,14 @@ pub use image_resize::{
     validate_buffer as validate_image_buffer, ResizeError, ResizeFilter,
 };
 
+// `AoProjParams` / `AoSamplingBuffers` are the argument types of the
+// flat-re-exported `ao_compute` and `apply_ssao`: without them a
+// crate-root-only caller cannot even build their parameters.
 pub use ambient_occlusion::{
     ao_apply_to_image, ao_bilateral_blur, ao_compute, ao_compute_stats, ao_cross, ao_dot,
     ao_noise_texture, ao_normalize, ao_sample_depth, ao_sample_kernel, ao_smoothstep, apply_ssao,
-    format_ao_config, format_ao_stats, AoConfig, AoError, AoStats, SsaoResult,
+    format_ao_config, format_ao_stats, AoConfig, AoError, AoProjParams, AoSamplingBuffers, AoStats,
+    SsaoResult,
 };
 pub use antialiasing::{
     aa_bilinear_sample,
@@ -194,9 +460,13 @@ pub use antialiasing::{
     aa_luminance_map,
     aa_quality_estimate,
     aa_sample_pixel,
+    aa_sample_pixel_edge,
     apply_antialiasing,
     apply_fxaa,
     apply_image_aa,
+    // Callers wanting *real* temporal AA must use this history-aware entry
+    // point; `apply_image_aa` has no history buffer to accumulate into.
+    apply_image_aa_with_history,
     apply_smaa_lite,
     apply_supersampling_aa,
     apply_temporal_aa,
@@ -205,6 +475,7 @@ pub use antialiasing::{
     format_aa_config,
     format_aa_stats,
     opacity_scale_from_screen_radius,
+    try_apply_antialiasing,
     AaConfig,
     // Post-processing AA
     AaError,
@@ -246,10 +517,31 @@ pub use color_calibration::{
     WhiteBalance,
 };
 pub use colorspace::{
-    apply_tone_mapping_image, apply_white_balance, color_linear_to_srgb, color_srgb_to_linear,
-    convert_color, convert_image_colorspace, hsl_to_linear_rgb, hsv_to_linear_rgb, lab_to_xyz,
-    linear_rgb_to_hsl, linear_rgb_to_hsv, linear_rgb_to_xyz, linear_to_srgb, srgb_to_linear,
-    white_balance_from_temperature, xyz_to_lab, xyz_to_linear_rgb, Color, ColorError, ColorSpace,
+    apply_tone_mapping_image,
+    // Channel-generic (RGB *and* RGBA) variants added alongside the
+    // `UnsupportedChannelCount` fix; the 3-channel-only functions above stay
+    // for source compatibility.
+    apply_tone_mapping_image_channels,
+    apply_white_balance,
+    color_linear_to_srgb,
+    color_srgb_to_linear,
+    convert_color,
+    convert_image_colorspace,
+    convert_image_colorspace_channels,
+    hsl_to_linear_rgb,
+    hsv_to_linear_rgb,
+    lab_to_xyz,
+    linear_rgb_to_hsl,
+    linear_rgb_to_hsv,
+    linear_rgb_to_xyz,
+    linear_to_srgb,
+    srgb_to_linear,
+    white_balance_from_temperature,
+    xyz_to_lab,
+    xyz_to_linear_rgb,
+    Color,
+    ColorError,
+    ColorSpace,
     ToneMapping,
 };
 pub use compression::{
@@ -258,8 +550,10 @@ pub use compression::{
     CompressionError, CompressionStats, DecompressedArrays, SceneBounds, ShCodebook, ShCompressed,
 };
 pub use config::RasterConfig;
+pub use cov2d_backward::{cov2d_backward, Cov2dBwdInput, Cov2dGrads};
 pub use cpu_reference::{CpuCamera, CpuRasterizer, CpuRenderOutput};
 pub use debug_readback::{DebugReadbackBuilder, RasterizationSnapshot, RasterizationStats};
+pub use deform::{deform_cpu, DeformPipeline, MeshBuffers};
 pub use denoising::{
     bilateral_filter, denoise_adaptive, estimate_noise, gaussian_denoise, joint_bilateral_filter,
     median_filter, non_local_means, BilateralConfig, DenoisingError, DenoisingMethod,
@@ -330,7 +624,17 @@ pub use gaussian_stats::{
     compute_scalar_stats, detect_anomalies, format_gaussian_report, GaussianHistograms,
     GaussianStats, Histogram, ScalarStats,
 };
+pub use gltf::{write_gltf, GltfError, EXTENSION_NAME};
 pub use init::{GaussianInitConfig, GaussianInitializer};
+pub use light_probe::{
+    lp_apply_ibl_to_gaussians, lp_blend_irradiance_sh, lp_compute_stats, lp_cubemap_to_sh,
+    lp_cubemap_to_sh_with_config, lp_dir_to_cubemap_uv, lp_evaluate_diffuse_ibl, lp_format_config,
+    lp_format_stats, lp_generate_sphere_samples, lp_normalize_dir, lp_project_latitude_longitude,
+    lp_project_latitude_longitude_with_config, lp_project_samples_to_sh, lp_sh_basis,
+    lp_sh_basis_l0, lp_sh_basis_l1, lp_sh_basis_l2, CubemapFace, CubemapProbe, IrradianceSH,
+    LightProbe, LightProbeBlend, LightProbeConfig, LightProbeError, LightProbeStats,
+    ProbeBlendMode,
+};
 pub use lod::{
     opacity_scale_from_radius, AdaptiveLodConfig, GaussianLodInfo, LodCamera, LodConfig, LodError,
     LodFilter, LodLevel, LodManager, LodSelector, LodStats, LodTransition,
@@ -821,5 +1125,84 @@ impl From<std::sync::mpsc::RecvError> for RenderError {
 impl From<image::ImageError> for RenderError {
     fn from(err: image::ImageError) -> Self {
         RenderError::ImageSaveFailed(err.to_string())
+    }
+}
+
+#[cfg(test)]
+mod crate_root_api {
+    //! Regression guards for the crate-root re-export surface.
+    //!
+    //! Every path below was, at some point, reachable only through its
+    //! defining module — so a downstream caller writing `use oxigaf_render::*`
+    //! could not name it, and in the `ambient_occlusion` case could not even
+    //! construct the arguments for the functions that *were* re-exported.
+    //! Naming them through `crate::` here turns a dropped `pub use` into a
+    //! compile error instead of a silent API regression.
+
+    #[test]
+    fn antialiasing_entry_points_are_re_exported() {
+        // `apply_image_aa_with_history` is the entry point callers must use
+        // for real temporal AA; `apply_image_aa` has no history to accumulate.
+        let _ = crate::try_apply_antialiasing;
+        let _ = crate::apply_image_aa_with_history;
+        let _ = crate::aa_sample_pixel_edge;
+    }
+
+    #[test]
+    fn ambient_occlusion_argument_types_are_re_exported() {
+        // `ao_compute` / `apply_ssao` take these by reference, so without the
+        // type re-exports a crate-root-only caller cannot build their args.
+        let _: Option<crate::AoProjParams> = None;
+        let _: Option<crate::AoSamplingBuffers<'_>> = None;
+        let _ = crate::ao_compute;
+        let _ = crate::apply_ssao;
+    }
+
+    #[test]
+    fn colorspace_channel_generic_api_is_re_exported() {
+        // The RGBA/channel-generic pair added with the `UnsupportedChannelCount`
+        // fix; the 3-channel-only originals stay re-exported alongside them.
+        let _ = crate::apply_tone_mapping_image_channels;
+        let _ = crate::convert_image_colorspace_channels;
+        let _ = crate::apply_tone_mapping_image;
+        let _ = crate::convert_image_colorspace;
+    }
+
+    #[test]
+    fn deform_api_is_re_exported() {
+        let _: Option<crate::MeshBuffers> = None;
+        let _: Option<crate::DeformPipeline> = None;
+        let _ = crate::deform_cpu;
+    }
+
+    #[test]
+    fn cov2d_backward_api_is_re_exported() {
+        let _: Option<crate::Cov2dBwdInput> = None;
+        let _: Option<crate::Cov2dGrads> = None;
+        let _ = crate::cov2d_backward;
+    }
+
+    #[test]
+    fn light_probe_api_is_re_exported() {
+        let sh = crate::IrradianceSH::new();
+        let probe = crate::LightProbe::new([0.0, 0.0, 0.0], sh, 0.0);
+        let blend = crate::LightProbeBlend::new(vec![probe], crate::ProbeBlendMode::Nearest)
+            .expect("a single-probe blend is valid");
+        let irradiance = blend
+            .evaluate([0.0, 0.0, 0.0], [0.0, 0.0, 1.0])
+            .expect("a unit normal is a valid direction");
+        assert_eq!(irradiance, [0.0, 0.0, 0.0], "a zeroed probe emits nothing");
+
+        let _: Option<crate::CubemapProbe> = None;
+        let _: Option<crate::CubemapFace> = None;
+        let _: Option<crate::LightProbeConfig> = None;
+        let _: Option<crate::LightProbeStats> = None;
+        let _: Option<crate::LightProbeError> = None;
+        let _ = crate::lp_sh_basis;
+        let _ = crate::lp_project_latitude_longitude;
+        let _ = crate::lp_cubemap_to_sh;
+        let _ = crate::lp_evaluate_diffuse_ibl;
+        let _ = crate::lp_apply_ibl_to_gaussians;
+        let _ = crate::lp_compute_stats;
     }
 }

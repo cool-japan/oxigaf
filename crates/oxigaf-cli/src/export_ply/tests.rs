@@ -626,6 +626,11 @@ mod tests_2 {
         let stats = ply_compute_scene_stats(&[]);
         assert_eq!(stats.n_gaussians, 0);
         assert_eq!(stats.sh_degree, 0);
+        // An empty scene has zero rest coefficients by construction — a
+        // genuine (if degenerate) SH degree 0, not a malformed-input case —
+        // so this must read as *known*, unlike the malformed-count cases
+        // covered by the F182 regression tests below.
+        assert!(stats.sh_degree_known);
         assert!(approx_eq(stats.mean_opacity, 0.0, 1e-6));
     }
     #[test]
@@ -633,6 +638,70 @@ mod tests_2 {
         let gaussians = make_test_gaussians(7, 0);
         let stats = ply_compute_scene_stats(&gaussians);
         assert_eq!(stats.n_gaussians, 7);
+    }
+    #[test]
+    fn test_scene_stats_valid_f_rest_count_is_known() {
+        // F182 regression (positive case): a well-formed f_rest count
+        // (9 coefficients → SH degree 1) must be reported as genuinely
+        // inferred, not merely as a fallback value that happens to
+        // coincide with a real degree.
+        let gaussians = make_test_gaussians(3, 1);
+        let stats = ply_compute_scene_stats(&gaussians);
+        assert!(stats.sh_degree_known);
+        assert_eq!(stats.sh_degree, 1);
+    }
+    #[test]
+    fn test_scene_stats_malformed_f_rest_count_not_multiple_of_three_is_unknown() {
+        // F182 regression: `ply_compute_scene_stats` previously computed
+        // `sh_degree_from_n_rest(n_rest).unwrap_or(0)`, silently reporting a
+        // fabricated SH degree 0 for *any* malformed f_rest count —
+        // indistinguishable from a genuine degree-0 scene. n_rest=5 hits
+        // the "not divisible by 3" error branch of `sh_degree_from_n_rest`
+        // (total = 5 + 3 = 8, not a multiple of 3).
+        let gaussians = vec![PlyGaussian {
+            f_rest: vec![0.0; 5],
+            ..PlyGaussian::identity()
+        }];
+        let stats = ply_compute_scene_stats(&gaussians);
+        assert!(
+            !stats.sh_degree_known,
+            "n_rest=5 does not correspond to any valid SH degree and must not be reported as known"
+        );
+        assert_eq!(stats.sh_degree, 0, "unknown case reports the 0 placeholder");
+    }
+    #[test]
+    fn test_scene_stats_malformed_f_rest_count_not_perfect_square_is_unknown() {
+        // F182 regression: n_rest=6 passes the "divisible by 3" check
+        // (total = 6 + 3 = 9, sq = 3) but 3 is not a perfect square,
+        // hitting the second error branch of `sh_degree_from_n_rest`.
+        let gaussians = vec![PlyGaussian {
+            f_rest: vec![0.0; 6],
+            ..PlyGaussian::identity()
+        }];
+        let stats = ply_compute_scene_stats(&gaussians);
+        assert!(!stats.sh_degree_known);
+        assert_eq!(stats.sh_degree, 0);
+    }
+    #[test]
+    fn test_format_stats_malformed_sh_degree_reads_unknown_not_zero() {
+        // F182 regression: the human-readable summary (as printed by
+        // `oxigaf inspect ply`) must not print "SH degree: 0" for a
+        // malformed count — that would be indistinguishable from a genuine
+        // degree-0 scene.
+        let gaussians = vec![PlyGaussian {
+            f_rest: vec![0.0; 5],
+            ..PlyGaussian::identity()
+        }];
+        let stats = ply_compute_scene_stats(&gaussians);
+        let s = ply_format_stats(&stats);
+        assert!(
+            s.contains("SH degree: unknown"),
+            "expected an explicit 'unknown' marker, got: {s}"
+        );
+        assert!(
+            !s.contains("SH degree: 0"),
+            "must not print a fabricated degree 0, got: {s}"
+        );
     }
     #[test]
     fn test_format_stats_non_empty() {

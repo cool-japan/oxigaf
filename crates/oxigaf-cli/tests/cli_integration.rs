@@ -380,9 +380,43 @@ fn benchmark_help_shows_options() {
         .stdout(predicate::str::contains("--format"));
 }
 
+/// A benchmark target that needs no external assets and no GPU.
+///
+/// `--target flame` needs a converted FLAME model directory (`--flame-model`)
+/// and `--target raster`/`train` need a working wgpu adapter, neither of which
+/// a test machine is guaranteed to have. The PLY-export benchmark runs against
+/// a synthetic model in `std::env::temp_dir()`, so it is the one target that
+/// can be asserted to *succeed* anywhere. `--size tiny` keeps that to 1 000
+/// Gaussians: at the `medium` default each of the warmup + timed iterations
+/// writes roughly 35 MB of ASCII PLY.
+const PORTABLE_BENCH_ARGS: &[&str] = &[
+    "benchmark",
+    "--target",
+    "export",
+    "--size",
+    "tiny",
+    "--warmup",
+    "1",
+    "--iterations",
+    "2",
+];
+
 #[test]
 fn benchmark_with_default_args_runs() {
     // Run a minimal benchmark (should complete quickly)
+    oxigaf_cmd()
+        .args(PORTABLE_BENCH_ARGS)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("PLY Export"));
+}
+
+/// Regression: this smoke test used to run `--target flame` with no
+/// `--flame-model` and assert *success*. The FLAME benchmark times a real
+/// forward pass and cannot synthesise a model, so it now exits non-zero with
+/// an actionable message — which is what the test asserts.
+#[test]
+fn benchmark_flame_target_requires_a_model() {
     oxigaf_cmd()
         .args([
             "benchmark",
@@ -392,12 +426,10 @@ fn benchmark_with_default_args_runs() {
             "1",
             "--iterations",
             "2",
-            "--size",
-            "tiny",
         ])
         .assert()
-        .success()
-        .stdout(predicate::str::contains("FLAME"));
+        .failure()
+        .stderr(predicate::str::contains("--flame-model"));
 }
 
 #[test]
@@ -406,16 +438,8 @@ fn benchmark_json_output_format() {
     let output_path = temp_dir.join(format!("bench_output_{}.json", std::process::id()));
 
     oxigaf_cmd()
+        .args(PORTABLE_BENCH_ARGS)
         .args([
-            "benchmark",
-            "--target",
-            "flame",
-            "--warmup",
-            "1",
-            "--iterations",
-            "2",
-            "--size",
-            "tiny",
             "--format",
             "json",
             "--output",
@@ -442,20 +466,22 @@ fn benchmark_invalid_target() {
         .stderr(predicate::str::contains("invalid"));
 }
 
+/// `--iterations 0` leaves the timing vector empty, so every reported
+/// statistic would be undefined. The parser refuses it before any work runs.
+#[test]
+fn benchmark_zero_iterations_rejected_at_parse_time() {
+    oxigaf_cmd()
+        .args(["benchmark", "--iterations", "0"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--iterations"));
+}
+
 #[test]
 fn benchmark_csv_format() {
     oxigaf_cmd()
-        .args([
-            "benchmark",
-            "--target",
-            "export",
-            "--format",
-            "csv",
-            "--warmup",
-            "1",
-            "--iterations",
-            "2",
-        ])
+        .args(PORTABLE_BENCH_ARGS)
+        .args(["--format", "csv"])
         .assert()
         .success()
         .stdout(predicate::str::contains("name,target,iterations"));
@@ -506,13 +532,23 @@ fn doctor_verbose_mode() {
         .stdout(predicate::str::contains("OxiGAF"));
 }
 
+/// `doctor` runs every check and reports each one, then exits non-zero when
+/// any of them failed.
+///
+/// This test used to assert `.success()` — "doctor should succeed but report
+/// issues" — which made the command useless in CI: a pipeline gating on
+/// `oxigaf doctor` could not tell a healthy machine from one with no GPU and
+/// no FLAME model. The report is still written in full (the section headers
+/// below are on stdout); only the exit status changed.
 #[test]
 fn doctor_with_invalid_flame_path() {
     oxigaf_cmd()
         .args(["doctor", "--flame-model", "/nonexistent/flame/model"])
         .assert()
-        .success() // doctor should succeed but report issues
-        .stdout(predicate::str::contains("FLAME Model"));
+        .failure()
+        .stdout(predicate::str::contains("FLAME Model"))
+        .stdout(predicate::str::contains("Version Information"))
+        .stderr(predicate::str::contains("FLAME model invalid"));
 }
 
 // ---------------------------------------------------------------------------
@@ -682,10 +718,10 @@ fn render_quality_ultra_accepted() {
         ])
         .assert()
         .failure() // Expected to fail due to missing model
-        // Model loading is the *first* thing `render` does, before
-        // `--quality` is even read, so this message proves `--quality
-        // ultra` was accepted by clap rather than rejected before reaching
-        // that point.
+        // Reaching the model load proves `--quality ultra` was accepted by
+        // clap: the only thing `render` does before it is read the preset's
+        // resolution, which cannot fail. A rejected value would have exited
+        // during parsing with a clap usage error instead.
         .stderr(predicate::str::contains(
             "Failed to load model: /nonexistent/model.ply",
         ));
@@ -1195,18 +1231,8 @@ fn quiet_flag_shows_in_help() {
 fn verbose_with_benchmark() {
     // Test verbosity with benchmark command
     oxigaf_cmd()
-        .args([
-            "-v",
-            "benchmark",
-            "--target",
-            "flame",
-            "--warmup",
-            "1",
-            "--iterations",
-            "2",
-            "--size",
-            "tiny",
-        ])
+        .arg("-v")
+        .args(PORTABLE_BENCH_ARGS)
         .assert()
         .success();
 }
@@ -1215,18 +1241,8 @@ fn verbose_with_benchmark() {
 fn quiet_with_benchmark() {
     // Test quiet mode with benchmark command
     oxigaf_cmd()
-        .args([
-            "-q",
-            "benchmark",
-            "--target",
-            "flame",
-            "--warmup",
-            "1",
-            "--iterations",
-            "2",
-            "--size",
-            "tiny",
-        ])
+        .arg("-q")
+        .args(PORTABLE_BENCH_ARGS)
         .assert()
         .success();
 }
@@ -1492,4 +1508,100 @@ fn dry_run_convert_shows_expected_outputs() {
 
     // Clean up
     cleanup_temp_file(&temp_input);
+}
+
+// ---------------------------------------------------------------------------
+// Config Subcommand Naming Tests
+// ---------------------------------------------------------------------------
+
+/// Regression: the error taxonomy and the CHANGELOG both told users to run
+/// `oxigaf config …`, but the derived clap name was `config-cmd`, so every
+/// suggestion the CLI printed named a subcommand that did not exist. The
+/// canonical spelling is now `config`.
+#[test]
+fn config_subcommand_is_spelled_config() {
+    oxigaf_cmd()
+        .args(["config", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("init"))
+        .stdout(predicate::str::contains("validate"))
+        .stdout(predicate::str::contains("show"));
+}
+
+/// The earlier `config-cmd` spelling stays available as an alias so scripts
+/// written against it keep working.
+#[test]
+fn legacy_config_cmd_alias_still_resolves() {
+    oxigaf_cmd()
+        .args(["config-cmd", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("init"));
+}
+
+/// `config init` with no `--output` writes the default TOML to stdout.
+#[test]
+fn config_init_prints_default_toml() {
+    oxigaf_cmd()
+        .args(["config", "init"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("[training]"))
+        .stdout(predicate::str::contains("total_iterations"));
+}
+
+/// A configuration error must suggest a command the parser accepts. The
+/// suggestion text is what drifted out of step with the parser, so it is
+/// asserted end to end rather than only in the unit test.
+#[test]
+fn config_validation_failure_suggests_a_real_command() {
+    let config_path = create_temp_config(
+        r#"
+[training]
+total_iterations = 0
+"#,
+    );
+
+    oxigaf_cmd()
+        .args([
+            "config",
+            "validate",
+            config_path.to_str().expect("valid path"),
+        ])
+        .assert()
+        .failure();
+
+    cleanup_temp_file(&config_path);
+}
+
+// ---------------------------------------------------------------------------
+// Doctor Device Selection Tests
+// ---------------------------------------------------------------------------
+
+/// `doctor` inspects the adapter `--device <index>` names, so it can
+/// pre-flight the device a `train --device <index>` run will actually use.
+/// It used to ask wgpu for whichever adapter it considered
+/// highest-performance, which on a multi-GPU machine could report a healthy
+/// GPU while the requested one was absent.
+#[test]
+fn doctor_device_flag_is_offered() {
+    oxigaf_cmd()
+        .args(["doctor", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--device"));
+}
+
+/// An index past the end of the adapter list is refused with the valid range
+/// and the enumerated adapters, not a bare "no GPU".
+#[test]
+fn doctor_rejects_an_out_of_range_device_index() {
+    oxigaf_cmd()
+        .args(["doctor", "--check", "gpu", "--device", "99"])
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("--device 99").or(predicate::str::contains("No GPU adapters")),
+        );
 }

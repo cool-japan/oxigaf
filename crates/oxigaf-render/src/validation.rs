@@ -346,8 +346,12 @@ pub fn validate_camera(camera: &RenderCamera) -> Vec<ValidationIssue> {
         );
     }
 
-    // Check projection matrix diagonal: column-major 4×4 diagonal at [0],[5],[10],[15]
-    let diag_indices = [0_usize, 5, 10, 15];
+    // Check projection matrix diagonal: column-major 4×4 diagonal at
+    // [0],[5],[10]. Index 15 (the w-w entry) is deliberately excluded: it is
+    // exactly 0.0 for every standard perspective projection matrix (only an
+    // orthographic matrix has m[15] == 1), so including it here flagged
+    // every correct perspective camera as "degenerate".
+    let diag_indices = [0_usize, 5, 10];
     let has_zero_diag = diag_indices
         .iter()
         .any(|&i| camera.proj_matrix[i].abs() < f32::EPSILON);
@@ -782,6 +786,25 @@ mod tests {
             .filter(|i| i.severity == IssueSeverity::Error)
             .count();
         assert_eq!(error_count, 0, "clean camera should have no errors");
+    }
+
+    #[test]
+    fn test_validate_camera_realistic_perspective_no_spurious_degenerate_warning() {
+        // A standard OpenGL-style perspective projection matrix has
+        // proj[15] == 0.0 (only an orthographic matrix has proj[15] == 1.0).
+        // Before the fix, `validate_camera` included index 15 in its
+        // near-zero diagonal check, so every correct perspective camera was
+        // flagged as having a "degenerate projection".
+        let mut cam = make_camera();
+        cam.proj_matrix[15] = 0.0;
+        let issues = validate_camera(&cam);
+        let has_degenerate_warning = issues
+            .iter()
+            .any(|i| i.field == "proj_matrix" && i.message.contains("degenerate"));
+        assert!(
+            !has_degenerate_warning,
+            "a standard perspective matrix (proj[15] == 0) must not be flagged as degenerate: {issues:?}"
+        );
     }
 
     // -----------------------------------------------------------------------

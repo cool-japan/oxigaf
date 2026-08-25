@@ -60,6 +60,14 @@ pub struct SphericalPose {
 
 impl SphericalPose {
     /// Create a new `SphericalPose`, validating that all values are finite.
+    ///
+    /// `yaw` is wrapped into `[-PI, PI]` and `pitch` is clamped to
+    /// `[-PI/2, PI/2]` so every constructed pose satisfies the ranges
+    /// documented on this struct's fields — free functions that operate on
+    /// `SphericalPose` (e.g. [`interpolate_poses`], [`pose_to_grid_idx`])
+    /// still defend against out-of-range values independently, since
+    /// `yaw`/`pitch` are public fields and a caller can bypass `new` with a
+    /// struct literal.
     pub fn new(yaw: f32, pitch: f32, radius: f32) -> Result<Self, PoseCondError> {
         if !yaw.is_finite() {
             return Err(PoseCondError::InvalidAngle(yaw));
@@ -70,7 +78,11 @@ impl SphericalPose {
         if !radius.is_finite() {
             return Err(PoseCondError::InvalidAngle(radius));
         }
-        Ok(Self { yaw, pitch, radius })
+        Ok(Self {
+            yaw: wrap_to_pi(yaw),
+            pitch: pitch.clamp(-PI / 2.0, PI / 2.0),
+            radius,
+        })
     }
 
     /// Convert to Cartesian camera position `(x, y, z)`.
@@ -100,6 +112,23 @@ impl SphericalPose {
             pitch,
             radius: r,
         }
+    }
+}
+
+/// Wrap an angle in radians into `[-PI, PI]`, matching the range documented
+/// on [`SphericalPose::yaw`]. Non-finite input propagates unchanged (no
+/// panic). Runs in O(1) regardless of input magnitude (a `while`-loop
+/// reduction would be unbounded for a pathological hand-constructed pose
+/// with an extreme yaw, since `SphericalPose`'s fields are public).
+fn wrap_to_pi(angle: f32) -> f32 {
+    const TAU: f32 = 2.0 * PI;
+    let wrapped = angle % TAU;
+    if wrapped > PI {
+        wrapped - TAU
+    } else if wrapped < -PI {
+        wrapped + TAU
+    } else {
+        wrapped
     }
 }
 
@@ -137,6 +166,19 @@ impl RegisteredPose {
             mean_loss: 1.0, // start high so unvisited poses are prioritised
             coverage_radius,
         }
+    }
+}
+
+/// Coverage-grid weight contributed by a single registered pose:
+/// `visit_count` once visited, or `1.0` while still unvisited (an
+/// unvisited pose still contributes a baseline weight equal to a
+/// freshly-visited one, so the first visit alone does not change the
+/// grid — only the second and later visits do).
+fn pose_coverage_weight(rp: &RegisteredPose) -> f32 {
+    if rp.visit_count == 0 {
+        1.0
+    } else {
+        rp.visit_count as f32
     }
 }
 
@@ -196,8 +238,20 @@ pub struct CoverageStats {
 pub struct PoseConditioner {
     config: PoseCondConfig,
     registered_poses: Vec<RegisteredPose>,
-    /// Flat grid of coverage scores; shape `[grid_res × (grid_res/2+1)]`.
+    /// Flat grid of coverage scores (normalized: `raw_grid / total_weight`);
+    /// shape `[grid_res × (grid_res/2+1)]`.
     coverage_grid: Vec<f32>,
+    /// Unnormalized `Σ weight_i * contribution_i` accumulator, same shape as
+    /// `coverage_grid`; kept in sync so `update()` can apply an
+    /// O(grid_len) weight delta instead of recomputing every registered
+    /// pose's contribution from scratch on every call.
+    raw_grid: Vec<f32>,
+    /// `Σ weight_i` over all registered poses, kept in sync with `raw_grid`.
+    total_weight: f32,
+    /// Cached per-pose coverage kernel (`spherical_gaussian_coverage`
+    /// evaluated once at registration), reused by `update()`'s incremental
+    /// path. Parallel to `registered_poses`.
+    cached_contribs: Vec<Vec<f32>>,
     step: usize,
     rng_state: u64,
 }
@@ -228,6 +282,9 @@ impl PoseConditioner {
             config,
             registered_poses: Vec::new(),
             coverage_grid: vec![0.0_f32; grid_len],
+            raw_grid: vec![0.0_f32; grid_len],
+            total_weight: 0.0,
+            cached_contribs: Vec::new(),
             step: 0,
             rng_state,
         })
@@ -247,11 +304,19 @@ impl PoseConditioner {
     }
 
     /// Update coverage and loss statistics after training on a registered pose.
+    ///
+    /// Coverage is updated incrementally in O(grid_len) — folding in only
+    /// this pose's weight delta via its cached kernel — rather than
+    /// recomputing every registered pose's contribution from scratch (see
+    /// [`Self::recompute_coverage`]), since this is called once per
+    /// training step.
     pub fn update(&mut self, pose_idx: usize, loss: f32) -> Result<(), PoseCondError> {
         let n = self.registered_poses.len();
         if pose_idx >= n {
             return Err(PoseCondError::PoseIndexOutOfRange(pose_idx));
         }
+        let old_weight = pose_coverage_weight(&self.registered_poses[pose_idx]);
+
         let rp = self
             .registered_poses
             .get_mut(pose_idx)
@@ -260,40 +325,75 @@ impl PoseConditioner {
         rp.last_loss = loss;
         let decay = self.config.ema_decay;
         rp.mean_loss = decay * rp.mean_loss + (1.0 - decay) * loss;
+        let new_weight = pose_coverage_weight(rp);
         self.step += 1;
-        self.recompute_coverage();
+
+        let delta = new_weight - old_weight;
+        if delta != 0.0 {
+            match self.cached_contribs.get(pose_idx).cloned() {
+                Some(contrib) => {
+                    for (g, c) in self.raw_grid.iter_mut().zip(contrib.iter()) {
+                        *g += delta * c;
+                    }
+                    self.total_weight += delta;
+                    let denom = self.total_weight.max(1.0);
+                    for (g, r) in self.coverage_grid.iter_mut().zip(self.raw_grid.iter()) {
+                        *g = r / denom;
+                    }
+                }
+                // Cache miss (should not happen in practice — every
+                // registered pose gets a cached contribution in
+                // `recompute_coverage`, which `register_poses` always
+                // calls). Fall back to a full rebuild for correctness.
+                None => self.recompute_coverage(),
+            }
+        }
         Ok(())
     }
 
-    /// Recompute the spherical coverage grid from all registered poses.
+    /// Recompute the spherical coverage grid from all registered poses,
+    /// rebuilding the per-pose contribution cache used by
+    /// [`Self::update`]'s incremental path.
+    ///
+    /// This is O(n_poses × grid_len) — called once by
+    /// [`Self::register_poses`] after a (typically rare) batch of pose
+    /// registrations. Per-step coverage updates should go through
+    /// [`Self::update`] instead, which is O(grid_len).
     pub fn recompute_coverage(&mut self) {
         let n = self.registered_poses.len();
-        if n == 0 {
-            for v in self.coverage_grid.iter_mut() {
-                *v = 0.0;
-            }
-            return;
-        }
         let grid_yaw = self.config.grid_resolution;
         let grid_pitch = self.config.grid_resolution / 2 + 1;
+        let grid_len = grid_yaw * grid_pitch;
+        if n == 0 {
+            self.raw_grid = vec![0.0_f32; grid_len];
+            self.total_weight = 0.0;
+            self.cached_contribs.clear();
+            self.coverage_grid = vec![0.0_f32; grid_len];
+            return;
+        }
         let sigma = self.config.coverage_sigma;
-        let mut grid = vec![0.0_f32; grid_yaw * grid_pitch];
+        let mut raw_grid = vec![0.0_f32; grid_len];
+        let mut cached_contribs = Vec::with_capacity(n);
+        let mut total_weight = 0.0_f32;
         for rp in &self.registered_poses {
-            let weight = if rp.visit_count == 0 {
-                1.0
-            } else {
-                rp.visit_count as f32
-            };
+            let weight = pose_coverage_weight(rp);
             let contrib = spherical_gaussian_coverage(&rp.pose, grid_yaw, grid_pitch, sigma);
-            for (g, c) in grid.iter_mut().zip(contrib.iter()) {
+            for (g, c) in raw_grid.iter_mut().zip(contrib.iter()) {
                 *g += weight * c;
             }
+            total_weight += weight;
+            cached_contribs.push(contrib);
         }
-        let denom = n as f32;
-        for v in grid.iter_mut() {
-            *v /= denom;
-        }
-        self.coverage_grid = grid;
+        // Normalize by the sum of weights (not by `n`): each pose
+        // contributes `weight * kernel`, where `weight` grows with
+        // `visit_count`, so dividing by a fixed `n` let coverage grow
+        // without bound as visits accumulated instead of staying in a
+        // fixed range comparable to `config.min_coverage`.
+        let denom = total_weight.max(1.0);
+        self.coverage_grid = raw_grid.iter().map(|&r| r / denom).collect();
+        self.raw_grid = raw_grid;
+        self.cached_contribs = cached_contribs;
+        self.total_weight = total_weight;
     }
 
     /// Get the interpolated coverage at a given spherical pose.
@@ -356,6 +456,15 @@ impl PoseConditioner {
     }
 
     /// Select a batch of `n` poses that maximise diversity (greedy farthest-point sampling).
+    ///
+    /// Runs in O(k × total) rather than O(k² × total): a
+    /// `min_dist_to_selected` array tracks each not-yet-selected pose's
+    /// running minimum distance to the selected set incrementally (folding
+    /// in only the newly-selected pose each round, instead of recomputing
+    /// the minimum over the whole selected set from scratch for every
+    /// candidate), and a `Vec<bool>` mask replaces an O(k) `Vec::contains`
+    /// membership check with O(1). Tie-breaking (first index wins) and
+    /// results are identical to the original algorithm.
     pub fn select_diverse_batch(&mut self, n: usize) -> Result<Vec<usize>, PoseCondError> {
         let total = self.registered_poses.len();
         if total == 0 {
@@ -364,30 +473,47 @@ impl PoseConditioner {
         let k = n.min(total);
         // Start with the least-visited pose.
         let start = self.least_visited_pose().unwrap_or(0);
-        let mut selected = vec![start];
+
+        let mut selected_mask = vec![false; total];
+        selected_mask[start] = true;
+        let mut selected = Vec::with_capacity(k);
+        selected.push(start);
+
+        let mut min_dist_to_selected = vec![f32::INFINITY; total];
+        let start_pose = self.registered_poses[start].pose.clone();
+        for (c, dist) in min_dist_to_selected.iter_mut().enumerate() {
+            if c != start {
+                *dist = self.registered_poses[c].pose.angular_distance(&start_pose);
+            }
+        }
+
         // Greedy farthest-point sampling.
         while selected.len() < k {
             let mut best_idx = 0usize;
             let mut best_min_dist = f32::NEG_INFINITY;
-            for candidate in 0..total {
-                if selected.contains(&candidate) {
+            for (candidate, &dist) in min_dist_to_selected.iter().enumerate() {
+                if selected_mask[candidate] {
                     continue;
                 }
-                let cand_pose = &self.registered_poses[candidate].pose;
-                // Minimum angular distance to already-selected set.
-                let min_dist = selected
-                    .iter()
-                    .map(|&s| {
-                        let sp = &self.registered_poses[s].pose;
-                        cand_pose.angular_distance(sp)
-                    })
-                    .fold(f32::INFINITY, f32::min);
-                if min_dist > best_min_dist {
-                    best_min_dist = min_dist;
+                if dist > best_min_dist {
+                    best_min_dist = dist;
                     best_idx = candidate;
                 }
             }
+            selected_mask[best_idx] = true;
             selected.push(best_idx);
+
+            // Fold the newly-selected pose into every remaining candidate's
+            // running minimum distance.
+            let new_pose = self.registered_poses[best_idx].pose.clone();
+            for (c, dist) in min_dist_to_selected.iter_mut().enumerate() {
+                if !selected_mask[c] {
+                    let d = self.registered_poses[c].pose.angular_distance(&new_pose);
+                    if d < *dist {
+                        *dist = d;
+                    }
+                }
+            }
         }
         Ok(selected)
     }
@@ -583,19 +709,33 @@ pub fn grid_idx_to_pose(grid_idx: usize, grid_res: usize, radius: f32) -> Spheri
 }
 
 /// Map a spherical pose to the nearest flat grid index.
+///
+/// `yaw` wraps around the ±PI seam (it is a periodic azimuth angle), so an
+/// out-of-range yaw (e.g. from a hand-constructed `SphericalPose` that
+/// bypassed `SphericalPose::new`) maps to the geometrically correct cell
+/// instead of clamping into the last yaw bin. `pitch` is not periodic — it
+/// clamps to `[-PI/2, PI/2]`.
 pub fn pose_to_grid_idx(pose: &SphericalPose, grid_res: usize) -> usize {
     let grid_pitch_res = grid_res / 2 + 1;
-    let yaw_norm = (pose.yaw + PI) / (2.0 * PI);
-    let pitch_norm = (pose.pitch + PI / 2.0) / PI;
+    let yaw = wrap_to_pi(pose.yaw);
+    let pitch = pose.pitch.clamp(-PI / 2.0, PI / 2.0);
+    let yaw_norm = (yaw + PI) / (2.0 * PI);
+    let pitch_norm = (pitch + PI / 2.0) / PI;
     let yaw_idx = ((yaw_norm * grid_res as f32).floor() as usize).min(grid_res - 1);
     let pitch_idx = ((pitch_norm * grid_pitch_res as f32).floor() as usize).min(grid_pitch_res - 1);
     yaw_idx * grid_pitch_res + pitch_idx
 }
 
 /// Linearly interpolate between two spherical poses.
+///
+/// `yaw` is interpolated along the shortest arc across the ±PI wrap
+/// boundary — e.g. interpolating from `yaw=3.0` to `yaw=-3.0` (a 0.28 rad
+/// arc across the seam) sweeps the short way through PI rather than the
+/// long way through 0. `pitch` and `radius` are interpolated linearly.
 pub fn interpolate_poses(a: &SphericalPose, b: &SphericalPose, t: f32) -> SphericalPose {
+    let dyaw = wrap_to_pi(b.yaw - a.yaw);
     SphericalPose {
-        yaw: a.yaw + t * (b.yaw - a.yaw),
+        yaw: a.yaw + t * dyaw,
         pitch: a.pitch + t * (b.pitch - a.pitch),
         radius: a.radius + t * (b.radius - a.radius),
     }
@@ -1050,6 +1190,30 @@ mod tests {
         assert!((r.radius - 2.0).abs() < 1e-6);
     }
 
+    #[test]
+    fn test_interpolate_wraps_across_seam_short_way() {
+        // Regression: interpolate_poses used to lerp yaw directly without
+        // wrapping, so interpolating from yaw=3.0 to yaw=-3.0 (a short
+        // ~0.28 rad arc across the +-PI seam) swept the LONG way through
+        // yaw=0.0 instead. With the fix, the midpoint lands near the seam
+        // (yaw ~ +-PI), not near 0.0.
+        let a = SphericalPose::new(3.0, 0.0, 1.0).unwrap();
+        let b = SphericalPose::new(-3.0, 0.0, 1.0).unwrap();
+        let r = interpolate_poses(&a, &b, 0.5);
+        let dist_to_seam = (r.yaw.abs() - PI).abs();
+        assert!(
+            dist_to_seam < 0.2,
+            "midpoint should be near the +-PI seam, got yaw={} \
+             (old buggy code would give ~0.0)",
+            r.yaw
+        );
+        assert!(
+            r.yaw.abs() > 1.0,
+            "midpoint should not be near 0.0 (the long-way bug), got yaw={}",
+            r.yaw
+        );
+    }
+
     // ---- pose_centroid ----
 
     #[test]
@@ -1225,6 +1389,28 @@ mod tests {
         cond.register_poses(vec![SphericalPose::new(0.0, 0.0, 1.0).unwrap()])
             .unwrap();
         assert_eq!(cond.coverage_grid.len(), 8 * (8 / 2 + 1));
+    }
+
+    #[test]
+    fn test_recompute_coverage_bounded_after_many_visits_not_unbounded() {
+        // Regression: recompute_coverage/update used to normalize by pose
+        // COUNT (n) rather than the SUM OF WEIGHTS, so coverage grew
+        // without bound as visits accumulated. With the fix,
+        // coverage_grid[cell] is a weighted AVERAGE of per-pose kernel
+        // contributions (each in (0, 1]), so it stays bounded to (0, 1]
+        // regardless of visit count — the old formula would have let a
+        // heavily-visited pose's peak cell reach ~10x its registration-time
+        // value here.
+        let mut cond = default_conditioner(2);
+        for _ in 0..20 {
+            cond.update(0, 0.1).unwrap();
+        }
+        let pose0 = cond.registered_poses[0].pose.clone();
+        let cov_at_pose0 = cond.coverage_at(&pose0);
+        assert!(
+            cov_at_pose0 <= 1.0 + 1e-4,
+            "coverage at a heavily-visited pose must stay bounded to ~1.0, got {cov_at_pose0}"
+        );
     }
 
     // ---- coverage_at ----

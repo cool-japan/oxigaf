@@ -119,10 +119,14 @@ impl ImagePyramid {
         self.levels.get(idx)
     }
 
-    /// Access the original (full-resolution) level.
-    pub fn original(&self) -> &PyramidLevel {
-        // SAFETY: build() always inserts at least level 0
-        &self.levels[0]
+    /// Access the original (full-resolution) level, or `None` if this
+    /// pyramid has no levels.
+    ///
+    /// `build()` always inserts at least level 0, so this only returns
+    /// `None` for a pyramid that was hand-constructed with an empty
+    /// `levels` vec (the field is public) rather than via `build()`.
+    pub fn original(&self) -> Option<&PyramidLevel> {
+        self.levels.first()
     }
 }
 
@@ -360,10 +364,26 @@ pub fn mr_l2_loss(pred: &[f32], gt: &[f32]) -> Result<f32, MultiResLossError> {
     Ok(sum / pred.len() as f32)
 }
 
-/// SSIM loss: 1 - ssim(pred, gt).
+/// Structural dissimilarity `1 - SSIM(pred, gt)`, clamped at `0.0`.
 ///
-/// Uses a simplified 3×3 window SSIM for efficiency.
-/// Channels are inferred from `pred.len() / (width * height)`.
+/// Uses the **same** SSIM definition as [`crate::loss::ssim_loss`] and
+/// [`crate::view_synthesis_eval::eval_ssim`]: a separable Gaussian window
+/// (11 taps, σ = 1.5) with replicate-boundary padding, `C1 = (0.01)²`,
+/// `C2 = (0.03)²`, averaged over every pixel and channel. The kernel itself
+/// comes from the shared [`crate::loss::gaussian_kernel_1d`] helper, so this
+/// pyramid loss and the primary training objective cannot drift apart.
+///
+/// The one concession to the pyramid is window *size*: an 11-tap window is
+/// meaningless on a deep pyramid level only a few pixels across, so the window
+/// shrinks to the largest odd size that fits (`min(11, min(width, height))`,
+/// rounded down to odd), with σ scaled by the same factor to preserve its
+/// shape. Consequently this agrees numerically with
+/// [`crate::loss::ssim_loss`] only when `min(width, height) >= 11`, where both
+/// use the full 11-tap window; below that it is the same estimator evaluated
+/// on a smaller support, not a different one.
+///
+/// Channels are inferred from `pred.len() / (width * height)` (any count, not
+/// just RGB — pyramid levels are frequently single-channel).
 pub fn mr_ssim_loss(
     pred: &[f32],
     gt: &[f32],
@@ -386,78 +406,119 @@ pub fn mr_ssim_loss(
         });
     }
     let channels = pred.len() / n_pixels;
-
-    // Constants following Wang et al. (2004), assuming data in [0,1]
-    const C1: f32 = 0.0001;
-    const C2: f32 = 0.0009;
-
-    // Need at least a 3×3 neighborhood; if image is 1×1 fall back to perfect
-    if width < 3 || height < 3 {
-        // Can't form 3×3 windows — return 0 (identical → 0 loss)
-        let l1 = mr_l1_loss(pred, gt)?;
-        // If images are identical, return 0; otherwise approximate
-        return Ok(if l1 < 1e-7 { 0.0 } else { l1.min(1.0) });
+    if channels == 0 {
+        return Ok(0.0);
     }
 
+    let taps = mr_ssim_window_size(width, height);
+    // σ scaled with the window so a shrunken kernel keeps the reference
+    // window's shape instead of becoming a near-box filter.
+    let sigma = MR_SSIM_SIGMA * taps as f32 / MR_SSIM_TAPS as f32;
+    let kernel = crate::loss::gaussian_kernel_1d(taps, sigma);
+
+    let mut plane_pred = vec![0.0_f32; n_pixels];
+    let mut plane_gt = vec![0.0_f32; n_pixels];
     let mut ssim_sum = 0.0_f32;
-    let mut count = 0u32;
-
     for c in 0..channels {
-        for y in 1..(height - 1) {
-            for x in 1..(width - 1) {
-                // Collect 3×3 window samples
-                let mut mu_x = 0.0_f32;
-                let mut mu_y = 0.0_f32;
-                let mut samples_x = [0.0_f32; 9];
-                let mut samples_y = [0.0_f32; 9];
-                let mut idx = 0;
+        for (i, (dst_pred, dst_gt)) in plane_pred.iter_mut().zip(plane_gt.iter_mut()).enumerate() {
+            *dst_pred = pred[i * channels + c];
+            *dst_gt = gt[i * channels + c];
+        }
+        ssim_sum += mr_ssim_channel(&plane_pred, &plane_gt, width, height, &kernel);
+    }
 
-                for dy in 0usize..3 {
-                    for dx in 0usize..3 {
-                        let px = (x + dx).wrapping_sub(1).min(width - 1);
-                        let py = (y + dy).wrapping_sub(1).min(height - 1);
-                        let flat = (py * width + px) * channels + c;
-                        let vx = pred[flat];
-                        let vy = gt[flat];
-                        samples_x[idx] = vx;
-                        samples_y[idx] = vy;
-                        mu_x += vx;
-                        mu_y += vy;
-                        idx += 1;
-                    }
-                }
-                mu_x /= 9.0;
-                mu_y /= 9.0;
+    let mean_ssim = ssim_sum / channels as f32;
+    Ok((1.0 - mean_ssim).max(0.0))
+}
 
-                let mut sigma_x2 = 0.0_f32;
-                let mut sigma_y2 = 0.0_f32;
-                let mut sigma_xy = 0.0_f32;
-                for i in 0..9 {
-                    let dx_i = samples_x[i] - mu_x;
-                    let dy_i = samples_y[i] - mu_y;
-                    sigma_x2 += dx_i * dx_i;
-                    sigma_y2 += dy_i * dy_i;
-                    sigma_xy += dx_i * dy_i;
-                }
-                sigma_x2 /= 9.0;
-                sigma_y2 /= 9.0;
-                sigma_xy /= 9.0;
+/// Taps in the reference SSIM window, matching [`crate::loss::ssim_loss`].
+const MR_SSIM_TAPS: usize = 11;
 
-                let num = (2.0 * mu_x * mu_y + C1) * (2.0 * sigma_xy + C2);
-                let den = (mu_x * mu_x + mu_y * mu_y + C1) * (sigma_x2 + sigma_y2 + C2);
+/// Standard deviation of the reference SSIM window, in pixels.
+const MR_SSIM_SIGMA: f32 = 1.5;
 
-                let ssim_val = if den.abs() < 1e-12 { 1.0 } else { num / den };
-                ssim_sum += ssim_val.clamp(-1.0, 1.0);
-                count += 1;
+/// Largest odd window (≥ 1) that fits inside a `width × height` image, capped
+/// at [`MR_SSIM_TAPS`].
+fn mr_ssim_window_size(width: usize, height: usize) -> usize {
+    let fit = width.min(height).clamp(1, MR_SSIM_TAPS);
+    if fit.is_multiple_of(2) {
+        fit - 1
+    } else {
+        fit
+    }
+}
+
+/// Mean SSIM over a single-channel plane, using the same statistics as
+/// `crate::loss`'s `ssim_channel`.
+fn mr_ssim_channel(pred: &[f32], gt: &[f32], width: usize, height: usize, kernel: &[f32]) -> f32 {
+    // (K₁ L)² and (K₂ L)² for L = 1, identical to `crate::loss::ssim_channel`.
+    const C1: f32 = 0.01 * 0.01;
+    const C2: f32 = 0.03 * 0.03;
+
+    let n = width * height;
+    if n == 0 {
+        return 0.0;
+    }
+
+    let pred_sq: Vec<f32> = pred.iter().map(|&v| v * v).collect();
+    let gt_sq: Vec<f32> = gt.iter().map(|&v| v * v).collect();
+    let pred_gt: Vec<f32> = pred.iter().zip(gt.iter()).map(|(&a, &b)| a * b).collect();
+
+    let mu_x = mr_convolve_separable(pred, width, height, kernel);
+    let mu_y = mr_convolve_separable(gt, width, height, kernel);
+    let ex_sq = mr_convolve_separable(&pred_sq, width, height, kernel);
+    let ey_sq = mr_convolve_separable(&gt_sq, width, height, kernel);
+    let exy = mr_convolve_separable(&pred_gt, width, height, kernel);
+
+    let mut ssim_sum = 0.0_f32;
+    for i in 0..n {
+        let mu_x_sq = mu_x[i] * mu_x[i];
+        let mu_y_sq = mu_y[i] * mu_y[i];
+        let mu_xy = mu_x[i] * mu_y[i];
+        let sigma_x_sq = ex_sq[i] - mu_x_sq;
+        let sigma_y_sq = ey_sq[i] - mu_y_sq;
+        let sigma_xy = exy[i] - mu_xy;
+
+        let num = (2.0 * mu_xy + C1) * (2.0 * sigma_xy + C2);
+        let den = (mu_x_sq + mu_y_sq + C1) * (sigma_x_sq + sigma_y_sq + C2);
+        ssim_sum += num / den;
+    }
+    ssim_sum / n as f32
+}
+
+/// Separable 2-D convolution of a single-channel plane with replicate-boundary
+/// padding — the same boundary rule `crate::loss`'s `convolve_separable` uses,
+/// so the two SSIM implementations agree pixel for pixel.
+fn mr_convolve_separable(image: &[f32], width: usize, height: usize, kernel: &[f32]) -> Vec<f32> {
+    let k = kernel.len();
+    let half = (k / 2) as isize;
+    let w = width as isize;
+    let h = height as isize;
+
+    let mut temp = vec![0.0_f32; width * height];
+    for y in 0..height {
+        for x in 0..width {
+            let mut sum = 0.0_f32;
+            for (i, &tap) in kernel.iter().enumerate() {
+                let ix = (x as isize + i as isize - half).clamp(0, w - 1) as usize;
+                sum += image[y * width + ix] * tap;
             }
+            temp[y * width + x] = sum;
         }
     }
 
-    if count == 0 {
-        return Ok(0.0);
+    let mut out = vec![0.0_f32; width * height];
+    for y in 0..height {
+        for x in 0..width {
+            let mut sum = 0.0_f32;
+            for (i, &tap) in kernel.iter().enumerate() {
+                let iy = (y as isize + i as isize - half).clamp(0, h - 1) as usize;
+                sum += temp[iy * width + x] * tap;
+            }
+            out[y * width + x] = sum;
+        }
     }
-    let mean_ssim = ssim_sum / count as f32;
-    Ok((1.0 - mean_ssim).max(0.0))
+    out
 }
 
 /// Laplacian pyramid loss: L1 between Laplacian pyramid coefficients.
@@ -529,8 +590,8 @@ pub fn mr_gradient_l1_loss(
     }
     let channels = pred.len() / n_pixels;
 
-    let pred_mag = mr_sobel_magnitude(pred, width, height, channels);
-    let gt_mag = mr_sobel_magnitude(gt, width, height, channels);
+    let pred_mag = mr_sobel_magnitude(pred, width, height, channels)?;
+    let gt_mag = mr_sobel_magnitude(gt, width, height, channels)?;
     mr_l1_loss(&pred_mag, &gt_mag)
 }
 
@@ -587,6 +648,9 @@ pub fn mr_downsample(
 }
 
 /// Upsample image by factor 2 using bilinear interpolation to an explicit target size.
+///
+/// # Errors
+/// [`MultiResLossError::SizeMismatch`] if `img.len() != width * height * channels`.
 pub fn mr_upsample(
     img: &[f32],
     width: usize,
@@ -594,9 +658,18 @@ pub fn mr_upsample(
     channels: usize,
     target_w: usize,
     target_h: usize,
-) -> Vec<f32> {
+) -> Result<Vec<f32>, MultiResLossError> {
     if width == 0 || height == 0 || target_w == 0 || target_h == 0 {
-        return vec![0.0_f32; target_w * target_h * channels];
+        return Ok(vec![0.0_f32; target_w * target_h * channels]);
+    }
+    let expected = width * height * channels;
+    if img.len() != expected {
+        return Err(MultiResLossError::SizeMismatch {
+            got: img.len(),
+            width,
+            height,
+            channels,
+        });
     }
 
     let mut out = vec![0.0_f32; target_w * target_h * channels];
@@ -638,15 +711,33 @@ pub fn mr_upsample(
         }
     }
 
-    out
+    Ok(out)
 }
 
 /// Apply 3×3 Gaussian blur with kernel \[1,2,1\]/4 (separable).
 ///
 /// Border pixels are handled by clamping coordinates.
-pub fn mr_gaussian_blur_3x3(img: &[f32], width: usize, height: usize, channels: usize) -> Vec<f32> {
+///
+/// # Errors
+/// [`MultiResLossError::SizeMismatch`] if `img.len() != width * height * channels`
+/// (for non-empty `img` with non-zero `width`/`height`).
+pub fn mr_gaussian_blur_3x3(
+    img: &[f32],
+    width: usize,
+    height: usize,
+    channels: usize,
+) -> Result<Vec<f32>, MultiResLossError> {
     if img.is_empty() || width == 0 || height == 0 {
-        return img.to_vec();
+        return Ok(img.to_vec());
+    }
+    let expected = width * height * channels;
+    if img.len() != expected {
+        return Err(MultiResLossError::SizeMismatch {
+            got: img.len(),
+            width,
+            height,
+            channels,
+        });
     }
 
     // Horizontal pass
@@ -680,7 +771,7 @@ pub fn mr_gaussian_blur_3x3(img: &[f32], width: usize, height: usize, channels: 
         }
     }
 
-    out
+    Ok(out)
 }
 
 /// Build a Laplacian pyramid from an image.
@@ -718,12 +809,12 @@ pub fn mr_laplacian_pyramid(
     let mut lap_levels = Vec::with_capacity(n_levels);
 
     // Gauss level 0 = blurred original
-    let gauss0 = mr_gaussian_blur_3x3(img, width, height, channels);
+    let gauss0 = mr_gaussian_blur_3x3(img, width, height, channels)?;
 
     if width >= 2 && height >= 2 {
         // lap[0] = img - upsample(downsample(gauss[0]))
         let (down0, dw0, dh0) = mr_downsample(&gauss0, width, height, channels)?;
-        let up0 = mr_upsample(&down0, dw0, dh0, channels, width, height);
+        let up0 = mr_upsample(&down0, dw0, dh0, channels, width, height)?;
         let lap0: Vec<f32> = img.iter().zip(up0.iter()).map(|(a, b)| a - b).collect();
         lap_levels.push(lap0);
     } else {
@@ -744,7 +835,7 @@ pub fn mr_laplacian_pyramid(
         let (next_gauss, next_w, next_h) = mr_downsample(&cur_gauss, cur_w, cur_h, channels)?;
 
         // lap[k] = gauss[k-1] - upsample(gauss[k], size of gauss[k-1])
-        let up = mr_upsample(&next_gauss, next_w, next_h, channels, cur_w, cur_h);
+        let up = mr_upsample(&next_gauss, next_w, next_h, channels, cur_w, cur_h)?;
         let lap: Vec<f32> = cur_gauss
             .iter()
             .zip(up.iter())
@@ -763,10 +854,29 @@ pub fn mr_laplacian_pyramid(
 /// Compute Sobel gradient magnitude, averaged across channels.
 ///
 /// Border pixels are set to 0. Output has one value per pixel (`width * height` elements).
-pub fn mr_sobel_magnitude(img: &[f32], width: usize, height: usize, channels: usize) -> Vec<f32> {
+///
+/// # Errors
+/// [`MultiResLossError::SizeMismatch`] if `img.len() != width * height * channels`
+/// (checked whenever `width * height != 0 && channels != 0`; a genuinely
+/// empty request returns an empty `Vec` rather than an error).
+pub fn mr_sobel_magnitude(
+    img: &[f32],
+    width: usize,
+    height: usize,
+    channels: usize,
+) -> Result<Vec<f32>, MultiResLossError> {
     let n_pixels = width * height;
     if n_pixels == 0 || channels == 0 {
-        return Vec::new();
+        return Ok(Vec::new());
+    }
+    let expected = n_pixels * channels;
+    if img.len() != expected {
+        return Err(MultiResLossError::SizeMismatch {
+            got: img.len(),
+            width,
+            height,
+            channels,
+        });
     }
 
     let mut out = vec![0.0_f32; n_pixels];
@@ -797,7 +907,7 @@ pub fn mr_sobel_magnitude(img: &[f32], width: usize, height: usize, channels: us
         }
     }
 
-    out
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -884,880 +994,4 @@ pub fn format_mr_stats(stats: &MultiResStats) -> String {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    // Helper: create a uniform flat image
-    fn uniform_image(w: usize, h: usize, c: usize, val: f32) -> Vec<f32> {
-        vec![val; w * h * c]
-    }
-
-    // Helper: create a checkerboard pattern (0.0 and 1.0)
-    fn checkerboard(w: usize, h: usize, c: usize) -> Vec<f32> {
-        let mut v = vec![0.0_f32; w * h * c];
-        for y in 0..h {
-            for x in 0..w {
-                let val = if (x + y) % 2 == 0 { 1.0 } else { 0.0 };
-                for ch in 0..c {
-                    v[(y * w + x) * c + ch] = val;
-                }
-            }
-        }
-        v
-    }
-
-    // Helper: create a horizontal edge image (top half = 0, bottom half = 1)
-    fn edge_image(w: usize, h: usize, c: usize) -> Vec<f32> {
-        let mut v = vec![0.0_f32; w * h * c];
-        for y in (h / 2)..h {
-            for x in 0..w {
-                for ch in 0..c {
-                    v[(y * w + x) * c + ch] = 1.0;
-                }
-            }
-        }
-        v
-    }
-
-    // ---------------------------------------------------------------------------
-    // mr_downsample
-    // ---------------------------------------------------------------------------
-
-    #[test]
-    fn test_downsample_4x4_to_2x2() {
-        let img: Vec<f32> = (0..16).map(|i| i as f32).collect();
-        // 4×4 single channel → 2×2
-        let (out, ow, oh) = mr_downsample(&img, 4, 4, 1).expect("downsample failed");
-        assert_eq!(ow, 2);
-        assert_eq!(oh, 2);
-        assert_eq!(out.len(), 4);
-        // Top-left 2×2 block: [0,1,4,5] → mean = 2.5
-        assert!((out[0] - 2.5).abs() < 1e-5, "TL={}", out[0]);
-        // Top-right: [2,3,6,7] → 4.5
-        assert!((out[1] - 4.5).abs() < 1e-5, "TR={}", out[1]);
-    }
-
-    #[test]
-    fn test_downsample_uniform_stays_uniform() {
-        let img = uniform_image(8, 8, 3, 0.7);
-        let (out, ow, oh) = mr_downsample(&img, 8, 8, 3).expect("downsample");
-        assert_eq!(ow, 4);
-        assert_eq!(oh, 4);
-        for &v in &out {
-            assert!((v - 0.7).abs() < 1e-5);
-        }
-    }
-
-    #[test]
-    fn test_downsample_odd_size() {
-        let img = uniform_image(5, 5, 1, 1.0);
-        let (out, ow, oh) = mr_downsample(&img, 5, 5, 1).expect("downsample");
-        assert_eq!(ow, 3);
-        assert_eq!(oh, 3);
-        assert_eq!(out.len(), 9);
-    }
-
-    #[test]
-    fn test_downsample_too_small_error() {
-        let img = vec![1.0_f32];
-        let res = mr_downsample(&img, 1, 1, 1);
-        assert!(matches!(res, Err(MultiResLossError::ImageTooSmall(_))));
-    }
-
-    #[test]
-    fn test_downsample_multi_channel() {
-        let img = uniform_image(4, 4, 3, 0.5);
-        let (out, ow, oh) = mr_downsample(&img, 4, 4, 3).expect("downsample");
-        assert_eq!(ow, 2);
-        assert_eq!(oh, 2);
-        assert_eq!(out.len(), 2 * 2 * 3);
-        for &v in &out {
-            assert!((v - 0.5).abs() < 1e-5);
-        }
-    }
-
-    // ---------------------------------------------------------------------------
-    // mr_upsample
-    // ---------------------------------------------------------------------------
-
-    #[test]
-    fn test_upsample_2x2_to_4x4() {
-        // 2×2 uniform → 4×4
-        let img = uniform_image(2, 2, 1, 0.6);
-        let out = mr_upsample(&img, 2, 2, 1, 4, 4);
-        assert_eq!(out.len(), 16);
-        for &v in &out {
-            assert!((v - 0.6).abs() < 1e-5);
-        }
-    }
-
-    #[test]
-    fn test_upsample_uniform_stays_uniform() {
-        let img = uniform_image(3, 3, 2, 0.3);
-        let out = mr_upsample(&img, 3, 3, 2, 5, 5);
-        assert_eq!(out.len(), 5 * 5 * 2);
-        for &v in &out {
-            assert!((v - 0.3).abs() < 1e-5);
-        }
-    }
-
-    #[test]
-    fn test_upsample_identity_target() {
-        // Upsample to same size should return identical (or very close)
-        let img = checkerboard(4, 4, 1);
-        let out = mr_upsample(&img, 4, 4, 1, 4, 4);
-        assert_eq!(out.len(), img.len());
-        for (a, b) in img.iter().zip(out.iter()) {
-            assert!((a - b).abs() < 1e-5);
-        }
-    }
-
-    #[test]
-    fn test_upsample_roundtrip_size() {
-        // Downsample 5×5 → 3×3 → upsample back to 5×5
-        let img = uniform_image(5, 5, 1, 1.0);
-        let (down, dw, dh) = mr_downsample(&img, 5, 5, 1).expect("down");
-        let up = mr_upsample(&down, dw, dh, 1, 5, 5);
-        assert_eq!(up.len(), 5 * 5);
-    }
-
-    // ---------------------------------------------------------------------------
-    // mr_gaussian_blur_3x3
-    // ---------------------------------------------------------------------------
-
-    #[test]
-    fn test_gaussian_blur_uniform_unchanged() {
-        let img = uniform_image(6, 6, 1, 0.5);
-        let out = mr_gaussian_blur_3x3(&img, 6, 6, 1);
-        assert_eq!(out.len(), img.len());
-        for &v in &out {
-            assert!((v - 0.5).abs() < 1e-5);
-        }
-    }
-
-    #[test]
-    fn test_gaussian_blur_edge_pixels_handled() {
-        let img = checkerboard(8, 8, 1);
-        let out = mr_gaussian_blur_3x3(&img, 8, 8, 1);
-        // Just verify no panic and output size is correct
-        assert_eq!(out.len(), img.len());
-        // All values should be in [0, 1]
-        for &v in &out {
-            assert!((0.0..=1.0 + 1e-5).contains(&v), "v={}", v);
-        }
-    }
-
-    #[test]
-    fn test_gaussian_blur_multi_channel() {
-        let img = uniform_image(4, 4, 3, 0.8);
-        let out = mr_gaussian_blur_3x3(&img, 4, 4, 3);
-        assert_eq!(out.len(), 4 * 4 * 3);
-        for &v in &out {
-            assert!((v - 0.8).abs() < 1e-5);
-        }
-    }
-
-    // ---------------------------------------------------------------------------
-    // mr_l1_loss
-    // ---------------------------------------------------------------------------
-
-    #[test]
-    fn test_l1_identical_is_zero() {
-        let img = checkerboard(8, 8, 3);
-        let loss = mr_l1_loss(&img, &img).expect("l1");
-        assert!(loss.abs() < 1e-7);
-    }
-
-    #[test]
-    fn test_l1_known_difference() {
-        let pred = vec![0.0_f32, 1.0, 0.0, 1.0];
-        let gt = vec![1.0_f32, 0.0, 1.0, 0.0];
-        let loss = mr_l1_loss(&pred, &gt).expect("l1");
-        assert!((loss - 1.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_l1_partial_difference() {
-        let pred = vec![0.0_f32, 0.0];
-        let gt = vec![0.5_f32, 0.5];
-        let loss = mr_l1_loss(&pred, &gt).expect("l1");
-        assert!((loss - 0.5).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_l1_shape_mismatch_error() {
-        let res = mr_l1_loss(&[1.0_f32, 2.0], &[1.0_f32]);
-        assert!(matches!(res, Err(MultiResLossError::ShapeMismatch)));
-    }
-
-    // ---------------------------------------------------------------------------
-    // mr_l2_loss
-    // ---------------------------------------------------------------------------
-
-    #[test]
-    fn test_l2_identical_is_zero() {
-        let img = uniform_image(4, 4, 1, 0.5);
-        let loss = mr_l2_loss(&img, &img).expect("l2");
-        assert!(loss.abs() < 1e-7);
-    }
-
-    #[test]
-    fn test_l2_known_difference() {
-        // Mean of (1-0)^2 = 1.0
-        let pred = vec![0.0_f32; 4];
-        let gt = vec![1.0_f32; 4];
-        let loss = mr_l2_loss(&pred, &gt).expect("l2");
-        assert!((loss - 1.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_l2_shape_mismatch_error() {
-        let res = mr_l2_loss(&[1.0_f32], &[1.0_f32, 2.0]);
-        assert!(matches!(res, Err(MultiResLossError::ShapeMismatch)));
-    }
-
-    // ---------------------------------------------------------------------------
-    // mr_ssim_loss
-    // ---------------------------------------------------------------------------
-
-    #[test]
-    fn test_ssim_identical_is_zero() {
-        let img = checkerboard(8, 8, 1);
-        let loss = mr_ssim_loss(&img, &img, 8, 8).expect("ssim");
-        assert!(loss < 1e-5, "loss={}", loss);
-    }
-
-    #[test]
-    fn test_ssim_different_is_positive() {
-        let pred = uniform_image(8, 8, 1, 0.0);
-        let gt = uniform_image(8, 8, 1, 1.0);
-        let loss = mr_ssim_loss(&pred, &gt, 8, 8).expect("ssim");
-        assert!(loss > 0.0, "Expected positive SSIM loss");
-    }
-
-    #[test]
-    fn test_ssim_small_image_no_panic() {
-        // 2×2 images — fall back to L1 approximation
-        let pred = vec![0.0_f32, 1.0, 0.0, 1.0];
-        let gt = vec![1.0_f32, 0.0, 1.0, 0.0];
-        let loss = mr_ssim_loss(&pred, &gt, 2, 2).expect("ssim small");
-        assert!(loss >= 0.0);
-    }
-
-    #[test]
-    fn test_ssim_shape_mismatch() {
-        let res = mr_ssim_loss(&[1.0_f32, 2.0], &[1.0_f32], 1, 1);
-        assert!(matches!(res, Err(MultiResLossError::ShapeMismatch)));
-    }
-
-    // ---------------------------------------------------------------------------
-    // mr_gradient_l1_loss
-    // ---------------------------------------------------------------------------
-
-    #[test]
-    fn test_gradient_l1_identical_is_zero() {
-        let img = edge_image(8, 8, 1);
-        let loss = mr_gradient_l1_loss(&img, &img, 8, 8).expect("grad");
-        assert!(loss.abs() < 1e-7);
-    }
-
-    #[test]
-    fn test_gradient_l1_edge_vs_flat_positive() {
-        let pred = edge_image(8, 8, 1);
-        let gt = uniform_image(8, 8, 1, 0.5);
-        let loss = mr_gradient_l1_loss(&pred, &gt, 8, 8).expect("grad");
-        assert!(loss > 0.0);
-    }
-
-    #[test]
-    fn test_gradient_l1_shape_mismatch() {
-        let res = mr_gradient_l1_loss(&[1.0_f32], &[1.0_f32, 2.0], 1, 1);
-        assert!(matches!(res, Err(MultiResLossError::ShapeMismatch)));
-    }
-
-    // ---------------------------------------------------------------------------
-    // mr_sobel_magnitude
-    // ---------------------------------------------------------------------------
-
-    #[test]
-    fn test_sobel_flat_image_is_zero() {
-        let img = uniform_image(6, 6, 1, 0.5);
-        let mag = mr_sobel_magnitude(&img, 6, 6, 1);
-        assert_eq!(mag.len(), 36);
-        // Interior pixels should all be 0 for a uniform image
-        for y in 1..5 {
-            for x in 1..5 {
-                assert!(
-                    mag[y * 6 + x].abs() < 1e-5,
-                    "mag[{},{}]={}",
-                    y,
-                    x,
-                    mag[y * 6 + x]
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_sobel_edge_image_nonzero() {
-        let img = edge_image(8, 8, 1);
-        let mag = mr_sobel_magnitude(&img, 8, 8, 1);
-        assert_eq!(mag.len(), 64);
-        // Should have nonzero gradient at the edge row
-        let max_mag = mag.iter().cloned().fold(0.0_f32, f32::max);
-        assert!(max_mag > 0.0, "Expected nonzero gradient");
-    }
-
-    #[test]
-    fn test_sobel_border_pixels_are_zero() {
-        let img = checkerboard(6, 6, 1);
-        let mag = mr_sobel_magnitude(&img, 6, 6, 1);
-        // Border pixels should be 0
-        for x in 0..6 {
-            assert_eq!(mag[x], 0.0, "top border x={}", x);
-            assert_eq!(mag[5 * 6 + x], 0.0, "bottom border x={}", x);
-        }
-        for y in 0..6 {
-            assert_eq!(mag[y * 6], 0.0, "left border y={}", y);
-            assert_eq!(mag[y * 6 + 5], 0.0, "right border y={}", y);
-        }
-    }
-
-    #[test]
-    fn test_sobel_multi_channel() {
-        let img = edge_image(8, 8, 3);
-        let mag = mr_sobel_magnitude(&img, 8, 8, 3);
-        // Output has one value per pixel
-        assert_eq!(mag.len(), 64);
-    }
-
-    // ---------------------------------------------------------------------------
-    // mr_laplacian_pyramid
-    // ---------------------------------------------------------------------------
-
-    #[test]
-    fn test_laplacian_pyramid_length() {
-        let img = checkerboard(16, 16, 1);
-        let lap = mr_laplacian_pyramid(&img, 16, 16, 1, 4).expect("lap");
-        assert_eq!(lap.len(), 4);
-    }
-
-    #[test]
-    fn test_laplacian_pyramid_level_sizes() {
-        let img = checkerboard(8, 8, 1);
-        let lap = mr_laplacian_pyramid(&img, 8, 8, 1, 3).expect("lap");
-        // lap[0] should be same size as original (8×8×1 = 64)
-        assert_eq!(lap[0].len(), 64);
-    }
-
-    #[test]
-    fn test_laplacian_pyramid_no_levels_error() {
-        let img = vec![1.0_f32];
-        let res = mr_laplacian_pyramid(&img, 1, 1, 1, 0);
-        assert!(matches!(res, Err(MultiResLossError::NoLevels)));
-    }
-
-    #[test]
-    fn test_laplacian_pyramid_single_level() {
-        let img = uniform_image(4, 4, 1, 0.5);
-        let lap = mr_laplacian_pyramid(&img, 4, 4, 1, 1).expect("lap");
-        assert_eq!(lap.len(), 1);
-    }
-
-    // ---------------------------------------------------------------------------
-    // mr_laplacian_loss
-    // ---------------------------------------------------------------------------
-
-    #[test]
-    fn test_laplacian_loss_identical_near_zero() {
-        let img = checkerboard(16, 16, 1);
-        let loss = mr_laplacian_loss(&img, &img, 16, 16).expect("lap_loss");
-        assert!(loss < 1e-5, "loss={}", loss);
-    }
-
-    #[test]
-    fn test_laplacian_loss_different_positive() {
-        let pred = uniform_image(8, 8, 1, 0.0);
-        let gt = checkerboard(8, 8, 1);
-        let loss = mr_laplacian_loss(&pred, &gt, 8, 8).expect("lap_loss");
-        assert!(loss >= 0.0);
-    }
-
-    #[test]
-    fn test_laplacian_loss_shape_mismatch() {
-        let res = mr_laplacian_loss(&[1.0_f32, 2.0], &[1.0_f32], 1, 1);
-        assert!(matches!(res, Err(MultiResLossError::ShapeMismatch)));
-    }
-
-    // ---------------------------------------------------------------------------
-    // ImagePyramid
-    // ---------------------------------------------------------------------------
-
-    #[test]
-    fn test_pyramid_build_correct_levels() {
-        let img = checkerboard(16, 16, 1);
-        let pyr = ImagePyramid::build(&img, 16, 16, 1, 4).expect("build");
-        assert_eq!(pyr.n_levels(), 4);
-    }
-
-    #[test]
-    fn test_pyramid_scale_halves() {
-        let img = checkerboard(16, 16, 1);
-        let pyr = ImagePyramid::build(&img, 16, 16, 1, 4).expect("build");
-        assert!((pyr.levels[0].scale - 1.0).abs() < 1e-6);
-        assert!((pyr.levels[1].scale - 0.5).abs() < 1e-6);
-        assert!((pyr.levels[2].scale - 0.25).abs() < 1e-6);
-        assert!((pyr.levels[3].scale - 0.125).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_pyramid_original_is_level_0() {
-        let img = checkerboard(8, 8, 3);
-        let pyr = ImagePyramid::build(&img, 8, 8, 3, 3).expect("build");
-        assert_eq!(pyr.original().width, 8);
-        assert_eq!(pyr.original().height, 8);
-        assert_eq!(pyr.original().data.len(), 8 * 8 * 3);
-    }
-
-    #[test]
-    fn test_pyramid_level_out_of_range_returns_none() {
-        let img = checkerboard(8, 8, 1);
-        let pyr = ImagePyramid::build(&img, 8, 8, 1, 3).expect("build");
-        assert!(pyr.level(100).is_none());
-        assert!(pyr.level(3).is_none());
-    }
-
-    #[test]
-    fn test_pyramid_level_in_range() {
-        let img = checkerboard(8, 8, 1);
-        let pyr = ImagePyramid::build(&img, 8, 8, 1, 3).expect("build");
-        assert!(pyr.level(0).is_some());
-        assert!(pyr.level(2).is_some());
-    }
-
-    #[test]
-    fn test_pyramid_size_mismatch_error() {
-        let img = vec![1.0_f32; 10]; // wrong size
-        let res = ImagePyramid::build(&img, 4, 4, 1, 2);
-        assert!(matches!(res, Err(MultiResLossError::SizeMismatch { .. })));
-    }
-
-    #[test]
-    fn test_pyramid_no_levels_error() {
-        let img = uniform_image(4, 4, 1, 0.5);
-        let res = ImagePyramid::build(&img, 4, 4, 1, 0);
-        assert!(matches!(res, Err(MultiResLossError::NoLevels)));
-    }
-
-    #[test]
-    fn test_pyramid_stops_when_too_small() {
-        // A 2×2 image can only have 1 meaningful level + 1 downsampled
-        let img = uniform_image(2, 2, 1, 0.5);
-        let pyr = ImagePyramid::build(&img, 2, 2, 1, 10).expect("build");
-        // Should not have 10 levels — image becomes too small
-        assert!(pyr.n_levels() < 10);
-    }
-
-    // ---------------------------------------------------------------------------
-    // mr_compute_loss
-    // ---------------------------------------------------------------------------
-
-    #[test]
-    fn test_compute_loss_uniform_near_zero() {
-        let pred = uniform_image(8, 8, 3, 0.5);
-        let gt = uniform_image(8, 8, 3, 0.5);
-        let config = MultiResLossConfig::default();
-        let result = mr_compute_loss(&pred, &gt, 8, 8, 3, &config).expect("compute");
-        assert!(result.total_loss < 1e-5, "total={}", result.total_loss);
-    }
-
-    #[test]
-    fn test_compute_loss_different_images_positive() {
-        let pred = uniform_image(8, 8, 3, 0.0);
-        let gt = uniform_image(8, 8, 3, 1.0);
-        let config = MultiResLossConfig::default();
-        let result = mr_compute_loss(&pred, &gt, 8, 8, 3, &config).expect("compute");
-        assert!(result.total_loss > 0.0, "Expected positive loss");
-    }
-
-    #[test]
-    fn test_compute_loss_non_negative() {
-        let pred = checkerboard(8, 8, 3);
-        let gt = edge_image(8, 8, 3);
-        let config = MultiResLossConfig::default();
-        let result = mr_compute_loss(&pred, &gt, 8, 8, 3, &config).expect("compute");
-        assert!(result.total_loss >= 0.0);
-        for &l in &result.per_level_losses {
-            assert!(l >= 0.0);
-        }
-        for &w in &result.weighted_level_losses {
-            assert!(w >= 0.0);
-        }
-    }
-
-    #[test]
-    fn test_compute_loss_size_mismatch_error() {
-        let pred = uniform_image(8, 8, 3, 0.5);
-        let gt = uniform_image(8, 8, 3, 0.5);
-        let config = MultiResLossConfig::default();
-        // Pass wrong size
-        let res = mr_compute_loss(&pred[..10], &gt, 8, 8, 3, &config);
-        assert!(matches!(res, Err(MultiResLossError::SizeMismatch { .. })));
-    }
-
-    #[test]
-    fn test_compute_loss_with_all_loss_types() {
-        let pred = edge_image(16, 16, 1);
-        let gt = checkerboard(16, 16, 1);
-        let config = MultiResLossConfig {
-            n_levels: 3,
-            level_weights: vec![1.0, 0.5, 0.25],
-            loss_types: vec![
-                MultiResLossType::L1,
-                MultiResLossType::L2,
-                MultiResLossType::Ssim,
-                MultiResLossType::Laplacian,
-                MultiResLossType::GradientL1,
-            ],
-            normalize_weights: true,
-        };
-        let result = mr_compute_loss(&pred, &gt, 16, 16, 1, &config).expect("compute all types");
-        assert!(result.total_loss >= 0.0);
-        assert_eq!(result.per_type_losses.len(), 5);
-    }
-
-    #[test]
-    fn test_compute_loss_per_level_count() {
-        let pred = checkerboard(16, 16, 1);
-        let gt = edge_image(16, 16, 1);
-        let config = MultiResLossConfig {
-            n_levels: 3,
-            level_weights: vec![1.0, 0.5, 0.25],
-            loss_types: vec![MultiResLossType::L1],
-            normalize_weights: false,
-        };
-        let result = mr_compute_loss(&pred, &gt, 16, 16, 1, &config).expect("compute");
-        assert_eq!(result.per_level_losses.len(), 3);
-        assert_eq!(result.weighted_level_losses.len(), 3);
-    }
-
-    // ---------------------------------------------------------------------------
-    // mr_level_loss
-    // ---------------------------------------------------------------------------
-
-    #[test]
-    fn test_level_loss_l1() {
-        let lvl_pred = PyramidLevel {
-            data: vec![0.0_f32; 16],
-            width: 4,
-            height: 4,
-            scale: 1.0,
-        };
-        let lvl_gt = PyramidLevel {
-            data: vec![1.0_f32; 16],
-            width: 4,
-            height: 4,
-            scale: 1.0,
-        };
-        let loss = mr_level_loss(&lvl_pred, &lvl_gt, &MultiResLossType::L1).expect("ll");
-        assert!((loss - 1.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_level_loss_l2() {
-        let lvl_pred = PyramidLevel {
-            data: vec![0.0_f32; 16],
-            width: 4,
-            height: 4,
-            scale: 1.0,
-        };
-        let lvl_gt = PyramidLevel {
-            data: vec![1.0_f32; 16],
-            width: 4,
-            height: 4,
-            scale: 1.0,
-        };
-        let loss = mr_level_loss(&lvl_pred, &lvl_gt, &MultiResLossType::L2).expect("ll");
-        assert!((loss - 1.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_level_loss_ssim() {
-        let pred_data = checkerboard(8, 8, 1);
-        let lvl_pred = PyramidLevel {
-            data: pred_data.clone(),
-            width: 8,
-            height: 8,
-            scale: 1.0,
-        };
-        let lvl_gt = PyramidLevel {
-            data: pred_data.clone(),
-            width: 8,
-            height: 8,
-            scale: 1.0,
-        };
-        let loss = mr_level_loss(&lvl_pred, &lvl_gt, &MultiResLossType::Ssim).expect("ll ssim");
-        assert!(loss < 1e-5, "loss={}", loss);
-    }
-
-    #[test]
-    fn test_level_loss_laplacian() {
-        let data = checkerboard(8, 8, 1);
-        let lvl_pred = PyramidLevel {
-            data: data.clone(),
-            width: 8,
-            height: 8,
-            scale: 1.0,
-        };
-        let lvl_gt = PyramidLevel {
-            data: data.clone(),
-            width: 8,
-            height: 8,
-            scale: 1.0,
-        };
-        let loss = mr_level_loss(&lvl_pred, &lvl_gt, &MultiResLossType::Laplacian).expect("ll lap");
-        assert!(loss < 1e-5, "loss={}", loss);
-    }
-
-    #[test]
-    fn test_level_loss_gradient_l1() {
-        let data = edge_image(8, 8, 1);
-        let lvl_pred = PyramidLevel {
-            data: data.clone(),
-            width: 8,
-            height: 8,
-            scale: 1.0,
-        };
-        let lvl_gt = PyramidLevel {
-            data: data.clone(),
-            width: 8,
-            height: 8,
-            scale: 1.0,
-        };
-        let loss =
-            mr_level_loss(&lvl_pred, &lvl_gt, &MultiResLossType::GradientL1).expect("ll grad");
-        assert!(loss.abs() < 1e-7);
-    }
-
-    #[test]
-    fn test_level_loss_shape_mismatch() {
-        let lvl_pred = PyramidLevel {
-            data: vec![0.0_f32; 4],
-            width: 2,
-            height: 2,
-            scale: 1.0,
-        };
-        let lvl_gt = PyramidLevel {
-            data: vec![0.0_f32; 9],
-            width: 3,
-            height: 3,
-            scale: 1.0,
-        };
-        let res = mr_level_loss(&lvl_pred, &lvl_gt, &MultiResLossType::L1);
-        assert!(matches!(res, Err(MultiResLossError::ShapeMismatch)));
-    }
-
-    // ---------------------------------------------------------------------------
-    // mr_compute_stats
-    // ---------------------------------------------------------------------------
-
-    #[test]
-    fn test_stats_quality_score() {
-        let result = MultiResLossResult {
-            total_loss: 0.0,
-            per_level_losses: vec![0.0],
-            per_type_losses: vec![0.0],
-            weighted_level_losses: vec![0.0],
-        };
-        let stats = mr_compute_stats(&result);
-        assert!((stats.quality_score - 1.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_stats_quality_decreases_with_loss() {
-        let result_low = MultiResLossResult {
-            total_loss: 0.1,
-            per_level_losses: vec![0.1],
-            per_type_losses: vec![0.1],
-            weighted_level_losses: vec![0.1],
-        };
-        let result_high = MultiResLossResult {
-            total_loss: 0.9,
-            per_level_losses: vec![0.9],
-            per_type_losses: vec![0.9],
-            weighted_level_losses: vec![0.9],
-        };
-        let stats_low = mr_compute_stats(&result_low);
-        let stats_high = mr_compute_stats(&result_high);
-        assert!(stats_low.quality_score > stats_high.quality_score);
-    }
-
-    #[test]
-    fn test_stats_dominant_scale() {
-        let result = MultiResLossResult {
-            total_loss: 1.0,
-            per_level_losses: vec![0.1, 0.5, 0.3],
-            per_type_losses: vec![0.5],
-            weighted_level_losses: vec![0.1, 0.5, 0.3],
-        };
-        let stats = mr_compute_stats(&result);
-        assert_eq!(
-            stats.dominant_scale, 1,
-            "Highest weighted loss is at index 1"
-        );
-    }
-
-    #[test]
-    fn test_stats_improvement_ratio() {
-        let result = MultiResLossResult {
-            total_loss: 0.5,
-            per_level_losses: vec![0.2, 0.4],
-            per_type_losses: vec![0.3],
-            weighted_level_losses: vec![0.2, 0.2],
-        };
-        let stats = mr_compute_stats(&result);
-        // fine(0.2) / coarse(0.4) = 0.5
-        assert!((stats.loss_improvement_ratio - 0.5).abs() < 1e-5);
-    }
-
-    // ---------------------------------------------------------------------------
-    // MultiResLossConfig
-    // ---------------------------------------------------------------------------
-
-    #[test]
-    fn test_config_default_n_levels() {
-        let cfg = MultiResLossConfig::default();
-        assert_eq!(cfg.n_levels, 4);
-    }
-
-    #[test]
-    fn test_config_default_weights() {
-        let cfg = MultiResLossConfig::default();
-        assert_eq!(cfg.level_weights.len(), 4);
-        assert!((cfg.level_weights[0] - 1.0).abs() < 1e-6);
-        assert!((cfg.level_weights[1] - 0.5).abs() < 1e-6);
-        assert!((cfg.level_weights[2] - 0.25).abs() < 1e-6);
-        assert!((cfg.level_weights[3] - 0.125).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_config_default_loss_types() {
-        let cfg = MultiResLossConfig::default();
-        assert_eq!(cfg.loss_types.len(), 2);
-        assert!(cfg.loss_types.contains(&MultiResLossType::L1));
-        assert!(cfg.loss_types.contains(&MultiResLossType::Ssim));
-    }
-
-    #[test]
-    fn test_config_invalid_weight_error() {
-        let cfg = MultiResLossConfig {
-            n_levels: 2,
-            level_weights: vec![1.0, -0.5],
-            loss_types: vec![MultiResLossType::L1],
-            normalize_weights: false,
-        };
-        assert!(matches!(
-            cfg.validate(),
-            Err(MultiResLossError::InvalidWeight(_))
-        ));
-    }
-
-    #[test]
-    fn test_config_zero_weight_error() {
-        let cfg = MultiResLossConfig {
-            n_levels: 2,
-            level_weights: vec![0.0, 1.0],
-            loss_types: vec![MultiResLossType::L1],
-            normalize_weights: false,
-        };
-        assert!(matches!(
-            cfg.validate(),
-            Err(MultiResLossError::InvalidWeight(_))
-        ));
-    }
-
-    #[test]
-    fn test_config_normalize_weights() {
-        let cfg = MultiResLossConfig {
-            n_levels: 2,
-            level_weights: vec![2.0, 2.0],
-            loss_types: vec![MultiResLossType::L1],
-            normalize_weights: true,
-        };
-        let weights = cfg.effective_weights(2);
-        assert!((weights[0] - 0.5).abs() < 1e-6);
-        assert!((weights[1] - 0.5).abs() < 1e-6);
-    }
-
-    // ---------------------------------------------------------------------------
-    // format functions
-    // ---------------------------------------------------------------------------
-
-    #[test]
-    fn test_format_mr_result_non_empty() {
-        let result = MultiResLossResult {
-            total_loss: 0.42,
-            per_level_losses: vec![0.1, 0.2],
-            per_type_losses: vec![0.15],
-            weighted_level_losses: vec![0.1, 0.1],
-        };
-        let s = format_mr_result(&result);
-        assert!(!s.is_empty());
-        assert!(s.contains("0.42") || s.contains("MultiRes"));
-    }
-
-    #[test]
-    fn test_format_mr_stats_non_empty() {
-        let result = MultiResLossResult {
-            total_loss: 0.5,
-            per_level_losses: vec![0.3, 0.7],
-            per_type_losses: vec![0.5],
-            weighted_level_losses: vec![0.3, 0.7],
-        };
-        let stats = mr_compute_stats(&result);
-        let s = format_mr_stats(&stats);
-        assert!(!s.is_empty());
-        assert!(s.contains("quality") || s.contains("MultiRes"));
-    }
-
-    // ---------------------------------------------------------------------------
-    // Error cases
-    // ---------------------------------------------------------------------------
-
-    #[test]
-    fn test_error_image_too_small() {
-        let img = vec![1.0_f32];
-        let res = mr_downsample(&img, 1, 1, 1);
-        assert!(matches!(res, Err(MultiResLossError::ImageTooSmall(_))));
-    }
-
-    #[test]
-    fn test_error_no_levels() {
-        let img = uniform_image(4, 4, 1, 0.5);
-        let res = ImagePyramid::build(&img, 4, 4, 1, 0);
-        assert!(matches!(res, Err(MultiResLossError::NoLevels)));
-    }
-
-    #[test]
-    fn test_error_shape_mismatch_gt() {
-        let pred = uniform_image(8, 8, 3, 0.5);
-        let gt = uniform_image(4, 4, 3, 0.5); // different size
-        let config = MultiResLossConfig::default();
-        let res = mr_compute_loss(&pred, &gt, 8, 8, 3, &config);
-        assert!(matches!(res, Err(MultiResLossError::SizeMismatch { .. })));
-    }
-
-    #[test]
-    fn test_error_invalid_weight() {
-        let cfg = MultiResLossConfig {
-            n_levels: 1,
-            level_weights: vec![f32::NAN],
-            loss_types: vec![MultiResLossType::L1],
-            normalize_weights: false,
-        };
-        assert!(matches!(
-            cfg.validate(),
-            Err(MultiResLossError::InvalidWeight(_))
-        ));
-    }
-}
+mod tests;

@@ -13,7 +13,7 @@ members = [
 [workspace.package]
 version = "0.1.2"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.87"
 license = "Apache-2.0"
 repository = "https://github.com/cool-japan/oxigaf"
 homepage = "https://github.com/cool-japan/oxigaf"
@@ -81,10 +81,17 @@ oxiarc-archive = "0.4.1"
 dirs = "6"
 crossterm = "0.29"
 
-# HuggingFace Hub Integration
-# default-features = false drops native-tls (C OpenSSL); only the sync ureq
-# API is used (oxigaf-cli/src/assets.rs).
-hf-hub = { version = "0.5", default-features = false, features = ["ureq"] }
+# HTTP downloads (oxigaf-cli/src/assets.rs) — Pure Rust TLS stack.
+# ureq's `rustls-no-provider` + `rustls-webpki-roots` features give rustls
+# without ring (C/asm) and compiled-in Mozilla roots (webpki-roots, pure
+# Rust); no gzip feature keeps flate2 out. The process-wide CryptoProvider
+# is installed at runtime from oxitls-rustcrypto-provider (COOLJAPAN fork of
+# rustls-rustcrypto: pure RustCrypto primitives, RUSTSEC-2026-0104 fixed).
+# rustls itself is a direct dep only for the CryptoProvider::install_default
+# call; default-features = false avoids its aws-lc-rs default provider.
+ureq = { version = "3.4", default-features = false, features = ["rustls-no-provider", "rustls-webpki-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "logging"] }
+oxitls-rustcrypto-provider = "0.3"
 
 # Cryptography
 sha2 = "0.11"

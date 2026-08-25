@@ -222,9 +222,91 @@ mod tests {
     #[test]
     fn test_set_timesteps() {
         let mut sched = DdimScheduler::new(1000, PredictionType::Epsilon);
-        sched.set_timesteps(50);
+        sched.set_timesteps(50).unwrap();
         assert_eq!(sched.timesteps().len(), 50);
         // Should be descending
         assert!(sched.timesteps()[0] > sched.timesteps()[49]);
+    }
+
+    /// Regression test: `set_timesteps(0)` used to panic with "attempt to
+    /// divide by zero" (`num_train_timesteps / num_inference_steps`).
+    #[test]
+    fn test_set_timesteps_zero_is_an_error_not_a_panic() {
+        let mut sched = DdimScheduler::new(1000, PredictionType::Epsilon);
+        let err = sched.set_timesteps(0).unwrap_err();
+        assert!(matches!(err, DiffusionError::InvalidConfig(_)));
+    }
+
+    /// Regression test: `num_inference_steps > num_train_timesteps` used to
+    /// silently truncate the integer division to `step = 0`, producing a
+    /// schedule of N identical zero timesteps instead of an error.
+    #[test]
+    fn test_set_timesteps_exceeding_train_steps_is_an_error() {
+        let mut sched = DdimScheduler::new(100, PredictionType::Epsilon);
+        let err = sched.set_timesteps(500).unwrap_err();
+        assert!(matches!(err, DiffusionError::InvalidConfig(_)));
+    }
+
+    /// Regression test: `DdimScheduler::new(1, ..)` used to produce NaN
+    /// alphas (the beta interpolation divided by `(1-1) as f64 == 0.0`).
+    #[test]
+    fn test_new_single_train_timestep_does_not_produce_nan() {
+        let sched = DdimScheduler::new(1, PredictionType::Epsilon);
+        assert!(
+            sched.alphas_cumprod[0].is_finite(),
+            "alphas_cumprod[0] must be finite for a 1-step training schedule, got {}",
+            sched.alphas_cumprod[0]
+        );
+    }
+
+    /// Regression test: `step()` used to index `alphas_cumprod[t]`
+    /// unchecked and panic for any `t >= num_train_timesteps`.
+    #[test]
+    fn test_step_out_of_range_timestep_is_an_error_not_a_panic() {
+        let mut sched = DdimScheduler::new(100, PredictionType::Epsilon);
+        sched.set_timesteps(10).unwrap();
+        let device = Device::Cpu;
+        let sample = Tensor::zeros((1, 4, 2, 2), DType::F32, &device).unwrap();
+        let model_output = sample.clone();
+        let err = sched.step(&model_output, 100, &sample).unwrap_err();
+        assert!(matches!(
+            err,
+            DiffusionError::InvalidTimestep {
+                value: 100,
+                max: 99
+            }
+        ));
+    }
+
+    /// Regression test: `step()` used to divide by
+    /// `self.timesteps.len() == 0` and panic when called before
+    /// `set_timesteps`.
+    #[test]
+    fn test_step_before_set_timesteps_is_an_error_not_a_panic() {
+        let sched = DdimScheduler::new(100, PredictionType::Epsilon);
+        let device = Device::Cpu;
+        let sample = Tensor::zeros((1, 4, 2, 2), DType::F32, &device).unwrap();
+        let model_output = sample.clone();
+        let err = sched.step(&model_output, 50, &sample).unwrap_err();
+        assert!(matches!(err, DiffusionError::SchedulerNotInitialized));
+    }
+
+    /// Regression test: `add_noise()` used to index
+    /// `alphas_cumprod[timestep]` unchecked and panic for any
+    /// `timestep >= num_train_timesteps`.
+    #[test]
+    fn test_add_noise_out_of_range_timestep_is_an_error_not_a_panic() {
+        let sched = DdimScheduler::new(100, PredictionType::Epsilon);
+        let device = Device::Cpu;
+        let original = Tensor::zeros((1, 4, 2, 2), DType::F32, &device).unwrap();
+        let noise = original.clone();
+        let err = sched.add_noise(&original, &noise, 100).unwrap_err();
+        assert!(matches!(
+            err,
+            DiffusionError::InvalidTimestep {
+                value: 100,
+                max: 99
+            }
+        ));
     }
 }

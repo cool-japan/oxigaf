@@ -117,7 +117,10 @@ pub struct LaplacianConfig {
     pub lambda: f32,
     /// Number of smoothing iterations. Default: 5
     pub iterations: usize,
-    /// Whether to fix boundary vertices (those with < 3 neighbors). Default: true
+    /// Whether to fix boundary vertices in place -- vertices touching an
+    /// edge shared by exactly one face, per the `boundary_mask` passed to
+    /// [`laplacian_smooth`] (see [`crate::mesh_ops::find_boundary_vertices`]).
+    /// Default: true
     pub preserve_boundary: bool,
 }
 
@@ -131,20 +134,57 @@ impl Default for LaplacianConfig {
     }
 }
 
+/// Validate that `adjacency` has exactly one entry per vertex and every
+/// neighbor index is in range, returning
+/// [`SmoothingError::VertexFaceMismatch`] otherwise.
+///
+/// `laplacian_smooth`, `taubin_smooth`, and `hc_laplacian_smooth` accept a
+/// caller-supplied `adjacency` independent of `vertices` (typically built
+/// once via [`build_adjacency`] and reused across calls), so a caller that
+/// mismatches the two -- easy, since `build_adjacency` takes a vertex
+/// *count* rather than the vertex slice -- would otherwise panic deep
+/// inside `neighbor_mean` instead of getting a typed error.
+fn validate_adjacency(vertices_len: usize, adjacency: &[Vec<usize>]) -> Result<(), SmoothingError> {
+    if adjacency.len() != vertices_len {
+        return Err(SmoothingError::VertexFaceMismatch {
+            got: vertices_len,
+            max_idx: adjacency.len(),
+        });
+    }
+    for neighbors in adjacency {
+        for &j in neighbors {
+            if j >= vertices_len {
+                return Err(SmoothingError::VertexFaceMismatch {
+                    got: vertices_len,
+                    max_idx: j,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Uniform Laplacian smoothing.
 ///
 /// Each iteration moves every vertex toward the average of its neighbors:
 /// `v[i] ← v[i] + λ * (mean(neighbors) − v[i])`
 ///
-/// With `preserve_boundary = true`, vertices with fewer than 3 neighbors are
-/// left unchanged (typical mesh-boundary vertices).
+/// With `preserve_boundary = true`, vertices marked in `boundary_mask` (see
+/// [`crate::mesh_ops::find_boundary_vertices`]) are left unchanged. A
+/// vertex's raw neighbor *count* is not a reliable boundary indicator: a
+/// genuine boundary vertex on a triangulated surface typically has 4-6
+/// neighbors, so a `< 3` valence test (the previous criterion) almost never
+/// fires, and the mesh boundary shrinks inward regardless of this flag.
 ///
 /// # Errors
 /// Returns [`SmoothingError::ZeroIterations`] if `config.iterations == 0`.
 /// Returns [`SmoothingError::InvalidLambda`] if `config.lambda` is outside `(0, 1)`.
+/// Returns [`SmoothingError::VertexFaceMismatch`] if `adjacency.len() !=
+/// vertices.len()` or any neighbor index in `adjacency` is out of range.
 pub fn laplacian_smooth(
     vertices: &[[f32; 3]],
     adjacency: &[Vec<usize>],
+    boundary_mask: &[bool],
     config: &LaplacianConfig,
 ) -> Result<Vec<[f32; 3]>, SmoothingError> {
     if config.iterations == 0 {
@@ -155,6 +195,7 @@ pub fn laplacian_smooth(
             lambda: config.lambda,
         });
     }
+    validate_adjacency(vertices.len(), adjacency)?;
 
     let mut current: Vec<[f32; 3]> = vertices.to_vec();
     let n = current.len();
@@ -163,7 +204,7 @@ pub fn laplacian_smooth(
         let mut next = current.clone();
         for i in 0..n {
             let neighbors = &adjacency[i];
-            if config.preserve_boundary && neighbors.len() < 3 {
+            if config.preserve_boundary && boundary_mask.get(i).copied().unwrap_or(false) {
                 continue;
             }
             if neighbors.is_empty() {
@@ -196,7 +237,10 @@ pub struct TaubinConfig {
     pub mu: f32,
     /// Number of (λ, μ) iteration pairs. Default: 5
     pub iterations: usize,
-    /// Fix boundary vertices. Default: true
+    /// Whether to fix boundary vertices in place -- vertices touching an
+    /// edge shared by exactly one face, per the `boundary_mask` passed to
+    /// [`taubin_smooth`] (see [`crate::mesh_ops::find_boundary_vertices`]).
+    /// Default: true
     pub preserve_boundary: bool,
 }
 
@@ -217,14 +261,21 @@ impl Default for TaubinConfig {
 /// reducing noise. Each full iteration consists of two Laplacian-like passes:
 /// one with `+λ` and one with `+μ` (where μ < 0).
 ///
+/// With `preserve_boundary = true`, vertices marked in `boundary_mask` (see
+/// [`crate::mesh_ops::find_boundary_vertices`]) are left unchanged; see
+/// [`laplacian_smooth`] for why raw neighbor count is not used for this.
+///
 /// # Errors
 /// Returns [`SmoothingError::ZeroIterations`] if `config.iterations == 0`.
 /// Returns [`SmoothingError::InvalidLambda`] if `config.lambda` is outside `(0, 1)`.
 /// Returns [`SmoothingError::InvalidMu`] if `config.mu >= 0`, `config.mu <= -1`, or
 /// `config.mu.abs() <= config.lambda`.
+/// Returns [`SmoothingError::VertexFaceMismatch`] if `adjacency.len() !=
+/// vertices.len()` or any neighbor index in `adjacency` is out of range.
 pub fn taubin_smooth(
     vertices: &[[f32; 3]],
     adjacency: &[Vec<usize>],
+    boundary_mask: &[bool],
     config: &TaubinConfig,
 ) -> Result<Vec<[f32; 3]>, SmoothingError> {
     if config.iterations == 0 {
@@ -238,15 +289,27 @@ pub fn taubin_smooth(
     if config.mu >= 0.0 || config.mu <= -1.0 || config.mu.abs() <= config.lambda {
         return Err(SmoothingError::InvalidMu { mu: config.mu });
     }
+    validate_adjacency(vertices.len(), adjacency)?;
 
     let mut current: Vec<[f32; 3]> = vertices.to_vec();
 
     for _ in 0..config.iterations {
         // λ step (shrink)
-        current =
-            apply_laplacian_step(&current, adjacency, config.lambda, config.preserve_boundary);
+        current = apply_laplacian_step(
+            &current,
+            adjacency,
+            boundary_mask,
+            config.lambda,
+            config.preserve_boundary,
+        );
         // μ step (inflate)
-        current = apply_laplacian_step(&current, adjacency, config.mu, config.preserve_boundary);
+        current = apply_laplacian_step(
+            &current,
+            adjacency,
+            boundary_mask,
+            config.mu,
+            config.preserve_boundary,
+        );
     }
 
     Ok(current)
@@ -289,6 +352,8 @@ impl Default for HcLaplacianConfig {
 /// # Errors
 /// Returns [`SmoothingError::ZeroIterations`] if `config.iterations == 0`.
 /// Returns [`SmoothingError::InvalidAlpha`] if `config.alpha` is outside `[0, 1]`.
+/// Returns [`SmoothingError::VertexFaceMismatch`] if `adjacency.len() !=
+/// vertices.len()` or any neighbor index in `adjacency` is out of range.
 pub fn hc_laplacian_smooth(
     vertices: &[[f32; 3]],
     adjacency: &[Vec<usize>],
@@ -300,6 +365,7 @@ pub fn hc_laplacian_smooth(
     if config.alpha < 0.0 || config.alpha > 1.0 {
         return Err(SmoothingError::InvalidAlpha(config.alpha));
     }
+    validate_adjacency(vertices.len(), adjacency)?;
 
     let mut current: Vec<[f32; 3]> = vertices.to_vec();
     let n = current.len();
@@ -488,18 +554,25 @@ pub fn cotan_laplacian_smooth(
 ///
 /// `V = (1/6) * |Σ_{face} dot(v0, cross(v1 - v0, v2 - v0))|`
 ///
-/// Returns 0.0 for empty meshes.
+/// Returns 0.0 for empty meshes. A face referencing a vertex index
+/// `>= vertices.len()` contributes nothing to the sum (its enclosed-volume
+/// contribution is undefined) rather than indexing out of bounds.
 #[must_use]
 pub fn compute_mesh_volume(vertices: &[[f32; 3]], faces: &[[u32; 3]]) -> f32 {
     if vertices.is_empty() || faces.is_empty() {
         return 0.0;
     }
+    let n = vertices.len();
 
     let mut signed_vol = 0.0f32;
     for face in faces {
-        let v0 = vertices[face[0] as usize];
-        let v1 = vertices[face[1] as usize];
-        let v2 = vertices[face[2] as usize];
+        let (i0, i1, i2) = (face[0] as usize, face[1] as usize, face[2] as usize);
+        if i0 >= n || i1 >= n || i2 >= n {
+            continue;
+        }
+        let v0 = vertices[i0];
+        let v1 = vertices[i1];
+        let v2 = vertices[i2];
 
         // Edge vectors from v0
         let e1 = [v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]];
@@ -633,10 +706,16 @@ pub fn compute_smoothing_stats(
     // Check if any boundary vertex (< 3 adjacency edges in at least one face's context)
     // was moved. We approximate this from displacement being > 0 for low-valence vertices.
     // Build a simple valence count to detect potential boundary vertices.
+    // A vertex index `>= original.len()` (a malformed face) is skipped
+    // rather than indexed out of bounds.
     let mut valence = vec![0usize; original.len()];
     for face in faces {
         for &idx in face {
-            valence[idx as usize] += 1;
+            let i = idx as usize;
+            if i >= valence.len() {
+                continue;
+            }
+            valence[i] += 1;
         }
     }
 
@@ -674,11 +753,14 @@ fn neighbor_mean(vertices: &[[f32; 3]], neighbors: &[usize]) -> [f32; 3] {
     [sum[0] / n, sum[1] / n, sum[2] / n]
 }
 
-/// Apply a single Laplacian step with step size `step` (may be negative for Taubin).
+/// Apply a single Laplacian step with step size `step` (may be negative for
+/// Taubin). `adjacency` is assumed already validated by the caller
+/// (`taubin_smooth`); this is only ever invoked from there.
 #[inline]
 fn apply_laplacian_step(
     vertices: &[[f32; 3]],
     adjacency: &[Vec<usize>],
+    boundary_mask: &[bool],
     step: f32,
     preserve_boundary: bool,
 ) -> Vec<[f32; 3]> {
@@ -686,7 +768,7 @@ fn apply_laplacian_step(
     let mut next = vertices.to_vec();
     for i in 0..n {
         let neighbors = &adjacency[i];
-        if preserve_boundary && neighbors.len() < 3 {
+        if preserve_boundary && boundary_mask.get(i).copied().unwrap_or(false) {
             continue;
         }
         if neighbors.is_empty() {
@@ -835,7 +917,9 @@ mod tests {
     fn test_laplacian_same_length() {
         let (v, f) = cube_mesh();
         let adj = build_adjacency(v.len(), &f).expect("adj");
-        let result = laplacian_smooth(&v, &adj, &LaplacianConfig::default()).expect("smooth");
+        let boundary_mask = crate::mesh_ops::find_boundary_vertices(v.len(), &f);
+        let result = laplacian_smooth(&v, &adj, &boundary_mask, &LaplacianConfig::default())
+            .expect("smooth");
         assert_eq!(result.len(), v.len());
     }
 
@@ -846,11 +930,12 @@ mod tests {
     fn test_laplacian_zero_iterations_error() {
         let (v, f) = cube_mesh();
         let adj = build_adjacency(v.len(), &f).expect("adj");
+        let boundary_mask = crate::mesh_ops::find_boundary_vertices(v.len(), &f);
         let config = LaplacianConfig {
             iterations: 0,
             ..Default::default()
         };
-        let result = laplacian_smooth(&v, &adj, &config);
+        let result = laplacian_smooth(&v, &adj, &boundary_mask, &config);
         assert!(matches!(result, Err(SmoothingError::ZeroIterations)));
     }
 
@@ -879,12 +964,13 @@ mod tests {
         ];
         let f: Vec<[u32; 3]> = vec![[0, 4, 2], [4, 1, 2], [0, 3, 4], [4, 3, 1]];
         let adj = build_adjacency(v.len(), &f).expect("adj");
+        let boundary_mask = crate::mesh_ops::find_boundary_vertices(v.len(), &f);
         let config = LaplacianConfig {
             lambda: 0.5,
             iterations: 5,
             preserve_boundary: false,
         };
-        let result = laplacian_smooth(&v, &adj, &config).expect("smooth");
+        let result = laplacian_smooth(&v, &adj, &boundary_mask, &config).expect("smooth");
         // Interior vertex 4 should not move (already at centroid of its 4 neighbors)
         let eps = 1e-5;
         assert!(
@@ -934,12 +1020,13 @@ mod tests {
 
         let residual_before = laplacian_residual(&v_noisy, &adj);
 
+        let boundary_mask = crate::mesh_ops::find_boundary_vertices(v_noisy.len(), &f);
         let config = LaplacianConfig {
             lambda: 0.5,
             iterations: 3,
             preserve_boundary: false,
         };
-        let smoothed = laplacian_smooth(&v_noisy, &adj, &config).expect("smooth");
+        let smoothed = laplacian_smooth(&v_noisy, &adj, &boundary_mask, &config).expect("smooth");
 
         let residual_after = laplacian_residual(&smoothed, &adj);
 
@@ -957,7 +1044,9 @@ mod tests {
     fn test_taubin_same_length() {
         let (v, f) = cube_mesh();
         let adj = build_adjacency(v.len(), &f).expect("adj");
-        let result = taubin_smooth(&v, &adj, &TaubinConfig::default()).expect("smooth");
+        let boundary_mask = crate::mesh_ops::find_boundary_vertices(v.len(), &f);
+        let result =
+            taubin_smooth(&v, &adj, &boundary_mask, &TaubinConfig::default()).expect("smooth");
         assert_eq!(result.len(), v.len());
     }
 
@@ -968,13 +1057,15 @@ mod tests {
     fn test_taubin_better_volume_preservation_than_laplacian() {
         let (v, f) = cube_mesh();
         let adj = build_adjacency(v.len(), &f).expect("adj");
+        let boundary_mask = crate::mesh_ops::find_boundary_vertices(v.len(), &f);
 
         let lap_config = LaplacianConfig {
             lambda: 0.5,
             iterations: 5,
             preserve_boundary: false,
         };
-        let lap_result = laplacian_smooth(&v, &adj, &lap_config).expect("laplacian");
+        let lap_result =
+            laplacian_smooth(&v, &adj, &boundary_mask, &lap_config).expect("laplacian");
 
         let tau_config = TaubinConfig {
             lambda: 0.5,
@@ -982,7 +1073,7 @@ mod tests {
             iterations: 5,
             preserve_boundary: false,
         };
-        let tau_result = taubin_smooth(&v, &adj, &tau_config).expect("taubin");
+        let tau_result = taubin_smooth(&v, &adj, &boundary_mask, &tau_config).expect("taubin");
 
         let v_orig = compute_mesh_volume(&v, &f);
         let v_lap = compute_mesh_volume(&lap_result, &f);
@@ -1004,11 +1095,12 @@ mod tests {
     fn test_taubin_invalid_lambda() {
         let (v, f) = cube_mesh();
         let adj = build_adjacency(v.len(), &f).expect("adj");
+        let boundary_mask = crate::mesh_ops::find_boundary_vertices(v.len(), &f);
         let config = TaubinConfig {
             lambda: 1.5,
             ..Default::default()
         };
-        let result = taubin_smooth(&v, &adj, &config);
+        let result = taubin_smooth(&v, &adj, &boundary_mask, &config);
         assert!(matches!(result, Err(SmoothingError::InvalidLambda { .. })));
     }
 
@@ -1019,13 +1111,14 @@ mod tests {
     fn test_taubin_invalid_mu() {
         let (v, f) = cube_mesh();
         let adj = build_adjacency(v.len(), &f).expect("adj");
+        let boundary_mask = crate::mesh_ops::find_boundary_vertices(v.len(), &f);
         // mu positive → invalid
         let config = TaubinConfig {
             lambda: 0.5,
             mu: 0.3,
             ..Default::default()
         };
-        let result = taubin_smooth(&v, &adj, &config);
+        let result = taubin_smooth(&v, &adj, &boundary_mask, &config);
         assert!(matches!(result, Err(SmoothingError::InvalidMu { .. })));
     }
 
@@ -1047,13 +1140,15 @@ mod tests {
     fn test_hc_laplacian_preserves_more_volume() {
         let (v_noisy, f) = noisy_cube();
         let adj = build_adjacency(v_noisy.len(), &f).expect("adj");
+        let boundary_mask = crate::mesh_ops::find_boundary_vertices(v_noisy.len(), &f);
 
         let lap_config = LaplacianConfig {
             lambda: 0.5,
             iterations: 5,
             preserve_boundary: false,
         };
-        let lap_result = laplacian_smooth(&v_noisy, &adj, &lap_config).expect("laplacian");
+        let lap_result =
+            laplacian_smooth(&v_noisy, &adj, &boundary_mask, &lap_config).expect("laplacian");
 
         // HC-Laplacian with beta > 0 blends back toward original → better volume preservation
         let hc_config = HcLaplacianConfig {
@@ -1182,7 +1277,9 @@ mod tests {
     fn test_smoothing_stats_non_negative_displacement() {
         let (v, f) = cube_mesh();
         let adj = build_adjacency(v.len(), &f).expect("adj");
-        let smoothed = laplacian_smooth(&v, &adj, &LaplacianConfig::default()).expect("smooth");
+        let boundary_mask = crate::mesh_ops::find_boundary_vertices(v.len(), &f);
+        let smoothed = laplacian_smooth(&v, &adj, &boundary_mask, &LaplacianConfig::default())
+            .expect("smooth");
         let stats = compute_smoothing_stats(&v, &smoothed, &f);
         assert!(
             stats.mean_displacement >= 0.0,
@@ -1229,11 +1326,13 @@ mod tests {
         let (v_noisy, f) = noisy_cube();
         let (v_clean, _) = cube_mesh();
         let adj = build_adjacency(v_noisy.len(), &f).expect("adj");
+        let boundary_mask = crate::mesh_ops::find_boundary_vertices(v_noisy.len(), &f);
 
         // Laplacian with 10 iterations
         let lap = laplacian_smooth(
             &v_noisy,
             &adj,
+            &boundary_mask,
             &LaplacianConfig {
                 lambda: 0.5,
                 iterations: 10,
@@ -1246,6 +1345,7 @@ mod tests {
         let tau = taubin_smooth(
             &v_noisy,
             &adj,
+            &boundary_mask,
             &TaubinConfig {
                 lambda: 0.5,
                 mu: -0.53,
@@ -1275,5 +1375,152 @@ mod tests {
             error_lap.is_finite(),
             "Taubin result has non-finite coordinates"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // preserve_boundary: real boundary-edge detection, not neighbor count
+    // (regression for the valence<3 heuristic that never matched real
+    // boundary vertices).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_laplacian_smooth_preserve_boundary_uses_real_boundary_edges() {
+        // A 3x3 grid (2x2 quads, 8 triangles), fully open (no closing
+        // faces). The center vertex (index 4) is the only interior vertex;
+        // every other vertex is on the boundary. Critically, the
+        // non-corner edge-midpoint vertices (1, 3, 5, 7) have valence 4
+        // (touched by 3 triangles each), so the old `< 3` valence
+        // heuristic would never have marked them as boundary and
+        // `preserve_boundary` would have silently done nothing for them.
+        let mut v: Vec<[f32; 3]> = Vec::new();
+        for j in 0..3u32 {
+            for i in 0..3u32 {
+                v.push([i as f32, j as f32, 0.0]);
+            }
+        }
+        let idx = |i: u32, j: u32| j * 3 + i;
+        let mut f: Vec<[u32; 3]> = Vec::new();
+        for j in 0..2u32 {
+            for i in 0..2u32 {
+                let tl = idx(i, j);
+                let tr = idx(i + 1, j);
+                let bl = idx(i, j + 1);
+                let br = idx(i + 1, j + 1);
+                f.push([tl, tr, bl]);
+                f.push([tr, br, bl]);
+            }
+        }
+        let adj = build_adjacency(v.len(), &f).expect("adj");
+        let boundary_mask = crate::mesh_ops::find_boundary_vertices(v.len(), &f);
+
+        assert!(!boundary_mask[4], "center vertex must not be boundary");
+        assert_eq!(
+            boundary_mask.iter().filter(|&&b| b).count(),
+            8,
+            "all 8 non-center vertices should be boundary vertices"
+        );
+        // Sanity: vertex 1 (a non-corner edge midpoint) has valence >= 3,
+        // so the old `neighbors.len() < 3` criterion would have missed it.
+        assert!(adj[1].len() >= 3);
+
+        let config = LaplacianConfig {
+            lambda: 0.5,
+            iterations: 5,
+            preserve_boundary: true,
+        };
+        let smoothed = laplacian_smooth(&v, &adj, &boundary_mask, &config).expect("smooth");
+
+        for i in 0..v.len() {
+            if boundary_mask[i] {
+                assert!(
+                    (smoothed[i][0] - v[i][0]).abs() < 1e-6
+                        && (smoothed[i][1] - v[i][1]).abs() < 1e-6,
+                    "boundary vertex {i} moved despite preserve_boundary=true: {:?} -> {:?}",
+                    v[i],
+                    smoothed[i]
+                );
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // adjacency/vertices mismatch validation (regression for panics inside
+    // neighbor_mean when a caller-supplied adjacency doesn't match).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_laplacian_smooth_rejects_mismatched_adjacency_length() {
+        let (v, f) = cube_mesh();
+        let adj = build_adjacency(v.len(), &f).expect("adj");
+        let short_adj = &adj[..adj.len() - 1];
+        let boundary_mask = vec![false; v.len()];
+        let result = laplacian_smooth(&v, short_adj, &boundary_mask, &LaplacianConfig::default());
+        assert!(matches!(
+            result,
+            Err(SmoothingError::VertexFaceMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn test_laplacian_smooth_rejects_out_of_range_neighbor_index() {
+        let (v, _) = cube_mesh();
+        let mut adj: Vec<Vec<usize>> = vec![Vec::new(); v.len()];
+        adj[0] = vec![999]; // neighbor index far out of range
+        let boundary_mask = vec![false; v.len()];
+        let result = laplacian_smooth(&v, &adj, &boundary_mask, &LaplacianConfig::default());
+        assert!(matches!(
+            result,
+            Err(SmoothingError::VertexFaceMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn test_taubin_smooth_rejects_mismatched_adjacency_length() {
+        let (v, f) = cube_mesh();
+        let adj = build_adjacency(v.len(), &f).expect("adj");
+        let short_adj = &adj[..adj.len() - 1];
+        let boundary_mask = vec![false; v.len()];
+        let result = taubin_smooth(&v, short_adj, &boundary_mask, &TaubinConfig::default());
+        assert!(matches!(
+            result,
+            Err(SmoothingError::VertexFaceMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn test_hc_laplacian_smooth_rejects_mismatched_adjacency_length() {
+        let (v, f) = cube_mesh();
+        let adj = build_adjacency(v.len(), &f).expect("adj");
+        let short_adj = &adj[..adj.len() - 1];
+        let result = hc_laplacian_smooth(&v, short_adj, &HcLaplacianConfig::default());
+        assert!(matches!(
+            result,
+            Err(SmoothingError::VertexFaceMismatch { .. })
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // compute_mesh_volume / compute_smoothing_stats: out-of-range faces
+    // don't panic.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compute_mesh_volume_out_of_range_face_does_not_panic() {
+        let v = vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+        let f: Vec<[u32; 3]> = vec![[0, 1, 99]];
+        let vol = compute_mesh_volume(&v, &f);
+        assert_eq!(
+            vol, 0.0,
+            "out-of-range face should contribute zero volume, not panic"
+        );
+    }
+
+    #[test]
+    fn test_compute_smoothing_stats_out_of_range_face_does_not_panic() {
+        let (v, _) = cube_mesh();
+        let bad_faces: Vec<[u32; 3]> = vec![[0, 1, 99]];
+        let stats = compute_smoothing_stats(&v, &v, &bad_faces);
+        assert!(stats.mean_displacement.is_finite());
+        assert!(stats.max_displacement.is_finite());
     }
 }

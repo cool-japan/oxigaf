@@ -8,6 +8,57 @@ use ndarray_npy::read_npy;
 use crate::error::FlameError;
 use crate::model::FlameModel;
 
+// ---------------------------------------------------------------------------
+// The `.npy` file set read by `load_flame_model`
+// ---------------------------------------------------------------------------
+//
+// Every name below is used *twice*: once as an element of
+// [`REQUIRED_NPY_FILES`], and once as the argument of the matching `load_npy`
+// call inside [`load_flame_model`]. Sharing one constant between the two is
+// what makes it impossible for a caller-facing "which files do I need?" list
+// (e.g. `oxigaf::verify_assets`) to drift away from the names the loader
+// actually opens — a drift this crate has already shipped once.
+
+/// File name of the rest-pose vertex array, shape `[n_verts, 3]`, `float32`.
+const V_TEMPLATE_NPY: &str = "v_template.npy";
+/// File name of the triangle index array, shape `[n_faces, 3]`, `int32`.
+const FACES_NPY: &str = "faces.npy";
+/// File name of the shape blend-shape basis, shape `[n_verts, 3, K]`, `float32`.
+const SHAPEDIRS_NPY: &str = "shapedirs.npy";
+/// File name of the expression blend-shape basis, shape `[n_verts, 3, K]`, `float32`.
+const EXPRESSIONDIRS_NPY: &str = "expressiondirs.npy";
+/// File name of the pose-corrective basis, shape `[n_verts, 3, (J-1)*9]`, `float32`.
+const POSEDIRS_NPY: &str = "posedirs.npy";
+/// File name of the joint regressor, shape `[n_joints, n_verts]`, `float32`.
+const J_REGRESSOR_NPY: &str = "j_regressor.npy";
+/// File name of the kinematic tree table, shape `[2, n_joints]`, `int32`.
+const KINTREE_TABLE_NPY: &str = "kintree_table.npy";
+/// File name of the linear-blend-skinning weights, shape `[n_verts, n_joints]`, `float32`.
+const LBS_WEIGHTS_NPY: &str = "lbs_weights.npy";
+
+/// The exact set of `.npy` file names [`load_flame_model`] opens, in the order
+/// it opens them.
+///
+/// This is the single source of truth for "what does a FLAME model directory
+/// have to contain?". Tools that pre-flight an asset directory — such as
+/// `oxigaf::verify_assets` — must iterate this constant rather than repeating
+/// the names, so that adding or renaming a loader input can never leave a
+/// second, stale copy of the list behind.
+///
+/// Names are spelled exactly as they must appear on disk (`scripts/convert_flame.py`
+/// writes them), so a directory that satisfies a check against this list also
+/// loads on case-sensitive filesystems.
+pub const REQUIRED_NPY_FILES: &[&str] = &[
+    V_TEMPLATE_NPY,
+    FACES_NPY,
+    SHAPEDIRS_NPY,
+    EXPRESSIONDIRS_NPY,
+    POSEDIRS_NPY,
+    J_REGRESSOR_NPY,
+    KINTREE_TABLE_NPY,
+    LBS_WEIGHTS_NPY,
+];
+
 /// Load a [`FlameModel`] from a directory of `.npy` files.
 ///
 /// Expected files (produced by `scripts/convert_flame.py`):
@@ -22,6 +73,10 @@ use crate::model::FlameModel;
 /// | `j_regressor.npy`   | `[5, 5023]`        | float32 |
 /// | `kintree_table.npy` | `[2, 5]`           | int32   |
 /// | `lbs_weights.npy`   | `[5023, 5]`        | float32 |
+///
+/// The file names are also available programmatically as
+/// [`REQUIRED_NPY_FILES`]; pre-flight checks should iterate that constant
+/// instead of repeating the list.
 ///
 /// # Errors
 ///
@@ -41,14 +96,14 @@ pub fn load_flame_model(dir: &Path) -> Result<FlameModel, FlameError> {
         )));
     }
 
-    let v_template: Array2<f32> = load_npy(dir, "v_template")?;
-    let faces_i32: Array2<i32> = load_npy(dir, "faces")?;
-    let shapedirs: Array3<f32> = load_npy(dir, "shapedirs")?;
-    let expressiondirs: Array3<f32> = load_npy(dir, "expressiondirs")?;
-    let posedirs: Array3<f32> = load_npy(dir, "posedirs")?;
-    let j_regressor: Array2<f32> = load_npy(dir, "j_regressor")?;
-    let kintree_i32: Array2<i32> = load_npy(dir, "kintree_table")?;
-    let lbs_weights: Array2<f32> = load_npy(dir, "lbs_weights")?;
+    let v_template: Array2<f32> = load_npy(dir, V_TEMPLATE_NPY)?;
+    let faces_i32: Array2<i32> = load_npy(dir, FACES_NPY)?;
+    let shapedirs: Array3<f32> = load_npy(dir, SHAPEDIRS_NPY)?;
+    let expressiondirs: Array3<f32> = load_npy(dir, EXPRESSIONDIRS_NPY)?;
+    let posedirs: Array3<f32> = load_npy(dir, POSEDIRS_NPY)?;
+    let j_regressor: Array2<f32> = load_npy(dir, J_REGRESSOR_NPY)?;
+    let kintree_i32: Array2<i32> = load_npy(dir, KINTREE_TABLE_NPY)?;
+    let lbs_weights: Array2<f32> = load_npy(dir, LBS_WEIGHTS_NPY)?;
 
     // --- Validate shapes that don't depend on downstream conversions ---
     let n_verts = v_template.nrows();
@@ -108,12 +163,19 @@ pub fn load_flame_model(dir: &Path) -> Result<FlameModel, FlameError> {
 // ---------------------------------------------------------------------------
 
 /// Load a single `.npy` file from a directory.
-fn load_npy<A, D>(dir: &Path, name: &str) -> Result<ndarray::Array<A, D>, FlameError>
+///
+/// `file_name` is the on-disk name including the `.npy` extension — always one
+/// of the [`REQUIRED_NPY_FILES`] constants, so the loader and that list cannot
+/// disagree about what is opened. The reported error carries the *stem*
+/// (`"lbs_weights"` rather than `"lbs_weights.npy"`), which is the array name
+/// callers match on.
+fn load_npy<A, D>(dir: &Path, file_name: &str) -> Result<ndarray::Array<A, D>, FlameError>
 where
     A: ndarray_npy::ReadableElement,
     D: ndarray::Dimension,
 {
-    let path = dir.join(format!("{name}.npy"));
+    let path = dir.join(file_name);
+    let name = file_name.strip_suffix(".npy").unwrap_or(file_name);
     read_npy(&path).map_err(|source| FlameError::NpyLoad {
         name: name.to_string(),
         source,
@@ -191,7 +253,11 @@ fn validate_parents(parents: &[i32]) -> Result<(), FlameError> {
         )));
     }
     for (j, &p) in parents.iter().enumerate().skip(1) {
-        let j_i32 = j as i32;
+        let j_i32 = i32::try_from(j).map_err(|_| {
+            FlameError::InvalidParams(format!(
+                "parents has too many entries ({j}) to validate as ancestor indices"
+            ))
+        })?;
         if p < 0 || p >= j_i32 {
             return Err(FlameError::InvalidParams(format!(
                 "parents[{j}] = {p} is not a valid ancestor; expected 0 <= parents[{j}] < {j}"
@@ -231,6 +297,153 @@ fn convert_faces(faces_i32: &Array2<i32>, n_verts: usize) -> Result<Vec<[u32; 3]
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use ndarray_npy::write_npy;
+    use std::path::PathBuf;
+
+    /// Create a fresh, empty temporary directory dedicated to one test.
+    fn temp_subdir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("oxigaf_flame_io_{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("test: temp dir creation should succeed");
+        dir
+    }
+
+    /// Write a minimal but fully valid FLAME model directory, using exactly the
+    /// [`REQUIRED_NPY_FILES`] names.
+    ///
+    /// 4 vertices, 2 joints, a 2-component shape/expression basis. The loader
+    /// fixes `posedirs`'s trailing dimension at `(n_joints - 1) * 9`.
+    fn write_minimal_npy_model(dir: &Path) {
+        const N: usize = 4;
+        const J: usize = 2;
+        const K: usize = 2;
+
+        let v_template = Array2::<f32>::from_shape_vec(
+            (N, 3),
+            vec![
+                0.0, 0.0, 0.0, //
+                1.0, 0.0, 0.0, //
+                0.0, 1.0, 0.0, //
+                0.0, 0.0, 1.0,
+            ],
+        )
+        .expect("test: (4, 3) shape for a 12-element vec");
+        let faces = Array2::<i32>::from_shape_vec((2, 3), vec![0, 1, 2, 1, 3, 2])
+            .expect("test: (2, 3) shape for a 6-element vec");
+        let shapedirs = Array3::<f32>::zeros((N, 3, K));
+        let expressiondirs = Array3::<f32>::zeros((N, 3, K));
+        let posedirs = Array3::<f32>::zeros((N, 3, (J - 1) * 9));
+        let j_regressor = Array2::<f32>::from_elem((J, N), 0.25);
+        // Row 0 holds parent indices: root marker, then joint 1 → joint 0.
+        let kintree_table = Array2::<i32>::from_shape_vec((2, J), vec![-1, 0, 0, 1])
+            .expect("test: (2, 2) shape for a 4-element vec");
+        let lbs_weights = Array2::<f32>::from_elem((N, J), 0.5);
+
+        write_npy(dir.join(V_TEMPLATE_NPY), &v_template).expect("test: write v_template.npy");
+        write_npy(dir.join(FACES_NPY), &faces).expect("test: write faces.npy");
+        write_npy(dir.join(SHAPEDIRS_NPY), &shapedirs).expect("test: write shapedirs.npy");
+        write_npy(dir.join(EXPRESSIONDIRS_NPY), &expressiondirs)
+            .expect("test: write expressiondirs.npy");
+        write_npy(dir.join(POSEDIRS_NPY), &posedirs).expect("test: write posedirs.npy");
+        write_npy(dir.join(J_REGRESSOR_NPY), &j_regressor).expect("test: write j_regressor.npy");
+        write_npy(dir.join(KINTREE_TABLE_NPY), &kintree_table)
+            .expect("test: write kintree_table.npy");
+        write_npy(dir.join(LBS_WEIGHTS_NPY), &lbs_weights).expect("test: write lbs_weights.npy");
+    }
+
+    // -----------------------------------------------------------------------
+    // REQUIRED_NPY_FILES — the shared list consumed by `oxigaf::verify_assets`
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn required_npy_files_is_a_well_formed_name_set() {
+        assert!(
+            !REQUIRED_NPY_FILES.is_empty(),
+            "the loader reads at least one file"
+        );
+        for name in REQUIRED_NPY_FILES {
+            // The names must be spelled exactly as they appear on disk —
+            // lower-case extension included, since a check against this list
+            // has to hold on case-sensitive filesystems.
+            assert!(
+                std::path::Path::new(name)
+                    .extension()
+                    .is_some_and(|ext| ext == "npy"),
+                "{name} must be spelled as an on-disk .npy file name"
+            );
+            assert_eq!(
+                REQUIRED_NPY_FILES.iter().filter(|n| *n == name).count(),
+                1,
+                "{name} is listed more than once"
+            );
+        }
+    }
+
+    #[test]
+    fn a_directory_of_exactly_required_npy_files_loads() {
+        // Upper bound on the list: the loader needs nothing that
+        // `REQUIRED_NPY_FILES` omits, so a directory built from that constant
+        // alone must load. This is what makes a pre-flight check against the
+        // constant meaningful rather than merely necessary.
+        let dir = temp_subdir("required_set_loads");
+        write_minimal_npy_model(&dir);
+
+        let entries: Vec<String> = std::fs::read_dir(&dir)
+            .expect("test: temp dir should be readable")
+            .filter_map(std::result::Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            entries.len(),
+            REQUIRED_NPY_FILES.len(),
+            "the fixture must write exactly the required set, got {entries:?}"
+        );
+
+        let model = load_flame_model(&dir).expect("test: a complete directory must load");
+        assert_eq!(model.n_joints, 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn every_required_npy_file_is_actually_opened_by_the_loader() {
+        // Lower bound on the list: removing any single entry must make the
+        // load fail *naming that entry*. A stale name that the loader no
+        // longer opens would survive its own removal and fail this test —
+        // which is exactly the drift `oxigaf::verify_assets` used to ship.
+        for (index, missing) in REQUIRED_NPY_FILES.iter().enumerate() {
+            let dir = temp_subdir(&format!("drop_one_{index}"));
+            write_minimal_npy_model(&dir);
+            std::fs::remove_file(dir.join(missing)).expect("test: fixture file should exist");
+
+            let stem = missing.strip_suffix(".npy").unwrap_or(missing);
+            let err = load_flame_model(&dir)
+                .err()
+                .unwrap_or_else(|| panic!("test: removing {missing} must make the load fail"));
+            assert!(
+                matches!(&err, FlameError::NpyLoad { name, .. } if name == stem),
+                "removing {missing} must be reported as a missing {stem} array, got: {err}"
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn load_npy_reports_the_array_stem_not_the_file_name() {
+        // `conversion.rs` (and any caller matching on `FlameError::NpyLoad`)
+        // relies on the reported `name` being the array stem, even though the
+        // loader now passes the full file name in.
+        let dir = temp_subdir("npy_error_stem");
+        let err = load_npy::<f32, ndarray::Ix2>(&dir, LBS_WEIGHTS_NPY)
+            .expect_err("test: an absent file must fail to load");
+        assert!(
+            matches!(&err, FlameError::NpyLoad { name, .. } if name == "lbs_weights"),
+            "got: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn validate_parents_accepts_well_formed_chain() {

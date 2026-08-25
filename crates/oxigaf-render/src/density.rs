@@ -135,15 +135,32 @@ impl GradientAccumulator {
     ///
     /// `grad_norms` must have the same length as the current Gaussian count.
     /// If the lengths differ the accumulation is skipped (safe no-op).
+    ///
+    /// A Gaussian that was not visible in this frame (had no rasterized
+    /// footprint) contributes nothing to the loss and therefore has an
+    /// exactly-zero screen-space position gradient *norm* (norms are
+    /// non-negative by construction). `observation_count` is only
+    /// incremented when `grad_norms[i] > 0.0`, so [`Self::average_grad_norm`]
+    /// divides by the number of iterations the Gaussian was actually visible
+    /// in rather than by the total number of `accumulate` calls - matching
+    /// the struct-level documentation above and the reference 3DGS `denom`
+    /// behaviour. This is a cheap proxy for an explicit visibility mask: it
+    /// only under-counts a genuinely-visible Gaussian in the (exceedingly
+    /// rare) case its gradient happens to land on exactly `0.0`.
     pub fn accumulate(&mut self, grad_norms: &[f32]) {
         if grad_norms.len() != self.position_grad_norm.len() {
             return;
         }
-        for (acc, &g) in self.position_grad_norm.iter_mut().zip(grad_norms.iter()) {
+        for ((acc, cnt), &g) in self
+            .position_grad_norm
+            .iter_mut()
+            .zip(self.observation_count.iter_mut())
+            .zip(grad_norms.iter())
+        {
             *acc += g;
-        }
-        for cnt in self.observation_count.iter_mut() {
-            *cnt += 1;
+            if g > 0.0_f32 {
+                *cnt += 1;
+            }
         }
     }
 
@@ -196,16 +213,23 @@ fn sh_total_for_degree(sh_degree: u32) -> usize {
 }
 
 /// Build an empty [`GaussianModel`] with the same metadata (sh_degree) as a
-/// reference model but zero Gaussians.
-fn empty_model_like(reference: &GaussianModel) -> GaussianModel {
+/// reference model, pre-sized to hold `cap` Gaussians.
+///
+/// Pre-sizing avoids the repeated reallocate-and-copy cycles that a bare
+/// `Vec::new()` followed by a long burst of `push`/`extend_from_slice` calls
+/// would otherwise incur - significant for large models, since `sh_coeffs`
+/// alone is `cap * sh_total_for_degree(sh_degree)` floats (e.g. ~200 MB for
+/// 1M degree-3 Gaussians).
+fn model_with_capacity(reference: &GaussianModel, cap: usize) -> GaussianModel {
+    let sh_c = sh_total_for_degree(reference.sh_degree);
     GaussianModel {
-        gaussians: Vec::new(),
-        sh_coeffs: Vec::new(),
+        gaussians: Vec::with_capacity(cap),
+        sh_coeffs: Vec::with_capacity(cap.saturating_mul(sh_c)),
         sh_degree: reference.sh_degree,
-        face_indices: Vec::new(),
-        barycentric: Vec::new(),
-        local_offsets: Vec::new(),
-        is_rigid: Vec::new(),
+        face_indices: Vec::with_capacity(cap),
+        barycentric: Vec::with_capacity(cap),
+        local_offsets: Vec::with_capacity(cap),
+        is_rigid: Vec::with_capacity(cap),
     }
 }
 
@@ -244,6 +268,72 @@ fn append_gaussian(
     dst.barycentric.push(bary);
     dst.local_offsets.push(off);
     dst.is_rigid.push(rig);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Gaussian transform helpers (clone / split)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Factored out so that `clone_gaussians_with_sources`, `split_gaussians_with_sources`
+// and the fused single-pass path in `DensityController::densify_and_prune` all
+// compute clone offsets / split children the exact same way - a single
+// source of truth instead of three copies of the same arithmetic that could
+// silently drift apart.
+
+/// Log-space scale multiplier applied to both children of a split:
+/// `ln(1/φ)` where `φ ≈ 1.618` is the golden ratio (so each child's linear
+/// scale is ≈0.618× the parent's).
+#[inline]
+fn split_scale_factor_log() -> f32 {
+    (1.0_f32 / 1.618_034_f32).ln() // ≈ -0.4812
+}
+
+/// Build the offset clone of a small, high-gradient Gaussian: identical
+/// attributes except the position is nudged by `scale[dominant] * 0.01`
+/// along the dominant scale axis.
+fn make_clone_attrs(g: GaussianAttributes) -> GaussianAttributes {
+    let dominant = argmax3(g.scale);
+    let offset_mag = g.scale[dominant].exp() * 0.01_f32;
+    let mut clone_pos = g.position;
+    clone_pos[dominant] += offset_mag;
+    GaussianAttributes {
+        position: clone_pos,
+        ..g
+    }
+}
+
+/// Build the two children of a large, high-gradient Gaussian being split:
+/// scale reduced by [`split_scale_factor_log`] in log-space on both, and
+/// positions offset by ±`exp(scale[dominant])` along the dominant axis.
+fn make_split_children(g: GaussianAttributes) -> (GaussianAttributes, GaussianAttributes) {
+    let dominant = argmax3(g.scale);
+    let offset_mag = g.scale[dominant].exp(); // world-space magnitude
+    let scale_factor_log = split_scale_factor_log();
+    let child_scale = [
+        g.scale[0] + scale_factor_log,
+        g.scale[1] + scale_factor_log,
+        g.scale[2] + scale_factor_log,
+    ];
+
+    // Child A: position + offset along dominant axis.
+    let mut pos_a = g.position;
+    pos_a[dominant] += offset_mag;
+    let child_a = GaussianAttributes {
+        position: pos_a,
+        scale: child_scale,
+        ..g
+    };
+
+    // Child B: position - offset along dominant axis.
+    let mut pos_b = g.position;
+    pos_b[dominant] -= offset_mag;
+    let child_b = GaussianAttributes {
+        position: pos_b,
+        scale: child_scale,
+        ..g
+    };
+
+    (child_a, child_b)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -287,14 +377,29 @@ impl DensityController {
     /// Returns the new (original + clones) model and an updated accumulator
     /// sized to the new model.
     pub fn clone_gaussians(&self, model: &GaussianModel) -> (GaussianModel, GradientAccumulator) {
+        let (new_model, new_acc, _sources) = self.clone_gaussians_with_sources(model);
+        (new_model, new_acc)
+    }
+
+    /// Same as [`Self::clone_gaussians`], but additionally returns, for every
+    /// Gaussian in the returned model, the index into `model` it was derived
+    /// from (identity for unmodified copies, the parent's index for clones).
+    ///
+    /// Used internally by [`Self::densify_and_prune`] to correctly remap a
+    /// caller-supplied `screen_sizes` buffer (computed against `model`)
+    /// across the clone/split transformations, and to pre-size the output
+    /// model's buffers in one allocation instead of growing them via
+    /// repeated reallocation.
+    fn clone_gaussians_with_sources(
+        &self,
+        model: &GaussianModel,
+    ) -> (GaussianModel, GradientAccumulator, Vec<usize>) {
         let avg_grad = self.accumulator.average_grad_norm();
-        let mut new_model = empty_model_like(model);
+        let n = model.gaussians.len();
         let mut clone_indices: Vec<usize> = Vec::new();
 
-        for i in 0..model.gaussians.len() {
+        for i in 0..n {
             let g = model.gaussians[i];
-            // Copy original unconditionally.
-            append_gaussian(&mut new_model, model, i, g);
 
             // Determine if this Gaussian should be cloned.
             let grad = avg_grad.get(i).copied().unwrap_or(0.0_f32);
@@ -311,25 +416,28 @@ impl DensityController {
             clone_indices.push(i);
         }
 
+        // Pre-size the output model/sources for exactly `n + clone_indices.len()`
+        // Gaussians so the append loops below never trigger a reallocation.
+        let out_len = n + clone_indices.len();
+        let mut new_model = model_with_capacity(model, out_len);
+        let mut sources: Vec<usize> = Vec::with_capacity(out_len);
+
+        // Copy every original unconditionally, in order.
+        for i in 0..n {
+            append_gaussian(&mut new_model, model, i, model.gaussians[i]);
+            sources.push(i);
+        }
+
         // Append clones.
         for i in clone_indices {
-            let g = model.gaussians[i];
-            let dominant = argmax3(g.scale);
-            let offset_mag = g.scale[dominant].exp() * 0.01_f32;
-
-            let mut clone_pos = g.position;
-            clone_pos[dominant] += offset_mag;
-
-            let clone_attrs = GaussianAttributes {
-                position: clone_pos,
-                ..g
-            };
+            let clone_attrs = make_clone_attrs(model.gaussians[i]);
             append_gaussian(&mut new_model, model, i, clone_attrs);
+            sources.push(i);
         }
 
         let new_n = new_model.gaussians.len();
         let new_acc = GradientAccumulator::new(new_n);
-        (new_model, new_acc)
+        (new_model, new_acc, sources)
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -350,62 +458,59 @@ impl DensityController {
     ///
     /// Returns the new model and a fresh accumulator sized to the new count.
     pub fn split_gaussians(&self, model: &GaussianModel) -> (GaussianModel, GradientAccumulator) {
-        // 1/φ ≈ 0.618 (reciprocal of the golden ratio).
-        let scale_factor_log = (1.0_f32 / 1.618_034_f32).ln(); // ≈ -0.4812
+        let (new_model, new_acc, _sources) = self.split_gaussians_with_sources(model);
+        (new_model, new_acc)
+    }
 
+    /// Same as [`Self::split_gaussians`], but additionally returns, for every
+    /// Gaussian in the returned model, the index into `model` it was derived
+    /// from. See [`Self::clone_gaussians_with_sources`] for why this exists.
+    fn split_gaussians_with_sources(
+        &self,
+        model: &GaussianModel,
+    ) -> (GaussianModel, GradientAccumulator, Vec<usize>) {
         let avg_grad = self.accumulator.average_grad_norm();
-        let mut new_model = empty_model_like(model);
+        let n = model.gaussians.len();
 
-        for i in 0..model.gaussians.len() {
+        // First pass: decide clone/split without touching the output model,
+        // so its buffers can be pre-sized in one allocation (see
+        // `model_with_capacity`) instead of growing via repeated
+        // reallocation across the loop.
+        let mut should_split: Vec<bool> = Vec::with_capacity(n);
+        let mut out_len = 0usize;
+        for i in 0..n {
             let g = model.gaussians[i];
             let grad = avg_grad.get(i).copied().unwrap_or(0.0_f32);
-
             let max_exp_scale = g.scale[0].exp().max(g.scale[1].exp()).max(g.scale[2].exp());
-            let should_split = grad >= self.config.grad_threshold
+            let split = grad >= self.config.grad_threshold
                 && max_exp_scale >= self.config.scale_split_threshold;
+            should_split.push(split);
+            out_len += if split { 2 } else { 1 };
+        }
 
-            if !should_split {
+        let mut new_model = model_with_capacity(model, out_len);
+        let mut sources: Vec<usize> = Vec::with_capacity(out_len);
+
+        for (i, &split) in should_split.iter().enumerate() {
+            let g = model.gaussians[i];
+
+            if !split {
                 // Copy unchanged.
                 append_gaussian(&mut new_model, model, i, g);
+                sources.push(i);
                 continue;
             }
 
-            // Build the two children.
-            let dominant = argmax3(g.scale);
-            let offset_mag = g.scale[dominant].exp(); // world-space magnitude
-
-            // Scaled-down log-scale for both children.
-            let child_scale = [
-                g.scale[0] + scale_factor_log,
-                g.scale[1] + scale_factor_log,
-                g.scale[2] + scale_factor_log,
-            ];
-
-            // Child A: position + offset along dominant axis.
-            let mut pos_a = g.position;
-            pos_a[dominant] += offset_mag;
-            let child_a = GaussianAttributes {
-                position: pos_a,
-                scale: child_scale,
-                ..g
-            };
-
-            // Child B: position - offset along dominant axis.
-            let mut pos_b = g.position;
-            pos_b[dominant] -= offset_mag;
-            let child_b = GaussianAttributes {
-                position: pos_b,
-                scale: child_scale,
-                ..g
-            };
-
+            let (child_a, child_b) = make_split_children(g);
             append_gaussian(&mut new_model, model, i, child_a);
+            sources.push(i);
             append_gaussian(&mut new_model, model, i, child_b);
+            sources.push(i);
         }
 
         let new_n = new_model.gaussians.len();
         let new_acc = GradientAccumulator::new(new_n);
-        (new_model, new_acc)
+        (new_model, new_acc, sources)
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -424,7 +529,10 @@ impl DensityController {
         model: &GaussianModel,
         screen_sizes: Option<&[f32]>,
     ) -> GaussianModel {
-        let mut new_model = empty_model_like(model);
+        // The result can never be larger than the input, so pre-sizing with
+        // the input length is a safe upper bound that guarantees zero
+        // reallocations regardless of how many Gaussians survive.
+        let mut new_model = model_with_capacity(model, model.gaussians.len());
 
         for i in 0..model.gaussians.len() {
             let g = model.gaussians[i];
@@ -455,13 +563,26 @@ impl DensityController {
     /// Combined densification step: clone small + split large + prune.
     ///
     /// This is the standard 3DGS densification operation applied once every
-    /// `densification_interval` training steps.
+    /// `densification_interval` training steps. Conceptually equivalent to
+    /// applying [`Self::clone_gaussians`], then [`Self::split_gaussians`] on
+    /// the result, then [`Self::prune_gaussians`] - those three remain
+    /// available separately for callers that want the individual steps -
+    /// but implemented as a single fused pass (see
+    /// `densify_and_prune_fused` for the per-Gaussian case analysis
+    /// proving the two are equivalent) so one densification interval
+    /// performs a single pre-sized output allocation and a single write
+    /// pass over the model, instead of chaining three full model copies
+    /// (each with its own SH-coefficient `extend_from_slice` traffic)
+    /// together.
     ///
-    /// Steps performed in order:
-    /// 1. Clone small, high-gradient Gaussians.
-    /// 2. Split large, high-gradient Gaussians (applied to the post-clone model).
-    /// 3. Prune low-opacity / large-size Gaussians.
-    /// 4. Update the internal accumulator to match the new model size.
+    /// `screen_sizes`, if given, must be indexed against `model` (i.e. the
+    /// *pre*-densification Gaussian count) - typically the per-Gaussian
+    /// screen-space size computed by the caller's most recent render pass.
+    /// Every Gaussian produced by cloning or splitting inherits its parent's
+    /// opacity and, for the purposes of this size check, its parent's screen
+    /// size unchanged - i.e. it is tested against `screen_sizes[parent]`,
+    /// never against whatever `screen_sizes` entry happens to share its
+    /// *post*-densification index.
     ///
     /// The controller's internal accumulator is updated automatically.
     pub fn densify_and_prune(
@@ -469,21 +590,160 @@ impl DensityController {
         model: &GaussianModel,
         screen_sizes: Option<&[f32]>,
     ) -> GaussianModel {
-        // 1. Clone small high-gradient Gaussians.
-        let (cloned_model, _) = self.clone_gaussians(model);
-
-        // 2. Split large high-gradient Gaussians (on the cloned model; the
-        //    accumulator held by `self` still refers to the original indices,
-        //    which are preserved as the prefix of `cloned_model`).
-        let (split_model, _) = self.split_gaussians(&cloned_model);
-
-        // 3. Prune.
-        let pruned_model = self.prune_gaussians(&split_model, screen_sizes);
-
-        // 4. Sync accumulator to new model size.
+        let pruned_model = self.densify_and_prune_fused(model, screen_sizes);
         self.sync_to_model(&pruned_model);
-
         pruned_model
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // densify_and_prune_fused (internal)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// One-pass fused clone + split + prune, used internally by
+    /// [`Self::densify_and_prune`].
+    ///
+    /// # Why this is semantically identical to the composed pipeline
+    ///
+    /// `split_gaussians_with_sources` evaluates its grad/scale test against
+    /// `self.accumulator`, which - inside `densify_and_prune` - is never
+    /// resized between the (conceptual) clone and split steps. So for any
+    /// post-clone index at or beyond the pre-clone Gaussian count `n` (i.e.
+    /// every clone), `average_grad_norm().get(index)` is `None` and the
+    /// split test's gradient defaults to `0.0`, which is always below
+    /// `grad_threshold`. Combined with a clone's scale being identical to
+    /// its (necessarily *small*, by the clone criterion) parent's, a
+    /// freshly-cloned entry can therefore never itself qualify for a split,
+    /// and symmetrically a Gaussian large enough to split is never small
+    /// enough to have been cloned in the first place. Every entry the
+    /// composed pipeline ultimately emits is therefore fully determined by
+    /// exactly one original Gaussian `i`, evaluated once against `model`
+    /// and `average_grad_norm()` alone (never against a post-clone or
+    /// post-split intermediate):
+    ///
+    /// - `grad < grad_threshold` → **Keep**: the single unchanged original.
+    /// - `grad >= grad_threshold` and `max(scale.exp()) < scale_split_threshold`
+    ///   → **Clone**: the unchanged original, plus one clone offset along
+    ///   the dominant scale axis ([`make_clone_attrs`]; this Gaussian's
+    ///   small scale means `split_gaussians` always leaves both the
+    ///   original-row copy and the later-appended clone unmodified).
+    /// - `grad >= grad_threshold` and `max(scale.exp()) >= scale_split_threshold`
+    ///   → **Split**: two children replacing the original
+    ///   ([`make_split_children`]; this Gaussian's large scale means
+    ///   `clone_gaussians` never clones it, so `split_gaussians` sees it
+    ///   unmodified at its original row and splits it there).
+    ///
+    /// Every entry derived from Gaussian `i` inherits `i`'s opacity
+    /// (`GaussianAttributes { ..g }` never overwrites `opacity`) and is
+    /// tested against `screen_sizes[i]` per `densify_and_prune`'s
+    /// screen-size contract - so the prune decision is identical for every
+    /// entry derived from a given `i` and can be made once per `i` rather
+    /// than once per output entry.
+    ///
+    /// Output order matches the composed pipeline exactly: for each
+    /// surviving original index in ascending order, its Keep/Clone-original/
+    /// Split-children entry (or entries) first, matching
+    /// `split_gaussians_with_sources` walking the post-clone model's first
+    /// `n` (original-row) positions before its appended-clone tail; then,
+    /// in a second pass over ascending original index, each surviving
+    /// Clone's tail entry - matching `clone_gaussians_with_sources`
+    /// appending all clones after all originals.
+    fn densify_and_prune_fused(
+        &self,
+        model: &GaussianModel,
+        screen_sizes: Option<&[f32]>,
+    ) -> GaussianModel {
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum Action {
+            /// Below the gradient threshold: emit the original unchanged.
+            Keep,
+            /// High gradient, small scale: emit the original plus one
+            /// offset clone.
+            Clone,
+            /// High gradient, large scale: emit two children in place of
+            /// the original.
+            Split,
+        }
+
+        let avg_grad = self.accumulator.average_grad_norm();
+        let n = model.gaussians.len();
+
+        // Decide the action and prune-survival for Gaussian `i` once; every
+        // entry `i` contributes shares this same verdict (see this
+        // function's doc).
+        let decide = |i: usize| -> (Action, bool) {
+            let g = model.gaussians[i];
+            let grad = avg_grad.get(i).copied().unwrap_or(0.0_f32);
+            let max_exp_scale = g.scale[0].exp().max(g.scale[1].exp()).max(g.scale[2].exp());
+            let action = if grad < self.config.grad_threshold {
+                Action::Keep
+            } else if max_exp_scale < self.config.scale_split_threshold {
+                Action::Clone
+            } else {
+                Action::Split
+            };
+
+            let mut survives = sigmoid(g.opacity) > self.config.opacity_prune_threshold;
+            if survives {
+                if let Some(sizes) = screen_sizes {
+                    let sz = sizes.get(i).copied().unwrap_or(0.0_f32);
+                    if sz > self.config.size_prune_threshold {
+                        survives = false;
+                    }
+                }
+            }
+            (action, survives)
+        };
+
+        // Pass 1: decide once per original Gaussian and count the exact
+        // number of surviving output entries, so the destination model's
+        // buffers can be pre-sized in a single allocation (`model_with_capacity`)
+        // instead of growing via repeated reallocation.
+        let mut decisions: Vec<(Action, bool)> = Vec::with_capacity(n);
+        let mut out_len = 0usize;
+        for i in 0..n {
+            let d = decide(i);
+            if d.1 {
+                out_len += match d.0 {
+                    Action::Keep => 1,
+                    Action::Clone | Action::Split => 2,
+                };
+            }
+            decisions.push(d);
+        }
+
+        let mut new_model = model_with_capacity(model, out_len);
+
+        // Pass 2a: main block, one entry (Keep/Clone-original) or split
+        // pair per surviving original index, in ascending index order.
+        for (i, &(action, survives)) in decisions.iter().enumerate() {
+            if !survives {
+                continue;
+            }
+            let g = model.gaussians[i];
+            match action {
+                Action::Keep | Action::Clone => {
+                    append_gaussian(&mut new_model, model, i, g);
+                }
+                Action::Split => {
+                    let (child_a, child_b) = make_split_children(g);
+                    append_gaussian(&mut new_model, model, i, child_a);
+                    append_gaussian(&mut new_model, model, i, child_b);
+                }
+            }
+        }
+
+        // Pass 2b: clone tail, in ascending index order - matching
+        // `clone_gaussians_with_sources`'s clones-appended-after-originals
+        // ordering.
+        for (i, &(action, survives)) in decisions.iter().enumerate() {
+            if action != Action::Clone || !survives {
+                continue;
+            }
+            let clone_attrs = make_clone_attrs(model.gaussians[i]);
+            append_gaussian(&mut new_model, model, i, clone_attrs);
+        }
+
+        new_model
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -613,6 +873,42 @@ mod tests {
         acc.accumulate(&[1.0, 2.0]); // length mismatch → no-op
         assert_eq!(acc.position_grad_norm, vec![0.0_f32; 3]);
         assert_eq!(acc.observation_count, vec![0_u32; 3]);
+    }
+
+    #[test]
+    fn test_accumulate_does_not_count_invisible_gaussians() {
+        // A Gaussian with an exactly-zero position-gradient norm did not
+        // contribute to the rendered image this iteration (was not
+        // visible), so it must not count toward the observation
+        // denominator - otherwise `average_grad_norm` dilutes rarely-visible
+        // Gaussians by the *total* iteration count instead of the number of
+        // iterations they were actually visible in (regression test for the
+        // bug where `observation_count` was incremented unconditionally).
+        let mut acc = GradientAccumulator::new(3);
+        // Gaussian 0 visible every iteration, gaussian 1 visible only on the
+        // second iteration, gaussian 2 never visible.
+        acc.accumulate(&[1.0, 0.0, 0.0]);
+        acc.accumulate(&[1.0, 1.0, 0.0]);
+        acc.accumulate(&[1.0, 0.0, 0.0]);
+
+        assert_eq!(
+            acc.observation_count[0], 3,
+            "gaussian 0 was visible all 3 iterations"
+        );
+        assert_eq!(
+            acc.observation_count[1], 1,
+            "gaussian 1 was visible only once"
+        );
+        assert_eq!(acc.observation_count[2], 0, "gaussian 2 was never visible");
+
+        let avg = acc.average_grad_norm();
+        assert!((avg[0] - 1.0).abs() < 1e-6);
+        assert!(
+            (avg[1] - 1.0).abs() < 1e-6,
+            "average should be 1.0/1 = 1.0 (diluted-by-total-count would give 1.0/3), got {}",
+            avg[1]
+        );
+        assert_eq!(avg[2], 0.0);
     }
 
     #[test]
@@ -891,6 +1187,127 @@ mod tests {
             new_model.gaussians.len(),
             0,
             "All low-opacity Gaussians should be pruned"
+        );
+    }
+
+    #[test]
+    fn test_densify_and_prune_remaps_screen_sizes_through_split() {
+        // Regression test: `screen_sizes` must be tested against the
+        // ORIGINAL Gaussian a post-split entry derives from, not against
+        // whichever index it happens to land on after cloning/splitting
+        // shifts everything.
+        //
+        // Index 0: high gradient + large scale → splits into 2 children.
+        // Index 1: zero gradient → left completely untouched (copied as-is).
+        let n = 2;
+        let scale_log = 0.05_f32.ln(); // exp = 0.05 >= default split threshold 0.01
+        let model = make_model(n, logit(0.9), scale_log);
+        let config = DensityConfig::default();
+        let mut ctrl = DensityController::new(n, config);
+        ctrl.accumulator.position_grad_norm[0] = 5e-4_f32; // >= grad_threshold
+        ctrl.accumulator.observation_count[0] = 1;
+        ctrl.accumulator.position_grad_norm[1] = 0.0_f32; // < grad_threshold
+        ctrl.accumulator.observation_count[1] = 1;
+
+        // Screen sizes indexed against the ORIGINAL 2-Gaussian model: index 0
+        // is small (its split children should survive), index 1 is over
+        // threshold (its untouched copy should be pruned).
+        let screen_sizes = [0.01_f32, 0.5_f32];
+        let result = ctrl.densify_and_prune(&model, Some(&screen_sizes));
+
+        assert_eq!(
+            result.gaussians.len(),
+            2,
+            "expected both children of index 0 to survive and index 1 to be \
+             pruned by its own (correctly-remapped) screen size, got {} Gaussians",
+            result.gaussians.len()
+        );
+        // Both survivors must be children of index 0 (position offset from
+        // 0.0 along the dominant axis), never index 1's untouched copy at
+        // x=0.1 - if `screen_sizes` were indexed by post-split position
+        // instead of by source Gaussian, a child of index 0 would be
+        // wrongly pruned and index 1's copy would wrongly survive.
+        for g in &result.gaussians {
+            assert!(
+                (g.position[0] - 0.1_f32).abs() > 1e-6,
+                "survivor at x={} looks like index 1's untouched copy, not a split child of index 0",
+                g.position[0]
+            );
+        }
+    }
+
+    #[test]
+    fn test_densify_and_prune_fused_matches_composed_pipeline() {
+        // Regression test proving the one-pass fused implementation
+        // (`densify_and_prune_fused`, called by `densify_and_prune`)
+        // produces *exactly* the same model - same Gaussians, same SH
+        // coefficients, same order - as manually composing
+        // clone_gaussians_with_sources -> split_gaussians_with_sources ->
+        // prune_gaussians with screen-size remapping, the three-full-model
+        // pipeline `densify_and_prune` used to run directly. Exercises
+        // every action category (kept, cloned, split) together with both
+        // an opacity-based and a screen-size-based prune, so every branch
+        // of the fused path is cross-checked in one go.
+        let n = 6;
+        let mut model = make_model(n, logit(0.9), 0.001_f32.ln()); // small scale by default
+                                                                   // Index 0: grad below threshold -> Keep.
+                                                                   // Index 1: high grad, small scale -> Clone (survives).
+                                                                   // Index 2: high grad, large scale -> Split (survives).
+                                                                   // Index 3: high grad, small scale, but low opacity -> pruned entirely.
+                                                                   // Index 4: high grad, small scale, oversized screen -> pruned entirely.
+                                                                   // Index 5: high grad, large scale -> Split (survives).
+        model.gaussians[2].scale = [0.05_f32.ln(); 3];
+        model.gaussians[5].scale = [0.05_f32.ln(); 3];
+        model.gaussians[3].opacity = logit(0.0001_f32); // below opacity_prune_threshold
+
+        let config = DensityConfig::default();
+        let mut ctrl = DensityController::new(n, config);
+        for i in [1, 2, 3, 4, 5] {
+            ctrl.accumulator.position_grad_norm[i] = 5e-4_f32; // >= grad_threshold
+            ctrl.accumulator.observation_count[i] = 1;
+        }
+        // Index 0 left at grad 0.0 (never accumulated) -> Keep.
+
+        let screen_sizes = [0.01_f32, 0.01, 0.01, 0.01, 0.9, 0.01]; // index 4 oversized
+
+        // Manually compose the three public steps the way `densify_and_prune`
+        // used to, remapping `screen_sizes` through clone then split.
+        let (cloned_model, _, clone_sources) = ctrl.clone_gaussians_with_sources(&model);
+        let cloned_sizes: Vec<f32> = clone_sources.iter().map(|&src| screen_sizes[src]).collect();
+        let (split_model, _, split_sources) = ctrl.split_gaussians_with_sources(&cloned_model);
+        let split_sizes: Vec<f32> = split_sources.iter().map(|&src| cloned_sizes[src]).collect();
+        let composed = ctrl.prune_gaussians(&split_model, Some(&split_sizes));
+
+        let fused = ctrl.densify_and_prune_fused(&model, Some(&screen_sizes));
+
+        assert_eq!(
+            composed.gaussians.len(),
+            fused.gaussians.len(),
+            "fused and composed pipelines must produce the same Gaussian count \
+             (composed={}, fused={})",
+            composed.gaussians.len(),
+            fused.gaussians.len()
+        );
+        assert_eq!(
+            composed.gaussians.len(),
+            7,
+            "expected 7 survivors: Keep(0), Clone(1)'s 2 entries, Split(2)'s \
+             2 children, Split(5)'s 2 children - indices 3 and 4 fully pruned"
+        );
+        for (i, (a, b)) in composed
+            .gaussians
+            .iter()
+            .zip(fused.gaussians.iter())
+            .enumerate()
+        {
+            assert_eq!(a.position, b.position, "position mismatch at {i}");
+            assert_eq!(a.scale, b.scale, "scale mismatch at {i}");
+            assert_eq!(a.opacity, b.opacity, "opacity mismatch at {i}");
+            assert_eq!(a.rotation, b.rotation, "rotation mismatch at {i}");
+        }
+        assert_eq!(
+            composed.sh_coeffs, fused.sh_coeffs,
+            "SH coefficients must match between fused and composed pipelines"
         );
     }
 

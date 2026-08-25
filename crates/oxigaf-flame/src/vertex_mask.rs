@@ -248,13 +248,12 @@ impl VertexMask {
                 .ok_or_else(|| VertexMaskError::UnknownRegion { name: name.clone() })?;
             for &raw_index in indices {
                 let index = raw_index as usize;
-                let slot =
-                    assigned
-                        .get_mut(index)
-                        .ok_or_else(|| VertexMaskError::IndexOutOfRange {
-                            index,
-                            num_vertices,
-                        })?;
+                let slot = assigned
+                    .get_mut(index)
+                    .ok_or(VertexMaskError::IndexOutOfRange {
+                        index,
+                        num_vertices,
+                    })?;
                 if let Some(existing) = slot {
                     if *existing != region {
                         return Err(VertexMaskError::DuplicateAssignment {
@@ -445,8 +444,7 @@ fn canonical_pose_violation(vertices: &[na::Point3<f32>]) -> Option<String> {
         .map(|axis| 0.5 * (max[axis] - min[axis]))
         .fold(0.0f32, f32::max);
     if !half_extent.is_finite()
-        || half_extent > CANONICAL_EXTENT_MAX
-        || half_extent < CANONICAL_EXTENT_MIN
+        || !(CANONICAL_EXTENT_MIN..=CANONICAL_EXTENT_MAX).contains(&half_extent)
     {
         return Some(format!(
             "largest half-extent is {half_extent:.3}, outside the canonical FLAME range \

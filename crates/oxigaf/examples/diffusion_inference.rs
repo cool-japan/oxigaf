@@ -92,7 +92,10 @@ fn main() {
         println!();
         println!("Running in demonstration mode (API showcase only).");
         println!();
-        demonstrate_api();
+        if let Err(e) = demonstrate_api() {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
         return;
     }
 
@@ -248,7 +251,7 @@ fn run_inference(weights_dir: &Path, _reference_image: Option<&Path>) -> oxigaf:
 }
 
 /// Demonstrate the API without requiring model weights.
-fn demonstrate_api() {
+fn demonstrate_api() -> oxigaf::Result<()> {
     println!("API Demonstration");
     println!("-----------------");
     println!();
@@ -296,7 +299,7 @@ fn demonstrate_api() {
 
     // Configure inference steps
     let mut scheduler = scheduler;
-    scheduler.set_timesteps(50);
+    scheduler.set_timesteps(50)?;
     let timesteps = scheduler.timesteps();
     println!(
         "   Inference timesteps (first 5): {:?}...",
@@ -352,6 +355,8 @@ fn demonstrate_api() {
     println!();
     println!("To run with actual model weights:");
     println!("  cargo run --example diffusion_inference -- --weights-dir /path/to/weights");
+
+    Ok(())
 }
 
 /// Select the best available compute device.
@@ -511,4 +516,19 @@ fn save_tensor_as_image(
 
     img.save(path)
         .map_err(|e| format!("Failed to save image: {}", e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test: `DdimScheduler::set_timesteps` returns
+    /// `DiffusionResult<()>` rather than being infallible. `demonstrate_api`
+    /// propagates that result with `?` instead of discarding it, so this
+    /// exercises the call site end-to-end and confirms it still succeeds for
+    /// a valid step count (50 inference steps out of 1000 training steps).
+    #[test]
+    fn demonstrate_api_propagates_set_timesteps_result() {
+        demonstrate_api().expect("demonstrate_api should succeed with a valid step count");
+    }
 }

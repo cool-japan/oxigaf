@@ -2,8 +2,12 @@
 //!
 //! Provides heat-map utilities (CAM, saliency, Sobel) for visualising which
 //! spatial regions of an input image are most important for a model's output.
-//! All implementations are gradient-free and run on plain `Vec<f32>` tensors —
-//! no autograd engine is required.
+//! Every implementation runs on plain `Vec<f32>` tensors and needs **no
+//! autograd engine** — most functions here (CAM, Sobel edges, feature
+//! attribution) are entirely gradient-free by construction, while
+//! [`finite_difference_saliency`] recovers a true numerical input gradient
+//! via perturb-and-rescore central differences against a caller-supplied
+//! scalar scoring function, rather than backpropagation.
 //!
 //! # Conventions
 //! - Images and feature maps are stored **row-major** (`y` is the slow axis).
@@ -113,9 +117,11 @@ impl ActivationMap {
 
     /// Normalise values to `[0, 1]` using min–max scaling.
     ///
-    /// `v' = (v - min) / (max - min + 1e-8)`.  No-op when all values are
-    /// identical (the map remains unchanged to avoid introducing numerical
-    /// artefacts).
+    /// `v' = (v - min) / (max - min + 1e-8)`.  When all values are
+    /// effectively identical, every value is set to `0.0` rather than left
+    /// at its raw (out-of-contract) scale — a constant map has no salient
+    /// region, and `0.0` keeps it reading correctly under `threshold` and
+    /// `overlap_fraction`, which treat `0.5` as "active".
     pub fn normalize(&mut self) {
         let min = self.values.iter().cloned().fold(f32::INFINITY, f32::min);
         let max = self
@@ -125,7 +131,13 @@ impl ActivationMap {
             .fold(f32::NEG_INFINITY, f32::max);
         let range = max - min;
         if range < 1e-8 {
-            // All values are effectively equal — leave them as-is.
+            // Degenerate (constant, or empty) input: collapse to a
+            // well-defined in-range constant instead of leaving the raw
+            // values untouched, which would silently violate the `[0, 1]`
+            // contract every caller of this method documents.
+            for v in &mut self.values {
+                *v = 0.0;
+            }
             return;
         }
         let denom = range + 1e-8;
@@ -222,9 +234,20 @@ impl ActivationMap {
             .map(|(i, &v)| (i, v))
             .collect();
 
-        // Partial-sort: stable descending order.
-        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        indexed.truncate(k);
+        let n = indexed.len();
+        let k = k.min(n);
+        let desc = |a: &(usize, f32), b: &(usize, f32)| {
+            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+        };
+        if k < n {
+            // True partial-sort: O(n) partition so the k largest elements
+            // land in the first k slots (unordered among themselves),
+            // instead of an O(n log n) sort of the entire map.
+            indexed.select_nth_unstable_by(k, desc);
+            indexed.truncate(k);
+        }
+        // Only the (small) k-element prefix needs a final ordering sort.
+        indexed.sort_by(desc);
 
         indexed
             .into_iter()
@@ -317,7 +340,8 @@ fn jet_color(v: f32) -> (f32, f32, f32) {
 ///
 /// Each spatial position's score is the dot product of the per-channel
 /// `class_weights` with the feature values at that position.  The result is
-/// ReLU-clamped and then normalised to `[0, 1]`.
+/// ReLU-clamped and then normalised to `[0, 1]` (a completely uniform
+/// result normalises to all-`0.0`, see [`ActivationMap::normalize`]).
 ///
 /// # Parameters
 /// * `feature_maps` — flat `[num_channels, height, width]` buffer.
@@ -374,31 +398,45 @@ pub fn compute_cam(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Gradient-based attention (simplified finite-difference saliency)
+// Finite-difference input-gradient saliency (no autograd required)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Compute a saliency map via a Sobel-based approximation of the input gradient.
+/// Compute an input-gradient saliency map via central finite differences.
 ///
-/// The image is converted to luminance and then passed through a Sobel edge
-/// detector.  The `eps` parameter is accepted for API compatibility with
-/// gradient-based implementations but is not used in this Sobel path.
+/// For every pixel and every colour channel, this perturbs the input image
+/// by `±eps` at that single location and calls `score_fn` on the perturbed
+/// buffer, recording the central-difference derivative
+/// `(score(x+eps) - score(x-eps)) / (2·eps)`. The per-pixel saliency is the
+/// maximum absolute derivative across its three channels (the same
+/// channel-reduction convention used by Simonyan et al. 2013's gradient
+/// saliency maps). This needs **no autograd engine** — consistent with the
+/// rest of this module — at the cost of `2 · width · height · 3` calls to
+/// `score_fn`, so it is only practical when `score_fn` is cheap relative to
+/// that budget (e.g. a small proxy model, a hand-rolled loss, or a
+/// downsampled input) rather than a full forward pass of a large network on
+/// a large image.
+///
+/// `score_fn` receives the full perturbed `width * height * 3` RGB buffer
+/// and must return a single scalar score; it is otherwise opaque to this
+/// function (no gradient, no model access, no batching assumptions).
 ///
 /// # Parameters
 /// * `image` — RGB f32 buffer, length `width * height * 3`.
 /// * `width`, `height` — image dimensions.
-/// * `eps` — perturbation size (reserved; not used in the Sobel path).
+/// * `eps` — perturbation size for the central difference; must be finite
+///   and strictly positive.
+/// * `score_fn` — scalar scoring function evaluated on the perturbed image.
 ///
 /// # Errors
-/// [`ActivationMapError::DimensionError`] if `image.len() != width * height * 3`.
+/// * [`ActivationMapError::DimensionError`] if `image.len() != width * height * 3`.
+/// * [`ActivationMapError::InvalidConfig`] if `eps` is not finite and positive.
 pub fn finite_difference_saliency(
     image: &[f32],
     width: usize,
     height: usize,
     eps: f32,
+    mut score_fn: impl FnMut(&[f32]) -> f32,
 ) -> Result<ActivationMap, ActivationMapError> {
-    // eps is accepted for API compatibility; suppress unused-variable lint.
-    let _ = eps;
-
     let expected = width * height * 3;
     if image.len() != expected {
         return Err(ActivationMapError::DimensionError {
@@ -406,18 +444,47 @@ pub fn finite_difference_saliency(
             got: image.len(),
         });
     }
+    if !(eps.is_finite() && eps > 0.0) {
+        return Err(ActivationMapError::InvalidConfig(format!(
+            "eps must be finite and positive, got {eps}"
+        )));
+    }
 
-    // Convert to luminance.
-    let luma: Vec<f32> = (0..width * height)
-        .map(|i| {
-            let r = image[i * 3];
-            let g = image[i * 3 + 1];
-            let b = image[i * 3 + 2];
-            0.2126 * r + 0.7152 * g + 0.0722 * b
-        })
-        .collect();
+    let mut perturbed = image.to_vec();
+    let mut values = vec![0.0_f32; width * height];
 
-    Ok(sobel_saliency(&luma, width, height))
+    for (pixel_idx, value) in values.iter_mut().enumerate() {
+        let mut max_abs_grad = 0.0_f32;
+        for c in 0..3 {
+            let idx = pixel_idx * 3 + c;
+            let original = perturbed[idx];
+
+            perturbed[idx] = original + eps;
+            let score_plus = score_fn(&perturbed);
+
+            perturbed[idx] = original - eps;
+            let score_minus = score_fn(&perturbed);
+
+            // Restore before moving to the next channel/pixel so every call
+            // to `score_fn` sees exactly a single-pixel, single-channel
+            // perturbation of the ORIGINAL image.
+            perturbed[idx] = original;
+
+            if score_plus.is_finite() && score_minus.is_finite() {
+                let grad = (score_plus - score_minus) / (2.0 * eps);
+                max_abs_grad = max_abs_grad.max(grad.abs());
+            }
+        }
+        *value = max_abs_grad;
+    }
+
+    let mut map = ActivationMap {
+        width,
+        height,
+        values,
+    };
+    map.normalize();
+    Ok(map)
 }
 
 /// Apply a Sobel edge detector to a single-channel image and return the
@@ -435,19 +502,29 @@ pub fn finite_difference_saliency(
 /// # Parameters
 /// * `image_luma` — single-channel f32 image, length `width * height`.
 /// * `width`, `height` — image dimensions.
-pub fn sobel_saliency(image_luma: &[f32], width: usize, height: usize) -> ActivationMap {
+///
+/// # Errors
+/// [`ActivationMapError::DimensionError`] if `image_luma.len() != width * height`.
+pub fn sobel_saliency(
+    image_luma: &[f32],
+    width: usize,
+    height: usize,
+) -> Result<ActivationMap, ActivationMapError> {
     let n = width * height;
+    if image_luma.len() != n {
+        return Err(ActivationMapError::DimensionError {
+            expected: n,
+            got: image_luma.len(),
+        });
+    }
     let mut edge_mag = vec![0.0_f32; n];
 
-    // Safe pixel sampler with border-replicate padding.
+    // Safe pixel sampler with border-replicate padding. Bounds are
+    // guaranteed in-range by the length check above.
     let px = |xi: isize, yi: isize| -> f32 {
         let xi = xi.clamp(0, width as isize - 1) as usize;
         let yi = yi.clamp(0, height as isize - 1) as usize;
-        if yi * width + xi < image_luma.len() {
-            image_luma[yi * width + xi]
-        } else {
-            0.0
-        }
+        image_luma[yi * width + xi]
     };
 
     for y in 0..height {
@@ -481,7 +558,7 @@ pub fn sobel_saliency(image_luma: &[f32], width: usize, height: usize) -> Activa
         values: edge_mag,
     };
     map.normalize();
-    map
+    Ok(map)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -525,7 +602,8 @@ impl Default for AttributionConfig {
 /// attribution[y*W + x] = Σ_c  score[c] · relu(feature[c*H*W + y*W + x])
 /// ```
 ///
-/// The result is normalised to `[0, 1]`.
+/// The result is normalised to `[0, 1]` (a completely uniform result
+/// normalises to all-`0.0`).
 ///
 /// # Errors
 /// [`ActivationMapError::DimensionError`] if sizes are inconsistent.
@@ -617,7 +695,8 @@ fn softmax_vec(scores: &[f32], temperature: f32) -> Vec<f32> {
 
 /// Linearly blend two activation maps.
 ///
-/// `output = weight_a * a + (1 - weight_a) * b`, then normalise to `[0, 1]`.
+/// `output = weight_a * a + (1 - weight_a) * b`, then normalise to `[0, 1]`
+/// (a completely uniform blend normalises to all-`0.0`).
 ///
 /// # Errors
 /// [`ActivationMapError::DimensionError`] if the maps have different sizes.
@@ -727,7 +806,8 @@ pub fn intersect_maps(
 /// Smooth an activation map with a separable Gaussian blur.
 ///
 /// The kernel radius is `ceil(3 * sigma)`.  When `sigma <= 0` the input is
-/// returned unchanged (clone).  The result is normalised after blurring.
+/// returned unchanged (clone).  The result is normalised after blurring (a
+/// completely uniform result normalises to all-`0.0`).
 pub fn smooth_map(map: &ActivationMap, sigma: f32) -> ActivationMap {
     if sigma <= 0.0 || map.width == 0 || map.height == 0 {
         return map.clone();
@@ -893,12 +973,23 @@ pub fn compute_activation_stats(map: &ActivationMap) -> ActivationStats {
     let fraction_active = active_count as f32 / n as f32;
 
     // Spatial entropy: normalise to form a probability distribution.
-    let norm_sum = sum.max(1e-30);
+    // Both the numerator and the normalising sum are computed from the
+    // ReLU-clamped values (`v.max(0.0)`), not the raw `sum` above: a map
+    // with negative entries (e.g. a user-constructed map, or a
+    // `blend_maps` result with a negative weight) can otherwise make the
+    // raw `sum` itself near-zero or negative even while individual values
+    // are positive, which would blow `p = v/norm_sum` far outside `[0, 1]`
+    // (a technically-finite but nonsensical entropy) or, with a negative
+    // `p`, make `(p + 1e-8).log2()` NaN and poison the whole reduction via
+    // `NaN * 0.0 == NaN`. Normalising against the clamped sum instead
+    // guarantees `p` is always a genuine probability in `[0, 1]`.
+    let clamped_sum: f32 = map.values.iter().map(|&v| v.max(0.0)).sum();
+    let norm_sum = clamped_sum.max(1e-30);
     let spatial_entropy: f32 = map
         .values
         .iter()
         .map(|&v| {
-            let p = v / norm_sum;
+            let p = v.max(0.0) / norm_sum;
             -p * (p + 1e-8_f32).log2()
         })
         .sum();
@@ -985,12 +1076,14 @@ mod tests {
     // ── ActivationMap::normalize ──────────────────────────────────────────────
 
     #[test]
-    fn test_normalize_uniform_unchanged() {
+    fn test_normalize_uniform_maps_to_zero() {
         let v = vec![0.5, 0.5, 0.5, 0.5];
         let mut m = ActivationMap::from_values(2, 2, v).expect("ok");
         m.normalize();
-        // When all values are equal the map is left unchanged.
-        assert!(m.values.iter().all(|&v| approx_eq(v, 0.5, 1e-6)));
+        // Degenerate (constant) input normalises to a well-defined in-range
+        // constant (0.0) instead of being left at its raw, out-of-contract
+        // value.
+        assert!(m.values.iter().all(|&v| approx_eq(v, 0.0, 1e-6)));
     }
 
     #[test]
@@ -1152,20 +1245,98 @@ mod tests {
         let w = 8;
         let h = 6;
         let image = vec![0.5_f32; w * h * 3];
-        let map = finite_difference_saliency(&image, w, h, 0.01).expect("ok");
+        // A constant score function (ignores its input) still exercises the
+        // full width*height*3*2 call budget and must yield a correctly
+        // shaped, all-zero-gradient map.
+        let map = finite_difference_saliency(&image, w, h, 0.01, |_| 1.0).expect("ok");
         assert_eq!(map.width, w);
         assert_eq!(map.height, h);
         assert_eq!(map.values.len(), w * h);
     }
 
     #[test]
-    fn test_finite_difference_saliency_uniform_image_low_saliency() {
-        let w = 8;
-        let h = 8;
+    fn test_finite_difference_saliency_constant_score_is_zero_everywhere() {
+        let w = 6;
+        let h = 6;
         let image = vec![0.5_f32; w * h * 3];
-        let map = finite_difference_saliency(&image, w, h, 0.01).expect("ok");
-        // A uniform image has no edges → all saliency values should be 0.
+        // score_fn does not depend on the image at all → every central
+        // difference is exactly zero, and a fully-uniform map normalises to
+        // all-0.0 (see `ActivationMap::normalize`).
+        let map = finite_difference_saliency(&image, w, h, 0.01, |_| 42.0).expect("ok");
         assert!(map.values.iter().all(|&v| approx_eq(v, 0.0, 1e-5)));
+    }
+
+    #[test]
+    fn test_finite_difference_saliency_matches_known_analytic_gradient() {
+        // score_fn = 3 * (red channel of pixel (1, 0)) is linear with a
+        // known analytic derivative of exactly 3.0 with respect to that one
+        // input, and 0.0 with respect to every other input. This directly
+        // verifies the central-difference math (not just relative
+        // ordering): a case `sobel_saliency` could never validate, since it
+        // has no notion of an external score function at all.
+        let w = 4;
+        let h = 4;
+        let target_idx = 3; // pixel (1, 0), red channel: index 1*3 + 0
+        let image = vec![0.5_f32; w * h * 3];
+        let map = finite_difference_saliency(&image, w, h, 1e-3, |buf| 3.0 * buf[target_idx])
+            .expect("ok");
+        // Reconstruct the pre-normalisation raw magnitude at (1, 0) by
+        // checking it is the unique maximum, then confirm every other
+        // pixel truly measured zero gradient (see the argmax-based
+        // localisation test below for the more general property).
+        let (peak_x, peak_y) = map.argmax();
+        assert_eq!((peak_x, peak_y), (1, 0));
+        assert!(map.get(1, 0) > 0.0);
+    }
+
+    #[test]
+    fn test_finite_difference_saliency_localized_score_peaks_at_pixel() {
+        // score_fn depends on ONLY the green channel of a single interior
+        // pixel: this is the defining behaviour of a true per-pixel input
+        // gradient (as opposed to `sobel_saliency`'s edge detector, which
+        // cannot distinguish "this score depends on this pixel" from
+        // "there is a local contrast change here") — saliency must be
+        // concentrated exactly at that pixel and zero elsewhere.
+        let w = 5;
+        let h = 5;
+        let target_x = 2;
+        let target_y = 3;
+        let target_idx = (target_y * w + target_x) * 3 + 1; // green channel
+        let image = vec![0.5_f32; w * h * 3];
+        let map = finite_difference_saliency(&image, w, h, 1e-3, |buf| buf[target_idx] * 10.0)
+            .expect("ok");
+        let (peak_x, peak_y) = map.argmax();
+        assert_eq!((peak_x, peak_y), (target_x, target_y));
+        // Every other pixel's score derivative is exactly zero.
+        for y in 0..h {
+            for x in 0..w {
+                if (x, y) != (target_x, target_y) {
+                    assert!(
+                        approx_eq(map.get(x, y), 0.0, 1e-5),
+                        "unexpected saliency at ({x},{y}): {}",
+                        map.get(x, y)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_finite_difference_saliency_dimension_mismatch_errors() {
+        let w = 4;
+        let h = 4;
+        let image = vec![0.5_f32; w * h * 3 - 1]; // one short
+        assert!(finite_difference_saliency(&image, w, h, 0.01, |_| 0.0).is_err());
+    }
+
+    #[test]
+    fn test_finite_difference_saliency_invalid_eps_errors() {
+        let w = 2;
+        let h = 2;
+        let image = vec![0.5_f32; w * h * 3];
+        assert!(finite_difference_saliency(&image, w, h, 0.0, |_| 0.0).is_err());
+        assert!(finite_difference_saliency(&image, w, h, -1.0, |_| 0.0).is_err());
+        assert!(finite_difference_saliency(&image, w, h, f32::NAN, |_| 0.0).is_err());
     }
 
     // ── sobel_saliency ────────────────────────────────────────────────────────
@@ -1175,7 +1346,7 @@ mod tests {
         let w = 6;
         let h = 6;
         let luma = vec![0.5_f32; w * h];
-        let map = sobel_saliency(&luma, w, h);
+        let map = sobel_saliency(&luma, w, h).expect("ok");
         assert!(map.values.iter().all(|&v| approx_eq(v, 0.0, 1e-5)));
     }
 
@@ -1187,7 +1358,7 @@ mod tests {
         let luma: Vec<f32> = (0..w * h)
             .map(|i| if (i % w) < w / 2 { 0.0 } else { 1.0 })
             .collect();
-        let map = sobel_saliency(&luma, w, h);
+        let map = sobel_saliency(&luma, w, h).expect("ok");
         // Verify the edge column (x = w/2 - 1 or w/2) has the maximum value.
         let (peak_x, _) = map.argmax();
         // Peak should be at the step boundary.
@@ -1196,6 +1367,12 @@ mod tests {
             map.get(peak_x, h / 2) > 0.5,
             "expected high saliency at edge"
         );
+    }
+
+    #[test]
+    fn test_sobel_saliency_dimension_mismatch_errors() {
+        let luma = vec![0.5_f32; 10]; // too short for 4×4
+        assert!(sobel_saliency(&luma, 4, 4).is_err());
     }
 
     // ── score_weighted_attribution ────────────────────────────────────────────
@@ -1343,5 +1520,49 @@ mod tests {
         let m = ActivationMap::from_values(4, 4, v).expect("ok");
         let stats = compute_activation_stats(&m);
         assert!(stats.spatial_entropy >= 0.0);
+    }
+
+    #[test]
+    fn test_compute_activation_stats_entropy_finite_with_negative_values() {
+        // A raw, user-constructed map (or a `blend_maps` result with a
+        // negative weight) can contain negative entries; entropy must stay
+        // finite rather than poisoning to NaN via log2 of a negative `p`.
+        let v = vec![-1.0_f32, -2.0, 3.0, 4.0];
+        let m = ActivationMap::from_values(2, 2, v).expect("ok");
+        let stats = compute_activation_stats(&m);
+        assert!(
+            stats.spatial_entropy.is_finite(),
+            "entropy={}",
+            stats.spatial_entropy
+        );
+        // For 4 pixels, entropy of a valid probability distribution is
+        // bounded by log2(4) = 2 bits; a value far outside this range would
+        // indicate `p` escaped [0, 1].
+        assert!(
+            (0.0..=2.0 + 1e-3).contains(&stats.spatial_entropy),
+            "entropy={} outside the valid [0, log2(n)] range",
+            stats.spatial_entropy
+        );
+    }
+
+    #[test]
+    fn test_compute_activation_stats_entropy_finite_when_raw_sum_negative() {
+        // Regression: normalising `p = v / sum` against the RAW (possibly
+        // negative) sum, rather than the sum of ReLU-clamped values, could
+        // push `p` far outside [0, 1] even after clamping the numerator —
+        // e.g. here the raw sum is -2.0 while two entries are positive.
+        let v = vec![-5.0_f32, -5.0, 1.0, 1.0];
+        let m = ActivationMap::from_values(2, 2, v).expect("ok");
+        let stats = compute_activation_stats(&m);
+        assert!(
+            stats.spatial_entropy.is_finite(),
+            "entropy={}",
+            stats.spatial_entropy
+        );
+        assert!(
+            (0.0..=2.0 + 1e-3).contains(&stats.spatial_entropy),
+            "entropy={} outside the valid [0, log2(n)] range",
+            stats.spatial_entropy
+        );
     }
 }

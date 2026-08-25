@@ -328,26 +328,18 @@ pub fn spec_build_cotangent_laplacian(
     let (row_ptr, col_idx, values) = build_csr(n, &adj, |i, j| {
         -w_clone.get(&(i, j)).copied().unwrap_or(0.0)
     });
-    // Diagonal: sum of positive weights for each row
+    // Diagonal: L_ii = sum_j w_ij, SIGNED -- matching the signed
+    // off-diagonal values L_ij = -w_ij built above. Cotangent weights are
+    // legitimately negative for obtuse triangles; summing |w| here (as the
+    // old code did) breaks the zero-row-sum property that defines a graph
+    // Laplacian (`L * 1 = 0`), since |w_ij| != w_ij whenever any incident
+    // triangle is obtuse at this vertex's opposite angle.
     let mut degree = vec![0.0f32; n];
     for (&(i, _j), &w) in &weights {
-        if w > 0.0 {
-            degree[i] += w;
-        } else {
-            degree[i] -= w; // absolute value
-        }
+        degree[i] += w;
     }
-    // degree[i] = sum of positive w_{ij}
-    // Re-compute: degree[i] = sum_j w_{ij}
-    // For cotangent L: L_ii = sum_j w_ij (positive), L_ij = -w_ij
-    let mut deg2 = vec![0.0f32; n];
-    for (&(i, _j), &w) in &weights {
-        deg2[i] += w.abs();
-    }
-    // Each undirected edge was counted twice (i→j and j→i), so divide by 2? No: we already
-    // stored each directed half-edge, so deg2[i] = sum_j w_{ij} which is correct for L_ii.
-    for (i, &d) in deg2.iter().enumerate() {
-        if d == 0.0 && !faces.is_empty() {
+    for (i, &d) in degree.iter().enumerate() {
+        if d.abs() < 1e-12 && !faces.is_empty() {
             return Err(SpectralError::IsolatedVertex { idx: i });
         }
     }
@@ -356,7 +348,7 @@ pub fn spec_build_cotangent_laplacian(
         row_ptr,
         col_idx,
         values,
-        degree: deg2,
+        degree,
         kind: LaplacianKind::Cotangent,
     })
 }
@@ -400,20 +392,110 @@ pub fn spec_normalize_laplacian(lap: &MeshLaplacian) -> Result<MeshLaplacian, Sp
     })
 }
 
+/// Convert a Combinatorial or Cotangent Laplacian to its random-walk form
+/// `L_rw = D^{-1}(D - A) = I - D^{-1}A`: `L_rw[i,i] = 1`,
+/// `L_rw[i,j] = -w_ij / d_i`. Unlike [`spec_normalize_laplacian`]'s
+/// symmetric form, this scales each row independently by its own degree;
+/// its spectrum is still confined to `[0, 2]` (same eigenvalues as the
+/// normalized form), which keeps [`spec_laplacian_smooth`] stable.
+///
+/// # Errors
+///
+/// Returns an error if the operation fails.
+pub fn spec_random_walk_laplacian(lap: &MeshLaplacian) -> Result<MeshLaplacian, SpectralError> {
+    let n = lap.n_vertices;
+    let mut new_values = lap.values.clone();
+    let mut new_degree = vec![1.0f32; n]; // normalized diagonal = 1 where degree > 0
+    for (i, new_degree_i) in new_degree.iter_mut().enumerate() {
+        let start = lap.row_ptr[i];
+        let end = lap.row_ptr[i + 1];
+        let d = lap.degree[i];
+        let inv_d = if d > 1e-12 { 1.0 / d } else { 0.0 };
+        for new_val in &mut new_values[start..end] {
+            *new_val *= inv_d;
+        }
+        if d < 1e-12 {
+            *new_degree_i = 0.0;
+        }
+    }
+    Ok(MeshLaplacian {
+        n_vertices: n,
+        row_ptr: lap.row_ptr.clone(),
+        col_idx: lap.col_idx.clone(),
+        values: new_values,
+        degree: new_degree,
+        kind: LaplacianKind::RandomWalk,
+    })
+}
+
+/// Build the graph Laplacian a [`SpectralConfig`] asks for.
+///
+/// This is the config-driven entry point: without it `SpectralConfig`'s
+/// [`laplacian_kind`](SpectralConfig::laplacian_kind) field is inert — every
+/// caller has to pick a `spec_build_*` function by hand and the configured
+/// kind only ever reaches [`spec_format_config`]'s output string.
+///
+/// Dispatch follows [`LaplacianKind`]'s own definitions:
+///
+/// - [`LaplacianKind::Combinatorial`] → [`spec_build_combinatorial_laplacian`]
+/// - [`LaplacianKind::Cotangent`] → [`spec_build_cotangent_laplacian`]
+/// - [`LaplacianKind::Normalized`] → [`spec_normalize_laplacian`] applied to
+///   the combinatorial Laplacian, because that variant is *defined* as
+///   `D^{-1/2}(D − A)D^{-1/2}` over the unweighted `D − A`. Callers wanting
+///   the cotangent-weighted geometric Laplacian in symmetric-normalized form
+///   should compose the two functions directly rather than expect this arm to
+///   silently switch weighting schemes.
+/// - [`LaplacianKind::RandomWalk`] → [`spec_random_walk_laplacian`] applied to
+///   the combinatorial Laplacian, for the same reason (`D^{-1}(D − A)`).
+///
+/// The returned [`MeshLaplacian::kind`] always equals `config.laplacian_kind`.
+///
+/// # Errors
+///
+/// Propagates whichever builder the configured kind selects: notably
+/// [`SpectralError::EmptyMesh`] for an empty `vertices` slice and
+/// [`SpectralError::IsolatedVertex`] for a vertex with no incident edge.
+pub fn spec_build_laplacian(
+    vertices: &[na::Point3<f32>],
+    faces: &[[u32; 3]],
+    config: &SpectralConfig,
+) -> Result<MeshLaplacian, SpectralError> {
+    match config.laplacian_kind {
+        LaplacianKind::Combinatorial => spec_build_combinatorial_laplacian(vertices, faces),
+        LaplacianKind::Cotangent => spec_build_cotangent_laplacian(vertices, faces),
+        LaplacianKind::Normalized => {
+            let base = spec_build_combinatorial_laplacian(vertices, faces)?;
+            spec_normalize_laplacian(&base)
+        }
+        LaplacianKind::RandomWalk => {
+            let base = spec_build_combinatorial_laplacian(vertices, faces)?;
+            spec_random_walk_laplacian(&base)
+        }
+    }
+}
+
 /// Compute L * x (sparse matrix-vector product).
+///
+/// `MeshLaplacian`'s fields are public and every other function here
+/// funnels through this primitive, so out-of-range terms (`x` shorter
+/// than `lap.n_vertices`, or a corrupted `col_idx`) are treated as zero
+/// instead of indexing out of bounds.
 #[must_use]
 pub fn spec_laplacian_matvec(lap: &MeshLaplacian, x: &[f32]) -> Vec<f32> {
     let n = lap.n_vertices;
     let mut result = vec![0.0f32; n];
-    for i in 0..n {
+    for (i, result_i) in result.iter_mut().enumerate() {
+        let Some(&xi) = x.get(i) else { continue };
         // Diagonal contribution
-        result[i] += lap.degree[i] * x[i];
+        *result_i += lap.degree[i] * xi;
         // Off-diagonal contributions
         let start = lap.row_ptr[i];
         let end = lap.row_ptr[i + 1];
         for idx in start..end {
             let j = lap.col_idx[idx];
-            result[i] += lap.values[idx] * x[j];
+            if let Some(&xj) = x.get(j) {
+                *result_i += lap.values[idx] * xj;
+            }
         }
     }
     result
@@ -482,6 +564,42 @@ pub fn spec_rayleigh_quotient(lap: &MeshLaplacian, v: &[f32]) -> f32 {
     }
 }
 
+/// Gershgorin upper bound on the spectral radius of `lap`:
+/// `max_i(|L_ii| + sum_j |L_ij|)`.
+///
+/// Computed directly from the CSR rows (diagonal `degree[i]` plus the
+/// absolute row sum of off-diagonal `values`) rather than as
+/// `2 * max(degree)`, because `2 * max(degree)` is only a valid bound when
+/// `degree[i]` equals the absolute off-diagonal row sum -- true for
+/// Combinatorial (every off-diagonal entry is exactly -1) but NOT for
+/// Cotangent, whose diagonal is the *signed* sum of (possibly negative, for
+/// obtuse triangles) cotangent weights while the off-diagonal magnitudes can
+/// still be large. On such a mesh `degree[i]` can be smaller than the true
+/// absolute row sum, so `2 * max(degree)` can underestimate this bound. The
+/// generic per-row form is valid for every [`LaplacianKind`] with no
+/// special-casing: for Combinatorial it reduces to exactly `2 * max(degree)`;
+/// for Normalized/RandomWalk (diagonal 1.0) it evaluates to ~2.0, matching
+/// their known spectral bound of `[0, 2]`; for Cotangent it correctly grows
+/// past `2 * max(degree)` when obtuse triangles are present.
+///
+/// Used as the shift in [`spec_power_iteration`]'s `(lambda_max * I - L)`
+/// operator: an underestimate there would make power iteration converge to
+/// a mix of the lowest- and highest-frequency modes instead of the k
+/// smallest, since a shifted eigenvalue near 0 (from an unaccounted-for high
+/// true eigenvalue) can rival the shifted value of the true smallest mode.
+fn gershgorin_lambda_max(lap: &MeshLaplacian) -> f32 {
+    (0..lap.n_vertices)
+        .map(|i| {
+            let row_abs: f32 = lap.values[lap.row_ptr[i]..lap.row_ptr[i + 1]]
+                .iter()
+                .map(|v| v.abs())
+                .sum();
+            lap.degree[i].abs() + row_abs
+        })
+        .fold(0.0f32, f32::max)
+        .max(1.0)
+}
+
 /// Compute k smallest eigenvectors using shifted block power iteration.
 ///
 /// # Errors
@@ -503,8 +621,10 @@ pub fn spec_power_iteration(
     if k > n {
         return Err(SpectralError::InsufficientBasis { k, available: n });
     }
-    // Approximate lambda_max = max(degree) for shift
-    let lambda_max = lap.degree.iter().copied().fold(0.0f32, f32::max).max(1.0);
+    // Shift bound for the `(lambda_max * I - L)` operator below -- see
+    // `gershgorin_lambda_max` for why this must be a generic per-row bound
+    // rather than `2 * max(degree)`.
+    let lambda_max = gershgorin_lambda_max(lap);
 
     // Initialize k random vectors
     let mut rng_state = seed.max(1);
@@ -689,18 +809,39 @@ pub fn spec_high_pass_filter(
 }
 
 /// Dirichlet energy: f^T L f (measures signal variation on the graph).
-#[must_use]
-pub fn spec_smoothness(signal: &SpectralSignal, lap: &MeshLaplacian) -> f32 {
+///
+/// # Errors
+///
+/// Returns [`SpectralError::DimensionMismatch`] if `signal.n_vertices !=
+/// lap.n_vertices` (otherwise this would silently compute a wrong, partial
+/// energy via `spec_laplacian_matvec`'s length clamping).
+pub fn spec_smoothness(signal: &SpectralSignal, lap: &MeshLaplacian) -> Result<f32, SpectralError> {
+    if signal.n_vertices != lap.n_vertices {
+        return Err(SpectralError::DimensionMismatch {
+            sig: signal.n_vertices,
+            mesh: lap.n_vertices,
+        });
+    }
     let lf = spec_laplacian_matvec(lap, &signal.values);
-    dot(&signal.values, &lf)
+    Ok(dot(&signal.values, &lf))
 }
 
 // ---------------------------------------------------------------------------
 // Direct Laplacian smoothing (no eigenvectors)
 // ---------------------------------------------------------------------------
 
-/// Explicit Laplacian smoothing: `x_new` = x + λ L x per iteration.
+/// Explicit Laplacian smoothing: `x_new` = x − λ L x per iteration (the
+/// standard umbrella-operator form, equivalent to
+/// `x_new = x + λ * (mean_of_neighbours − x)`).
+///
 /// `positions` is a flat slice of length 3 * `n_vertices` (x0,y0,z0, x1,y1,z1, ...).
+///
+/// # Stability
+///
+/// With the unnormalized `L = D − A` (`Combinatorial`/`Cotangent`), stable
+/// only for `lambda < 2 / lambda_max(L)` (`<= 2 * max(degree)` by
+/// Gershgorin). [`spec_normalize_laplacian`]/[`spec_random_walk_laplacian`]
+/// avoid this bound (spectrum confined to `[0, 2]`).
 #[must_use]
 pub fn spec_laplacian_smooth(
     positions: &[f32],
@@ -719,7 +860,7 @@ pub fn spec_laplacian_smooth(
             }
             let lx = spec_laplacian_matvec(lap, &coord);
             for i in 0..n {
-                pos[3 * i + dim] += lambda * lx[i];
+                pos[3 * i + dim] -= lambda * lx[i];
             }
         }
     }
@@ -728,6 +869,11 @@ pub fn spec_laplacian_smooth(
 
 /// Taubin smoothing: alternating λ (shrink) and μ (inflate) pairs.
 /// Each iteration applies one λ step followed by one μ step, avoiding volume loss.
+///
+/// Uses the same `x_new = x − step * L x` convention as
+/// [`spec_laplacian_smooth`] for both steps, so the standard
+/// parameterization (`lambda > 0` shrink, `mu < 0` inflate) behaves as
+/// documented; see that function's `# Stability` note.
 #[must_use]
 pub fn spec_taubin_smooth(
     positions: &[f32],
@@ -747,7 +893,7 @@ pub fn spec_taubin_smooth(
             }
             let lx = spec_laplacian_matvec(lap, &coord);
             for i in 0..n {
-                pos[3 * i + dim] += lambda * lx[i];
+                pos[3 * i + dim] -= lambda * lx[i];
             }
         }
         // μ step (inflate)
@@ -757,7 +903,7 @@ pub fn spec_taubin_smooth(
             }
             let lx = spec_laplacian_matvec(lap, &coord);
             for i in 0..n {
-                pos[3 * i + dim] += mu * lx[i];
+                pos[3 * i + dim] -= mu * lx[i];
             }
         }
     }
@@ -784,6 +930,13 @@ pub fn spec_cluster_vertices(
         });
     }
     let n = basis.n_vertices;
+    if n == 0 {
+        // `SpectralBasis`'s fields are all public, so a hand-constructed
+        // zero-vertex basis is reachable here; without this guard, the
+        // `xorshift64(&mut rng) as usize % n` k-means++ seed selection
+        // below panics on division/modulo by zero.
+        return Err(SpectralError::EmptyMesh);
+    }
     let k_feat = n_clusters.min(basis.k); // features = first n_clusters eigenvectors
     if k_feat == 0 {
         return Err(SpectralError::InsufficientBasis {
@@ -969,935 +1122,125 @@ pub fn spec_format_config(config: &SpectralConfig) -> String {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+#[path = "spectral_analysis/tests.rs"]
+mod tests;
 
-    // Helper: single equilateral triangle vertices
-    fn triangle_verts() -> Vec<na::Point3<f32>> {
-        vec![
-            na::Point3::new(0.0, 0.0, 0.0),
-            na::Point3::new(1.0, 0.0, 0.0),
-            na::Point3::new(0.5, 3.0_f32.sqrt() / 2.0, 0.0),
-        ]
-    }
-    fn triangle_faces() -> Vec<[u32; 3]> {
-        vec![[0, 1, 2]]
-    }
+#[cfg(test)]
+mod config_dispatch_tests {
+    use super::{
+        spec_build_combinatorial_laplacian, spec_build_cotangent_laplacian, spec_build_laplacian,
+        spec_normalize_laplacian, spec_random_walk_laplacian, LaplacianKind, SpectralConfig,
+        SpectralError,
+    };
+    use nalgebra as na;
 
-    // Helper: path graph 0-1-2 (2 edges)
-    fn path_verts() -> Vec<na::Point3<f32>> {
-        vec![
-            na::Point3::new(0.0, 0.0, 0.0),
-            na::Point3::new(1.0, 0.0, 0.0),
-            na::Point3::new(2.0, 0.0, 0.0),
-        ]
-    }
-    fn path_faces() -> Vec<[u32; 3]> {
-        // Degenerate triangle to get edges 0-1 and 1-2
-        // Use two faces sharing edge 0-1-2
-        vec![[0, 1, 2]]
-    }
+    /// Every [`LaplacianKind`] variant, so a newly added variant makes these
+    /// tests fail to compile rather than silently go untested.
+    const ALL_KINDS: [LaplacianKind; 4] = [
+        LaplacianKind::Combinatorial,
+        LaplacianKind::Normalized,
+        LaplacianKind::Cotangent,
+        LaplacianKind::RandomWalk,
+    ];
 
-    // Helper: tetrahedron (4 vertices, each connected to the other 3)
-    fn tet_verts() -> Vec<na::Point3<f32>> {
-        vec![
-            na::Point3::new(0.0, 0.0, 0.0),
-            na::Point3::new(1.0, 0.0, 0.0),
-            na::Point3::new(0.5, 1.0, 0.0),
-            na::Point3::new(0.5, 0.5, 1.0),
-        ]
-    }
-    fn tet_faces() -> Vec<[u32; 3]> {
-        vec![[0, 1, 2], [0, 1, 3], [0, 2, 3], [1, 2, 3]]
-    }
-
-    // Test 1: single triangle — degree = 2 for all vertices
-    #[test]
-    fn test_combinatorial_triangle_degree() {
-        let verts = triangle_verts();
-        let faces = triangle_faces();
-        let lap = spec_build_combinatorial_laplacian(&verts, &faces).expect("build lap");
-        assert_eq!(lap.n_vertices, 3);
-        for &d in &lap.degree {
-            assert!((d - 2.0).abs() < 1e-6, "expected degree 2, got {d}");
-        }
-    }
-
-    // Test 2: row_ptr length = n + 1
-    #[test]
-    fn test_combinatorial_row_ptr_len() {
-        let verts = triangle_verts();
-        let faces = triangle_faces();
-        let lap = spec_build_combinatorial_laplacian(&verts, &faces).expect("build lap");
-        assert_eq!(lap.row_ptr.len(), 4); // n+1 = 4
-    }
-
-    // Test 3: row sums of combinatorial Laplacian = 0
-    #[test]
-    fn test_combinatorial_row_sums_zero() {
-        let verts = triangle_verts();
-        let faces = triangle_faces();
-        let lap = spec_build_combinatorial_laplacian(&verts, &faces).expect("build lap");
-        for i in 0..lap.n_vertices {
-            let mut row_sum = lap.degree[i]; // diagonal
-            let start = lap.row_ptr[i];
-            let end = lap.row_ptr[i + 1];
-            for idx in start..end {
-                row_sum += lap.values[idx];
-            }
-            assert!(row_sum.abs() < 1e-5, "row {i} sum = {row_sum}");
-        }
-    }
-
-    // Test 4: L * 1 = 0 (constant vector in null space)
-    #[test]
-    fn test_matvec_constant_zero() {
-        let verts = triangle_verts();
-        let faces = triangle_faces();
-        let lap = spec_build_combinatorial_laplacian(&verts, &faces).expect("build lap");
-        let ones = vec![1.0f32; lap.n_vertices];
-        let result = spec_laplacian_matvec(&lap, &ones);
-        for &r in &result {
-            assert!(r.abs() < 1e-5, "L*1 != 0: {r}");
-        }
-    }
-
-    // Test 5: matvec dimension correctness
-    #[test]
-    fn test_matvec_dimension() {
-        let verts = tet_verts();
-        let faces = tet_faces();
-        let lap = spec_build_combinatorial_laplacian(&verts, &faces).expect("build lap");
-        let x = vec![1.0, 2.0, 3.0, 4.0];
-        let result = spec_laplacian_matvec(&lap, &x);
-        assert_eq!(result.len(), 4);
-    }
-
-    // Test 6: cotangent Laplacian on equilateral triangle — symmetric weights
-    #[test]
-    fn test_cotangent_symmetric() {
-        let verts = triangle_verts();
-        let faces = triangle_faces();
-        let lap = spec_build_cotangent_laplacian(&verts, &faces).expect("cotangent lap");
-        // For equilateral triangle all angles are 60°, cot(60°) = 1/sqrt(3)
-        // All off-diagonal weights should be equal (symmetric)
-        let n = lap.n_vertices;
-        let mut w_vals = Vec::new();
-        for i in 0..n {
-            let start = lap.row_ptr[i];
-            let end = lap.row_ptr[i + 1];
-            for idx in start..end {
-                w_vals.push(lap.values[idx].abs());
-            }
-        }
-        let first = w_vals[0];
-        for &w in &w_vals {
-            assert!(
-                (w - first).abs() < 1e-4,
-                "weights not equal: {w} vs {first}"
-            );
-        }
-    }
-
-    // Test 7: cotangent row sums ≈ 0
-    #[test]
-    fn test_cotangent_row_sums_zero() {
-        let verts = triangle_verts();
-        let faces = triangle_faces();
-        let lap = spec_build_cotangent_laplacian(&verts, &faces).expect("cotangent lap");
-        for i in 0..lap.n_vertices {
-            let mut row_sum = lap.degree[i];
-            let start = lap.row_ptr[i];
-            let end = lap.row_ptr[i + 1];
-            for idx in start..end {
-                row_sum += lap.values[idx];
-            }
-            assert!(row_sum.abs() < 1e-3, "cotangent row {i} sum = {row_sum}");
-        }
-    }
-
-    // Test 8: normalized Laplacian — diagonal values are 1 (or 0 for isolated)
-    #[test]
-    fn test_normalize_laplacian_diagonal() {
-        let verts = triangle_verts();
-        let faces = triangle_faces();
-        let lap = spec_build_combinatorial_laplacian(&verts, &faces).expect("build lap");
-        let norm_lap = spec_normalize_laplacian(&lap).expect("normalize");
-        for &d in &norm_lap.degree {
-            // Normalized diagonal should be 1 for connected vertices
-            assert!(
-                (d - 1.0).abs() < 1e-6,
-                "normalized degree should be 1, got {d}"
-            );
-        }
-    }
-
-    // Test 9: normalized Laplacian — off-diagonal |values| <= 1
-    #[test]
-    fn test_normalize_laplacian_values_bounded() {
-        let verts = tet_verts();
-        let faces = tet_faces();
-        let lap = spec_build_combinatorial_laplacian(&verts, &faces).expect("build lap");
-        let norm_lap = spec_normalize_laplacian(&lap).expect("normalize");
-        for &v in &norm_lap.values {
-            assert!(v.abs() <= 1.0 + 1e-5, "normalized value out of range: {v}");
-        }
-    }
-
-    // Test 10: Gram-Schmidt — output vectors are orthonormal
-    #[test]
-    fn test_gram_schmidt_orthonormal() {
-        let n = 4;
-        let mut vecs = vec![
-            vec![1.0, 2.0, 3.0, 4.0],
-            vec![5.0, 6.0, 7.0, 8.0],
-            vec![9.0, 10.0, 11.0, 12.0],
+    /// A regular tetrahedron: closed, no isolated vertices, and every face is
+    /// equilateral, so all cotangent weights are strictly positive and the
+    /// cotangent arm cannot trip `IsolatedVertex` on a near-zero diagonal.
+    fn tetrahedron() -> (Vec<na::Point3<f32>>, Vec<[u32; 3]>) {
+        let vertices = vec![
+            na::Point3::new(1.0, 1.0, 1.0),
+            na::Point3::new(1.0, -1.0, -1.0),
+            na::Point3::new(-1.0, 1.0, -1.0),
+            na::Point3::new(-1.0, -1.0, 1.0),
         ];
-        let k = vecs.len();
-        spec_gram_schmidt(&mut vecs, n, k);
-        for (i, vi) in vecs.iter().enumerate() {
-            // Self dot = 1
-            let self_d = dot(vi, vi);
-            assert!((self_d - 1.0).abs() < 1e-5, "v{i} not normalized: {self_d}");
-            for (j, vj) in vecs.iter().enumerate() {
-                if i != j {
-                    let cross_d = dot(vi, vj).abs();
-                    assert!(cross_d < 1e-5, "v{i} · v{j} = {cross_d}, not orthogonal");
-                }
-            }
-        }
+        let faces = vec![[0, 1, 2], [0, 1, 3], [0, 2, 3], [1, 2, 3]];
+        (vertices, faces)
     }
 
-    // Test 11: Gram-Schmidt — doesn't change span (reconstructed same vector up to sign)
-    #[test]
-    fn test_gram_schmidt_preserves_span() {
-        let n = 3;
-        let original = vec![1.0f32, 2.0, 3.0];
-        let mut vecs = vec![original.clone(), vec![0.0, 1.0, 0.0]];
-        spec_gram_schmidt(&mut vecs, n, 2);
-        // First GS vector should be proportional to original
-        let d = dot(&vecs[0], &original);
-        assert!(d.abs() > 0.99, "GS first vector not along original: {d}");
-    }
-
-    // Test 12: Rayleigh quotient of constant vector = 0 (L*1=0)
-    #[test]
-    fn test_rayleigh_quotient_constant() {
-        let verts = tet_verts();
-        let faces = tet_faces();
-        let lap = spec_build_combinatorial_laplacian(&verts, &faces).expect("build lap");
-        let ones = vec![1.0f32; lap.n_vertices];
-        let rq = spec_rayleigh_quotient(&lap, &ones);
-        assert!(
-            rq.abs() < 1e-4,
-            "RQ of constant vector should be 0, got {rq}"
-        );
-    }
-
-    // Test 13: Rayleigh quotient of non-constant vector > 0
-    #[test]
-    fn test_rayleigh_quotient_positive() {
-        let verts = tet_verts();
-        let faces = tet_faces();
-        let lap = spec_build_combinatorial_laplacian(&verts, &faces).expect("build lap");
-        let v = vec![1.0f32, -1.0, 1.0, -1.0];
-        let rq = spec_rayleigh_quotient(&lap, &v);
-        assert!(
-            rq > 0.0,
-            "RQ of non-constant vector should be positive, got {rq}"
-        );
-    }
-
-    // Test 14: power iteration on path graph k=2, eigenvalues sorted ascending
-    #[test]
-    fn test_power_iteration_sorted() {
-        let verts = path_verts();
-        let faces = path_faces();
-        let lap = spec_build_combinatorial_laplacian(&verts, &faces).expect("build lap");
-        let basis = spec_power_iteration(&lap, 2, 2000, 1e-7, 42).expect("power iter");
-        assert_eq!(basis.k, 2);
-        assert!(
-            basis.eigenvalues[0] <= basis.eigenvalues[1] + 1e-5,
-            "eigenvalues not sorted: {:?}",
-            basis.eigenvalues
-        );
-    }
-
-    // Test 15: power iteration eigenvectors are orthogonal
-    #[test]
-    fn test_power_iteration_orthogonal() {
-        let verts = tet_verts();
-        let faces = tet_faces();
-        let lap = spec_build_combinatorial_laplacian(&verts, &faces).expect("build lap");
-        let basis = spec_power_iteration(&lap, 3, 2000, 1e-7, 7).expect("power iter");
-        let k = basis.k;
-        for i in 0..k {
-            for j in (i + 1)..k {
-                let d = dot(&basis.eigenvectors[i], &basis.eigenvectors[j]).abs();
-                assert!(d < 0.05, "eigenvectors {i} and {j} not orthogonal: dot={d}");
-            }
-        }
-    }
-
-    // Test 16: smallest eigenvalue ≈ 0 for connected graph
-    #[test]
-    fn test_power_iteration_smallest_near_zero() {
-        let verts = triangle_verts();
-        let faces = triangle_faces();
-        let lap = spec_build_combinatorial_laplacian(&verts, &faces).expect("build lap");
-        let basis = spec_power_iteration(&lap, 2, 2000, 1e-7, 1).expect("power iter");
-        assert!(
-            basis.eigenvalues[0].abs() < 0.3,
-            "smallest eigenvalue should be ~0 for connected graph, got {}",
-            basis.eigenvalues[0]
-        );
-    }
-
-    // Test 17: eigenvalues ordered ascending
-    #[test]
-    fn test_eigenvalues_ascending() {
-        let verts = tet_verts();
-        let faces = tet_faces();
-        let lap = spec_build_combinatorial_laplacian(&verts, &faces).expect("build lap");
-        let basis = spec_power_iteration(&lap, 3, 2000, 1e-7, 99).expect("power iter");
-        for i in 0..basis.eigenvalues.len() - 1 {
-            assert!(
-                basis.eigenvalues[i] <= basis.eigenvalues[i + 1] + 1e-4,
-                "eigenvalues not ascending at {i}: {:?}",
-                basis.eigenvalues
-            );
-        }
-    }
-
-    // Test 18: project → reconstruct round-trip
-    #[test]
-    fn test_project_reconstruct_roundtrip() {
-        let verts = tet_verts();
-        let faces = tet_faces();
-        let lap = spec_build_combinatorial_laplacian(&verts, &faces).expect("build lap");
-        let basis = spec_power_iteration(&lap, 4, 3000, 1e-8, 5).expect("power iter");
-        let signal = SpectralSignal {
-            values: vec![1.0, 2.0, 3.0, 4.0],
-            n_vertices: 4,
-        };
-        let coeffs = spec_project(&signal, &basis).expect("project");
-        let reconstructed = spec_reconstruct(&coeffs, &basis).expect("reconstruct");
-        let mse: f32 = signal
-            .values
-            .iter()
-            .zip(reconstructed.values.iter())
-            .map(|(a, b)| (a - b) * (a - b))
-            .sum::<f32>()
-            / 4.0;
-        assert!(mse < 0.1, "round-trip MSE = {mse} (should be near 0)");
-    }
-
-    // Test 19: low-pass filter produces smoother output
-    #[test]
-    fn test_low_pass_filter_smoother() {
-        let verts = tet_verts();
-        let faces = tet_faces();
-        let lap = spec_build_combinatorial_laplacian(&verts, &faces).expect("build lap");
-        let basis = spec_power_iteration(&lap, 3, 2000, 1e-7, 13).expect("power iter");
-        let signal = SpectralSignal {
-            values: vec![1.0, -2.0, 3.0, -4.0],
-            n_vertices: 4,
-        };
-        let smoothed = spec_low_pass_filter(&signal, &basis, 1).expect("low pass");
-        let s_before = spec_smoothness(&signal, &lap);
-        let s_after = spec_smoothness(&smoothed, &lap);
-        assert!(
-            s_after <= s_before + 1e-3,
-            "low pass did not reduce smoothness: before={s_before}, after={s_after}"
-        );
-    }
-
-    // Test 20: high-pass filter removes low-freq content
-    #[test]
-    fn test_high_pass_filter() {
-        let verts = tet_verts();
-        let faces = tet_faces();
-        let lap = spec_build_combinatorial_laplacian(&verts, &faces).expect("build lap");
-        let basis = spec_power_iteration(&lap, 4, 2000, 1e-7, 21).expect("power iter");
-        let signal = SpectralSignal {
-            values: vec![1.0, 1.0, 1.0, 2.0],
-            n_vertices: 4,
-        };
-        let coeffs_full = spec_project(&signal, &basis).expect("project full");
-        let hp = spec_high_pass_filter(&signal, &basis, 1).expect("high pass");
-        let coeffs_hp = spec_project(&hp, &basis).expect("project hp");
-        // First coefficient should be zeroed or near zero
-        assert!(
-            coeffs_hp[0].abs() < coeffs_full[0].abs() + 0.5,
-            "high pass did not attenuate low freq: full={}, hp={}",
-            coeffs_full[0],
-            coeffs_hp[0]
-        );
-    }
-
-    // Test 21: smoothness of constant signal = 0
-    #[test]
-    fn test_smoothness_constant_zero() {
-        let verts = triangle_verts();
-        let faces = triangle_faces();
-        let lap = spec_build_combinatorial_laplacian(&verts, &faces).expect("build lap");
-        let signal = SpectralSignal {
-            values: vec![3.0, 3.0, 3.0],
-            n_vertices: 3,
-        };
-        let s = spec_smoothness(&signal, &lap);
-        assert!(s.abs() < 1e-4, "smoothness of constant = {s}");
-    }
-
-    // Test 22: smoothness of non-constant > 0
-    #[test]
-    fn test_smoothness_nonconstant_positive() {
-        let verts = triangle_verts();
-        let faces = triangle_faces();
-        let lap = spec_build_combinatorial_laplacian(&verts, &faces).expect("build lap");
-        let signal = SpectralSignal {
-            values: vec![1.0, -1.0, 0.0],
-            n_vertices: 3,
-        };
-        let s = spec_smoothness(&signal, &lap);
-        assert!(
-            s > 0.0,
-            "smoothness of non-constant should be positive, got {s}"
-        );
-    }
-
-    // Test 23: Laplacian smooth changes positions
-    #[test]
-    fn test_laplacian_smooth_changes() {
-        let verts = triangle_verts();
-        let faces = triangle_faces();
-        let lap = spec_build_combinatorial_laplacian(&verts, &faces).expect("build lap");
-        let positions: Vec<f32> = verts.iter().flat_map(|p| [p.x, p.y, p.z]).collect();
-        let smoothed = spec_laplacian_smooth(&positions, &lap, 0.1, 5);
-        let diff: f32 = positions
-            .iter()
-            .zip(smoothed.iter())
-            .map(|(a, b)| (a - b).abs())
-            .sum();
-        assert!(diff > 1e-6, "Laplacian smooth did not change positions");
-    }
-
-    // Test 24: Laplacian smooth with constant positions → no change
-    #[test]
-    fn test_laplacian_smooth_constant_no_change() {
-        let verts = triangle_verts();
-        let faces = triangle_faces();
-        let lap = spec_build_combinatorial_laplacian(&verts, &faces).expect("build lap");
-        // Constant position (all the same): gradient is zero
-        let positions = vec![1.0f32; 9]; // 3 vertices × 3 coords, all 1.0
-        let smoothed = spec_laplacian_smooth(&positions, &lap, 0.1, 5);
-        let diff: f32 = positions
-            .iter()
-            .zip(smoothed.iter())
-            .map(|(a, b)| (a - b).abs())
-            .sum();
-        assert!(
-            diff < 1e-5,
-            "Constant positions changed under smooth: diff={diff}"
-        );
-    }
-
-    // Test 25: Taubin smooth changes positions
-    #[test]
-    fn test_taubin_smooth_changes() {
-        let verts = triangle_verts();
-        let faces = triangle_faces();
-        let lap = spec_build_combinatorial_laplacian(&verts, &faces).expect("build lap");
-        let positions: Vec<f32> = verts.iter().flat_map(|p| [p.x, p.y, p.z]).collect();
-        let smoothed = spec_taubin_smooth(&positions, &lap, 0.5, -0.53, 10);
-        let diff: f32 = positions
-            .iter()
-            .zip(smoothed.iter())
-            .map(|(a, b)| (a - b).abs())
-            .sum();
-        assert!(diff > 0.0, "Taubin smooth did not change positions");
-    }
-
-    // Test 26: Taubin closer to original than pure Laplacian (less shrinkage)
-    // Use stable parameters: for tet with max eigenvalue ~6, lambda < 1/6 ≈ 0.1
-    // Laplacian shrinks mesh each iteration; Taubin compensates with mu step
-    #[test]
-    fn test_taubin_less_shrinkage() {
-        let verts = tet_verts();
-        let faces = tet_faces();
-        let lap = spec_build_combinatorial_laplacian(&verts, &faces).expect("build lap");
-        let positions: Vec<f32> = verts.iter().flat_map(|p| [p.x, p.y, p.z]).collect();
-        // Pure Laplacian: 20 iters with lambda=0.05 → steady shrinkage
-        let lap_smooth = spec_laplacian_smooth(&positions, &lap, 0.05, 20);
-        // Taubin: 5 pairs with stable lambda=0.05, mu=-0.06 → less shrinkage
-        let taubin = spec_taubin_smooth(&positions, &lap, 0.05, -0.06, 5);
-        let err_lap: f32 = positions
-            .iter()
-            .zip(lap_smooth.iter())
-            .map(|(a, b)| (a - b) * (a - b))
-            .sum();
-        let err_taubin: f32 = positions
-            .iter()
-            .zip(taubin.iter())
-            .map(|(a, b)| (a - b) * (a - b))
-            .sum();
-        // Taubin with fewer iters must deviate less than pure Laplacian with 20 iters
-        assert!(
-            err_taubin < err_lap + 1e-3,
-            "Taubin should have less deviation from original: lap={err_lap}, taubin={err_taubin}"
-        );
-    }
-
-    // Test 27: cluster_vertices k=3 returns labels all in [0,3)
-    #[test]
-    fn test_cluster_labels_in_range() {
-        let verts = tet_verts();
-        let faces = tet_faces();
-        let lap = spec_build_combinatorial_laplacian(&verts, &faces).expect("build lap");
-        let basis = spec_power_iteration(&lap, 3, 2000, 1e-7, 77).expect("power iter");
-        let labels = spec_cluster_vertices(&basis, 3, 42).expect("cluster");
-        assert_eq!(labels.len(), 4);
-        for &l in &labels {
-            assert!(l < 3, "label {l} out of range [0,3)");
-        }
-    }
-
-    // Test 28: cluster_vertices returns n_vertices assignments
-    #[test]
-    fn test_cluster_returns_n_assignments() {
-        let verts = tet_verts();
-        let faces = tet_faces();
-        let lap = spec_build_combinatorial_laplacian(&verts, &faces).expect("build lap");
-        let basis = spec_power_iteration(&lap, 2, 2000, 1e-7, 3).expect("power iter");
-        let labels = spec_cluster_vertices(&basis, 2, 11).expect("cluster");
-        assert_eq!(labels.len(), verts.len());
-    }
-
-    // Test 29: stats n_edges correct for single triangle (= 3 undirected edges)
-    #[test]
-    fn test_stats_n_edges_triangle() {
-        let verts = triangle_verts();
-        let faces = triangle_faces();
-        let lap = spec_build_combinatorial_laplacian(&verts, &faces).expect("build lap");
-        let stats = spec_compute_stats(&lap, None);
-        assert_eq!(
-            stats.n_edges, 3,
-            "triangle has 3 edges, got {}",
-            stats.n_edges
-        );
-    }
-
-    // Test 30: stats mean_degree correct for triangle (= 2.0)
-    #[test]
-    fn test_stats_mean_degree_triangle() {
-        let verts = triangle_verts();
-        let faces = triangle_faces();
-        let lap = spec_build_combinatorial_laplacian(&verts, &faces).expect("build lap");
-        let stats = spec_compute_stats(&lap, None);
-        assert!(
-            (stats.mean_degree - 2.0).abs() < 1e-5,
-            "mean degree should be 2.0, got {}",
-            stats.mean_degree
-        );
-    }
-
-    // Test 31: format_stats returns non-empty string
-    #[test]
-    fn test_format_stats_nonempty() {
-        let verts = triangle_verts();
-        let faces = triangle_faces();
-        let lap = spec_build_combinatorial_laplacian(&verts, &faces).expect("build lap");
-        let stats = spec_compute_stats(&lap, None);
-        let s = spec_format_stats(&stats);
-        assert!(!s.is_empty(), "format_stats returned empty string");
-    }
-
-    // Test 32: format_config returns non-empty string
-    #[test]
-    fn test_format_config_nonempty() {
-        let config = SpectralConfig {
-            k: 10,
-            max_power_iters: 500,
+    fn config_with(kind: LaplacianKind) -> SpectralConfig {
+        SpectralConfig {
+            k: 2,
+            max_power_iters: 64,
             tol: 1e-6,
-            laplacian_kind: LaplacianKind::Combinatorial,
-        };
-        let s = spec_format_config(&config);
-        assert!(!s.is_empty(), "format_config returned empty string");
+            laplacian_kind: kind,
+        }
     }
 
-    // Test 33: EmptyMesh error for 0 vertices
     #[test]
-    fn test_empty_mesh_error() {
-        let result = spec_build_combinatorial_laplacian(&[], &[]);
-        assert!(
-            matches!(result, Err(SpectralError::EmptyMesh)),
-            "expected EmptyMesh error"
-        );
+    fn spec_build_laplacian_returns_the_configured_kind() {
+        // Regression test for `SpectralConfig::laplacian_kind` being a
+        // write-only field: before `spec_build_laplacian` existed the only
+        // reader was `spec_format_config`, so a caller configuring
+        // `Cotangent` still had to hand-pick a builder and could silently get
+        // a combinatorial Laplacian. Rewiring any arm must fail here.
+        let (vertices, faces) = tetrahedron();
+        for kind in ALL_KINDS {
+            let lap = spec_build_laplacian(&vertices, &faces, &config_with(kind))
+                .expect("test: a regular tetrahedron is valid for every Laplacian kind");
+            assert_eq!(
+                lap.kind, kind,
+                "spec_build_laplacian must return the configured kind {kind:?}"
+            );
+            assert_eq!(lap.n_vertices, vertices.len());
+        }
     }
 
-    // Test 34: EmptyMesh error for cotangent with 0 vertices
     #[test]
-    fn test_empty_mesh_cotangent() {
-        let result = spec_build_cotangent_laplacian(&[], &[]);
-        assert!(
-            matches!(result, Err(SpectralError::EmptyMesh)),
-            "expected EmptyMesh error"
-        );
+    fn spec_build_laplacian_matches_hand_composed_builders() {
+        let (vertices, faces) = tetrahedron();
+        let combinatorial = spec_build_combinatorial_laplacian(&vertices, &faces)
+            .expect("test: combinatorial build should succeed");
+
+        let expected: Vec<(LaplacianKind, Vec<f32>, Vec<f32>)> = vec![
+            (
+                LaplacianKind::Combinatorial,
+                combinatorial.values.clone(),
+                combinatorial.degree.clone(),
+            ),
+            {
+                let normalized = spec_normalize_laplacian(&combinatorial)
+                    .expect("test: normalize should succeed");
+                (
+                    LaplacianKind::Normalized,
+                    normalized.values,
+                    normalized.degree,
+                )
+            },
+            {
+                let cotangent = spec_build_cotangent_laplacian(&vertices, &faces)
+                    .expect("test: cotangent build should succeed");
+                (LaplacianKind::Cotangent, cotangent.values, cotangent.degree)
+            },
+            {
+                let random_walk = spec_random_walk_laplacian(&combinatorial)
+                    .expect("test: random-walk conversion should succeed");
+                (
+                    LaplacianKind::RandomWalk,
+                    random_walk.values,
+                    random_walk.degree,
+                )
+            },
+        ];
+
+        for (kind, values, degree) in expected {
+            let lap = spec_build_laplacian(&vertices, &faces, &config_with(kind))
+                .expect("test: dispatch should succeed");
+            assert_eq!(lap.values, values, "{kind:?}: off-diagonal values differ");
+            assert_eq!(lap.degree, degree, "{kind:?}: diagonal differs");
+        }
     }
 
-    // Test 35: DimensionMismatch error for project
     #[test]
-    fn test_dimension_mismatch_project() {
-        let verts = triangle_verts();
-        let faces = triangle_faces();
-        let lap = spec_build_combinatorial_laplacian(&verts, &faces).expect("build lap");
-        let basis = spec_power_iteration(&lap, 2, 1000, 1e-6, 1).expect("power iter");
-        let signal = SpectralSignal {
-            values: vec![1.0, 2.0, 3.0, 4.0], // 4 != 3
-            n_vertices: 4,
-        };
-        let result = spec_project(&signal, &basis);
-        assert!(
-            matches!(result, Err(SpectralError::DimensionMismatch { .. })),
-            "expected DimensionMismatch error"
-        );
-    }
-
-    // Test 36: InsufficientBasis error for reconstruct
-    #[test]
-    fn test_insufficient_basis_reconstruct() {
-        let verts = triangle_verts();
-        let faces = triangle_faces();
-        let lap = spec_build_combinatorial_laplacian(&verts, &faces).expect("build lap");
-        let basis = spec_power_iteration(&lap, 2, 1000, 1e-6, 1).expect("power iter");
-        // More coefficients than k
-        let coeffs = vec![1.0f32; 5];
-        let result = spec_reconstruct(&coeffs, &basis);
-        assert!(
-            matches!(result, Err(SpectralError::InsufficientBasis { .. })),
-            "expected InsufficientBasis error"
-        );
-    }
-
-    // Test 37: InsufficientBasis error for power_iteration with k > n
-    #[test]
-    fn test_insufficient_basis_k_gt_n() {
-        let verts = triangle_verts();
-        let faces = triangle_faces();
-        let lap = spec_build_combinatorial_laplacian(&verts, &faces).expect("build lap");
-        let result = spec_power_iteration(&lap, 10, 100, 1e-6, 1);
-        assert!(
-            matches!(result, Err(SpectralError::InsufficientBasis { .. })),
-            "expected InsufficientBasis error for k > n"
-        );
-    }
-
-    // Test 38: tetrahedron Laplacian — all degrees = 3
-    #[test]
-    fn test_tet_all_degrees_three() {
-        let verts = tet_verts();
-        let faces = tet_faces();
-        let lap = spec_build_combinatorial_laplacian(&verts, &faces).expect("build lap");
-        for (i, &d) in lap.degree.iter().enumerate() {
+    fn spec_build_laplacian_propagates_empty_mesh_for_every_kind() {
+        for kind in ALL_KINDS {
+            // Matched rather than unwrapped: `MeshLaplacian` deliberately does
+            // not implement `Debug` (it is a bulky CSR payload), so
+            // `expect_err` is unavailable on this `Result`.
+            let result = spec_build_laplacian(&[], &[], &config_with(kind));
             assert!(
-                (d - 3.0).abs() < 1e-6,
-                "tet vertex {i} degree = {d}, expected 3"
+                matches!(result, Err(SpectralError::EmptyMesh)),
+                "{kind:?}: an empty vertex slice must fail with EmptyMesh"
             );
         }
-    }
-
-    // Test 39: algebraic connectivity (λ₂) > 0 for connected mesh
-    #[test]
-    fn test_algebraic_connectivity_positive() {
-        let verts = triangle_verts();
-        let faces = triangle_faces();
-        let lap = spec_build_combinatorial_laplacian(&verts, &faces).expect("build lap");
-        let basis = spec_power_iteration(&lap, 2, 2000, 1e-7, 42).expect("power iter");
-        let stats = spec_compute_stats(&lap, Some(&basis));
-        assert!(
-            stats.algebraic_connectivity > -0.1,
-            "algebraic connectivity should be >= 0 for connected mesh, got {}",
-            stats.algebraic_connectivity
-        );
-    }
-
-    // Test 40: signal projection coefficients length = k
-    #[test]
-    fn test_projection_coefficients_length() {
-        let verts = tet_verts();
-        let faces = tet_faces();
-        let lap = spec_build_combinatorial_laplacian(&verts, &faces).expect("build lap");
-        let basis = spec_power_iteration(&lap, 3, 2000, 1e-7, 55).expect("power iter");
-        let signal = SpectralSignal {
-            values: vec![1.0, 2.0, 3.0, 4.0],
-            n_vertices: 4,
-        };
-        let coeffs = spec_project(&signal, &basis).expect("project");
-        assert_eq!(coeffs.len(), 3, "coefficients length should be k=3");
-    }
-
-    // Test 41: low-pass filter with cutoff_k=0 → all zeros (no basis kept)
-    #[test]
-    fn test_low_pass_cutoff_zero() {
-        let verts = triangle_verts();
-        let faces = triangle_faces();
-        let lap = spec_build_combinatorial_laplacian(&verts, &faces).expect("build lap");
-        let basis = spec_power_iteration(&lap, 2, 2000, 1e-7, 99).expect("power iter");
-        let signal = SpectralSignal {
-            values: vec![1.0, 2.0, 3.0],
-            n_vertices: 3,
-        };
-        let filtered = spec_low_pass_filter(&signal, &basis, 0).expect("low pass k=0");
-        let total: f32 = filtered.values.iter().map(|x| x.abs()).sum();
-        assert!(
-            total < 1e-4,
-            "low pass with cutoff 0 should give ~0 output, got {total}"
-        );
-    }
-
-    // Test 42: CSR row_ptr is non-decreasing
-    #[test]
-    fn test_csr_row_ptr_nondecreasing() {
-        let verts = tet_verts();
-        let faces = tet_faces();
-        let lap = spec_build_combinatorial_laplacian(&verts, &faces).expect("build lap");
-        for i in 0..lap.row_ptr.len() - 1 {
-            assert!(
-                lap.row_ptr[i] <= lap.row_ptr[i + 1],
-                "row_ptr not non-decreasing at {i}"
-            );
-        }
-    }
-
-    // Test 43: CSR col_idx all in valid range
-    #[test]
-    fn test_csr_col_idx_valid() {
-        let verts = tet_verts();
-        let faces = tet_faces();
-        let lap = spec_build_combinatorial_laplacian(&verts, &faces).expect("build lap");
-        let n = lap.n_vertices;
-        for &c in &lap.col_idx {
-            assert!(c < n, "col_idx {c} out of range [0, {n})");
-        }
-    }
-
-    // Test 44: off-diagonal values of combinatorial Laplacian are -1
-    #[test]
-    fn test_combinatorial_off_diag_neg_one() {
-        let verts = triangle_verts();
-        let faces = triangle_faces();
-        let lap = spec_build_combinatorial_laplacian(&verts, &faces).expect("build lap");
-        for &v in &lap.values {
-            assert!(
-                (v + 1.0).abs() < 1e-6,
-                "off-diag value should be -1, got {v}"
-            );
-        }
-    }
-
-    // Test 45: laplacian_matvec with zero vector gives zero
-    #[test]
-    fn test_matvec_zero_vector() {
-        let verts = tet_verts();
-        let faces = tet_faces();
-        let lap = spec_build_combinatorial_laplacian(&verts, &faces).expect("build lap");
-        let zeros = vec![0.0f32; lap.n_vertices];
-        let result = spec_laplacian_matvec(&lap, &zeros);
-        for &r in &result {
-            assert!(r.abs() < 1e-10, "L*0 should be 0, got {r}");
-        }
-    }
-
-    // Test 46: cluster_vertices with n_clusters=1 → all zeros
-    #[test]
-    fn test_cluster_one_cluster() {
-        let verts = tet_verts();
-        let faces = tet_faces();
-        let lap = spec_build_combinatorial_laplacian(&verts, &faces).expect("build lap");
-        let basis = spec_power_iteration(&lap, 1, 1000, 1e-6, 1).expect("power iter");
-        let labels = spec_cluster_vertices(&basis, 1, 7).expect("cluster");
-        for &l in &labels {
-            assert_eq!(l, 0, "all labels should be 0 for n_clusters=1");
-        }
-    }
-
-    // Test 47: spectral_gap = algebraic_connectivity - lambda1
-    #[test]
-    fn test_spectral_gap_definition() {
-        let verts = tet_verts();
-        let faces = tet_faces();
-        let lap = spec_build_combinatorial_laplacian(&verts, &faces).expect("build lap");
-        let basis = spec_power_iteration(&lap, 2, 2000, 1e-7, 123).expect("power iter");
-        let stats = spec_compute_stats(&lap, Some(&basis));
-        let expected_gap = basis.eigenvalues[1] - basis.eigenvalues[0];
-        assert!(
-            (stats.spectral_gap - expected_gap).abs() < 0.01,
-            "spectral gap mismatch: {} vs {}",
-            stats.spectral_gap,
-            expected_gap
-        );
-    }
-
-    // Test 48: normalize Laplacian kind is Normalized
-    #[test]
-    fn test_normalized_laplacian_kind() {
-        let verts = triangle_verts();
-        let faces = triangle_faces();
-        let lap = spec_build_combinatorial_laplacian(&verts, &faces).expect("build lap");
-        let norm = spec_normalize_laplacian(&lap).expect("normalize");
-        assert!(
-            matches!(norm.kind, LaplacianKind::Normalized),
-            "kind should be Normalized"
-        );
-    }
-
-    // Test 49: cotangent Laplacian kind is Cotangent
-    #[test]
-    fn test_cotangent_laplacian_kind() {
-        let verts = triangle_verts();
-        let faces = triangle_faces();
-        let lap = spec_build_cotangent_laplacian(&verts, &faces).expect("cotangent lap");
-        assert!(
-            matches!(lap.kind, LaplacianKind::Cotangent),
-            "kind should be Cotangent"
-        );
-    }
-
-    // Test 50: SpectralSignal n_vertices matches values.len()
-    #[test]
-    fn test_spectral_signal_consistency() {
-        let signal = SpectralSignal {
-            values: vec![1.0, 2.0, 3.0, 4.0],
-            n_vertices: 4,
-        };
-        assert_eq!(signal.values.len(), signal.n_vertices);
-    }
-
-    // Test 51: spec_compute_stats with basis has spectral_radius from basis
-    #[test]
-    fn test_stats_spectral_radius_from_basis() {
-        let verts = tet_verts();
-        let faces = tet_faces();
-        let lap = spec_build_combinatorial_laplacian(&verts, &faces).expect("build lap");
-        let basis = spec_power_iteration(&lap, 3, 2000, 1e-7, 456).expect("power iter");
-        let stats = spec_compute_stats(&lap, Some(&basis));
-        // spectral_radius should equal max eigenvalue in basis
-        let max_ev = basis.eigenvalues.iter().copied().fold(0.0f32, f32::max);
-        assert!(
-            (stats.spectral_radius - max_ev).abs() < 1e-4,
-            "spectral_radius mismatch: {} vs {}",
-            stats.spectral_radius,
-            max_ev
-        );
-    }
-
-    // Test 52: tetrahedron has 6 undirected edges
-    #[test]
-    fn test_tet_n_edges() {
-        let verts = tet_verts();
-        let faces = tet_faces();
-        let lap = spec_build_combinatorial_laplacian(&verts, &faces).expect("build lap");
-        let stats = spec_compute_stats(&lap, None);
-        assert_eq!(
-            stats.n_edges, 6,
-            "tetrahedron has 6 edges, got {}",
-            stats.n_edges
-        );
-    }
-
-    // Test 53: xorshift64 never returns 0
-    #[test]
-    fn test_xorshift64_nonzero() {
-        let mut state = 1u64;
-        for _ in 0..10_000 {
-            let v = xorshift64(&mut state);
-            assert_ne!(v, 0, "xorshift64 returned 0");
-        }
-    }
-
-    // Test 54: format_stats contains expected fields
-    #[test]
-    fn test_format_stats_contains_fields() {
-        let verts = triangle_verts();
-        let faces = triangle_faces();
-        let lap = spec_build_combinatorial_laplacian(&verts, &faces).expect("build lap");
-        let stats = spec_compute_stats(&lap, None);
-        let s = spec_format_stats(&stats);
-        assert!(s.contains("n_vertices"), "missing n_vertices");
-        assert!(s.contains("n_edges"), "missing n_edges");
-        assert!(s.contains("mean_degree"), "missing mean_degree");
-    }
-
-    // Test 55: format_config contains expected fields
-    #[test]
-    fn test_format_config_contains_fields() {
-        let config = SpectralConfig {
-            k: 5,
-            max_power_iters: 100,
-            tol: 1e-5,
-            laplacian_kind: LaplacianKind::Cotangent,
-        };
-        let s = spec_format_config(&config);
-        assert!(s.contains("k:"), "missing k");
-        assert!(s.contains("Cotangent"), "missing laplacian kind");
-    }
-
-    // Test 56: spec_laplacian_smooth output length = input length
-    #[test]
-    fn test_laplacian_smooth_output_length() {
-        let verts = tet_verts();
-        let faces = tet_faces();
-        let lap = spec_build_combinatorial_laplacian(&verts, &faces).expect("build lap");
-        let positions: Vec<f32> = verts.iter().flat_map(|p| [p.x, p.y, p.z]).collect();
-        let smoothed = spec_laplacian_smooth(&positions, &lap, 0.1, 3);
-        assert_eq!(smoothed.len(), positions.len());
-    }
-
-    // Test 57: spec_taubin_smooth output length = input length
-    #[test]
-    fn test_taubin_smooth_output_length() {
-        let verts = tet_verts();
-        let faces = tet_faces();
-        let lap = spec_build_combinatorial_laplacian(&verts, &faces).expect("build lap");
-        let positions: Vec<f32> = verts.iter().flat_map(|p| [p.x, p.y, p.z]).collect();
-        let smoothed = spec_taubin_smooth(&positions, &lap, 0.5, -0.53, 4);
-        assert_eq!(smoothed.len(), positions.len());
-    }
-
-    // Test 58: cluster_vertices with 0 clusters returns error
-    #[test]
-    fn test_cluster_zero_clusters_error() {
-        let verts = tet_verts();
-        let faces = tet_faces();
-        let lap = spec_build_combinatorial_laplacian(&verts, &faces).expect("build lap");
-        let basis = spec_power_iteration(&lap, 2, 1000, 1e-6, 1).expect("power iter");
-        let result = spec_cluster_vertices(&basis, 0, 1);
-        assert!(
-            matches!(result, Err(SpectralError::InvalidConfig { .. })),
-            "expected InvalidConfig error for 0 clusters"
-        );
-    }
-
-    // Test 59: power_iteration with k=0 returns error
-    #[test]
-    fn test_power_iteration_k_zero_error() {
-        let verts = triangle_verts();
-        let faces = triangle_faces();
-        let lap = spec_build_combinatorial_laplacian(&verts, &faces).expect("build lap");
-        let result = spec_power_iteration(&lap, 0, 100, 1e-6, 1);
-        assert!(
-            matches!(result, Err(SpectralError::InvalidConfig { .. })),
-            "expected InvalidConfig error for k=0"
-        );
-    }
-
-    // Test 60: n_vertices in basis matches mesh
-    #[test]
-    fn test_basis_n_vertices_matches() {
-        let verts = tet_verts();
-        let faces = tet_faces();
-        let lap = spec_build_combinatorial_laplacian(&verts, &faces).expect("build lap");
-        let basis = spec_power_iteration(&lap, 2, 1000, 1e-6, 1).expect("power iter");
-        assert_eq!(basis.n_vertices, verts.len());
     }
 }

@@ -693,7 +693,7 @@ fn pick_right_and_forward(axes: [[f32; 3]; 3]) -> ([f32; 3], [f32; 3]) {
 ///
 /// Each PCA axis is assigned to the left-right or front-back role by which
 /// original coordinate axis it is closest to (see
-/// [`pick_right_and_forward`]) — NOT by variance rank, which is wrong for
+/// `pick_right_and_forward`) — NOT by variance rank, which is wrong for
 /// head-shaped meshes (their largest-variance axis is vertical).
 /// Result: front-back → +Z, left-right → +X, up = cross(right, forward).
 ///
@@ -1001,16 +1001,16 @@ mod tests {
     /// which is exactly the case that trips up a variance-rank-based axis
     /// assignment.
     fn head_like_mesh(n_theta: usize, n_phi: usize) -> Vec<[f32; 3]> {
-        let (a, b, c) = (0.15_f32, 0.25_f32, 0.20_f32); // X, Y, Z semi-axes
+        let (semi_x, semi_y, semi_z) = (0.15_f32, 0.25_f32, 0.20_f32); // X, Y, Z semi-axes
         let mut pts = Vec::with_capacity(n_theta * n_phi);
         for i in 0..n_theta {
             let theta = std::f32::consts::PI * (i as f32 + 0.5) / n_theta as f32; // (0, PI)
             for j in 0..n_phi {
                 let phi = 2.0 * std::f32::consts::PI * j as f32 / n_phi as f32; // [0, 2*PI)
-                let x = a * theta.sin() * phi.cos();
-                let y = b * theta.cos();
-                let z = c * theta.sin() * phi.sin();
-                pts.push([x, y, z]);
+                let px = semi_x * theta.sin() * phi.cos();
+                let py = semi_y * theta.cos();
+                let pz = semi_z * theta.sin() * phi.sin();
+                pts.push([px, py, pz]);
             }
         }
         pts

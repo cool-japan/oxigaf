@@ -362,10 +362,10 @@ fn header_has_non_float_vertex_property(header: &str) -> bool {
 ///   `end_header` line itself.
 /// - Binary little-endian: raw IEEE 754 f32 values packed sequentially;
 ///   every vertex property must be declared `float`/`float32` (see
-///   [`header_has_non_float_vertex_property`]).
+///   `header_has_non_float_vertex_property`).
 /// - Binary big-endian: returns [`PlyError::UnsupportedFormat`].
 ///
-/// Fields are looked up by property *name* via [`floats_to_gaussian_indexed`],
+/// Fields are looked up by property *name* via `floats_to_gaussian_indexed`,
 /// not by a fixed column position, so a header that lists properties in a
 /// different order, omits the (cosmetic, always-zero in 3DGS) normals, or
 /// declares extra custom properties is still read correctly rather than
@@ -653,13 +653,24 @@ pub fn ply_import_scene(path: &Path) -> Result<PlySceneData, PlyError> {
 }
 /// Compute scene statistics for a slice of Gaussians.
 ///
-/// Returns zeroed stats for an empty slice.
+/// Returns zeroed stats for an empty slice, with `sh_degree_known: true`
+/// (zero Gaussians unambiguously implies zero rest coefficients, a genuine
+/// SH degree 0 — not a malformed-input case).
+///
+/// SH degree is inferred from `gaussians[0].f_rest.len()`. If that length
+/// does not correspond to any valid SH degree (0, 9, 24, or 45
+/// coefficients) — which can only happen with hand-built or corrupted
+/// `PlyGaussian` data, since [`ply_read`] already rejects a malformed count
+/// before constructing any `PlyGaussian` — the returned `sh_degree` is `0`
+/// as a placeholder and `sh_degree_known` is `false`, rather than silently
+/// reporting a fabricated degree 0 as if it had been genuinely inferred.
 #[must_use]
 pub fn ply_compute_scene_stats(gaussians: &[PlyGaussian]) -> PlySceneStats {
     if gaussians.is_empty() {
         return PlySceneStats {
             n_gaussians: 0,
             sh_degree: 0,
+            sh_degree_known: true,
             mean_opacity: 0.0,
             mean_scale: 0.0,
             bbox_min: [0.0; 3],
@@ -667,7 +678,10 @@ pub fn ply_compute_scene_stats(gaussians: &[PlyGaussian]) -> PlySceneStats {
         };
     }
     let n_rest = gaussians[0].f_rest.len();
-    let sh_degree = sh_degree_from_n_rest(n_rest).unwrap_or(0);
+    let (sh_degree, sh_degree_known) = match sh_degree_from_n_rest(n_rest) {
+        Ok(d) => (d, true),
+        Err(_) => (0, false),
+    };
     let mut sum_opacity = 0.0f64;
     let mut sum_scale = 0.0f64;
     let mut bbox_min = [f32::INFINITY; 3];
@@ -691,6 +705,7 @@ pub fn ply_compute_scene_stats(gaussians: &[PlyGaussian]) -> PlySceneStats {
     PlySceneStats {
         n_gaussians: gaussians.len(),
         sh_degree,
+        sh_degree_known,
         mean_opacity: (sum_opacity / n) as f32,
         mean_scale: (sum_scale / n) as f32,
         bbox_min,
@@ -698,8 +713,18 @@ pub fn ply_compute_scene_stats(gaussians: &[PlyGaussian]) -> PlySceneStats {
     }
 }
 /// Format scene statistics as a human-readable string.
+///
+/// The "SH degree" line reads `unknown (invalid f_rest coefficient count)`
+/// rather than a bare `0` when [`PlySceneStats::sh_degree_known`] is
+/// `false`, so a malformed scene is never misreported as a genuine SH
+/// degree 0.
 #[must_use]
 pub fn ply_format_stats(stats: &PlySceneStats) -> String {
+    let sh_degree_display = if stats.sh_degree_known {
+        stats.sh_degree.to_string()
+    } else {
+        "unknown (invalid f_rest coefficient count)".to_string()
+    };
     format!(
         "Gaussians: {}\n\
          SH degree: {}\n\
@@ -708,7 +733,7 @@ pub fn ply_format_stats(stats: &PlySceneStats) -> String {
          BBox min: ({:.4}, {:.4}, {:.4})\n\
          BBox max: ({:.4}, {:.4}, {:.4})",
         stats.n_gaussians,
-        stats.sh_degree,
+        sh_degree_display,
         stats.mean_opacity,
         stats.mean_scale,
         stats.bbox_min[0],

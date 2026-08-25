@@ -100,16 +100,26 @@ pub fn so_compute_snapshot(
     }
 
     // Opacities — activate (apply sigmoid) only if not already activated.
+    // `n` is caller-supplied and need not match `opacities.len()`, so clamp
+    // exactly as the scale and position loops below do; indexing `0..n`
+    // straight into `opacities` panicked on a short array.
+    let opacity_count = n.min(opacities.len());
     let mut sum_opacity = 0.0f32;
     let mut max_opacity = f32::NEG_INFINITY;
-    for i in 0..n {
-        let s = so_activate_opacity(opacities[i], opacity_space);
+    for &v in &opacities[..opacity_count] {
+        let s = so_activate_opacity(v, opacity_space);
         sum_opacity += s;
         if s > max_opacity {
             max_opacity = s;
         }
     }
-    let mean_opacity = sum_opacity / n as f32;
+    let (mean_opacity, max_opacity) = if opacity_count > 0 {
+        (sum_opacity / opacity_count as f32, max_opacity)
+    } else {
+        // No opacity data at all: report zeros rather than leaking the
+        // `-inf` seed of the running maximum into the snapshot.
+        (0.0, 0.0)
+    };
 
     // Scales
     let mut sum_scale = 0.0f32;
@@ -121,10 +131,10 @@ pub fn so_compute_snapshot(
             max_scale = v;
         }
     }
-    let mean_scale = if scale_count > 0 {
-        sum_scale / scale_count as f32
+    let (mean_scale, max_scale) = if scale_count > 0 {
+        (sum_scale / scale_count as f32, max_scale)
     } else {
-        0.0
+        (0.0, 0.0)
     };
 
     // Bounds from positions
@@ -249,9 +259,24 @@ pub struct OptimizationStepResult {
 // Math helpers
 // ---------------------------------------------------------------------------
 
+/// Numerically stable logistic sigmoid.
+///
+/// The textbook form `1 / (1 + exp(-x))` overflows `f32`'s exponent for
+/// `x < -88.7` (`exp` saturates to `+inf`), collapsing the result to exactly
+/// `0.0` — so a Gaussian with an opacity logit of, say, `-100` looked
+/// *completely* transparent instead of merely almost so, and
+/// [`so_prune_by_opacity`] deleted it even at `threshold = 0`. Branching on
+/// the sign keeps the exponent argument negative in both halves, so the
+/// result stays positive down to `x ≈ -103`, where `exp` genuinely
+/// underflows past the smallest subnormal `f32`.
 #[inline]
 fn so_sigmoid(x: f32) -> f32 {
-    1.0 / (1.0 + (-x).exp())
+    if x >= 0.0 {
+        1.0 / (1.0 + (-x).exp())
+    } else {
+        let e = x.exp();
+        e / (1.0 + e)
+    }
 }
 
 /// Which space an opacity array is currently in (see module docs).
@@ -279,12 +304,7 @@ fn so_activate_opacity(v: f32, space: OpacitySpace) -> f32 {
 // ---------------------------------------------------------------------------
 
 /// Apply a keep mask with arbitrary stride; retains rows where `mask[i]` is true.
-pub fn so_apply_keep_mask_nd(
-    data: &[f32],
-    mask: &[bool],
-    n: usize,
-    stride: usize,
-) -> Vec<f32> {
+pub fn so_apply_keep_mask_nd(data: &[f32], mask: &[bool], n: usize, stride: usize) -> Vec<f32> {
     let mut out = Vec::with_capacity(n * stride);
     let elements = (n * stride).min(data.len());
     for i in 0..n {
@@ -316,12 +336,7 @@ pub fn so_apply_keep_mask_4d(data: &[f32], mask: &[bool], n: usize) -> Vec<f32> 
 }
 
 /// Reorder a flat array by the given index permutation.
-pub fn so_reorder_by_indices(
-    data: &[f32],
-    indices: &[usize],
-    n: usize,
-    stride: usize,
-) -> Vec<f32> {
+pub fn so_reorder_by_indices(data: &[f32], indices: &[usize], n: usize, stride: usize) -> Vec<f32> {
     let mut out = Vec::with_capacity(n * stride);
     for &idx in indices.iter().take(n) {
         let start = idx * stride;
@@ -380,7 +395,16 @@ pub fn so_quantize_position(
 // ---------------------------------------------------------------------------
 
 /// Compute keep mask: activated_opacity > threshold (strict; see
-/// [`OpacitySpace`]). When activating, threshold=0 keeps everything.
+/// [`OpacitySpace`]).
+///
+/// In [`OpacitySpace::Logit`], `sigmoid` is strictly positive for every
+/// finite logit, so `threshold = 0` keeps every Gaussian (down to the
+/// `x ≈ -103` point where `exp` underflows to zero in `f32` — see
+/// `so_sigmoid`). In [`OpacitySpace::Probability`] a stored value of
+/// exactly `0.0` is fully transparent and *is* pruned at `threshold = 0`,
+/// which is the point of the strict comparison.
+///
+/// Entries past `opacities.len()` keep their default `true`.
 pub fn so_prune_by_opacity(
     opacities: &[f32],
     n: usize,
@@ -388,8 +412,9 @@ pub fn so_prune_by_opacity(
     opacity_space: OpacitySpace,
 ) -> Vec<bool> {
     let mut mask = vec![true; n];
-    for i in 0..n.min(opacities.len()) {
-        mask[i] = so_activate_opacity(opacities[i], opacity_space) > threshold;
+    let count = n.min(opacities.len());
+    for (keep, &opacity) in mask[..count].iter_mut().zip(&opacities[..count]) {
+        *keep = so_activate_opacity(opacity, opacity_space) > threshold;
     }
     mask
 }
@@ -406,18 +431,25 @@ pub fn so_deduplicate_near(positions: &[f32], n: usize, radius: f32) -> Vec<bool
     }
 
     if n < 1000 {
-        // O(N²) brute force
+        // O(N²) brute force.
+        //
+        // `split_at_mut` hands the inner loop an exclusive borrow of the
+        // *later* entries only, so it can clear duplicates through an
+        // iterator while the outer loop still reads `keep[i]`.
         for i in 0..n {
-            if !keep[i] {
+            let (earlier, later) = keep.split_at_mut(i + 1);
+            let keep_i = earlier.last().copied().unwrap_or(false);
+            if !keep_i {
                 continue;
             }
             let xi = positions.get(i * 3).copied().unwrap_or(0.0);
             let yi = positions.get(i * 3 + 1).copied().unwrap_or(0.0);
             let zi = positions.get(i * 3 + 2).copied().unwrap_or(0.0);
-            for j in (i + 1)..n {
-                if !keep[j] {
+            for (offset, keep_j) in later.iter_mut().enumerate() {
+                if !*keep_j {
                     continue;
                 }
+                let j = i + 1 + offset;
                 let xj = positions.get(j * 3).copied().unwrap_or(0.0);
                 let yj = positions.get(j * 3 + 1).copied().unwrap_or(0.0);
                 let zj = positions.get(j * 3 + 2).copied().unwrap_or(0.0);
@@ -426,7 +458,7 @@ pub fn so_deduplicate_near(positions: &[f32], n: usize, radius: f32) -> Vec<bool
                 let dz = zi - zj;
                 let dist = (dx * dx + dy * dy + dz * dz).sqrt();
                 if dist < radius {
-                    keep[j] = false;
+                    *keep_j = false;
                 }
             }
         }
@@ -496,7 +528,7 @@ pub fn so_deduplicate_near(positions: &[f32], n: usize, radius: f32) -> Vec<bool
 
 /// Clamp every scale component to `[min_scale, max_scale]` in-place.
 /// All three are log-scale (see the [module-level](self) "Scale space" note).
-pub fn so_clamp_scales(scales: &mut Vec<f32>, n: usize, min_scale: f32, max_scale: f32) {
+pub fn so_clamp_scales(scales: &mut [f32], n: usize, min_scale: f32, max_scale: f32) {
     let count = (n * 3).min(scales.len());
     for v in scales[..count].iter_mut() {
         *v = v.clamp(min_scale, max_scale);
@@ -529,11 +561,7 @@ pub fn so_sort_morton(positions: &[f32], n: usize) -> Vec<usize> {
     let mut pairs: Vec<(u32, usize)> = (0..n)
         .map(|i| {
             if i < full_n {
-                let pos = [
-                    positions[i * 3],
-                    positions[i * 3 + 1],
-                    positions[i * 3 + 2],
-                ];
+                let pos = [positions[i * 3], positions[i * 3 + 1], positions[i * 3 + 2]];
                 let [qx, qy, qz] = so_quantize_position(pos, bounds_min, bounds_max, 10);
                 (so_morton_code(qx, qy, qz), i)
             } else {
@@ -584,32 +612,22 @@ pub fn so_normalize_opacity(opacities: &[f32], n: usize) -> Vec<f32> {
 }
 
 /// Keep mask: points inside the sphere (distance from center < radius).
-pub fn so_clip_to_sphere(
-    positions: &[f32],
-    n: usize,
-    center: [f32; 3],
-    radius: f32,
-) -> Vec<bool> {
+pub fn so_clip_to_sphere(positions: &[f32], n: usize, center: [f32; 3], radius: f32) -> Vec<bool> {
     let r2 = radius * radius;
     let mut mask = vec![true; n];
-    for i in 0..n {
+    for (i, inside) in mask.iter_mut().enumerate() {
         let x = positions.get(i * 3).copied().unwrap_or(0.0) - center[0];
         let y = positions.get(i * 3 + 1).copied().unwrap_or(0.0) - center[1];
         let z = positions.get(i * 3 + 2).copied().unwrap_or(0.0) - center[2];
-        mask[i] = x * x + y * y + z * z <= r2;
+        *inside = x * x + y * y + z * z <= r2;
     }
     mask
 }
 
 /// Keep mask: points inside the AABB [min, max] (inclusive on both sides).
-pub fn so_clip_to_aabb(
-    positions: &[f32],
-    n: usize,
-    min: [f32; 3],
-    max: [f32; 3],
-) -> Vec<bool> {
+pub fn so_clip_to_aabb(positions: &[f32], n: usize, min: [f32; 3], max: [f32; 3]) -> Vec<bool> {
     let mut mask = vec![true; n];
-    for i in 0..n {
+    for (i, keep) in mask.iter_mut().enumerate() {
         let mut inside = true;
         for ax in 0..3 {
             let v = positions.get(i * 3 + ax).copied().unwrap_or(0.0);
@@ -618,7 +636,7 @@ pub fn so_clip_to_aabb(
                 break;
             }
         }
-        mask[i] = inside;
+        *keep = inside;
     }
     mask
 }
@@ -735,17 +753,25 @@ impl OptimizationPipeline {
         }
 
         // Snapshot before — pipeline input is always raw opacity logits.
-        let snapshot_before =
-            so_compute_snapshot(positions, scales, opacities, n_gaussians, sh_channels, OpacitySpace::Logit);
+        let snapshot_before = so_compute_snapshot(
+            positions,
+            scales,
+            opacities,
+            n_gaussians,
+            sh_channels,
+            OpacitySpace::Logit,
+        );
 
         // Working copies
-        let mut cur_positions = positions.to_vec();
-        let mut cur_rotations = rotations.to_vec();
-        let mut cur_scales = scales.to_vec();
-        let mut cur_opacities = opacities.to_vec();
-        let mut cur_sh = sh_coefficients.to_vec();
-        let mut cur_n = n_gaussians;
-        // Tracks whether `cur_opacities` currently holds raw logits or
+        let mut cur = WorkingScene {
+            positions: positions.to_vec(),
+            rotations: rotations.to_vec(),
+            scales: scales.to_vec(),
+            opacities: opacities.to_vec(),
+            sh: sh_coefficients.to_vec(),
+            n: n_gaussians,
+        };
+        // Tracks whether `cur.opacities` currently holds raw logits or
         // already-activated probabilities, so every opacity-consuming step
         // below applies `so_sigmoid` at most once overall (see
         // `OpacitySpace`).
@@ -754,105 +780,53 @@ impl OptimizationPipeline {
         let mut step_results = Vec::with_capacity(self.config.steps.len());
 
         for step in &self.config.steps {
-            let n_before = cur_n;
+            let n_before = cur.n;
             let step_name = step.name().to_string();
             let duration_hint = step.duration_hint().to_string();
 
             let notes = match step {
                 OptimizationStep::PruneByOpacity { threshold } => {
-                    let mask = so_prune_by_opacity(&cur_opacities, cur_n, *threshold, opacity_space);
-                    let (new_positions, new_rotations, new_scales, new_opacities, new_sh, new_n) =
-                        apply_mask_all(
-                            &cur_positions,
-                            &cur_rotations,
-                            &cur_scales,
-                            &cur_opacities,
-                            &cur_sh,
-                            &mask,
-                            cur_n,
-                            sh_channels,
-                        );
-                    cur_positions = new_positions;
-                    cur_rotations = new_rotations;
-                    cur_scales = new_scales;
-                    cur_opacities = new_opacities;
-                    cur_sh = new_sh;
-                    cur_n = new_n;
+                    let mask =
+                        so_prune_by_opacity(&cur.opacities, cur.n, *threshold, opacity_space);
+                    cur.apply_mask(&mask, sh_channels);
                     format!("threshold={threshold:.4}")
                 }
 
                 OptimizationStep::DeduplicateNear { position_radius } => {
-                    let mask = so_deduplicate_near(&cur_positions, cur_n, *position_radius);
-                    let (new_positions, new_rotations, new_scales, new_opacities, new_sh, new_n) =
-                        apply_mask_all(
-                            &cur_positions,
-                            &cur_rotations,
-                            &cur_scales,
-                            &cur_opacities,
-                            &cur_sh,
-                            &mask,
-                            cur_n,
-                            sh_channels,
-                        );
-                    cur_positions = new_positions;
-                    cur_rotations = new_rotations;
-                    cur_scales = new_scales;
-                    cur_opacities = new_opacities;
-                    cur_sh = new_sh;
-                    cur_n = new_n;
+                    let mask = so_deduplicate_near(&cur.positions, cur.n, *position_radius);
+                    cur.apply_mask(&mask, sh_channels);
                     format!("radius={position_radius:.4}")
                 }
 
-                OptimizationStep::ClampScales { min_scale, max_scale } => {
+                OptimizationStep::ClampScales {
+                    min_scale,
+                    max_scale,
+                } => {
                     if min_scale > max_scale {
                         return Err(OptimizerError::InvalidThreshold {
                             value: *min_scale,
                             param: "min_scale (must be ≤ max_scale)".to_string(),
                         });
                     }
-                    so_clamp_scales(&mut cur_scales, cur_n, *min_scale, *max_scale);
+                    so_clamp_scales(&mut cur.scales, cur.n, *min_scale, *max_scale);
                     format!("min={min_scale:.5} max={max_scale:.5}")
                 }
 
                 OptimizationStep::SortMorton => {
-                    let indices = so_sort_morton(&cur_positions, cur_n);
-                    cur_positions =
-                        so_reorder_by_indices(&cur_positions, &indices, cur_n, 3);
-                    cur_rotations =
-                        so_reorder_by_indices(&cur_rotations, &indices, cur_n, 4);
-                    cur_scales = so_reorder_by_indices(&cur_scales, &indices, cur_n, 3);
-                    cur_opacities =
-                        so_reorder_by_indices(&cur_opacities, &indices, cur_n, 1);
-                    if !cur_sh.is_empty() {
-                        cur_sh = so_reorder_by_indices(
-                            &cur_sh,
-                            &indices,
-                            cur_n,
-                            sh_channels,
-                        );
+                    let indices = so_sort_morton(&cur.positions, cur.n);
+                    cur.positions = so_reorder_by_indices(&cur.positions, &indices, cur.n, 3);
+                    cur.rotations = so_reorder_by_indices(&cur.rotations, &indices, cur.n, 4);
+                    cur.scales = so_reorder_by_indices(&cur.scales, &indices, cur.n, 3);
+                    cur.opacities = so_reorder_by_indices(&cur.opacities, &indices, cur.n, 1);
+                    if !cur.sh.is_empty() {
+                        cur.sh = so_reorder_by_indices(&cur.sh, &indices, cur.n, sh_channels);
                     }
                     "Morton code sort".to_string()
                 }
 
                 OptimizationStep::TopNByOpacity { n } => {
-                    let mask = so_top_n_by_opacity(&cur_opacities, cur_n, *n, opacity_space);
-                    let (new_positions, new_rotations, new_scales, new_opacities, new_sh, new_n) =
-                        apply_mask_all(
-                            &cur_positions,
-                            &cur_rotations,
-                            &cur_scales,
-                            &cur_opacities,
-                            &cur_sh,
-                            &mask,
-                            cur_n,
-                            sh_channels,
-                        );
-                    cur_positions = new_positions;
-                    cur_rotations = new_rotations;
-                    cur_scales = new_scales;
-                    cur_opacities = new_opacities;
-                    cur_sh = new_sh;
-                    cur_n = new_n;
+                    let mask = so_top_n_by_opacity(&cur.opacities, cur.n, *n, opacity_space);
+                    cur.apply_mask(&mask, sh_channels);
                     format!("n_keep={n}")
                 }
 
@@ -864,31 +838,15 @@ impl OptimizationPipeline {
                         // converting a logit, so this is a no-op.
                         "already activated (no-op)".to_string()
                     } else {
-                        cur_opacities = so_normalize_opacity(&cur_opacities, cur_n);
+                        cur.opacities = so_normalize_opacity(&cur.opacities, cur.n);
                         opacity_space = OpacitySpace::Probability;
                         "sigmoid applied".to_string()
                     }
                 }
 
                 OptimizationStep::ClipToSphere { center, radius } => {
-                    let mask = so_clip_to_sphere(&cur_positions, cur_n, *center, *radius);
-                    let (new_positions, new_rotations, new_scales, new_opacities, new_sh, new_n) =
-                        apply_mask_all(
-                            &cur_positions,
-                            &cur_rotations,
-                            &cur_scales,
-                            &cur_opacities,
-                            &cur_sh,
-                            &mask,
-                            cur_n,
-                            sh_channels,
-                        );
-                    cur_positions = new_positions;
-                    cur_rotations = new_rotations;
-                    cur_scales = new_scales;
-                    cur_opacities = new_opacities;
-                    cur_sh = new_sh;
-                    cur_n = new_n;
+                    let mask = so_clip_to_sphere(&cur.positions, cur.n, *center, *radius);
+                    cur.apply_mask(&mask, sh_channels);
                     format!(
                         "center=[{:.2},{:.2},{:.2}] r={:.4}",
                         center[0], center[1], center[2], radius
@@ -896,24 +854,8 @@ impl OptimizationPipeline {
                 }
 
                 OptimizationStep::ClipToAabb { min, max } => {
-                    let mask = so_clip_to_aabb(&cur_positions, cur_n, *min, *max);
-                    let (new_positions, new_rotations, new_scales, new_opacities, new_sh, new_n) =
-                        apply_mask_all(
-                            &cur_positions,
-                            &cur_rotations,
-                            &cur_scales,
-                            &cur_opacities,
-                            &cur_sh,
-                            &mask,
-                            cur_n,
-                            sh_channels,
-                        );
-                    cur_positions = new_positions;
-                    cur_rotations = new_rotations;
-                    cur_scales = new_scales;
-                    cur_opacities = new_opacities;
-                    cur_sh = new_sh;
-                    cur_n = new_n;
+                    let mask = so_clip_to_aabb(&cur.positions, cur.n, *min, *max);
+                    cur.apply_mask(&mask, sh_channels);
                     format!(
                         "min=[{:.2},{:.2},{:.2}] max=[{:.2},{:.2},{:.2}]",
                         min[0], min[1], min[2], max[0], max[1], max[2]
@@ -921,7 +863,7 @@ impl OptimizationPipeline {
                 }
             };
 
-            let n_after = cur_n;
+            let n_after = cur.n;
             step_results.push(OptimizationStepResult {
                 step_name,
                 n_before,
@@ -932,17 +874,24 @@ impl OptimizationPipeline {
             });
         }
 
-        let snapshot_after =
-            so_compute_snapshot(&cur_positions, &cur_scales, &cur_opacities, cur_n, sh_channels, opacity_space);
+        let snapshot_after = so_compute_snapshot(
+            &cur.positions,
+            &cur.scales,
+            &cur.opacities,
+            cur.n,
+            sh_channels,
+            opacity_space,
+        );
 
-        let total_removed = n_gaussians.saturating_sub(cur_n);
+        let total_removed = n_gaussians.saturating_sub(cur.n);
         let total_reduction_percent = if n_gaussians > 0 {
             100.0 * total_removed as f32 / n_gaussians as f32
         } else {
             0.0
         };
-        let memory_saved_bytes =
-            snapshot_before.memory_bytes.saturating_sub(snapshot_after.memory_bytes);
+        let memory_saved_bytes = snapshot_before
+            .memory_bytes
+            .saturating_sub(snapshot_after.memory_bytes);
 
         let report = OptimizationReport {
             step_results,
@@ -954,12 +903,12 @@ impl OptimizationPipeline {
         };
 
         let optimized = OptimizedScene {
-            positions: cur_positions,
-            rotations: cur_rotations,
-            scales: cur_scales,
-            opacities: cur_opacities,
-            sh_coefficients: cur_sh,
-            n_gaussians: cur_n,
+            positions: cur.positions,
+            rotations: cur.rotations,
+            scales: cur.scales,
+            opacities: cur.opacities,
+            sh_coefficients: cur.sh,
+            n_gaussians: cur.n,
             sh_channels,
         };
 
@@ -967,28 +916,40 @@ impl OptimizationPipeline {
     }
 }
 
-/// Internal helper: apply a boolean keep-mask to all five Gaussian arrays at once.
-fn apply_mask_all(
-    positions: &[f32],
-    rotations: &[f32],
-    scales: &[f32],
-    opacities: &[f32],
-    sh: &[f32],
-    mask: &[bool],
+/// The five flat Gaussian arrays a pipeline run carries from step to step,
+/// plus the current Gaussian count.
+///
+/// The arrays are only ever resized together — dropping a Gaussian from one
+/// without dropping it from the other four silently desynchronises the whole
+/// scene — so [`OptimizationPipeline::run`] keeps them in one value with a
+/// single [`apply_mask`](WorkingScene::apply_mask) entry point rather than as
+/// six independent locals threaded through an eight-argument helper.
+struct WorkingScene {
+    positions: Vec<f32>,
+    rotations: Vec<f32>,
+    scales: Vec<f32>,
+    opacities: Vec<f32>,
+    sh: Vec<f32>,
     n: usize,
-    sh_channels: usize,
-) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, usize) {
-    let new_positions = so_apply_keep_mask_3d(positions, mask, n);
-    let new_rotations = so_apply_keep_mask_4d(rotations, mask, n);
-    let new_scales = so_apply_keep_mask_3d(scales, mask, n);
-    let new_opacities = so_apply_keep_mask_1d(opacities, mask, n);
-    let new_sh = if sh_channels > 0 {
-        so_apply_keep_mask_nd(sh, mask, n, sh_channels)
-    } else {
-        Vec::new()
-    };
-    let new_n = mask.iter().filter(|&&v| v).count();
-    (new_positions, new_rotations, new_scales, new_opacities, new_sh, new_n)
+}
+
+impl WorkingScene {
+    /// Apply a boolean keep-mask to all five arrays at once and update `n`.
+    ///
+    /// `n` is written last: every array is filtered against the count the
+    /// mask was built for.
+    fn apply_mask(&mut self, mask: &[bool], sh_channels: usize) {
+        self.positions = so_apply_keep_mask_3d(&self.positions, mask, self.n);
+        self.rotations = so_apply_keep_mask_4d(&self.rotations, mask, self.n);
+        self.scales = so_apply_keep_mask_3d(&self.scales, mask, self.n);
+        self.opacities = so_apply_keep_mask_1d(&self.opacities, mask, self.n);
+        self.sh = if sh_channels > 0 {
+            so_apply_keep_mask_nd(&self.sh, mask, self.n, sh_channels)
+        } else {
+            Vec::new()
+        };
+        self.n = mask.iter().filter(|&&v| v).count();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1052,20 +1013,48 @@ pub fn so_profile_config(profile: OptimizationProfile, sh_channels: usize) -> Sc
     }
 }
 
+/// Borrowed view of the five flat per-Gaussian arrays that describe a scene.
+///
+/// The arrays always travel together and are always the same length in
+/// Gaussians, so entry points that take a whole scene take one of these
+/// rather than five same-typed `&[f32]` parameters that are trivial to pass
+/// in the wrong order.
+#[derive(Debug, Clone, Copy)]
+pub struct GaussianArrays<'a> {
+    /// `3 × n` XYZ centres.
+    pub positions: &'a [f32],
+    /// `4 × n` rotation quaternions.
+    pub rotations: &'a [f32],
+    /// `3 × n` log-scales (see the module-level "Scale space" note).
+    pub scales: &'a [f32],
+    /// `n` opacity logits.
+    pub opacities: &'a [f32],
+    /// `sh_channels × n` spherical-harmonic coefficients, or empty.
+    pub sh_coefficients: &'a [f32],
+}
+
 /// One-line convenience function: build a pipeline from a profile and run it.
+///
+/// # Errors
+///
+/// Propagates every error [`OptimizationPipeline::run`] reports: an empty
+/// scene, or an array whose length disagrees with `n`/`sh_channels`.
 pub fn so_quick_optimize(
-    positions: &[f32],
-    rotations: &[f32],
-    scales: &[f32],
-    opacities: &[f32],
-    sh_coefficients: &[f32],
+    arrays: GaussianArrays<'_>,
     n: usize,
     sh_channels: usize,
     profile: OptimizationProfile,
 ) -> Result<(OptimizedScene, OptimizationReport), OptimizerError> {
     let config = so_profile_config(profile, sh_channels);
     let pipeline = OptimizationPipeline::new(config);
-    pipeline.run(positions, rotations, scales, opacities, sh_coefficients, n)
+    pipeline.run(
+        arrays.positions,
+        arrays.rotations,
+        arrays.scales,
+        arrays.opacities,
+        arrays.sh_coefficients,
+        n,
+    )
 }
 
 // ---------------------------------------------------------------------------

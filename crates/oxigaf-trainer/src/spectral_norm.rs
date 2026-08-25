@@ -284,6 +284,14 @@ pub fn power_iteration(
 }
 
 /// Compute the spectral norm (largest singular value) of a row-major matrix.
+///
+/// Returns [`SpectralNormError::ConvergenceFailed`] if power iteration does not
+/// settle within `config.tolerance` inside `config.max_iter` iterations, rather
+/// than silently handing back an unreliable `sigma`. Every function in this
+/// module that estimates a spectral norm (`normalize_by_spectral_norm`,
+/// `stable_rank`, `estimate_condition_number`, `batch_spectral_norm`,
+/// `sequence_lipschitz_bound`) is built on top of this one, so the check
+/// applies uniformly across all of them.
 pub fn spectral_norm(
     matrix: &[f32],
     n_rows: usize,
@@ -291,6 +299,11 @@ pub fn spectral_norm(
     config: &PowerIterationConfig,
 ) -> Result<f32, SpectralNormError> {
     let est = power_iteration(matrix, n_rows, n_cols, config)?;
+    if !est.converged {
+        return Err(SpectralNormError::ConvergenceFailed {
+            max_iter: config.max_iter,
+        });
+    }
     Ok(est.sigma)
 }
 
@@ -499,11 +512,205 @@ pub fn stable_rank(
 // Conditioning
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Apply the (regularised) Gram operator used by [`estimate_sigma_min`]'s inverse
+/// power iteration.
+///
+/// Computes `A·Aᵀ·x + eps·x` when `use_row_space` (chosen when `n_rows <=
+/// n_cols`), otherwise `Aᵀ·A·x + eps·x`. Always operating on the smaller of the
+/// two Gram matrices means every eigenvalue produced is a genuine squared
+/// singular value of `A` — the larger Gram matrix would carry `|n_rows -
+/// n_cols|` extra exact-zero eigenvalues forced by rank deficiency, which would
+/// masquerade as a vanishing singular value for any rectangular matrix.
+fn apply_gram_operator(
+    matrix: &[f32],
+    n_rows: usize,
+    n_cols: usize,
+    use_row_space: bool,
+    eps: f32,
+    x: &[f32],
+) -> Result<Vec<f32>, SpectralNormError> {
+    let mut out = if use_row_space {
+        let at_x = mat_transpose_vec_mul(matrix, n_rows, n_cols, x)?;
+        mat_vec_mul(matrix, n_rows, n_cols, &at_x)?
+    } else {
+        let a_x = mat_vec_mul(matrix, n_rows, n_cols, x)?;
+        mat_transpose_vec_mul(matrix, n_rows, n_cols, &a_x)?
+    };
+    for (o, xi) in out.iter_mut().zip(x.iter()) {
+        *o += eps * xi;
+    }
+    Ok(out)
+}
+
+/// Conjugate-gradient solve of `(G + eps·I) y = b`, where `G` is applied
+/// matrix-free through [`apply_gram_operator`].
+///
+/// `G + eps·I` is symmetric positive definite for `eps > 0` (`G` itself is
+/// only positive *semi*-definite), so CG is well-posed and converges
+/// monotonically; capping at `dim` iterations is exact in exact arithmetic
+/// (a `dim`-dimensional SPD system solves in at most `dim` CG steps), and
+/// for larger `dim` this becomes an inexact/truncated CG solve, which is the
+/// standard practical variant of inverse iteration.
+fn cg_solve_gram(
+    matrix: &[f32],
+    n_rows: usize,
+    n_cols: usize,
+    use_row_space: bool,
+    eps: f32,
+    b: &[f32],
+    tol: f32,
+) -> Result<Vec<f32>, SpectralNormError> {
+    let dim = b.len();
+    let mut x = vec![0.0f32; dim];
+    let mut r = b.to_vec();
+    let mut p = r.clone();
+    let mut rs_old: f32 = r.iter().map(|v| v * v).sum();
+    let max_cg_iter = dim.clamp(1, 64);
+    let tol_sq = tol.max(1e-10).powi(2);
+
+    for _ in 0..max_cg_iter {
+        if rs_old < tol_sq {
+            break;
+        }
+        let ap = apply_gram_operator(matrix, n_rows, n_cols, use_row_space, eps, &p)?;
+        let p_dot_ap: f32 = p.iter().zip(ap.iter()).map(|(a, b)| a * b).sum();
+        if p_dot_ap.abs() < 1e-20 {
+            break;
+        }
+        let alpha = rs_old / p_dot_ap;
+        for (xi, pi) in x.iter_mut().zip(p.iter()) {
+            *xi += alpha * pi;
+        }
+        for (ri, ai) in r.iter_mut().zip(ap.iter()) {
+            *ri -= alpha * ai;
+        }
+        let rs_new: f32 = r.iter().map(|v| v * v).sum();
+        let beta = rs_new / rs_old.max(1e-30);
+        for (pi, ri) in p.iter_mut().zip(r.iter()) {
+            *pi = *ri + beta * *pi;
+        }
+        rs_old = rs_new;
+    }
+
+    Ok(x)
+}
+
+/// Estimate the smallest singular value of a matrix via inverse power
+/// iteration, using conjugate gradient (matrix-free, via [`cg_solve_gram`])
+/// in place of an explicit linear solve at each outer step — the textbook
+/// inverse-iteration method (Golub & Van Loan, "Matrix Computations",
+/// §8.2.3) applied to whichever Gram matrix, `A·Aᵀ` or `Aᵀ·A`, has the
+/// smaller dimension.
+///
+/// Unlike a column-norm bound this converges toward the *true* sigma_min
+/// (subject to the iteration budget and single-precision rounding), so it
+/// can end up slightly above or slightly below the true value rather than
+/// carrying a systematic directional bias.
+fn estimate_sigma_min(
+    matrix: &[f32],
+    n_rows: usize,
+    n_cols: usize,
+    config: &PowerIterationConfig,
+) -> Result<f32, SpectralNormError> {
+    if n_rows == 0 || n_cols == 0 {
+        return Err(SpectralNormError::EmptyMatrix { n_rows, n_cols });
+    }
+    if matrix.len() != n_rows * n_cols {
+        return Err(SpectralNormError::DimensionMismatch {
+            n_rows,
+            n_cols,
+            actual: matrix.len(),
+        });
+    }
+
+    let use_row_space = n_rows <= n_cols;
+    let dim = if use_row_space { n_rows } else { n_cols };
+    // Small Tikhonov shift keeps `G + eps*I` strictly positive definite (so CG
+    // is well-posed) even when `A` is exactly rank-deficient. A scalar shift
+    // does not perturb eigenvectors, only eigenvalues, so it does not bias
+    // which eigenvector inverse iteration converges to.
+    let eps = 1e-6f32;
+
+    let mut state = config.seed ^ 0x5EED_5EED_5EED_5EEDu64;
+    let mut x = vec![0.0f32; dim];
+    for xi in x.iter_mut() {
+        *xi = (xorshift64(&mut state) % 10_000) as f32 / 10_000.0 - 0.5;
+    }
+    spectral_normalize(&mut x);
+    if spectral_l2_norm(&x) < 1e-12 {
+        x[0] = 1.0;
+    }
+
+    // Track the *minimum* Rayleigh quotient seen across iterates, not just
+    // the latest one: inverse iteration's Rayleigh quotients approach
+    // lambda_min from above (in exact arithmetic they decrease
+    // monotonically), so the running minimum is never a worse estimate of
+    // sigma_min than the final iterate and is robust to a single
+    // poorly-conditioned CG step landing slightly off the true eigenvector
+    // (which would otherwise inflate the reported sigma_min and understate
+    // the condition number — the exact failure mode this function exists to
+    // avoid). The convergence check still compares consecutive raw Rayleigh
+    // quotients, not the running minimum, so it isn't fooled into stopping
+    // early just because the minimum stopped moving.
+    let mut sigma_min_sq = 0.0f32;
+    let mut prev_rayleigh = 0.0f32;
+    for iter in 0..config.max_iter {
+        let y = cg_solve_gram(
+            matrix,
+            n_rows,
+            n_cols,
+            use_row_space,
+            eps,
+            &x,
+            config.tolerance,
+        )?;
+        let y_norm = spectral_l2_norm(&y);
+        if y_norm < 1e-20 {
+            break;
+        }
+        let mut x_new = y;
+        for v in x_new.iter_mut() {
+            *v /= y_norm;
+        }
+
+        // Rayleigh quotient against the *unshifted* Gram operator (eps=0) so
+        // the reported value estimates the true smallest eigenvalue, not the
+        // regularised one.
+        let g_x = apply_gram_operator(matrix, n_rows, n_cols, use_row_space, 0.0, &x_new)?;
+        let rayleigh: f32 = x_new.iter().zip(g_x.iter()).map(|(a, b)| a * b).sum();
+        let rayleigh_nonneg = rayleigh.max(0.0);
+        let rel_change = (rayleigh_nonneg - prev_rayleigh).abs() / (prev_rayleigh.abs() + 1e-8);
+        prev_rayleigh = rayleigh_nonneg;
+        sigma_min_sq = if iter == 0 {
+            rayleigh_nonneg
+        } else {
+            sigma_min_sq.min(rayleigh_nonneg)
+        };
+        x = x_new;
+
+        if rel_change < config.tolerance {
+            break;
+        }
+    }
+
+    Ok(sigma_min_sq.max(0.0).sqrt())
+}
+
 /// Estimate the condition number (sigma_max / sigma_min) of a matrix.
 ///
-/// Uses the simplified lower-bound approximation: the smallest singular value
-/// is lower-bounded by the minimum column norm. If any column has near-zero norm
-/// the condition number is `f32::INFINITY`.
+/// `sigma_max` comes from power iteration; `sigma_min` from inverse power
+/// iteration (see `estimate_sigma_min`) — both converge toward their true
+/// values, rather than `sigma_min` being approximated by a bound that
+/// actually points the wrong way (the minimum column norm is an *upper*
+/// bound on sigma_min, not a lower bound, since `sigma_min = min_{‖x‖=1}
+/// ‖Ax‖ ≤ ‖A·e_j‖` for every standard basis vector `e_j`; dividing by an
+/// upper bound on sigma_min silently produces a lower bound on the
+/// condition number, which can never certify ill-conditioning). If the
+/// estimated `sigma_min` falls at or below the standard numerical-rank
+/// tolerance `max(n_rows, n_cols) * f32::EPSILON * sigma_max` (the
+/// convention used by LAPACK-based rank/pinv routines), the matrix is
+/// treated as numerically singular and the condition number is
+/// `f32::INFINITY`.
 pub fn estimate_condition_number(
     matrix: &[f32],
     n_rows: usize,
@@ -522,22 +729,14 @@ pub fn estimate_condition_number(
     }
 
     let sigma_max = spectral_norm(matrix, n_rows, n_cols, config)?;
+    let sigma_min = estimate_sigma_min(matrix, n_rows, n_cols, config)?;
 
-    // Lower bound for sigma_min: minimum column L2 norm
-    let mut min_col_norm = f32::INFINITY;
-    for j in 0..n_cols {
-        let col_norm_sq: f32 = (0..n_rows).map(|i| matrix[i * n_cols + j].powi(2)).sum();
-        let col_norm = col_norm_sq.sqrt();
-        if col_norm < min_col_norm {
-            min_col_norm = col_norm;
-        }
-    }
-
-    if min_col_norm < 1e-10 {
+    let singular_tol = (n_rows.max(n_cols) as f32) * f32::EPSILON * sigma_max.max(1e-30);
+    if sigma_min <= singular_tol {
         return Ok(f32::INFINITY);
     }
 
-    Ok(sigma_max / min_col_norm)
+    Ok(sigma_max / sigma_min)
 }
 
 /// Returns `true` if the condition number of the matrix is below `threshold`.
@@ -1100,6 +1299,62 @@ mod tests {
             (tracker.current_sigma() - 4.0).abs() < 0.5,
             "sigma={}",
             tracker.current_sigma()
+        );
+    }
+
+    #[test]
+    fn test_spectral_norm_convergence_failed_with_one_iteration() {
+        // With only 1 iteration allowed, the relative-change convergence
+        // check is measured against sigma=0 (the value before any iteration
+        // ran), so it can never be satisfied on the very first pass for a
+        // matrix with a nonzero spectral norm. `spectral_norm` must surface
+        // `ConvergenceFailed` here rather than silently returning an
+        // unreliable one-iteration estimate (previously `ConvergenceFailed`
+        // was declared but never constructed anywhere in the crate).
+        let a = vec![1.0f32, 2.0, 3.0, 4.0];
+        let config = PowerIterationConfig {
+            max_iter: 1,
+            tolerance: 1e-6,
+            seed: 42,
+        };
+        let err = spectral_norm(&a, 2, 2, &config);
+        assert!(
+            matches!(
+                err,
+                Err(SpectralNormError::ConvergenceFailed { max_iter: 1 })
+            ),
+            "expected ConvergenceFailed, got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_estimate_condition_number_catches_near_singular_matrix() {
+        // Regression for "min column norm is an upper bound on sigma_min,
+        // not a lower bound": A = [[1,1],[0,1e-6]] has column norms ~1.0 and
+        // ~1.0 (nearly equal), so the old column-norm heuristic reported
+        // cond ≈ sigma_max / 1.0 ≈ 1.41 — implying "well conditioned" —
+        // while the true condition number is ≈ 2e6 (true sigma_min ≈ 7e-7).
+        // The fixed estimate must never let this be certified as
+        // well-conditioned, regardless of whether it lands on a large
+        // finite value or f32::INFINITY (single precision cannot reliably
+        // distinguish the two once cond exceeds roughly 1/f32::EPSILON).
+        let a = vec![1.0f32, 1.0, 0.0, 1e-6];
+        let config = default_config();
+
+        let cond = estimate_condition_number(&a, 2, 2, &config).unwrap();
+        assert!(
+            cond > 1.0e3 || cond.is_infinite(),
+            "cond={} should reflect the true ill-conditioning (~2e6), not \
+             the old buggy lower-bound estimate of ~1.41",
+            cond
+        );
+
+        let well_conditioned = is_well_conditioned(&a, 2, 2, 1.0e3, &config).unwrap();
+        assert!(
+            !well_conditioned,
+            "a matrix with true condition number ~2e6 must never be \
+             reported as well-conditioned against a threshold of 1e3"
         );
     }
 

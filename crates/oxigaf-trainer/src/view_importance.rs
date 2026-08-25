@@ -69,6 +69,15 @@ pub enum ViewImportanceError {
 
     #[error("All importance weights are zero")]
     ZeroImportanceWeights,
+
+    /// `history_window == 0` would make `update`'s eviction check
+    /// (`hist.len() >= history_window`) true on an empty history, i.e.
+    /// `Vec::remove(0)` on an empty vector.
+    #[error("Invalid history_window {window}: must be >= 1")]
+    InvalidHistoryWindow { window: usize },
+
+    #[error("Invalid ema_decay {decay}: must be in (0.0, 1.0)")]
+    InvalidEmaDecay { decay: f32 },
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -137,6 +146,27 @@ impl ViewImportanceConfig {
         }
         if self.n_views == 0 {
             return Err(ViewImportanceError::NoViews);
+        }
+        if self.history_window == 0 {
+            return Err(ViewImportanceError::InvalidHistoryWindow {
+                window: self.history_window,
+            });
+        }
+        // The interval is OPEN at both ends, matching
+        // `InvalidEmaDecay`'s "must be in (0.0, 1.0)" and every other EMA
+        // decay in this crate (`online_learning`, `weight_averaging`,
+        // `pose_conditioning`, `curriculum_learning`).  Both endpoints
+        // degenerate `update`'s smoothing step
+        // `ema = d·ema + (1 − d)·raw`: at `d == 0.0` there is no smoothing
+        // at all (`ema == raw`, the EMA is pure noise), and at `d == 1.0`
+        // the EMA is frozen at its uniform initial value and never sees a
+        // single loss observation.  Written as "not strictly inside" rather
+        // than `<= 0.0 || >= 1.0` so NaN is rejected too.
+        let in_open_unit_interval = self.ema_decay > 0.0 && self.ema_decay < 1.0;
+        if !in_open_unit_interval {
+            return Err(ViewImportanceError::InvalidEmaDecay {
+                decay: self.ema_decay,
+            });
         }
         Ok(())
     }
@@ -221,9 +251,15 @@ impl ViewImportanceSampler {
             });
         }
 
-        // Maintain rolling window.
+        // Maintain rolling window. `config` is a `pub` field, so it can be
+        // mutated to `history_window == 0` after construction even though
+        // `validate()` now rejects that at `new()` time — a `while` (not
+        // `if`) guarded by `!hist.is_empty()` is defence in depth against
+        // that: `hist.len() >= 0` is always true, so it evicts down to
+        // empty (net effect: a window of 1) instead of calling
+        // `Vec::remove(0)` on an already-empty history, which panics.
         let hist = &mut self.loss_history[view_idx];
-        if hist.len() >= self.config.history_window {
+        while hist.len() >= self.config.history_window && !hist.is_empty() {
             hist.remove(0);
         }
         hist.push(loss);
@@ -695,6 +731,85 @@ mod tests {
         assert!(ViewImportanceConfig::default().validate().is_ok());
     }
 
+    #[test]
+    fn test_config_validate_zero_history_window() {
+        let cfg = ViewImportanceConfig {
+            history_window: 0,
+            ..ViewImportanceConfig::default()
+        };
+        assert!(matches!(
+            cfg.validate(),
+            Err(ViewImportanceError::InvalidHistoryWindow { window: 0 })
+        ));
+    }
+
+    #[test]
+    fn test_config_validate_ema_decay_out_of_range() {
+        for bad in [-0.1_f32, 0.0, 1.0, 1.1] {
+            let cfg = ViewImportanceConfig {
+                ema_decay: bad,
+                ..ViewImportanceConfig::default()
+            };
+            assert!(
+                matches!(
+                    cfg.validate(),
+                    Err(ViewImportanceError::InvalidEmaDecay { .. })
+                ),
+                "ema_decay={bad} should be rejected"
+            );
+        }
+    }
+
+    /// Regression: `validate` must implement the OPEN interval `(0, 1)` that
+    /// `InvalidEmaDecay`'s message documents.  It previously used the
+    /// half-open range `[0.0, 1.0)`, which accepted `ema_decay == 0.0` — a
+    /// decay that disables smoothing entirely, since `update`'s
+    /// `ema = d·ema + (1 − d)·raw` collapses to `ema = raw`.  NaN must be
+    /// rejected as well: it is not inside any interval, and it would poison
+    /// the EMA permanently on the first `update`.
+    #[test]
+    fn test_config_validate_ema_decay_open_interval_boundaries() {
+        let with_decay = |d: f32| ViewImportanceConfig {
+            ema_decay: d,
+            ..ViewImportanceConfig::default()
+        };
+
+        for bad in [f32::NAN, f32::NEG_INFINITY, f32::INFINITY, 0.0, 1.0] {
+            assert!(
+                matches!(
+                    with_decay(bad).validate(),
+                    Err(ViewImportanceError::InvalidEmaDecay { .. })
+                ),
+                "ema_decay={bad} is outside (0, 1) and must be rejected"
+            );
+        }
+
+        // Strictly interior values, including ones adjacent to the excluded
+        // endpoints, stay accepted.
+        for good in [f32::MIN_POSITIVE, 1e-6, 0.5, 0.9, 0.999_999] {
+            assert!(
+                with_decay(good).validate().is_ok(),
+                "ema_decay={good} is inside (0, 1) and must be accepted"
+            );
+        }
+    }
+
+    /// A rejected `ema_decay` must also stop `ViewImportanceSampler::new`,
+    /// which is the only way the invalid value could otherwise reach
+    /// `update`'s smoothing step.
+    #[test]
+    fn test_sampler_new_rejects_zero_ema_decay() {
+        let cfg = ViewImportanceConfig {
+            n_views: 4,
+            ema_decay: 0.0,
+            ..ViewImportanceConfig::default()
+        };
+        assert!(matches!(
+            ViewImportanceSampler::new(cfg),
+            Err(ViewImportanceError::InvalidEmaDecay { decay }) if decay == 0.0
+        ));
+    }
+
     // ── ViewImportanceSampler::new ────────────────────────────────────────────
 
     #[test]
@@ -725,6 +840,38 @@ mod tests {
         s.update(0, 0.5, 1).expect("valid");
         s.update(0, 0.6, 2).expect("valid");
         assert_eq!(s.loss_history[0].len(), 2);
+    }
+
+    #[test]
+    fn test_new_rejects_zero_history_window() {
+        // Regression: `ViewImportanceSampler::new(ViewImportanceConfig {
+        // n_views: 1, history_window: 0, ..Default::default() })` used to
+        // succeed and then panic on the very first `update()` call
+        // (`Vec::remove(0)` on an empty history). `new()` now rejects the
+        // config outright instead of deferring the failure.
+        let cfg = ViewImportanceConfig {
+            n_views: 1,
+            history_window: 0,
+            ..ViewImportanceConfig::default()
+        };
+        assert!(matches!(
+            ViewImportanceSampler::new(cfg),
+            Err(ViewImportanceError::InvalidHistoryWindow { window: 0 })
+        ));
+    }
+
+    #[test]
+    fn test_update_does_not_panic_if_history_window_mutated_to_zero() {
+        // `config` is a `pub` field, so `validate()` at construction time
+        // cannot fully protect `update()` against `history_window == 0` —
+        // this exercises the defence-in-depth `while` loop directly.
+        let mut s = default_sampler(1);
+        s.config.history_window = 0;
+        s.update(0, 0.5, 1).expect("update must not panic");
+        s.update(0, 0.6, 2).expect("update must not panic");
+        // Degrades to keeping only the single most recent sample.
+        assert_eq!(s.loss_history[0].len(), 1);
+        assert!(approx_eq(s.loss_history[0][0], 0.6, 1e-6));
     }
 
     #[test]

@@ -204,7 +204,7 @@ impl ContourVertexChains {
                 "dynamic landmark embedding: n_contour must be > 0".to_string(),
             ));
         }
-        if lmk_faces_idx.is_empty() || lmk_faces_idx.len() % n_contour != 0 {
+        if lmk_faces_idx.is_empty() || !lmk_faces_idx.len().is_multiple_of(n_contour) {
             return Err(FlameError::InvalidParams(format!(
                 "dynamic landmark embedding: dynamic_lmk_faces_idx has {} entries, which is not a positive multiple of n_contour {n_contour}",
                 lmk_faces_idx.len()

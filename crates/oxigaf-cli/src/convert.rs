@@ -17,6 +17,16 @@
 //! `shapedirs` array and store `J_regressor` as a SciPy sparse matrix, so the
 //! conversion splits the basis, densifies the regressor and casts every array
 //! to the dtype the loader requires.
+//!
+//! An output directory produced by an older `oxigaf convert` may still
+//! contain a `parents.npy` file. Earlier releases wrote it as a verbatim
+//! copy of the full `[2, N]` `kintree_table` array -- not the derived
+//! parent-index vector its name implied. `oxigaf_flame::load_flame_model`
+//! has never read `parents.npy`; it derives joint parent indices from row 0
+//! of `kintree_table.npy` itself. This converter no longer writes
+//! `parents.npy`, and any copy left over from an older conversion is inert
+//! and safe to delete (`run_convert` also prints a hint pointing this out
+//! when it finds one).
 
 use std::collections::{HashMap, HashSet};
 use std::io::BufReader;
@@ -161,7 +171,7 @@ pub fn run_convert(
             report.add_create(format!("{}/{}", args.output.display(), comp));
         }
 
-        report.resource_estimates.estimated_disk_mb = Some(250);
+        report.resource_estimates.estimated_disk_mb = Some(estimated_output_disk_mb(&FLAME_SPEC));
 
         if !json_mode {
             report.print_report();
@@ -235,6 +245,14 @@ pub fn run_convert(
             args.input.display()
         ));
         output::path_value("Output", &args.output);
+
+        if let Some(stale) = stale_parents_npy(&args.output) {
+            output::hint(&format!(
+                "{} is left over from an older `oxigaf convert`; the loader \
+                 never reads it, so it is safe to delete.",
+                stale.display()
+            ));
+        }
 
         if verbosity.show_timing() {
             let elapsed = start.elapsed();
@@ -583,13 +601,18 @@ fn verify_output(output_dir: &Path, version: &str) -> Result<()> {
         }
     }
 
-    // Version-specific validation
+    // Version-specific validation. The clap `value_parser` on
+    // `ConvertArgs::version` (crates/oxigaf-cli/src/cli.rs) already
+    // restricts CLI input to "2020"/"2023", but this function takes a bare
+    // `&str` and cannot rely on that guarantee holding for every caller --
+    // reject an unrecognised value here too, hard, instead of silently
+    // skipping the version-specific shape checks and still reporting
+    // "All files validated successfully" as if nothing were wrong.
     let issues = match version {
         "2020" => validate_flame_2020(output_dir)?,
         "2023" => validate_flame_2023(output_dir)?,
         other => {
-            tracing::warn!("Unknown FLAME version '{other}', skipping version-specific validation");
-            Vec::new()
+            anyhow::bail!("Unknown FLAME version '{other}': expected '2020' or '2023'");
         }
     };
     for issue in &issues {
@@ -606,6 +629,22 @@ fn verify_output(output_dir: &Path, version: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Path to a stale `parents.npy` left over in `output_dir` by an older
+/// `oxigaf convert` release, or `None` if there isn't one.
+///
+/// Earlier releases wrote `parents.npy` as a verbatim copy of the full
+/// `[2, N]` `kintree_table` array -- never the derived parent-index vector
+/// its name implied. `oxigaf_flame::load_flame_model` has never read it
+/// (see the module doc), and this converter no longer writes it, but
+/// `run_convert`'s output-directory handling only ever adds files -- a
+/// `--force` re-run over a directory from an older binary does not clean
+/// out files the current version no longer produces. The file is
+/// completely inert, so this is surfaced as a hint, not an error.
+fn stale_parents_npy(output_dir: &Path) -> Option<std::path::PathBuf> {
+    let path = output_dir.join("parents.npy");
+    path.exists().then_some(path)
 }
 
 /// Information about an NPY file.
@@ -688,6 +727,51 @@ const FLAME_SPEC: FlameSpec = FlameSpec {
     n_pose: 36,
     n_basis: 400,
 };
+
+/// Canonical number of mesh faces in the FLAME topology (see the
+/// `faces.npy` entry in the module doc) -- constant across the FLAME 2020
+/// and 2023 releases, which share one watertight head mesh.
+///
+/// This lives as its own constant rather than a `FlameSpec` field because
+/// `validate_flame_shapes` deliberately does *not* enforce this exact
+/// count (only that `faces.npy` has shape `[F, 3]`); it is only an input to
+/// the disk-size estimate below.
+const FLAME_FACE_COUNT: usize = 9976;
+
+/// Estimate the on-disk size, in MB, of the loader-required output file set
+/// (see [`OUTPUT_FILES`]) for the canonical FLAME geometry in `spec`.
+///
+/// This is a floor, not a total. It covers exactly the 8 always-produced
+/// files -- `prepare_outputs` errors out if any of them ends up missing --
+/// computed from their known shapes and dtypes rather than approximated.
+/// It excludes the source model's optional landmark-embedding and UV
+/// arrays (`full_lmk_bary_coords.npy`, `neck_kin_chain.npy`, `uv.npy`,
+/// ...), since whether the source file even has those, and how large they
+/// are, is not knowable without parsing it -- which `--dry-run` does not
+/// do, on purpose.
+///
+/// Unlike [`crate::dry_run::estimate_export_disk_mb`], which sizes a
+/// Gaussian-splat PLY/safetensors/glTF export from `num_gaussians` and
+/// `sh_degree`, a FLAME conversion has no Gaussians at all, so that helper
+/// does not apply here -- the FLAME output shapes are fixed by `spec`
+/// instead.
+fn estimated_output_disk_mb(spec: &FlameSpec) -> u64 {
+    let n = spec.n_verts as u64;
+    let f = FLAME_FACE_COUNT as u64;
+    let j = spec.n_joints as u64;
+    let pose = spec.n_pose as u64;
+    let basis = spec.n_basis as u64;
+
+    let bytes = n * 3 * 4 // v_template.npy    <f4>
+        + f * 3 * 4 // faces.npy         <i4>
+        + n * 3 * basis * 4 // shapedirs.npy + expressiondirs.npy <f4>
+        + n * 3 * pose * 4 // posedirs.npy      <f4>
+        + j * n * 4 // j_regressor.npy   <f4>
+        + 2 * j * 4 // kintree_table.npy <i4>
+        + n * j * 4; // lbs_weights.npy   <f4>
+
+    bytes / (1024 * 1024)
+}
 
 /// Read the shape of a converted file, or `None` when it is absent/unreadable.
 fn shape_of(output_dir: &Path, name: &str) -> Result<Option<Vec<usize>>> {
@@ -871,6 +955,45 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Dry-run disk estimate
+    //
+    // Regression coverage for: `--dry-run convert` used to report a fixed
+    // `Some(250)` MB disk estimate for every conversion, regardless of the
+    // FLAME geometry actually being converted.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_estimated_output_disk_mb_is_not_the_old_hardcoded_literal() {
+        let mb = estimated_output_disk_mb(&FLAME_SPEC);
+        assert_ne!(mb, 250, "must not report the old hardcoded literal");
+        assert!(
+            mb > 0,
+            "a real FLAME conversion produces non-trivial output"
+        );
+    }
+
+    #[test]
+    fn test_estimated_output_disk_mb_scales_with_geometry() {
+        // Half the canonical vertex count, everything else unchanged.
+        let half = FlameSpec {
+            n_verts: FLAME_SPEC.n_verts / 2,
+            n_joints: FLAME_SPEC.n_joints,
+            n_pose: FLAME_SPEC.n_pose,
+            n_basis: FLAME_SPEC.n_basis,
+        };
+        let full_mb = estimated_output_disk_mb(&FLAME_SPEC);
+        let half_mb = estimated_output_disk_mb(&half);
+        assert!(
+            half_mb > 0,
+            "halved geometry must still report non-trivial disk usage, got {half_mb}"
+        );
+        assert!(
+            full_mb > half_mb,
+            "a larger vertex count must report more disk usage (full={full_mb}, half={half_mb})"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // NPY container
     // -----------------------------------------------------------------------
 
@@ -892,16 +1015,10 @@ mod tests {
     #[test]
     fn test_npy_round_trip() {
         let array = f32_array(&[2, 3], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let encoded = match npy::serialize(&array) {
-            Ok(bytes) => bytes,
-            Err(e) => panic!("serialize failed: {e}"),
-        };
+        let encoded = npy::serialize(&array).expect("serialize failed");
         assert_eq!(&encoded[0..6], b"\x93NUMPY");
         assert_eq!(encoded.len() % 64, array.data.len() % 64);
-        let decoded = match npy::parse(&encoded) {
-            Ok(a) => a,
-            Err(e) => panic!("parse failed: {e}"),
-        };
+        let decoded = npy::parse(&encoded).expect("parse failed");
         assert_eq!(decoded, array);
     }
 
@@ -926,10 +1043,7 @@ mod tests {
         stream.extend_from_slice(&1.0f32.to_le_bytes());
         stream.extend_from_slice(&2.0f32.to_le_bytes());
 
-        let parsed = match npy::parse_header(&stream) {
-            Ok(h) => h,
-            Err(e) => panic!("v2 header rejected: {e}"),
-        };
+        let parsed = npy::parse_header(&stream).expect("v2 header rejected");
         assert_eq!(parsed.descr, "<f4");
         assert_eq!(parsed.shape, vec![2]);
         assert_eq!(parsed.data_offset, 12 + header.len());
@@ -948,10 +1062,7 @@ mod tests {
             shape: vec![2, 3],
             data: c_order,
         };
-        let values = match npy::to_f64_vec(&array) {
-            Ok(v) => v,
-            Err(e) => panic!("to_f64_vec failed: {e}"),
-        };
+        let values = npy::to_f64_vec(&array).expect("to_f64_vec failed");
         assert_eq!(values, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
     }
 
@@ -959,20 +1070,11 @@ mod tests {
     fn test_slice_last_axis() {
         let values: Vec<f32> = (0..24).map(|i| i as f32).collect();
         let array = f32_array(&[2, 3, 4], &values);
-        let head = match npy::slice_last_axis(&array, 0, 3) {
-            Ok(a) => a,
-            Err(e) => panic!("slice failed: {e}"),
-        };
-        let tail = match npy::slice_last_axis(&array, 3, 4) {
-            Ok(a) => a,
-            Err(e) => panic!("slice failed: {e}"),
-        };
+        let head = npy::slice_last_axis(&array, 0, 3).expect("slice failed");
+        let tail = npy::slice_last_axis(&array, 3, 4).expect("slice failed");
         assert_eq!(head.shape, vec![2, 3, 3]);
         assert_eq!(tail.shape, vec![2, 3, 1]);
-        let tail_values = match npy::to_f64_vec(&tail) {
-            Ok(v) => v,
-            Err(e) => panic!("to_f64_vec failed: {e}"),
-        };
+        let tail_values = npy::to_f64_vec(&tail).expect("to_f64_vec failed");
         assert_eq!(tail_values, vec![3.0, 7.0, 11.0, 15.0, 19.0, 23.0]);
     }
 
@@ -987,10 +1089,7 @@ mod tests {
             shape: vec![2],
             data,
         };
-        let narrow = match npy::cast(&wide, "<f4") {
-            Ok(a) => a,
-            Err(e) => panic!("cast failed: {e}"),
-        };
+        let narrow = npy::cast(&wide, "<f4").expect("cast failed");
         assert_eq!(narrow.descr, "<f4");
         assert_eq!(narrow.data.len(), 8);
 
@@ -1003,14 +1102,11 @@ mod tests {
             shape: vec![2],
             data: unsigned,
         };
-        let signed = match npy::cast(&source, "<i4") {
-            Ok(a) => a,
-            Err(e) => panic!("cast failed: {e}"),
-        };
-        match npy::to_i64_vec(&signed) {
-            Ok(v) => assert_eq!(v, vec![7, 9]),
-            Err(e) => panic!("to_i64_vec failed: {e}"),
-        }
+        let signed = npy::cast(&source, "<i4").expect("cast failed");
+        assert_eq!(
+            npy::to_i64_vec(&signed).expect("to_i64_vec failed"),
+            vec![7, 9]
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1021,13 +1117,9 @@ mod tests {
     fn test_validate_npy_file_rejects_garbage() {
         let dir = scratch_dir("garbage");
         let path = dir.join("v_template.npy");
-        if let Err(e) = std::fs::write(&path, b"definitely not an npy file") {
-            panic!("failed to write fixture: {e}");
-        }
-        match validate_npy_file(&path) {
-            Ok(info) => assert!(!info.valid, "garbage must not be reported as valid"),
-            Err(e) => panic!("validate_npy_file errored: {e}"),
-        }
+        std::fs::write(&path, b"definitely not an npy file").expect("failed to write fixture");
+        let info = validate_npy_file(&path).expect("validate_npy_file errored");
+        assert!(!info.valid, "garbage must not be reported as valid");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1037,9 +1129,8 @@ mod tests {
         // `all_valid`, so a directory of correctly-named garbage passed.
         let dir = scratch_dir("verify");
         for name in OUTPUT_FILES {
-            if let Err(e) = std::fs::write(dir.join(name), b"not an npy file at all") {
-                panic!("failed to write fixture: {e}");
-            }
+            std::fs::write(dir.join(name), b"not an npy file at all")
+                .expect("failed to write fixture");
         }
         assert!(
             verify_output(&dir, "2023").is_err(),
@@ -1052,6 +1143,52 @@ mod tests {
     fn test_verify_output_detects_missing_files() {
         let dir = scratch_dir("missing");
         assert!(verify_output(&dir, "2020").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_verify_output_rejects_unknown_version_instead_of_warning() {
+        // Regression: an unrecognised `version` used to fall through to a
+        // `tracing::warn!` that merely skipped the version-specific shape
+        // checks, so `verify_output` could still report "All files
+        // validated successfully" for a version it never actually checked.
+        // It must now fail hard and name the offending value. The version
+        // match runs before the generic "missing or invalid" bail at the
+        // end of the function, so this must surface a message about the
+        // version itself, not a generic missing-files message, even though
+        // the scratch dir here is empty.
+        let dir = scratch_dir("unknown_version");
+        let err = verify_output(&dir, "2021")
+            .expect_err("verify_output must reject an unrecognised version");
+        assert!(
+            format!("{err:#}").contains("2021"),
+            "error should name the offending version string, got: {err:#}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // Stale parents.npy detection
+    //
+    // Regression coverage for: a `parents.npy` left over by an older
+    // `oxigaf convert` release (a verbatim `kintree_table` copy, never the
+    // parents vector its name implied) is inert but was previously
+    // undetected and undocumented.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_stale_parents_npy_detects_leftover_file() {
+        let dir = scratch_dir("stale_parents_present");
+        std::fs::write(dir.join("parents.npy"), b"old kintree_table copy")
+            .expect("failed to write fixture");
+        assert_eq!(stale_parents_npy(&dir), Some(dir.join("parents.npy")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_stale_parents_npy_absent_when_not_present() {
+        let dir = scratch_dir("stale_parents_absent");
+        assert_eq!(stale_parents_npy(&dir), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1070,10 +1207,7 @@ mod tests {
         components.insert("kintree_table".to_string(), zeros("<u4", &[2, 5]));
         components.insert("weights".to_string(), zeros("<f8", &[2, 5]));
 
-        let files = match prepare_outputs(&components, false) {
-            Ok(f) => f,
-            Err(e) => panic!("prepare_outputs failed: {e}"),
-        };
+        let files = prepare_outputs(&components, false).expect("prepare_outputs failed");
         let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, OUTPUT_FILES.to_vec());
 
@@ -1108,16 +1242,10 @@ mod tests {
         components.insert("vt".to_string(), zeros("<f4", &[4, 2]));
         components.insert("ft".to_string(), zeros("<i4", &[1, 3]));
 
-        let without = match prepare_outputs(&components, false) {
-            Ok(f) => f,
-            Err(e) => panic!("prepare_outputs failed: {e}"),
-        };
+        let without = prepare_outputs(&components, false).expect("prepare_outputs failed");
         assert!(!without.iter().any(|(n, _)| n == "uv.npy"));
 
-        let with = match prepare_outputs(&components, true) {
-            Ok(f) => f,
-            Err(e) => panic!("prepare_outputs failed: {e}"),
-        };
+        let with = prepare_outputs(&components, true).expect("prepare_outputs failed");
         assert!(with.iter().any(|(n, _)| n == "uv.npy"));
         assert!(with.iter().any(|(n, _)| n == "uv_faces.npy"));
     }
@@ -1235,26 +1363,25 @@ mod tests {
         let first = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
         let second = [-1.5f32, 0.5, 2.25, 4.0, 8.0, 16.0];
         let stream = build_flame_like_pickle(&first, &second);
-        let arrays = match pickle::load_arrays(&stream) {
-            Ok(a) => a,
-            Err(e) => panic!("pickle decoding failed: {e:#}"),
-        };
+        let arrays = pickle::load_arrays(&stream).expect("pickle decoding failed");
 
         for (name, expected) in [
             ("v_template", first.as_slice()),
             ("weights", second.as_slice()),
         ] {
-            let array = match arrays.get(name) {
-                Some(a) => a,
-                None => panic!("{name} missing from decoded pickle"),
-            };
+            assert!(
+                arrays.contains_key(name),
+                "{name} missing from decoded pickle"
+            );
+            let array = &arrays[name];
             assert_eq!(array.descr, ">f4", "{name} lost its dtype byte order");
             assert_eq!(array.shape, vec![2, 3]);
             let values: Vec<f64> = expected.iter().map(|v| f64::from(*v)).collect();
-            match npy::to_f64_vec(array) {
-                Ok(v) => assert_eq!(v, values, "{name} decoded to the wrong values"),
-                Err(e) => panic!("to_f64_vec failed: {e}"),
-            }
+            assert_eq!(
+                npy::to_f64_vec(array).expect("to_f64_vec failed"),
+                values,
+                "{name} decoded to the wrong values"
+            );
         }
     }
 
@@ -1272,15 +1399,13 @@ mod tests {
         let values = [7.0f64, 4.0];
         let indices = [1i64, 0];
         let indptr = [0i64, 1, 1, 2];
-        let dense = match pickle::densify(2, 3, &values, &indices, &indptr, true) {
-            Ok(a) => a,
-            Err(e) => panic!("densify failed: {e}"),
-        };
+        let dense =
+            pickle::densify(2, 3, &values, &indices, &indptr, true).expect("densify failed");
         assert_eq!(dense.shape, vec![2, 3]);
-        match npy::to_f64_vec(&dense) {
-            Ok(v) => assert_eq!(v, vec![0.0, 0.0, 4.0, 7.0, 0.0, 0.0]),
-            Err(e) => panic!("to_f64_vec failed: {e}"),
-        }
+        assert_eq!(
+            npy::to_f64_vec(&dense).expect("to_f64_vec failed"),
+            vec![0.0, 0.0, 4.0, 7.0, 0.0, 0.0]
+        );
     }
 
     #[test]

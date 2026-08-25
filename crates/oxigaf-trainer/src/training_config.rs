@@ -22,6 +22,7 @@
 
 use std::fmt::Write as FmtWrite;
 
+use crate::config::{DensityConfig, InitConfig, LossConfig, OptimizerConfig, TrainingConfig};
 use crate::TrainerError;
 
 // ---------------------------------------------------------------------------
@@ -234,6 +235,57 @@ impl TrainingProfileConfig {
             return Err(TrainerError::InvalidConfig("lr_sh must be > 0".to_string()));
         }
 
+        // SH degree: the renderer allocates `(d+1)^2*3` SH channels per
+        // Gaussian; mirrors the identical bound in
+        // `progressive_training::TrainingStage::validate`.
+        if self.sh_degree > 3 {
+            return Err(TrainerError::InvalidConfig(format!(
+                "sh_degree ({}) must be <= 3",
+                self.sh_degree
+            )));
+        }
+
+        // Warmup must fit inside the run it's warming up.
+        if self.warmup_iterations > self.max_iterations {
+            return Err(TrainerError::InvalidConfig(format!(
+                "warmup_iterations ({}) must be <= max_iterations ({})",
+                self.warmup_iterations, self.max_iterations
+            )));
+        }
+
+        // The trainer gates these with `iteration.is_multiple_of(interval)`,
+        // which for `interval == 0` is true only at iteration 0 — a zero
+        // interval silently disables checkpointing/logging/opacity-reset for
+        // the entire run instead of erroring.
+        if self.checkpoint_interval == 0 {
+            return Err(TrainerError::InvalidConfig(
+                "checkpoint_interval must be > 0 (0 silently disables checkpointing)".to_string(),
+            ));
+        }
+        if self.log_interval == 0 {
+            return Err(TrainerError::InvalidConfig(
+                "log_interval must be > 0 (0 silently disables logging)".to_string(),
+            ));
+        }
+        if self.opacity_reset_interval == 0 {
+            return Err(TrainerError::InvalidConfig(
+                "opacity_reset_interval must be > 0 (0 silently disables opacity reset)"
+                    .to_string(),
+            ));
+        }
+
+        // A nonzero `lpips_weight` with `use_lpips = false` is internally
+        // inconsistent: the weight implies LPIPS should contribute to the
+        // loss, but the flag means it never actually does (see
+        // `TrainingProfile::Standard`, which had exactly this shape before
+        // being fixed alongside this check).
+        if self.lpips_weight > 0.0 && !self.use_lpips {
+            return Err(TrainerError::InvalidConfig(format!(
+                "lpips_weight ({}) is > 0 but use_lpips is false",
+                self.lpips_weight
+            )));
+        }
+
         Ok(())
     }
 
@@ -346,6 +398,78 @@ impl TrainingProfileConfig {
         let _ = writeln!(out, "│ {:<24} │ {:>9.1} MiB │", "est. memory", mem);
         let _ = writeln!(out, "└──────────────────────────┴──────────────┘");
         out
+    }
+}
+
+impl From<TrainingProfileConfig> for TrainingConfig {
+    /// Convert a flat preset config into the nested [`TrainingConfig`] that
+    /// the trainer actually accepts, so a [`TrainingProfile`] preset can
+    /// drive it directly instead of requiring a hand-written field-by-field
+    /// copy at every call site.
+    ///
+    /// Every optimiser/loss/density/init field with a direct counterpart is
+    /// carried over (learning rates narrow `f64 -> f32`; `sh_degree` and the
+    /// checkpoint/log/opacity-reset intervals map 1:1). `TrainingConfig` has
+    /// no equivalent for some `TrainingProfileConfig` fields, so this
+    /// conversion is necessarily lossy for:
+    /// - `image_height` / `image_width` — render resolution isn't part of
+    ///   `TrainingConfig`; it's supplied to the renderer separately.
+    /// - `warmup_iterations` — no LR/loss-schedule warmup concept exists on
+    ///   `TrainingConfig`.
+    /// - `use_ema` — the current trainer has no EMA support.
+    ///
+    /// `init.num_rigid` / `init.num_flexible` have no split in
+    /// `TrainingProfileConfig` (only a single `initial_num_gaussians`), so
+    /// the total is divided evenly, matching [`InitConfig::default`]'s own
+    /// 50/50 split. Fields with no source at all (`guidance_*`,
+    /// `density_control_interval`, `lr_position_final`, `lr_offset`, Adam
+    /// betas/epsilon, `min_opacity`/`max_screen_size`/
+    /// `split_scale_threshold`, `initial_scale`/`initial_opacity`,
+    /// `tensorboard`, `precision`, `enable_profiling`) keep their
+    /// `TrainingConfig` defaults.
+    fn from(profile: TrainingProfileConfig) -> Self {
+        let total_gaussians = profile.initial_num_gaussians as usize;
+        let num_rigid = total_gaussians / 2;
+        let num_flexible = total_gaussians - num_rigid;
+
+        TrainingConfig {
+            total_iterations: profile.max_iterations,
+            views_per_step: profile.views_per_step as usize,
+            density_control_start: profile.densify_from_iter,
+            density_control_end: profile.densify_until_iter,
+            opacity_reset_interval: profile.opacity_reset_interval,
+            checkpoint_interval: profile.checkpoint_interval,
+            log_interval: profile.log_interval,
+            optimizer: OptimizerConfig {
+                lr_position: profile.lr_position as f32,
+                lr_rotation: profile.lr_rotation as f32,
+                lr_scale: profile.lr_scale as f32,
+                lr_opacity: profile.lr_opacity as f32,
+                lr_sh: profile.lr_sh as f32,
+                ..Default::default()
+            },
+            loss: LossConfig {
+                w_l1: profile.photometric_weight,
+                w_ssim: profile.ssim_weight,
+                w_lpips: profile.lpips_weight,
+                w_position_reg: profile.position_reg_weight,
+                w_scale_reg: profile.scale_reg_weight,
+                w_opacity_reg: profile.opacity_reg_weight,
+                ..Default::default()
+            },
+            density: DensityConfig {
+                grad_threshold: profile.densify_grad_threshold,
+                max_gaussians: profile.max_num_gaussians as usize,
+                ..Default::default()
+            },
+            init: InitConfig {
+                num_rigid,
+                num_flexible,
+                sh_degree: profile.sh_degree,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
     }
 }
 
@@ -472,7 +596,11 @@ impl TrainingProfile {
                 log_interval: 50,
                 // Features
                 use_ema: true,
-                use_lpips: false,
+                // `lpips_weight: 0.1` above only takes effect if this is
+                // true; previously `false` here silently zeroed out LPIPS
+                // for the "Standard" profile despite its nonzero weight
+                // (an inconsistency `validate()` now rejects outright).
+                use_lpips: true,
             },
             TrainingProfile::Production => TrainingProfileConfig {
                 // Training loop
@@ -547,7 +675,10 @@ mod tests {
         assert_eq!(cfg.sh_degree, 1);
         assert_eq!(cfg.initial_num_gaussians, 5_000);
         assert!(cfg.use_ema);
-        assert!(!cfg.use_lpips);
+        // `use_lpips` must agree with the nonzero `lpips_weight` this
+        // preset sets — see the fix note at the `use_lpips: true` site.
+        assert!(cfg.use_lpips);
+        assert!(cfg.lpips_weight > 0.0);
     }
 
     #[test]
@@ -624,6 +755,63 @@ mod tests {
         let mut cfg = TrainingProfile::development().config();
         cfg.densify_until_iter = cfg.densify_from_iter; // equal, not strictly greater
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_sh_degree_too_high() {
+        let mut cfg = TrainingProfile::development().config();
+        cfg.sh_degree = 4; // renderer only supports 0..=3
+        let result = cfg.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("sh_degree"));
+    }
+
+    #[test]
+    fn test_validate_warmup_exceeds_max_iterations() {
+        let mut cfg = TrainingProfile::development().config();
+        cfg.warmup_iterations = cfg.max_iterations + 1;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_zero_intervals_rejected() {
+        for zero_field in ["checkpoint", "log", "opacity_reset"] {
+            let mut cfg = TrainingProfile::development().config();
+            match zero_field {
+                "checkpoint" => cfg.checkpoint_interval = 0,
+                "log" => cfg.log_interval = 0,
+                _ => cfg.opacity_reset_interval = 0,
+            }
+            assert!(
+                cfg.validate().is_err(),
+                "{zero_field}_interval = 0 must be rejected (it silently disables the schedule, not runs it once)"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_lpips_weight_without_use_lpips_rejected() {
+        let mut cfg = TrainingProfile::development().config();
+        cfg.lpips_weight = 0.1;
+        cfg.use_lpips = false;
+        let result = cfg.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("lpips_weight"));
+    }
+
+    #[test]
+    fn test_all_presets_are_internally_consistent() {
+        // Regression: `TrainingProfile::Standard` used to pair a nonzero
+        // `lpips_weight` with `use_lpips = false`; every built-in preset
+        // must now pass its own `validate()`.
+        for profile in [
+            TrainingProfile::development(),
+            TrainingProfile::standard(),
+            TrainingProfile::production(),
+        ] {
+            let cfg = profile.config();
+            assert!(cfg.validate().is_ok(), "{cfg:?} failed validate()");
+        }
     }
 
     // ------------------------------------------------------------------ resource estimates
@@ -734,6 +922,51 @@ mod tests {
     }
 
     // ------------------------------------------------------------------ format_summary production
+
+    // ------------------------------------------------------------------ From<TrainingProfileConfig>
+
+    #[test]
+    fn test_from_profile_maps_fields() {
+        // Regression: `TrainingProfileConfig` previously had no conversion
+        // to the type `Trainer::new` actually accepts.
+        let profile = TrainingProfile::production().config();
+        let cfg: TrainingConfig = profile.clone().into();
+
+        assert_eq!(cfg.total_iterations, profile.max_iterations);
+        assert_eq!(cfg.views_per_step, profile.views_per_step as usize);
+        assert_eq!(cfg.density_control_start, profile.densify_from_iter);
+        assert_eq!(cfg.density_control_end, profile.densify_until_iter);
+        assert_eq!(cfg.checkpoint_interval, profile.checkpoint_interval);
+        assert_eq!(cfg.log_interval, profile.log_interval);
+        assert!((cfg.optimizer.lr_position - profile.lr_position as f32).abs() < 1e-12);
+        assert!((cfg.loss.w_l1 - profile.photometric_weight).abs() < 1e-9);
+        assert!((cfg.loss.w_lpips - profile.lpips_weight).abs() < 1e-9);
+        assert_eq!(
+            cfg.density.max_gaussians,
+            profile.max_num_gaussians as usize
+        );
+        assert_eq!(cfg.init.sh_degree, profile.sh_degree);
+        assert_eq!(
+            cfg.init.num_rigid + cfg.init.num_flexible,
+            profile.initial_num_gaussians as usize,
+            "the rigid/flexible split must preserve the total Gaussian count"
+        );
+    }
+
+    #[test]
+    fn test_from_profile_produces_valid_training_config() {
+        // Every built-in preset, once converted, must itself pass
+        // `TrainingConfig::validate` — the whole point of the conversion is
+        // to feed `Trainer::new` a usable config.
+        for profile in [
+            TrainingProfile::development(),
+            TrainingProfile::standard(),
+            TrainingProfile::production(),
+        ] {
+            let cfg: TrainingConfig = profile.config().into();
+            assert!(cfg.validate().is_ok(), "converted config failed validate()");
+        }
+    }
 
     #[test]
     fn test_format_summary_production_contains_lpips() {

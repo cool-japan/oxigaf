@@ -1092,14 +1092,14 @@ mod tests {
             10.0,
             5.0, // near > far → error
         );
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            StreamingError::InvalidFrustum { near, far } => {
-                assert_eq!(near, 10.0);
-                assert_eq!(far, 5.0);
-            }
-            e => panic!("wrong error: {e}"),
-        }
+        let err = result.unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                StreamingError::InvalidFrustum { near, far } if *near == 10.0 && *far == 5.0
+            ),
+            "wrong error: {err}"
+        );
     }
 
     #[test]

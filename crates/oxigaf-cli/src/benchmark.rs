@@ -1334,16 +1334,12 @@ mod tests {
     /// Regression: `--iterations 0` must be rejected up front.
     #[test]
     fn test_validate_args_rejects_zero_iterations() {
-        match validate_args(&test_args(0, 3)) {
-            Ok(()) => panic!("iterations = 0 must be rejected"),
-            Err(e) => {
-                let message = format!("{e:#}");
-                assert!(
-                    message.contains("--iterations"),
-                    "error must mention the offending flag, got: {message}"
-                );
-            }
-        }
+        let e = validate_args(&test_args(0, 3)).expect_err("iterations = 0 must be rejected");
+        let message = format!("{e:#}");
+        assert!(
+            message.contains("--iterations"),
+            "error must mention the offending flag, got: {message}"
+        );
     }
 
     #[test]
@@ -1359,10 +1355,8 @@ mod tests {
         let comparison = compute_baseline_comparison(&current, &baseline);
         assert_eq!(comparison.len(), 1);
         assert_eq!(comparison[0].target, "raster");
-        match comparison[0].diff_pct {
-            Some(diff) => assert!((diff - 50.0).abs() < 1e-6, "unexpected diff: {diff}"),
-            None => panic!("expected a diff percentage"),
-        }
+        let diff = comparison[0].diff_pct.expect("expected a diff percentage");
+        assert!((diff - 50.0).abs() < 1e-6, "unexpected diff: {diff}");
     }
 
     /// Regression: a zero baseline mean used to produce an infinite percentage.
@@ -1407,13 +1401,9 @@ mod tests {
         }"#;
 
         let parsed: std::result::Result<BenchmarkReport, _> = serde_json::from_str(legacy);
-        match parsed {
-            Ok(report) => {
-                assert!(report.skipped.is_empty());
-                assert!(report.baseline_comparison.is_none());
-            }
-            Err(e) => panic!("legacy baseline must parse: {e}"),
-        }
+        let report = parsed.expect("legacy baseline must parse");
+        assert!(report.skipped.is_empty());
+        assert!(report.baseline_comparison.is_none());
     }
 
     #[test]
@@ -1427,22 +1417,13 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("oxigaf_bench_report_{}", unique_suffix()));
         let path = dir.join("report.json");
 
-        let rendered = match format_json(&report) {
-            Ok(text) => text,
-            Err(e) => panic!("format_json failed: {e}"),
-        };
-        if let Err(e) = write_report_file(&rendered, &path) {
-            panic!("write_report_file failed: {e}");
-        }
+        let rendered = format_json(&report).expect("format_json failed");
+        write_report_file(&rendered, &path).expect("write_report_file failed");
 
-        match load_baseline(&path) {
-            Ok(loaded) => {
-                assert_eq!(loaded.results.len(), 1);
-                assert_eq!(loaded.skipped.len(), 1);
-                assert_eq!(loaded.results[0].target, "export");
-            }
-            Err(e) => panic!("load_baseline failed: {e}"),
-        }
+        let loaded = load_baseline(&path).expect("load_baseline failed");
+        assert_eq!(loaded.results.len(), 1);
+        assert_eq!(loaded.skipped.len(), 1);
+        assert_eq!(loaded.results[0].target, "export");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1493,14 +1474,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("oxigaf_bench_ply_{}", unique_suffix()));
         let path = dir.join("bench.ply");
 
-        if let Err(e) = crate::export::export_ply(&model, &path) {
-            panic!("export_ply failed: {e}");
-        }
+        crate::export::export_ply(&model, &path).expect("export_ply failed");
 
-        let content = match std::fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(e) => panic!("failed to read exported PLY: {e}"),
-        };
+        let content = std::fs::read_to_string(&path).expect("failed to read exported PLY");
         assert!(content.starts_with("ply"), "not a PLY file");
         assert!(content.contains("element vertex 4"), "wrong vertex count");
 
@@ -1512,10 +1488,7 @@ mod tests {
     #[test]
     fn test_benchmark_export_measures_real_work() {
         let args = test_args(2, 1);
-        let results = match benchmark_export(&args, None) {
-            Ok(results) => results,
-            Err(e) => panic!("benchmark_export failed: {e}"),
-        };
+        let results = benchmark_export(&args, None).expect("benchmark_export failed");
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].target, "export");
@@ -1528,16 +1501,13 @@ mod tests {
     #[test]
     fn test_benchmark_flame_requires_model() {
         let args = test_args(1, 0);
-        match benchmark_flame(&args, None) {
-            Ok(_) => panic!("flame benchmark must not run without --flame-model"),
-            Err(e) => {
-                let message = format!("{e:#}");
-                assert!(
-                    message.contains("--flame-model"),
-                    "error must name the missing flag, got: {message}"
-                );
-            }
-        }
+        let e = benchmark_flame(&args, None)
+            .expect_err("flame benchmark must not run without --flame-model");
+        let message = format!("{e:#}");
+        assert!(
+            message.contains("--flame-model"),
+            "error must name the missing flag, got: {message}"
+        );
     }
 
     #[test]

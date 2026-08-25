@@ -848,6 +848,24 @@ mod tests_2 {
         .expect("compress with clustering");
         let decomp = gc_decompress(&scene).expect("decompress");
         assert_eq!(decomp.n_gaussians, scene.n_gaussians);
+        // Clustering is residual coding, not a no-op: the codebook must be
+        // persisted, and decompression must add it back so world positions
+        // survive the round trip (they used to collapse toward the origin).
+        let clustering = scene
+            .position_clustering
+            .as_ref()
+            .expect("codebook must be persisted");
+        assert_eq!(clustering.n_clusters(), 10);
+        assert_eq!(clustering.assignments.len(), scene.n_gaussians);
+        assert_eq!(decomp.positions.len(), pos.len());
+        for (a, b) in decomp.positions.iter().zip(pos.iter()) {
+            assert!(
+                (a - b).abs() < 1e-3,
+                "clustered position round-trip failed: {a} vs {b}"
+            );
+        }
+        // Survivor provenance is recorded even when nothing is pruned.
+        assert_eq!(scene.kept_indices.len(), scene.n_gaussians);
     }
     #[test]
     fn test_compress_with_pruning_reduces_gaussians() {

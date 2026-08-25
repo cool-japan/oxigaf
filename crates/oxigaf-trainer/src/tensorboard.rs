@@ -26,6 +26,7 @@
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -57,8 +58,15 @@ fn crc32c_table() -> [u32; 256] {
 }
 
 /// Compute CRC32C checksum of data.
+///
+/// The 256-entry lookup table is built once (2048 shift/xor iterations) and
+/// cached process-wide, rather than being regenerated on every call —
+/// `write_record` calls this twice per TFEvents record, and a training run
+/// logs at least two records per step.
 fn crc32c(data: &[u8]) -> u32 {
-    let table = crc32c_table();
+    static TABLE: OnceLock<[u32; 256]> = OnceLock::new();
+    let table = TABLE.get_or_init(crc32c_table);
+
     let mut crc = !0u32;
     for byte in data {
         let idx = ((crc ^ (*byte as u32)) & 0xFF) as usize;
@@ -327,6 +335,43 @@ fn write_record<W: Write>(writer: &mut W, data: &[u8]) -> Result<(), TrainerErro
     writer.write_all(&data_crc.to_le_bytes())?;
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Histogram bucketing
+// ---------------------------------------------------------------------------
+
+/// TensorBoard's canonical default histogram bucket edges: fixed, symmetric,
+/// geometrically-spaced limits covering the full range of `f64` magnitudes
+/// (mirrors `tensorflow::histogram::Histogram`'s default bucketer in
+/// `tensorflow/core/lib/histogram/histogram.cc`). Computed once and cached
+/// process-wide, since the edges never depend on the data being
+/// histogrammed.
+///
+/// Layout (sorted ascending): `[-f64::MAX, ..., -v, ..., -1e-12, 1e-12,
+/// ..., v, ..., f64::MAX]` where each `v` steps `*= 1.1` starting from
+/// `1e-12` while `v < 1e20`. Every finite value falls into exactly one
+/// bucket on the correct side of zero — including data with `min < 0 <
+/// max`, which the old `ln|min|..ln|max|` scheme (negated only when `max <
+/// 0`) put almost entirely into bucket 0.
+fn default_bucket_limits() -> &'static [f64] {
+    static LIMITS: OnceLock<Vec<f64>> = OnceLock::new();
+    LIMITS
+        .get_or_init(|| {
+            let mut positive = Vec::new();
+            let mut v = 1.0e-12_f64;
+            while v < 1.0e20 {
+                positive.push(v);
+                v *= 1.1;
+            }
+            positive.push(f64::MAX);
+
+            let mut limits = Vec::with_capacity(positive.len() * 2);
+            limits.extend(positive.iter().rev().map(|&p| -p)); // -MAX .. -1e-12
+            limits.extend(positive.iter().copied()); //            1e-12 .. MAX
+            limits
+        })
+        .as_slice()
 }
 
 // ---------------------------------------------------------------------------
@@ -670,7 +715,7 @@ impl TensorBoardWriter {
             data.len() as f64,
             sum,
             sum_squares,
-            &bucket_limits,
+            bucket_limits,
             &bucket_counts,
         );
         let summary = build_summary(&[histo_value]);
@@ -684,7 +729,15 @@ impl TensorBoardWriter {
     }
 
     /// Compute histogram bins and statistics.
-    fn compute_histogram(&self, data: &[f32]) -> (f64, f64, f64, f64, Vec<f64>, Vec<f64>) {
+    ///
+    /// Bucket edges use the fixed, symmetric [`default_bucket_limits`]
+    /// scheme rather than deriving them from this call's `min`/`max`: the
+    /// previous scheme built limits from `ln|min|..ln|max|` and negated them
+    /// only when `max < 0`, which put nearly all samples of mixed-sign data
+    /// (the common case for gradients, `min < 0 < max`) into bucket 0. Using
+    /// fixed edges also means `bucket_limits.len() == bucket_counts.len()`
+    /// always holds, with no special-casing needed for constant-valued data.
+    fn compute_histogram(&self, data: &[f32]) -> (f64, f64, f64, f64, &'static [f64], Vec<f64>) {
         let mut min = f64::MAX;
         let mut max = f64::MIN;
         let mut sum = 0.0f64;
@@ -702,44 +755,18 @@ impl TensorBoardWriter {
             sum_squares += vf * vf;
         }
 
-        // Use TensorBoard's default bucket limits (exponential)
-        let num_buckets = 30;
-        let mut bucket_limits = Vec::with_capacity(num_buckets);
-        let mut bucket_counts = vec![0.0f64; num_buckets];
-
-        if (max - min).abs() < 1e-10 {
-            // All values are the same, use a single bucket
-            bucket_limits.push(max);
-            bucket_counts[0] = data.len() as f64;
-        } else {
-            // Create logarithmic bucket limits
-            let log_min = if min.abs() < 1e-10 {
-                -10.0
-            } else {
-                min.abs().ln()
-            };
-            let log_max = if max.abs() < 1e-10 {
-                10.0
-            } else {
-                max.abs().ln()
-            };
-            let log_range = (log_max - log_min).max(1.0);
-
-            for i in 0..num_buckets {
-                let t = (i + 1) as f64 / num_buckets as f64;
-                let limit = (log_min + t * log_range).exp();
-                bucket_limits.push(if max >= 0.0 { limit } else { -limit });
-            }
-
-            // Count values in each bucket
-            for &v in data {
-                let vf = v as f64;
-                let bucket_idx = bucket_limits
-                    .iter()
-                    .position(|&limit| vf <= limit)
-                    .unwrap_or(num_buckets - 1);
-                bucket_counts[bucket_idx] += 1.0;
-            }
+        let bucket_limits = default_bucket_limits();
+        let mut bucket_counts = vec![0.0f64; bucket_limits.len()];
+        for &v in data {
+            let vf = v as f64;
+            // First bucket whose limit is >= vf (limits are sorted
+            // ascending, so this is exactly `partition_point`'s contract).
+            // `+inf` is the only finite-or-not value that can exceed even
+            // the final `f64::MAX` limit, hence the clamp.
+            let idx = bucket_limits
+                .partition_point(|&limit| limit < vf)
+                .min(bucket_limits.len() - 1);
+            bucket_counts[idx] += 1.0;
         }
 
         (min, max, sum, sum_squares, bucket_limits, bucket_counts)
@@ -976,6 +1003,27 @@ mod tests {
     }
 
     #[test]
+    fn test_crc32c_stable_across_repeated_calls() {
+        // Regression: `crc32c` now caches its lookup table in a `OnceLock`
+        // instead of rebuilding it every call. Repeated calls — including
+        // interleaved with different inputs, which would surface any
+        // staleness from a badly-cached table — must keep matching the
+        // freshly-computed table's results.
+        let fresh_table = crc32c_table();
+        for i in 0..5u8 {
+            let data = vec![i; 16];
+            let mut crc = !0u32;
+            for &byte in &data {
+                let idx = ((crc ^ (byte as u32)) & 0xFF) as usize;
+                crc = (crc >> 8) ^ fresh_table[idx];
+            }
+            crc = !crc;
+            assert_eq!(crc32c(&data), crc, "mismatch on iteration {i}");
+        }
+        assert_eq!(crc32c(b"123456789"), 0xE306_9283);
+    }
+
+    #[test]
     fn test_mask_crc() {
         let crc = 0xDEAD_BEEF;
         let masked = mask_crc(crc);
@@ -1107,6 +1155,83 @@ mod tests {
 
         // Clean up
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_default_bucket_limits_sorted_symmetric_and_bounded() {
+        let limits = default_bucket_limits();
+        assert!(limits.len() >= 4);
+        assert_eq!(limits.len() % 2, 0, "symmetric scheme needs an even count");
+        for w in limits.windows(2) {
+            assert!(
+                w[0] < w[1],
+                "limits must be strictly ascending: {} >= {}",
+                w[0],
+                w[1]
+            );
+        }
+        let half = limits.len() / 2;
+        for i in 0..half {
+            assert_eq!(
+                limits[i],
+                -limits[limits.len() - 1 - i],
+                "not symmetric at {i}"
+            );
+        }
+        assert_eq!(limits[half - 1], -1.0e-12);
+        assert_eq!(limits[half], 1.0e-12);
+        assert_eq!(*limits.first().unwrap(), -f64::MAX);
+        assert_eq!(*limits.last().unwrap(), f64::MAX);
+    }
+
+    #[test]
+    fn test_compute_histogram_limits_and_counts_same_length() {
+        let writer = TensorBoardWriter::disabled();
+        for data in [
+            vec![-0.5_f32, -0.2, 0.0, 0.3, 0.5], // mixed sign
+            vec![1.0_f32; 10],                   // constant (the old degenerate branch)
+            vec![-3.0_f32, -1.0, -0.1],          // all negative
+            vec![0.1_f32, 1.0, 100.0],           // all positive
+        ] {
+            let (_, _, _, _, bucket_limits, bucket_counts) = writer.compute_histogram(&data);
+            assert_eq!(
+                bucket_limits.len(),
+                bucket_counts.len(),
+                "mismatch for {data:?}"
+            );
+            let total: f64 = bucket_counts.iter().sum();
+            assert_eq!(
+                total,
+                data.len() as f64,
+                "counts must sum to n for {data:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_compute_histogram_mixed_sign_not_all_in_one_bucket() {
+        // Regression: gradients uniform in [-0.5, 0.5] used to put ~99% of
+        // samples in bucket 0, because bucket limits were built from
+        // `ln|min|..ln|max|` and negated only when `max < 0` — every limit
+        // ended up positive and near `ln(0.5)`, so every negative value
+        // (half the data) plus most positives fell below the smallest one.
+        let writer = TensorBoardWriter::disabled();
+        let n = 1000;
+        let data: Vec<f32> = (0..n).map(|i| -0.5 + i as f32 / (n - 1) as f32).collect();
+        let (min, max, _, _, _, bucket_counts) = writer.compute_histogram(&data);
+        assert!(min < 0.0 && max > 0.0, "fixture must be mixed-sign");
+
+        let total: f64 = bucket_counts.iter().sum();
+        assert_eq!(total, n as f64);
+
+        let max_single_bucket = bucket_counts.iter().copied().fold(0.0_f64, f64::max);
+        assert!(
+            max_single_bucket < 0.5 * n as f64,
+            "no bucket should absorb the majority of mixed-sign samples: {max_single_bucket} of {n}"
+        );
+        // The extreme overflow buckets stay empty for ordinary bounded data.
+        assert_eq!(bucket_counts[0], 0.0);
+        assert_eq!(*bucket_counts.last().unwrap(), 0.0);
     }
 
     #[test]

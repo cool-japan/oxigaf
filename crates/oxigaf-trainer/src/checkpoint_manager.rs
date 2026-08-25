@@ -176,11 +176,17 @@ pub struct CheckpointManager {
 
 impl CheckpointManager {
     /// Create a new manager.  Creates `checkpoint_dir` if it does not exist.
+    ///
+    /// Returns [`TrainerError::InvalidConfig`] if `policy` fails
+    /// [`CheckpointPolicy::validate`]. Note that `policy` remains a public
+    /// field for tuning after construction; callers mutating it directly
+    /// are responsible for calling `validate()` themselves afterwards.
     pub fn new(
         checkpoint_dir: PathBuf,
         prefix: &str,
         policy: CheckpointPolicy,
     ) -> Result<Self, TrainerError> {
+        policy.validate()?;
         std::fs::create_dir_all(&checkpoint_dir)?;
         Ok(Self {
             policy,
@@ -372,9 +378,9 @@ impl CheckpointIndex {
                 "    {{\"iteration\":{},\"path\":\"{}\",\"psnr\":{},\"ssim\":{},\"loss\":{},\"num_gaussians\":{},\"saved_at_unix_secs\":{},\"size_bytes\":{},\"is_best\":{}}}{}",
                 r.iteration,
                 escape_json_string(&r.path.to_string_lossy()),
-                r.psnr,
-                r.ssim,
-                r.loss,
+                format_json_f32(r.psnr),
+                format_json_f32(r.ssim),
+                format_json_f32(r.loss),
                 r.num_gaussians,
                 r.saved_at_unix_secs,
                 r.size_bytes,
@@ -389,9 +395,13 @@ impl CheckpointIndex {
     /// Parse a JSON string previously produced by `to_json`.
     pub fn from_json(s: &str) -> Result<Self, TrainerError> {
         // Extract prefix.
-        let prefix = extract_json_string_field(s, "prefix").ok_or_else(|| {
-            TrainerError::CheckpointCorrupted("missing 'prefix' field in index JSON".to_string())
-        })?;
+        let prefix = extract_json_string_field(s, "prefix")
+            .map(unescape_json_string)
+            .ok_or_else(|| {
+                TrainerError::CheckpointCorrupted(
+                    "missing 'prefix' field in index JSON".to_string(),
+                )
+            })?;
 
         // Find the records array content between the outermost '[' and ']'.
         let records_start = s.find("\"records\"").ok_or_else(|| {
@@ -429,6 +439,26 @@ impl CheckpointIndex {
 // JSON helpers (private)
 // ---------------------------------------------------------------------------
 
+/// Format an `f32` metric value as a JSON value.
+///
+/// Finite values are emitted as plain JSON numbers. Non-finite values
+/// (`NaN`, `inf`, `-inf`) have no legal JSON number representation, so they
+/// are emitted as quoted sentinel strings (`"NaN"`, `"Infinity"`,
+/// `"-Infinity"`) instead — this keeps the output parseable by any
+/// standards-compliant JSON reader (which a bare `NaN`/`inf` token is not)
+/// while still round-tripping exactly through [`extract_json_f32`].
+fn format_json_f32(v: f32) -> String {
+    if v.is_finite() {
+        format!("{v}")
+    } else if v.is_nan() {
+        "\"NaN\"".to_string()
+    } else if v.is_sign_positive() {
+        "\"Infinity\"".to_string()
+    } else {
+        "\"-Infinity\"".to_string()
+    }
+}
+
 /// Escape special characters for JSON string values.
 fn escape_json_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -439,6 +469,12 @@ fn escape_json_string(s: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                // Remaining control characters (U+0000..U+001F, excluding
+                // \n/\r/\t handled above) have no direct JSON escape; fall
+                // back to the standard \uXXXX form.
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
             c => out.push(c),
         }
     }
@@ -457,6 +493,16 @@ fn unescape_json_string(s: &str) -> String {
                 Some('n') => out.push('\n'),
                 Some('r') => out.push('\r'),
                 Some('t') => out.push('\t'),
+                Some('u') => {
+                    let hex: String = chars.by_ref().take(4).collect();
+                    if let Some(c) = u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
+                        out.push(c);
+                    }
+                    // Malformed \u escapes (bad hex, truncated, or a
+                    // surrogate half with no valid scalar value) are
+                    // dropped rather than propagating an error, matching
+                    // this function's existing best-effort contract.
+                }
                 Some(c) => {
                     out.push('\\');
                     out.push(c);
@@ -470,8 +516,22 @@ fn unescape_json_string(s: &str) -> String {
     out
 }
 
-/// Extract the value of a simple top-level JSON string field.
-fn extract_json_string_field(json: &str, field: &str) -> Option<String> {
+/// Extract the *raw* (still-escaped) value of a simple top-level JSON string
+/// field: the substring between the field's opening and matching closing
+/// quote, with escape sequences left untouched.
+///
+/// Callers must decode the result exactly once via [`unescape_json_string`].
+/// This function previously did its own partial inline decoding (handling
+/// only `"`, `\`, `n`, `r`, `t` and silently dropping `\u` escapes), and at
+/// least one caller then ran the already-decoded result through
+/// `unescape_json_string` a second time — corrupting any value containing a
+/// literal backslash immediately followed by `n`/`r`/`t`/`"`/`\`/`u` (for
+/// example a Windows-style checkpoint path such as `C:\Users\name`). Scanning
+/// here only for the matching close-quote (respecting escapes so an escaped
+/// `\"` does not terminate the scan early) and leaving decoding to the single
+/// shared decoder fixes that double-decode and gives `\u` support to every
+/// caller uniformly.
+fn extract_json_string_field<'a>(json: &'a str, field: &str) -> Option<&'a str> {
     let needle = format!("\"{}\"", field);
     let field_start = json.find(&needle)?;
     let after_key = &json[field_start + needle.len()..];
@@ -482,31 +542,17 @@ fn extract_json_string_field(json: &str, field: &str) -> Option<String> {
         return None;
     }
     let inner = &after_colon[1..];
-    let mut value = String::new();
     let mut escaped = false;
-    for ch in inner.chars() {
+    for (i, ch) in inner.char_indices() {
         if escaped {
-            match ch {
-                '"' => value.push('"'),
-                '\\' => value.push('\\'),
-                'n' => value.push('\n'),
-                'r' => value.push('\r'),
-                't' => value.push('\t'),
-                c => {
-                    value.push('\\');
-                    value.push(c);
-                }
-            }
             escaped = false;
         } else if ch == '\\' {
             escaped = true;
         } else if ch == '"' {
-            break;
-        } else {
-            value.push(ch);
+            return Some(&inner[..i]);
         }
     }
-    Some(value)
+    None
 }
 
 /// Find the index of the matching closing bracket for an opening bracket at
@@ -586,7 +632,7 @@ fn parse_single_record(obj: &str) -> Result<CheckpointRecord, TrainerError> {
     })?;
     let path_str = extract_json_string_field(obj, "path")
         .ok_or_else(|| TrainerError::CheckpointCorrupted("record missing 'path'".to_string()))?;
-    let path = PathBuf::from(unescape_json_string(&path_str));
+    let path = PathBuf::from(unescape_json_string(path_str));
     let psnr = extract_json_f32(obj, "psnr")
         .ok_or_else(|| TrainerError::CheckpointCorrupted("record missing 'psnr'".to_string()))?;
     let ssim = extract_json_f32(obj, "ssim")
@@ -631,9 +677,23 @@ fn extract_json_u64(obj: &str, field: &str) -> Option<u64> {
 }
 
 /// Extract an f32 field from a JSON object string.
+///
+/// Handles both plain JSON numbers (`25.3`) and the quoted non-finite
+/// sentinels written by [`format_json_f32`] (`"NaN"`, `"Infinity"`,
+/// `"-Infinity"`).
 fn extract_json_f32(obj: &str, field: &str) -> Option<f32> {
     let raw = extract_json_number_raw(obj, field)?;
-    raw.trim().parse::<f32>().ok()
+    let trimmed = raw.trim();
+    if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
+        let inner = &trimmed[1..trimmed.len() - 1];
+        return match inner {
+            "NaN" => Some(f32::NAN),
+            "Infinity" => Some(f32::INFINITY),
+            "-Infinity" => Some(f32::NEG_INFINITY),
+            other => other.parse::<f32>().ok(),
+        };
+    }
+    trimmed.parse::<f32>().ok()
 }
 
 /// Extract a boolean field from a JSON object string.
@@ -680,7 +740,10 @@ mod tests {
     }
 
     fn make_record(iter: u32, psnr: f32) -> CheckpointRecord {
-        let path = PathBuf::from(format!("/tmp/ckpt_{iter:08}.json"));
+        // Never used for real filesystem I/O (only as `CheckpointRecord.path`
+        // metadata compared/serialized in-memory), but still must not hardcode
+        // an absolute path per policy — root it under the real OS temp dir.
+        let path = std::env::temp_dir().join(format!("ckpt_{iter:08}.json"));
         CheckpointRecord::new(iter, path, psnr, 0.85, 0.05, 5000, 1024)
     }
 
@@ -758,6 +821,27 @@ mod tests {
     // -----------------------------------------------------------------------
     // Manager construction
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_manager_new_rejects_invalid_policy() {
+        let dir = temp_dir("new_rejects_invalid_policy");
+        let _ = std::fs::remove_dir_all(&dir);
+        let bad_policy = CheckpointPolicy {
+            keep_last_n: 0,
+            ..CheckpointPolicy::default()
+        };
+        let result = CheckpointManager::new(dir.clone(), "run", bad_policy);
+        assert!(
+            result.is_err(),
+            "CheckpointManager::new must reject a policy that fails validate()"
+        );
+        // The directory must not have been created for a rejected policy.
+        assert!(
+            !dir.exists(),
+            "checkpoint_dir should not be created when policy validation fails"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn test_manager_new_creates_dir() -> Result<(), TrainerError> {
@@ -1041,6 +1125,156 @@ mod tests {
             assert_eq!(orig.is_best, loaded.is_best, "is_best mismatch");
             assert_eq!(orig.size_bytes, loaded.size_bytes, "size_bytes mismatch");
         }
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Non-finite metric / control-character JSON handling
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_to_json_emits_no_bare_non_finite_tokens() {
+        // A diverged run can produce NaN loss / infinite psnr; the emitted
+        // JSON must never contain a bare `NaN`/`inf`/`-inf` token since none
+        // of those are legal JSON literals.
+        let mut r = make_record(1000, f32::NAN);
+        r.ssim = f32::INFINITY;
+        r.loss = f32::NEG_INFINITY;
+        let index = CheckpointIndex {
+            prefix: "diverged".to_string(),
+            records: vec![r],
+        };
+        let json = index.to_json();
+        assert!(
+            json.contains("\"NaN\"")
+                && json.contains("\"Infinity\"")
+                && json.contains("\"-Infinity\""),
+            "non-finite values must be emitted as quoted sentinels: {json}"
+        );
+        assert!(
+            !json.contains(":NaN") && !json.contains(": NaN"),
+            "must not emit a bare NaN token: {json}"
+        );
+        assert!(
+            !json.contains(":inf") && !json.contains(":-inf"),
+            "must not emit a bare inf token: {json}"
+        );
+    }
+
+    #[test]
+    fn test_checkpoint_index_json_nonfinite_roundtrip() -> Result<(), TrainerError> {
+        let dir = temp_dir("json_nonfinite_roundtrip");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+
+        let mut r = make_record(2000, f32::NAN);
+        r.ssim = f32::INFINITY;
+        r.loss = f32::NEG_INFINITY;
+        let index = CheckpointIndex {
+            prefix: "diverged".to_string(),
+            records: vec![r],
+        };
+
+        let index_path = dir.join("checkpoint_index.json");
+        index.save(&index_path)?;
+        let loaded = CheckpointIndex::load(&index_path)?;
+
+        assert_eq!(loaded.records.len(), 1);
+        assert!(
+            loaded.records[0].psnr.is_nan(),
+            "psnr should round-trip as NaN"
+        );
+        assert_eq!(
+            loaded.records[0].ssim,
+            f32::INFINITY,
+            "ssim should round-trip as +inf"
+        );
+        assert_eq!(
+            loaded.records[0].loss,
+            f32::NEG_INFINITY,
+            "loss should round-trip as -inf"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_escape_json_string_escapes_control_characters() {
+        // U+0001 has no dedicated JSON escape (unlike \n/\r/\t) and must
+        // fall back to the generic backslash-u-hex4 form to stay valid JSON.
+        let escaped = escape_json_string("a\u{1}b");
+        assert_eq!(escaped, "a\\u0001b", "unexpected escape output: {escaped}");
+    }
+
+    #[test]
+    fn test_checkpoint_index_json_roundtrip_with_control_char_path() -> Result<(), TrainerError> {
+        let dir = temp_dir("json_control_char_path");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+
+        // A path containing a raw control character must still produce
+        // parseable JSON and round-trip back to the same PathBuf. Rooted
+        // under `dir` (the real OS temp dir via the `temp_dir` helper above)
+        // rather than a hardcoded absolute path, per policy.
+        let mut r = make_record(3000, 25.0);
+        r.path = dir.join("ck\u{1}pt.json");
+        let index = CheckpointIndex {
+            prefix: "ctrl".to_string(),
+            records: vec![r.clone()],
+        };
+
+        let index_path = dir.join("checkpoint_index.json");
+        index.save(&index_path)?;
+        let loaded = CheckpointIndex::load(&index_path)?;
+
+        assert_eq!(loaded.records.len(), 1);
+        assert_eq!(
+            loaded.records[0].path, r.path,
+            "control character in path must round-trip"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_checkpoint_index_json_roundtrip_with_windows_style_path() -> Result<(), TrainerError> {
+        // Regression: `extract_json_string_field` used to perform its own
+        // partial inline unescaping *and* `parse_single_record` ran the
+        // result through `unescape_json_string` a second time. A path
+        // containing a literal backslash immediately followed by a letter
+        // that also happens to be a valid escape target (n/r/t/u/"/\\) was
+        // silently corrupted by the second decode pass — e.g. a Windows
+        // path's `\name` segment became a newline + "ame". Verify the fix:
+        // the field is decoded exactly once end-to-end.
+        let dir = temp_dir("json_windows_style_path");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+
+        let mut r = make_record(4000, 25.0);
+        r.path = PathBuf::from(r"C:\Users\name\ckpt_00004000.json");
+        let index = CheckpointIndex {
+            prefix: r"run\name".to_string(),
+            records: vec![r.clone()],
+        };
+
+        let index_path = dir.join("checkpoint_index.json");
+        index.save(&index_path)?;
+        let loaded = CheckpointIndex::load(&index_path)?;
+
+        assert_eq!(
+            loaded.prefix, index.prefix,
+            "prefix containing a literal backslash must not be double-decoded"
+        );
+        assert_eq!(loaded.records.len(), 1);
+        assert_eq!(
+            loaded.records[0].path, r.path,
+            "Windows-style path must round-trip without corruption: got {:?}",
+            loaded.records[0].path
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())

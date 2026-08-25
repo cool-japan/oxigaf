@@ -1,6 +1,15 @@
 // cov2d_bwd.wgsl — Standalone documentation module: 2D Covariance Backward Pass
 //
-// Mirrors `preprocess_bwd.wgsl` lines 144–264 (blocks 2, 3, 4, 4b).
+// Mirrors these sections of `preprocess_bwd.wgsl`'s `preprocess_backward`
+// entry point (referenced by section heading, never by line number — the
+// headings survive edits above them, line numbers do not):
+//
+//   `---- 2. grad_cov2d from grad_conics ----`
+//   `---- 3. grad_cov3d from grad_cov2d ----`
+//   `---- 4. grad_rotation, grad_scale from grad_cov3d ----`
+//   `---- 4b. Position gradient through covariance (dJ/dp_view contribution) ----`
+//
+// all of which live under that file's `--- COV2D BACKWARD ---` banner.
 //
 // PURPOSE
 // ───────
@@ -8,6 +17,20 @@
 // 2D covariance / conic computation from 3DGS preprocessing. It has NO
 // @compute entry point — it is a reference implementation and tutorial-quality
 // documentation intended to be read alongside the active shader.
+//
+// PARITY
+// ──────
+// Nothing in the build keeps this file and `preprocess_bwd.wgsl` in step
+// automatically. `src/cov2d_backward.rs` carries the tests that pin the two
+// steps that silently drift — the conic inverse derivative (block 2) against
+// finite differences, and the `∂L/∂Σ3D = Tᵀ·G·T` chain (block 3) against the
+// CPU reference — so treat that module's test names as the parity contract.
+//
+// ONE DELIBERATE DIFFERENCE from `preprocess_bwd.wgsl`: `dL_dpos_cov` below is
+// returned in CAMERA space. The active shader immediately rotates it to world
+// space (`dL_dpos += transpose(W) * …` at the end of its block 4b); this file
+// stops one step earlier so the Jacobian sensitivity can be inspected on its
+// own. Callers comparing the two must apply `transpose(W)` themselves.
 //
 // MATHEMATICAL OVERVIEW
 // ─────────────────────

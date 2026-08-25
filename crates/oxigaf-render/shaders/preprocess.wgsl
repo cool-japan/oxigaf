@@ -314,7 +314,32 @@ fn eval_sh_from_buffer(dir: vec3<f32>, sh_degree: u32, sh_offset: u32) -> vec3<f
 // Quaternion and Covariance Functions
 // ============================================================================
 
-// Quaternion to rotation matrix
+// Quaternion to rotation matrix.
+//
+// Normalisation convention
+// ────────────────────────
+// `q` is used **as given**: this function does not divide by `length(q)`, and
+// the resulting matrix is a rotation only while `q` is already a unit
+// quaternion. A drifting quaternion of norm `k` scales `R` by `k²`, which
+// `compute_cov3d` then squares again into the covariance.
+//
+// This is a deliberate, crate-wide convention rather than an oversight, and it
+// is what every other piece of the pipeline assumes:
+//
+//   * `preprocess_sh0/1/2/3.wgsl` carry the same non-normalising `quat_to_mat`,
+//     and pipeline.rs picks one of them whenever `sh_optimization &&
+//     use_sh_variants` (both default to true) — i.e. on the default path.
+//   * `preprocess_bwd.wgsl` differentiates the covariance with respect to the
+//     raw `q`, so it carries no normalisation Jacobian to chain.
+//   * `cpu_reference.rs` builds its rotation matrix from the raw quaternion
+//     specifically to stay bit-comparable with this shader.
+//
+// Normalising here alone would therefore desync this fallback path from the
+// default SH-variant path, from the backward pass and from the CPU reference.
+// Unit-norm input is instead enforced upstream: `validation.rs` reports a
+// non-normalised rotation before it ever reaches the GPU. Making the shaders
+// normalise is a coherent, all-six-files change (four variants + this file +
+// the backward Jacobian, plus the CPU reference), not a local one.
 fn quat_to_mat(q: vec4<f32>) -> mat3x3<f32> {
     let x = q.x;
     let y = q.y;
@@ -339,14 +364,34 @@ fn quat_to_mat(q: vec4<f32>) -> mat3x3<f32> {
     );
 }
 
-// Extract the principal normal from a quaternion.
-// The normal is the direction of minimum scale (most "flat" axis).
-// For a Gaussian splat, this is typically the Z-axis in local space,
-// transformed to world space.
-fn quat_to_normal(q: vec4<f32>) -> vec3<f32> {
+// Extract the principal normal of a Gaussian.
+//
+// The normal is the direction of *minimum* scale — the axis the ellipsoid is
+// flattest along, i.e. the disc's surface normal. That is usually, but not
+// always, the local Z axis: whichever of `s.x`, `s.y`, `s.z` is smallest picks
+// the corresponding column of the rotation matrix. Unconditionally returning
+// `R[2]` emits a vector tangent to the disc whenever the Gaussian is flat in X
+// or Y.
+//
+// `s` holds *log*-scales (see `compute_cov3d`, which exponentiates them).
+// `exp` is strictly increasing, so the argmin of the log-scales is the argmin
+// of the scales and no `exp` call is needed here.
+//
+// NOTE: preprocess_sh0/1/2/3.wgsl each carry their own byte-identical copy of
+// this function, and pipeline.rs selects one of those variants whenever
+// `sh_optimization && use_sh_variants` (both default to true) and
+// `sh_degree <= 3`; this file is the fallback path. Any change here has to be
+// mirrored into all four variants so the default path and the fallback keep
+// emitting the same normal.
+fn quat_to_normal(q: vec4<f32>, s: vec3<f32>) -> vec3<f32> {
     let R = quat_to_mat(q);
-    // The third column of R is the transformed Z-axis (surface normal)
-    return normalize(R[2]);
+    var axis = R[2];
+    if s.x <= s.y && s.x <= s.z {
+        axis = R[0];
+    } else if s.y <= s.z {
+        axis = R[1];
+    }
+    return normalize(axis);
 }
 
 // Compute 3D covariance from rotation quaternion and log-scale
@@ -495,10 +540,11 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     // ---- Compute per-Gaussian normals (for optional normal output) ----
-    // The normal is the direction of minimum scale (most flat axis)
-    // which corresponds to the Z-axis of the Gaussian's local coordinate system.
+    // The normal is the direction of minimum scale (the most flat axis), which
+    // is the local axis whose entry in `scale` is smallest — not unconditionally
+    // the local Z axis.
     // Check if normal output is enabled (bit 1 of output_flags)
     if (uniforms.output_flags & 2u) != 0u {
-        normals[idx] = vec4<f32>(quat_to_normal(rot), 0.0);
+        normals[idx] = vec4<f32>(quat_to_normal(rot, scale), 0.0);
     }
 }

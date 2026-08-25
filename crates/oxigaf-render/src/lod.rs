@@ -100,6 +100,32 @@ impl LodCamera {
         half_height / (depth * half_tan)
     }
 
+    /// Pixels per world-unit at a given depth, computed from the
+    /// *horizontal* field of view derived from `fov_y` and the image
+    /// aspect ratio (`image_width / image_height`).
+    ///
+    /// For a standard square-pixel perspective camera this equals
+    /// [`LodCamera::pixels_per_unit`] exactly (the two can diverge only if
+    /// `image_width`/`image_height` describe a non-square-pixel aspect on
+    /// purpose). Returns `0.0` for non-positive depth or a degenerate
+    /// (zero-height) image.
+    pub fn pixels_per_unit_horizontal(&self, depth: f32) -> f32 {
+        if depth <= 0.0 || self.image_height == 0 {
+            return 0.0;
+        }
+        let half_tan_y = (self.fov_y / 2.0).tan();
+        if half_tan_y <= 0.0 {
+            return 0.0;
+        }
+        let aspect = self.image_width as f32 / self.image_height as f32;
+        let half_tan_x = half_tan_y * aspect;
+        if half_tan_x <= 0.0 {
+            return 0.0;
+        }
+        let half_width = self.image_width as f32 / 2.0;
+        half_width / (depth * half_tan_x)
+    }
+
     /// Signed depth of a world-space point (projection onto `view_dir`).
     ///
     /// Positive = in front of the camera.
@@ -163,9 +189,11 @@ pub struct LodConfig {
     /// `0.0` disables depth-based culling.
     pub max_depth: f32,
 
-    /// Whether [`LodFilter::apply`] should modify the model in place.
-    ///
-    /// Currently unused; [`LodFilter::apply`] always returns a new model.
+    /// Caller-facing hint for which entry point to prefer: when `true`,
+    /// callers should use [`LodFilter::apply_mut`] (filters `model` in
+    /// place); when `false`, [`LodFilter::apply`] (returns a new model,
+    /// leaving the input untouched). Both methods work regardless of this
+    /// flag's value — it does not change `LodFilter`'s own behaviour.
     pub modify_in_place: bool,
 }
 
@@ -343,6 +371,24 @@ impl LodFilter {
         }
     }
 
+    /// In-place counterpart to [`LodFilter::apply`].
+    ///
+    /// Filters `model` according to this filter's configuration and
+    /// overwrites `*model` with the result, avoiding a separate owned
+    /// return value at the call site. This is the entry point
+    /// [`LodConfig::modify_in_place`] refers to.
+    ///
+    /// Returns the number of Gaussians removed.
+    pub fn apply_mut(&self, model: &mut GaussianModel, camera: &LodCamera) -> usize {
+        let filtered = self.apply(model, camera);
+        let culled = model
+            .gaussians
+            .len()
+            .saturating_sub(filtered.gaussians.len());
+        *model = filtered;
+        culled
+    }
+
     /// Count the number of Gaussians that would be culled by this filter.
     pub fn count_culled(&self, model: &GaussianModel, camera: &LodCamera) -> usize {
         self.compute(model, camera)
@@ -354,7 +400,8 @@ impl LodFilter {
     /// Estimate the memory (bytes) freed by removing culled Gaussians.
     ///
     /// Accounts for:
-    /// - `GaussianAttributes` struct (32 bytes each, due to `_pad0`)
+    /// - `GaussianAttributes` struct (48 bytes each: position+`_pad0` 16B,
+    ///   rotation 16B, scale 12B, opacity 4B)
     /// - SH coefficients: `(sh_degree+1)^2 * 3 * 4` bytes per Gaussian
     /// - `face_indices`: 4 bytes
     /// - `barycentric`: 12 bytes (3 × f32)
@@ -516,6 +563,17 @@ impl AdaptiveLodConfig {
                     dist_a: prev,
                     dist_b: curr,
                 });
+            }
+        }
+        // `LodManager::update` and `LodStats::record_frame` index by array
+        // position, not by `level_index` — a mismatch would make transitions
+        // fire spuriously and misattribute per-level frame/histogram stats.
+        for (i, level) in self.levels.iter().enumerate() {
+            if level.level_index != i {
+                return Err(LodError::InvalidConfig(format!(
+                    "levels[{i}].level_index = {} does not match its array position {i}",
+                    level.level_index
+                )));
             }
         }
         Ok(())
@@ -841,6 +899,14 @@ impl LodStats {
 
 // ── LodManager ────────────────────────────────────────────────────────────────
 
+/// Scale a level's `target_gaussian_count` by its `quality_factor`
+/// (clamped to `[0.0, 1.0]`), rounding to the nearest Gaussian count.
+#[inline]
+fn quality_scaled_count(level: &LodLevel) -> usize {
+    let scale = level.quality_factor.clamp(0.0, 1.0);
+    ((level.target_gaussian_count as f32) * scale).round() as usize
+}
+
 /// Top-level adaptive LOD manager combining selection, transitions, and stats.
 pub struct LodManager {
     selector: LodSelector,
@@ -869,8 +935,12 @@ impl LodManager {
     pub fn update(&mut self, camera_distance: f32) -> usize {
         let prev_idx = self.selector.current_level_idx;
         let level = self.selector.select_by_distance(camera_distance);
-        let new_idx = level.level_index;
         let count = level.target_gaussian_count;
+        // `level`'s borrow of `self.selector` ends after the read above, so
+        // this is a fresh read of the array index `select_by_distance` just
+        // wrote — NOT `level.level_index` (a user-supplied field that need
+        // not match the array position; see `AdaptiveLodConfig::validate`).
+        let new_idx = self.selector.current_level_idx;
 
         if new_idx != prev_idx {
             self.stats.record_transition();
@@ -891,10 +961,52 @@ impl LodManager {
     }
 
     /// Return the Gaussian count for the current level, clamped to
-    /// `total_gaussians`.
+    /// `total_gaussians` and scaled by [`LodLevel::quality_factor`] (a
+    /// frame-budget throttle independent of the level's base target count).
     pub fn current_gaussian_count(&self, total_gaussians: usize) -> usize {
         let level = self.selector.current_level();
-        level.target_gaussian_count.min(total_gaussians)
+        quality_scaled_count(level).min(total_gaussians)
+    }
+
+    /// Return the (possibly blended) Gaussian count for the current frame,
+    /// clamped to `total_gaussians`.
+    ///
+    /// While a blend transition is in progress (see [`LodManager::advance_transition`])
+    /// this interpolates between the `from_level` and `to_level` quality-scaled
+    /// target counts using [`LodTransition::blended_count`]; otherwise it
+    /// behaves like [`LodManager::current_gaussian_count`].
+    pub fn blended_gaussian_count(&self, total_gaussians: usize) -> usize {
+        let count = if self.transition.is_blending {
+            let levels = &self.selector.config().levels;
+            let from_count = levels
+                .get(self.transition.from_level)
+                .map(quality_scaled_count)
+                .unwrap_or(0);
+            let to_count = self
+                .transition
+                .to_level
+                .and_then(|idx| levels.get(idx))
+                .map(quality_scaled_count)
+                .unwrap_or(from_count);
+            self.transition.blended_count(from_count, to_count)
+        } else {
+            quality_scaled_count(self.selector.current_level())
+        };
+        count.min(total_gaussians)
+    }
+
+    /// Advance any in-progress blend transition by `delta_distance` (world
+    /// units the camera has travelled since the last call), driven by
+    /// [`AdaptiveLodConfig::blend_distance`].
+    ///
+    /// Returns `true` when the transition completes during this call.
+    /// No-op (returns `false`) when no transition is in progress — call
+    /// this once per frame after [`LodManager::update`] to make
+    /// [`LodManager::is_transitioning`] and [`LodManager::blended_gaussian_count`]
+    /// actually progress instead of latching at `alpha = 0.0` forever.
+    pub fn advance_transition(&mut self, delta_distance: f32) -> bool {
+        let blend_distance = self.selector.config().blend_distance;
+        self.transition.advance(delta_distance, blend_distance)
     }
 
     /// Return the currently active LOD level.
@@ -1616,5 +1728,157 @@ mod tests {
         assert_eq!(mgr.current_gaussian_count(50_000), 10_000);
         // total_gaussians < target → clamped to total.
         assert_eq!(mgr.current_gaussian_count(8_000), 8_000);
+    }
+
+    // ── AdaptiveLodConfig::validate: level_index must match array position ──
+
+    #[test]
+    fn test_lod_config_validate_rejects_mismatched_level_index() {
+        let cfg = AdaptiveLodConfig {
+            levels: vec![
+                LodLevel {
+                    level_index: 0,
+                    target_gaussian_count: 1000,
+                    max_distance: 5.0,
+                    min_pixel_coverage: 1.0,
+                    quality_factor: 1.0,
+                },
+                LodLevel {
+                    level_index: 5, // ← does not match array position 1
+                    target_gaussian_count: 500,
+                    max_distance: 10.0,
+                    min_pixel_coverage: 0.5,
+                    quality_factor: 0.5,
+                },
+            ],
+            hysteresis: 0.0,
+            enable_blending: false,
+            blend_distance: 0.5,
+        };
+        assert!(
+            matches!(cfg.validate(), Err(LodError::InvalidConfig(_))),
+            "mismatched level_index should be rejected by validate()"
+        );
+        // LodSelector::new / LodManager::new both call validate() and must
+        // propagate the same rejection.
+        assert!(LodSelector::new(cfg.clone()).is_err());
+        assert!(LodManager::new(cfg).is_err());
+    }
+
+    // ── LodManager::advance_transition / blended_gaussian_count ─────────────
+
+    #[test]
+    fn test_lod_manager_advance_transition_completes_and_clears_flag() {
+        let mut cfg = make_adaptive_config();
+        cfg.enable_blending = true;
+        cfg.blend_distance = 1.0;
+        let mut mgr = LodManager::new(cfg).expect("valid config");
+
+        mgr.update(1.0); // level 0, no transition yet (first frame)
+        assert!(!mgr.is_transitioning());
+
+        mgr.update(3.0); // crosses into level 1 → starts a blend
+        assert!(mgr.is_transitioning(), "level change should start a blend");
+
+        // Advance by less than blend_distance: still blending.
+        let done = mgr.advance_transition(0.5);
+        assert!(!done);
+        assert!(mgr.is_transitioning());
+
+        // Advance past blend_distance: transition completes.
+        let done = mgr.advance_transition(0.6);
+        assert!(done);
+        assert!(
+            !mgr.is_transitioning(),
+            "transition should clear once alpha reaches 1.0"
+        );
+    }
+
+    #[test]
+    fn test_lod_manager_advance_transition_noop_without_blending_enabled() {
+        let cfg = make_adaptive_config(); // enable_blending = false
+        let mut mgr = LodManager::new(cfg).expect("valid config");
+        mgr.update(1.0);
+        mgr.update(10.0); // level change, but blending disabled
+        assert!(!mgr.is_transitioning());
+        assert!(!mgr.advance_transition(100.0), "no transition to advance");
+    }
+
+    #[test]
+    fn test_lod_manager_blended_gaussian_count_interpolates() {
+        let mut cfg = make_adaptive_config();
+        cfg.enable_blending = true;
+        cfg.blend_distance = 2.0;
+        let mut mgr = LodManager::new(cfg).expect("valid config");
+
+        mgr.update(1.0); // level 0, target=10_000, quality_factor=1.0
+        mgr.update(3.0); // → level 1, target=5_000, quality_factor=0.75; starts blend at alpha=0
+
+        // Immediately after the transition starts, alpha=0 → fully from_count.
+        let from_count = (10_000.0_f32 * 1.0).round() as usize;
+        assert_eq!(mgr.blended_gaussian_count(1_000_000), from_count);
+
+        // Halfway through the blend distance.
+        mgr.advance_transition(1.0);
+        let to_count = (5_000.0_f32 * 0.75).round() as usize;
+        let expected_half = ((from_count as f32) * 0.5 + (to_count as f32) * 0.5) as usize;
+        assert_eq!(mgr.blended_gaussian_count(1_000_000), expected_half);
+    }
+
+    // ── LodFilter::apply_mut ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_lod_filter_apply_mut_matches_apply() {
+        let cam = make_camera();
+        let config = LodConfig {
+            min_pixel_radius: 1.0,
+            full_opacity_radius: 5.0,
+            cull_threshold_fraction: 0.5,
+            max_depth: 0.0,
+            modify_in_place: true,
+        };
+        let filter = LodFilter::new(config);
+        let gaussians = vec![
+            make_gaussian([0.0, 0.0, 2.0], [0.0, 0.0, 0.0], 2.0),
+            make_gaussian([0.0, 0.0, 50.0], [-5.0, -5.0, -5.0], 2.0),
+        ];
+        let model_a = make_model_with_gaussians(gaussians.clone());
+        let mut model_b = make_model_with_gaussians(gaussians);
+
+        let expected = filter.apply(&model_a, &cam);
+        let culled = filter.apply_mut(&mut model_b, &cam);
+
+        assert_eq!(model_b.gaussians.len(), expected.gaussians.len());
+        assert_eq!(culled, model_a.gaussians.len() - expected.gaussians.len());
+        for (a, b) in expected.gaussians.iter().zip(model_b.gaussians.iter()) {
+            assert_eq!(a.position, b.position);
+            assert!((a.opacity - b.opacity).abs() < 1e-6);
+        }
+    }
+
+    // ── LodCamera::pixels_per_unit_horizontal ────────────────────────────────
+
+    #[test]
+    fn test_pixels_per_unit_horizontal_matches_vertical_for_square_pixels() {
+        let cam = make_camera(); // 800x600, matches its own aspect ratio
+        let depth = 4.0_f32;
+        let vert = cam.pixels_per_unit(depth);
+        let horiz = cam.pixels_per_unit_horizontal(depth);
+        assert!(
+            (vert - horiz).abs() < 1e-3,
+            "expected pixels_per_unit_horizontal ({horiz}) to match pixels_per_unit ({vert})"
+        );
+    }
+
+    #[test]
+    fn test_pixels_per_unit_horizontal_zero_depth() {
+        let cam = make_camera();
+        assert_eq!(cam.pixels_per_unit_horizontal(0.0), 0.0);
+    }
+
+    #[test]
+    fn test_pixels_per_unit_horizontal_zero_height() {
+        let cam = LodCamera::new([0.0, 0.0, 0.0], [0.0, 0.0, 1.0], 1.0, 100, 0);
+        assert_eq!(cam.pixels_per_unit_horizontal(1.0), 0.0);
     }
 }

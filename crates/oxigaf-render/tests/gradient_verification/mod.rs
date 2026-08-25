@@ -7,9 +7,12 @@
 //!
 //! 1. **Setup**: Create simple test scene (1-10 Gaussians)
 //! 2. **Forward**: Render image, compute loss
-//! 3. **Backward**: Compute analytical gradients (when GPU backward is implemented)
+//! 3. **Backward**: Compute analytical gradients via the GPU backward pass
+//!    (see [`compute_analytical_gradients_sync`]; requires a GPU adapter,
+//!    checked at runtime by [`gpu_available`] rather than statically
+//!    `#[ignore]`d)
 //! 4. **Verify**: Compare with numerical gradients from finite-difference
-//! 5. **Assert**: `relative_error < 1e-3`
+//! 5. **Assert**: `median_error < MEDIAN_ERROR_THRESHOLD`
 
 use nalgebra as na;
 use oxigaf_render::config::RasterConfig;
@@ -30,16 +33,10 @@ pub use finite_diff::{
     MseLoss,
 };
 
-/// Maximum relative error threshold for gradient tests (legacy).
-/// Prefer using `median_error` with `MEDIAN_ERROR_THRESHOLD`.
-#[allow(dead_code)]
-pub const MAX_RELATIVE_ERROR: f32 = 1e-1;
-
 /// Median error threshold for gradient verification.
 ///
 /// The median is naturally robust to outliers regardless of sample size.
 /// At least 50% of gradient entries must match within this threshold.
-#[allow(dead_code)]
 pub const MEDIAN_ERROR_THRESHOLD: f32 = 5e-2;
 
 /// Position-specific median error threshold for gradient verification.
@@ -47,20 +44,35 @@ pub const MEDIAN_ERROR_THRESHOLD: f32 = 5e-2;
 /// Position gradients through a tiled rasterizer have higher finite-difference error
 /// because position perturbation directly affects tile assignment, causing discontinuities
 /// in the forward pass that the backward pass (correctly) doesn't model.
-#[allow(dead_code)]
 pub const POSITION_MEDIAN_ERROR_THRESHOLD: f32 = 2.5e-1;
 
 /// Maximum fraction of entries allowed to be outliers (error > 0.5).
-#[allow(dead_code)]
 pub const MAX_OUTLIER_FRACTION: f32 = 0.3;
 
 /// Compute median of a (mutable) error vector.
 ///
 /// The median is naturally robust to outliers regardless of sample size.
-/// The vector is sorted in-place.
+/// On success the vector is left sorted in-place. Returns `f32::NAN` -
+/// without sorting - if `errors` is empty or contains any non-finite (NaN)
+/// entry, so a downstream `median_err < THRESHOLD` assertion always fails
+/// on either condition instead of silently reporting a passing median.
 pub fn median_error(errors: &mut [f32]) -> f32 {
     if errors.is_empty() {
-        return 0.0;
+        // Nothing was actually compared. Returning a "clean" 0.0 here would
+        // let every call site's `median_err < THRESHOLD` assertion silently
+        // pass on an empty comparison, so surface NaN instead (NaN compares
+        // `false` against everything, including `<`).
+        return f32::NAN;
+    }
+    if errors.iter().any(|e| e.is_nan()) {
+        // `partial_cmp` returns `None` for any comparison involving NaN, so
+        // the `unwrap_or(Ordering::Equal)` below treats a NaN as tied with
+        // every other value and lets `sort_by` place it anywhere - silently
+        // picking an arbitrary "median" instead of surfacing that a
+        // backward shader produced a non-finite gradient. Return NaN
+        // instead so `median_err < THRESHOLD` assertions at call sites
+        // correctly evaluate to `false` and the test fails loudly.
+        return f32::NAN;
     }
     errors.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let n = errors.len();
@@ -145,15 +157,59 @@ pub fn create_test_scene(config: &TestSceneConfig) -> Result<GaussianModel, Rend
         }
     }
 
+    let n = gaussians.len();
+    let third = 1.0_f32 / 3.0_f32;
+
     Ok(GaussianModel {
         gaussians,
         sh_coeffs,
         sh_degree: config.sh_degree,
-        face_indices: vec![],
-        barycentric: vec![],
-        local_offsets: vec![],
-        is_rigid: vec![],
+        // These synthetic gradient-test scenes have no real FLAME mesh
+        // binding, but every `GaussianModel` invariant is that the binding
+        // arrays are parallel to `gaussians` (one entry per Gaussian) - code
+        // that indexes them in lockstep (FLAME deform, density control
+        // clone/split) would panic or read misaligned data otherwise.
+        // Defaults mirror `GaussianModel::load_ply`'s "no binding" case.
+        face_indices: vec![0u32; n],
+        barycentric: vec![[third, third, third]; n],
+        local_offsets: vec![[0.0, 0.0, 0.0]; n],
+        is_rigid: vec![false; n],
     })
+}
+
+/// Build a [`GaussianModel`] from explicit per-Gaussian attributes.
+///
+/// Gradient tests that need a *specific* configuration (extreme anisotropy,
+/// a chosen opacity, a hand-picked SH coefficient set) cannot use
+/// [`create_test_scene`], which only emits its own deterministic pattern.
+/// They previously hand-wrote a `GaussianModel` literal with **empty**
+/// `face_indices` / `barycentric` / `local_offsets` / `is_rigid` vectors,
+/// which violates the type's invariant that every binding array is parallel
+/// to `gaussians` - code that indexes them in lockstep (FLAME deform,
+/// density-control clone/split) panics or reads misaligned data on such a
+/// model.
+///
+/// This helper builds the same "no FLAME binding" defaults that
+/// [`create_test_scene`] and `GaussianModel::load_ply` use, sized to
+/// `gaussians`, so a test can pick its own attributes without re-deriving
+/// (or forgetting) the invariant.
+pub fn model_from_gaussians(
+    gaussians: Vec<GaussianAttributes>,
+    sh_coeffs: Vec<f32>,
+    sh_degree: u32,
+) -> GaussianModel {
+    let n = gaussians.len();
+    let third = 1.0_f32 / 3.0_f32;
+
+    GaussianModel {
+        gaussians,
+        sh_coeffs,
+        sh_degree,
+        face_indices: vec![0u32; n],
+        barycentric: vec![[third, third, third]; n],
+        local_offsets: vec![[0.0, 0.0, 0.0]; n],
+        is_rigid: vec![false; n],
+    }
 }
 
 /// Create a test camera looking at the origin.
@@ -195,45 +251,63 @@ pub fn create_target_image(resolution: (u32, u32)) -> Vec<f32> {
 
 /// Gradient verification result.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct GradientVerificationResult {
-    /// Maximum relative error across all gradients.
+    /// Maximum relative error across all *finite* gradients (0.0 if none
+    /// were finite).
     pub max_error: f32,
-    /// Mean relative error.
+    /// Mean relative error. May be non-finite if any input error was
+    /// non-finite, or if `errors` was empty.
     pub mean_error: f32,
     /// Number of gradients checked.
     pub num_gradients: usize,
-    /// Whether verification passed (max_error < threshold).
+    /// Number of non-finite (NaN or +/-Inf) relative errors encountered.
+    /// A backward shader emitting a non-finite gradient is always a bug,
+    /// not merely an out-of-tolerance value, so any non-zero count fails
+    /// verification regardless of `max_error`.
+    pub num_non_finite: usize,
+    /// Whether verification passed: `errors` was non-empty, every entry was
+    /// finite, and the maximum finite error was below `threshold`.
     pub passed: bool,
 }
 
 impl GradientVerificationResult {
     /// Create a new verification result.
+    ///
+    /// Fails verification (`passed = false`) when `errors` is empty (nothing
+    /// was actually compared) or contains any non-finite entry, even though
+    /// naively folding with `f32::max` would silently discard NaNs (it
+    /// returns the non-NaN operand) and `sum() / 0` on an empty slice would
+    /// produce a `mean_error` of NaN while `max_error` stayed `0.0` - both
+    /// of which previously left `passed` incorrectly `true`.
     pub fn new(errors: &[f32], threshold: f32) -> Self {
-        let max_error = errors.iter().fold(0.0f32, |a, b| a.max(*b));
-        let mean_error = errors.iter().sum::<f32>() / errors.len() as f32;
         let num_gradients = errors.len();
-        let passed = max_error < threshold;
+        let num_non_finite = errors.iter().filter(|e| !e.is_finite()).count();
+
+        if num_gradients == 0 {
+            return Self {
+                max_error: f32::INFINITY,
+                mean_error: f32::INFINITY,
+                num_gradients,
+                num_non_finite,
+                passed: false,
+            };
+        }
+
+        let max_error = errors
+            .iter()
+            .copied()
+            .filter(|e| e.is_finite())
+            .fold(0.0f32, f32::max);
+        let mean_error = errors.iter().sum::<f32>() / num_gradients as f32;
+        let passed = num_non_finite == 0 && max_error < threshold;
 
         Self {
             max_error,
             mean_error,
             num_gradients,
+            num_non_finite,
             passed,
         }
-    }
-
-    /// Print verification summary.
-    #[allow(dead_code)]
-    pub fn print_summary(&self) {
-        println!("Gradient Verification:");
-        println!("  Max Error:  {:.6e}", self.max_error);
-        println!("  Mean Error: {:.6e}", self.mean_error);
-        println!("  Num Grads:  {}", self.num_gradients);
-        println!(
-            "  Status:     {}",
-            if self.passed { "PASS" } else { "FAIL" }
-        );
     }
 }
 
@@ -253,7 +327,6 @@ pub fn compare_gradients_3d(analytical: &[[f32; 3]], numerical: &[[f32; 3]]) -> 
 }
 
 /// Compare two gradient arrays (4D) and compute relative errors.
-#[allow(dead_code)]
 pub fn compare_gradients_4d(analytical: &[[f32; 4]], numerical: &[[f32; 4]]) -> Vec<f32> {
     analytical
         .iter()
@@ -270,7 +343,6 @@ pub fn compare_gradients_4d(analytical: &[[f32; 4]], numerical: &[[f32; 4]]) -> 
 }
 
 /// Compare two gradient arrays (1D) and compute relative errors.
-#[allow(dead_code)]
 pub fn compare_gradients_1d(analytical: &[f32], numerical: &[f32]) -> Vec<f32> {
     analytical
         .iter()
@@ -288,7 +360,6 @@ pub fn compare_gradients_1d(analytical: &[f32], numerical: &[f32]) -> Vec<f32> {
 /// 4. Runs backward pass to get per-Gaussian gradients
 ///
 /// Returns analytical gradients that can be compared with numerical gradients.
-#[allow(dead_code)]
 pub async fn compute_analytical_gradients(
     model: &GaussianModel,
     camera: &CpuCamera,
@@ -352,7 +423,6 @@ pub async fn compute_analytical_gradients(
 /// Synchronous wrapper for compute_analytical_gradients using pollster.
 ///
 /// This is more convenient for tests that don't want to deal with async.
-#[allow(dead_code)]
 pub fn compute_analytical_gradients_sync(
     model: &GaussianModel,
     camera: &CpuCamera,
@@ -360,6 +430,39 @@ pub fn compute_analytical_gradients_sync(
     config: &RasterConfig,
 ) -> Result<oxigaf_render::GaussianGradients, RenderError> {
     pollster::block_on(compute_analytical_gradients(model, camera, target, config))
+}
+
+/// Cached result of probing for a usable GPU adapter (see [`gpu_available`]).
+static GPU_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Whether a compatible GPU adapter is available for the analytical
+/// (GPU backward-pass) gradient comparison tests in this environment.
+///
+/// The comparison tests construct a real [`oxigaf_render::Rasterizer`],
+/// which fails with `RenderError::GpuInit`/`AdapterNotFound` on a machine
+/// with no compatible adapter (e.g. many headless CI runners). Rather than
+/// permanently `#[ignore]`ing those tests - which lets the whole suite
+/// report green without a single backward shader ever having run - each
+/// comparison test calls this at the top and returns early when it is
+/// `false`, so the test actually executes (and gates CI) on any machine
+/// that does have a GPU.
+///
+/// The result is cached in a [`std::sync::OnceLock`] (safe under the test
+/// harness's default parallel execution) since probing constructs a full
+/// `Rasterizer`; this is only done once per test binary run.
+pub fn gpu_available() -> bool {
+    *GPU_AVAILABLE.get_or_init(|| {
+        let probe_config = RasterConfig::new();
+        match pollster::block_on(oxigaf_render::Rasterizer::new(probe_config)) {
+            Ok(_) => true,
+            Err(err) => {
+                eprintln!(
+                    "skipping GPU-dependent gradient test: no compatible GPU adapter available ({err})"
+                );
+                false
+            }
+        }
+    })
 }
 
 #[cfg(test)]
@@ -378,6 +481,59 @@ mod tests {
         assert_eq!(model.len(), config.num_gaussians);
     }
 
+    /// Regression test: the FLAME binding arrays must be parallel to
+    /// `gaussians` (one entry per Gaussian), not left empty. Code that
+    /// indexes them in lockstep with `gaussians` (FLAME deform, density
+    /// control clone/split) would otherwise panic or read misaligned data.
+    #[test]
+    fn test_create_test_scene_binding_arrays_match_gaussian_count() {
+        let config = TestSceneConfig {
+            num_gaussians: 4,
+            ..TestSceneConfig::default()
+        };
+        let model = create_test_scene(&config).expect("Failed to create test scene");
+
+        assert_eq!(model.gaussians.len(), config.num_gaussians);
+        assert_eq!(model.face_indices.len(), config.num_gaussians);
+        assert_eq!(model.barycentric.len(), config.num_gaussians);
+        assert_eq!(model.local_offsets.len(), config.num_gaussians);
+        assert_eq!(model.is_rigid.len(), config.num_gaussians);
+    }
+
+    /// Regression test: `model_from_gaussians` must size every FLAME binding
+    /// array to the Gaussian count. The hand-written `GaussianModel` literals
+    /// this helper replaces left them empty, breaking the type's invariant.
+    #[test]
+    fn test_model_from_gaussians_fills_binding_arrays() {
+        let gaussian = GaussianAttributes {
+            position: [0.0, 0.0, -3.0],
+            _pad0: 0.0,
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            scale: [-1.0, -1.0, -1.0],
+            opacity: 0.0,
+        };
+        let model = model_from_gaussians(vec![gaussian; 3], vec![0.5; 9], 0);
+
+        assert_eq!(model.gaussians.len(), 3);
+        assert_eq!(model.face_indices.len(), 3);
+        assert_eq!(model.barycentric.len(), 3);
+        assert_eq!(model.local_offsets.len(), 3);
+        assert_eq!(model.is_rigid.len(), 3);
+        assert_eq!(model.sh_degree, 0);
+    }
+
+    /// An empty Gaussian list must still produce empty (not mismatched)
+    /// binding arrays.
+    #[test]
+    fn test_model_from_gaussians_empty() {
+        let model = model_from_gaussians(Vec::new(), Vec::new(), 2);
+        assert_eq!(model.len(), 0);
+        assert!(model.face_indices.is_empty());
+        assert!(model.barycentric.is_empty());
+        assert!(model.local_offsets.is_empty());
+        assert!(model.is_rigid.is_empty());
+    }
+
     #[test]
     fn test_create_test_camera() {
         let camera = create_test_camera((128, 128));
@@ -392,6 +548,63 @@ mod tests {
         assert!(result.passed);
         assert_eq!(result.max_error, 0.0003);
         assert!((result.mean_error - 0.0002).abs() < 1e-6);
+        assert_eq!(result.num_non_finite, 0);
+    }
+
+    /// Regression test: an empty error list must not silently report PASS.
+    /// Previously, `mean_error` divided by zero (`NaN`) while `max_error`
+    /// stayed `0.0` and `passed` stayed `true`.
+    #[test]
+    fn test_gradient_verification_result_empty_fails() {
+        let errors: Vec<f32> = vec![];
+        let result = GradientVerificationResult::new(&errors, 1e-3);
+
+        assert!(!result.passed, "an empty gradient comparison must not pass");
+        assert_eq!(result.num_gradients, 0);
+    }
+
+    /// Regression test: a NaN relative error (e.g. from a backward shader
+    /// emitting a non-finite gradient) must fail verification. Previously
+    /// `f32::max` silently discarded the NaN (it returns the non-NaN
+    /// operand), so `max_error` stayed at the tiny finite value and
+    /// `passed` stayed `true`.
+    #[test]
+    fn test_gradient_verification_result_nan_fails() {
+        let errors = vec![0.0001, f32::NAN, 0.0002];
+        let result = GradientVerificationResult::new(&errors, 1e-3);
+
+        assert!(!result.passed, "a non-finite error must fail verification");
+        assert_eq!(result.num_non_finite, 1);
+        // The finite errors are tiny: if the NaN were silently dropped (the
+        // pre-fix behavior), max_error would stay under the threshold and
+        // this would incorrectly report PASS.
+        assert!(result.max_error < 1e-3);
+    }
+
+    /// Regression test: `median_error` must not let a NaN entry sort to an
+    /// arbitrary position and return a misleadingly "passing" median.
+    #[test]
+    fn test_median_error_nan_propagates() {
+        let mut errors = vec![0.1, f32::NAN, 0.2];
+        let median = median_error(&mut errors);
+
+        // NaN compares `false` against everything (a language guarantee),
+        // so this is what makes every downstream `median_err < THRESHOLD`
+        // assertion at call sites correctly fail.
+        assert!(median.is_nan(), "NaN input must yield a NaN median");
+    }
+
+    /// Regression test: an empty error list must not report a "passing"
+    /// median of `0.0`.
+    #[test]
+    fn test_median_error_empty_is_not_a_silent_pass() {
+        let mut errors: Vec<f32> = vec![];
+        let median = median_error(&mut errors);
+
+        assert!(
+            median.is_nan(),
+            "empty error list must not report a passing median"
+        );
     }
 
     #[test]

@@ -42,7 +42,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 3. Set inference timesteps (20-step DDIM)
     // -----------------------------------------------------------------
     let num_inference_steps = 20_usize;
-    scheduler.set_timesteps(num_inference_steps);
+    scheduler.set_timesteps(num_inference_steps)?;
 
     let timesteps = scheduler.timesteps();
     println!(

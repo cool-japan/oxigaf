@@ -148,7 +148,11 @@ impl FisherInformation {
 pub struct EwcRegularizer {
     /// EWC configuration.
     pub config: EwcConfig,
-    /// Stored Fisher anchors, one per completed task.
+    /// Stored Fisher anchors. In vanilla mode (`config.online == false`),
+    /// one entry per completed task. In online mode
+    /// (`config.online == true`), always 0 or 1 entries: a single running
+    /// Fisher estimate that every [`Self::register_task`] call blends into
+    /// via EMA, regardless of `task_id`.
     pub task_fishers: Vec<FisherInformation>,
 }
 
@@ -169,8 +173,28 @@ impl EwcRegularizer {
 
     /// Register the current parameter state as the optimum for a completed task.
     ///
-    /// For online EWC, the Fisher diagonal of a previously registered task with the
-    /// same `task_id` is updated via the exponential moving average.
+    /// - **Vanilla EWC** (`config.online == false`): appends a brand-new
+    ///   anchor per call, so the regularizer accumulates one full Fisher
+    ///   diagonal *and* one full copy of θ* per task — `O(n_tasks ×
+    ///   n_params)` memory (e.g. ~240 MB for a 500k-Gaussian / ~30M-param
+    ///   model after just 4 tasks). `penalty`/`penalty_gradient` sum over
+    ///   every stored anchor, so the per-step cost also grows with
+    ///   `n_tasks`.
+    /// - **Online EWC** (`config.online == true`, Schwarz et al. 2018):
+    ///   maintains exactly one running Fisher estimate, updated by an
+    ///   exponential moving average (`F_new = γ·F_old + (1−γ)·F_task`) on
+    ///   *every* call — `O(n_params)` memory regardless of how many tasks
+    ///   have been seen. The `task_id` argument is stored on the single
+    ///   anchor purely as an informational label (last call wins); it is
+    ///   **not** used to decide whether to blend, since requiring a
+    ///   repeated `task_id` to trigger the EMA path (the previous
+    ///   behaviour) meant every call with the natural "fresh id per task"
+    ///   pattern silently fell through to the vanilla per-task-anchor path
+    ///   instead — i.e. `online: true` had no effect for that (the common)
+    ///   usage. Switching `config.online` from `false` to `true` after
+    ///   anchors already exist is not a supported transition: the online
+    ///   path only ever updates `task_fishers[0]`, so pre-existing
+    ///   additional anchors would remain and keep contributing.
     pub fn register_task(
         &mut self,
         task_id: usize,
@@ -188,15 +212,23 @@ impl EwcRegularizer {
         }
 
         if self.config.online {
-            // Find existing anchor for this task_id and apply EMA update.
-            if let Some(existing) = self.task_fishers.iter_mut().find(|f| f.task_id == task_id) {
+            // Blend into the single consolidated anchor (index 0) if one
+            // already exists, regardless of `task_id` — online EWC's whole
+            // point is not needing to track per-task identity.
+            if let Some(existing) = self.task_fishers.first_mut() {
                 let gamma = self.config.gamma;
                 for (old, new_val) in existing.fisher_diag.iter_mut().zip(fisher.iter()) {
                     *old = gamma * (*old) + (1.0 - gamma) * new_val;
                 }
                 existing.param_values = params;
+                existing.task_id = task_id;
                 return Ok(());
             }
+            // First call: seed the sole anchor directly (nothing to blend
+            // with yet).
+            let info = FisherInformation::new(task_id, params, fisher)?;
+            self.task_fishers.push(info);
+            return Ok(());
         }
 
         let info = FisherInformation::new(task_id, params, fisher)?;
@@ -236,6 +268,12 @@ impl EwcRegularizer {
     /// Compute the gradient of the total EWC penalty with respect to `current_params`.
     ///
     /// Returns a zero vector when no tasks have been registered yet.
+    ///
+    /// Accumulates directly into a single output buffer across all
+    /// registered tasks instead of allocating a fresh `Vec<f32>` per task
+    /// (as calling [`ewc_gradient_single`] per task and summing the results
+    /// would): for a `n_tasks`-task run over an `n_params`-parameter model
+    /// this drops `n_tasks` full-size heap allocations down to 1.
     pub fn penalty_gradient(
         &self,
         current_params: &[f32],
@@ -246,6 +284,7 @@ impl EwcRegularizer {
         }
 
         let mut grad = vec![0.0f32; n];
+        let lambda = self.config.lambda;
         for fi in &self.task_fishers {
             if fi.n_params() != n {
                 return Err(ContinualLearningError::DimensionMismatch {
@@ -253,14 +292,15 @@ impl EwcRegularizer {
                     actual: n,
                 });
             }
-            let task_grad = ewc_gradient_single(
-                current_params,
-                &fi.param_values,
-                &fi.fisher_diag,
-                self.config.lambda,
-            )?;
-            for (g, tg) in grad.iter_mut().zip(task_grad.iter()) {
-                *g += tg;
+            // Inlined `ewc_gradient_single`, accumulating straight into
+            // `grad` rather than materialising a per-task `Vec<f32>` first.
+            for (((g, &theta), &theta_star), &f) in grad
+                .iter_mut()
+                .zip(current_params.iter())
+                .zip(fi.param_values.iter())
+                .zip(fi.fisher_diag.iter())
+            {
+                *g += lambda * f * (theta - theta_star);
             }
         }
         Ok(grad)
@@ -326,7 +366,17 @@ impl ReplayBuffer {
         self.size == 0
     }
 
-    /// Sample `n` random (input, target) pairs (with replacement when `n > size`).
+    /// Sample `n` random (input, target) pairs, **always with replacement**
+    /// (independent uniform draws), regardless of how `n` compares to the
+    /// current buffer size — even `n == len()` can return duplicates and
+    /// omit some entries; this is not a shuffled permutation of the buffer.
+    ///
+    /// `seed` fully determines the output: this call is a pure function of
+    /// `(seed, buffer contents)`, with no internal RNG state carried
+    /// between calls. Reusing the same `seed` across calls (with unchanged
+    /// buffer contents) returns an identical batch every time — vary `seed`
+    /// per call (e.g. from a step counter) if that is not the desired
+    /// behaviour.
     pub fn sample(&self, n: usize, seed: u64) -> Result<Vec<SamplePair>, ContinualLearningError> {
         if self.is_empty() {
             return Err(ContinualLearningError::ReplayBufferEmpty);
@@ -740,9 +790,20 @@ pub fn compute_cl_stats(
             .iter()
             .map(|&(end, cur)| forgetting_measure(end, cur))
             .sum();
+        // Bug fix: this previously destructured the pair as `(cur, end)` —
+        // swapped labels only, since `task_accuracies` is always
+        // `(acc_at_task_i_end, acc_current)` regardless of what the closure
+        // binding names its components. That made the call compute
+        // `backward_transfer(end, cur)` = `end - cur`, identical to
+        // `forgetting_measure(end, cur)` above, so `backward_transfer` in
+        // the returned stats always equaled `mean_forgetting` with the sign
+        // of genuine backward transfer inverted. Destructuring with the
+        // truthful names and passing `(cur, end)` gives `cur - end`, the
+        // negation of forgetting, matching `backward_transfer`'s own
+        // doc-comment definition `BWT = acc_after_j − acc_before_j`.
         let bwt_sum: f32 = task_accuracies
             .iter()
-            .map(|&(cur, end)| backward_transfer(cur, end))
+            .map(|&(end, cur)| backward_transfer(cur, end))
             .sum();
         let n = task_accuracies.len() as f32;
         (forgetting_sum / n, bwt_sum / n)
@@ -922,6 +983,95 @@ mod tests {
         assert_eq!(reg.n_tasks(), 1);
     }
 
+    // ------------------------------------------------------------------
+    // Online EWC (regression: previously only EMA-blended on task_id reuse)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_online_ewc_fresh_task_ids_still_consolidate() {
+        // Regression: online EWC previously only took the EMA-blend branch
+        // when `register_task` was called twice with the SAME `task_id`.
+        // With the natural usage pattern -- a fresh `task_id` per completed
+        // task -- every call fell through to the vanilla "push a brand-new
+        // anchor" path, so `online: true` behaved identically to vanilla
+        // EWC (one anchor per task) despite the config claiming a single
+        // moving-average Fisher. Assert the fix: distinct task_ids must
+        // still consolidate into exactly one anchor.
+        let cfg = EwcConfig {
+            online: true,
+            gamma: 0.5,
+            ..Default::default()
+        };
+        let mut reg = EwcRegularizer::new(cfg).expect("ok");
+
+        reg.register_task(0, vec![1.0, 1.0], vec![2.0, 2.0])
+            .expect("register task 0");
+        assert_eq!(reg.n_tasks(), 1, "first registration seeds the sole anchor");
+
+        reg.register_task(1, vec![3.0, 3.0], vec![4.0, 4.0])
+            .expect("register task 1 (different task_id)");
+        assert_eq!(
+            reg.n_tasks(),
+            1,
+            "online EWC must consolidate into a single anchor even across distinct task_ids"
+        );
+
+        reg.register_task(2, vec![5.0, 5.0], vec![0.0, 0.0])
+            .expect("register task 2 (different task_id again)");
+        assert_eq!(reg.n_tasks(), 1);
+
+        // Fisher after task 0: [2.0, 2.0] (seeded directly, no blend yet).
+        // Fisher after task 1: gamma*2.0 + (1-gamma)*4.0 = 0.5*2 + 0.5*4 = 3.0.
+        // Fisher after task 2: gamma*3.0 + (1-gamma)*0.0 = 0.5*3 + 0.5*0 = 1.5.
+        let fisher = &reg.task_fishers[0].fisher_diag;
+        assert!(
+            close(fisher[0], 1.5, 1e-5) && close(fisher[1], 1.5, 1e-5),
+            "expected EMA-consolidated fisher [1.5, 1.5], got {fisher:?}"
+        );
+        // param_values must reflect the most recent task (last write wins).
+        assert_eq!(reg.task_fishers[0].param_values, vec![5.0, 5.0]);
+    }
+
+    #[test]
+    fn test_online_ewc_memory_stays_bounded_across_many_tasks() {
+        // Online EWC's entire point is O(n_params) memory regardless of
+        // task count -- verify n_tasks() never exceeds 1 across many
+        // registrations with unique task_ids.
+        let cfg = EwcConfig {
+            online: true,
+            ..Default::default()
+        };
+        let mut reg = EwcRegularizer::new(cfg).expect("ok");
+        for task_id in 0..50usize {
+            reg.register_task(task_id, vec![task_id as f32; 4], vec![1.0; 4])
+                .expect("register");
+            assert!(
+                reg.n_tasks() <= 1,
+                "n_tasks grew past 1 at task_id={task_id}"
+            );
+        }
+        assert_eq!(reg.n_tasks(), 1);
+    }
+
+    #[test]
+    fn test_vanilla_ewc_still_accumulates_one_anchor_per_task() {
+        // Vanilla EWC (online: false, the default) must be unaffected by
+        // the online-mode fix: every registration still appends a new
+        // anchor regardless of task_id.
+        let mut reg = EwcRegularizer::new(EwcConfig::default()).expect("ok");
+        reg.register_task(0, vec![1.0, 1.0], vec![1.0, 1.0])
+            .expect("register 0");
+        reg.register_task(1, vec![2.0, 2.0], vec![1.0, 1.0])
+            .expect("register 1");
+        reg.register_task(2, vec![3.0, 3.0], vec![1.0, 1.0])
+            .expect("register 2");
+        assert_eq!(
+            reg.n_tasks(),
+            3,
+            "vanilla EWC must keep one anchor per task"
+        );
+    }
+
     #[test]
     fn test_ewc_penalty_zero_at_optimal() {
         let mut reg = EwcRegularizer::new(EwcConfig::default()).expect("ok");
@@ -966,6 +1116,34 @@ mod tests {
         let g = reg.penalty_gradient(&[1.0, -1.0]).expect("grad");
         assert!(g[0] > 0.0);
         assert!(g[1] < 0.0);
+    }
+
+    #[test]
+    fn test_ewc_penalty_gradient_sums_across_multiple_tasks() {
+        // Regression guard for the in-place-accumulation refactor of
+        // `penalty_gradient`: the total gradient must equal the sum of each
+        // task's individual `ewc_gradient_single` contribution.
+        let mut reg = EwcRegularizer::new(EwcConfig {
+            lambda: 2.0,
+            ..Default::default()
+        })
+        .expect("ok");
+        reg.register_task(0, vec![0.0, 0.0], vec![1.0, 2.0])
+            .expect("register 0");
+        reg.register_task(1, vec![1.0, 1.0], vec![3.0, 0.5])
+            .expect("register 1");
+
+        let current = [2.0_f32, -1.0];
+        let combined = reg.penalty_gradient(&current).expect("grad");
+
+        let g0 = ewc_gradient_single(&current, &[0.0, 0.0], &[1.0, 2.0], 2.0).expect("g0");
+        let g1 = ewc_gradient_single(&current, &[1.0, 1.0], &[3.0, 0.5], 2.0).expect("g1");
+        let expected = [g0[0] + g1[0], g0[1] + g1[1]];
+
+        assert!(
+            close(combined[0], expected[0], 1e-5) && close(combined[1], expected[1], 1e-5),
+            "combined gradient {combined:?} should equal per-task sum {expected:?}"
+        );
     }
 
     #[test]
@@ -1031,6 +1209,54 @@ mod tests {
         let result = buf.sample(10, 99);
         assert!(result.is_ok());
         assert_eq!(result.expect("sample").len(), 10);
+    }
+
+    #[test]
+    fn test_replay_buffer_sample_at_capacity_is_still_with_replacement() {
+        // Regression for the doc fix: `n == len()` must still sample WITH
+        // replacement (independent draws), not return a shuffled
+        // permutation of the buffer. With a 1-entry buffer, sampling
+        // n == len() == 1 trivially returns that one entry either way, so
+        // use a larger buffer and confirm duplicates are possible, which a
+        // true without-replacement permutation could never produce.
+        let mut buf = ReplayBuffer::new(5);
+        for i in 0..5 {
+            buf.push(vec![i as f32], vec![0.0]);
+        }
+        // Try several seeds; at least one must produce a duplicate input
+        // value among the 5 draws if sampling is truly independent/uniform
+        // with replacement (a without-replacement permutation never would).
+        let mut saw_duplicate = false;
+        for seed in 1u64..200 {
+            let sampled = buf.sample(5, seed).expect("sample");
+            let mut inputs: Vec<i64> = sampled.iter().map(|(inp, _)| inp[0] as i64).collect();
+            inputs.sort_unstable();
+            let mut deduped = inputs.clone();
+            deduped.dedup();
+            if deduped.len() < inputs.len() {
+                saw_duplicate = true;
+                break;
+            }
+        }
+        assert!(
+            saw_duplicate,
+            "sample(n=len(), ...) must be with-replacement: expected at least one seed \
+             (out of 199 tried) to produce a duplicate draw"
+        );
+    }
+
+    #[test]
+    fn test_replay_buffer_sample_same_seed_is_deterministic() {
+        // Regression for the doc fix: `sample` carries no internal RNG
+        // state between calls, so the same seed against unchanged buffer
+        // contents must reproduce the exact same batch every time.
+        let mut buf = ReplayBuffer::new(4);
+        for i in 0..4 {
+            buf.push(vec![i as f32], vec![i as f32 * 10.0]);
+        }
+        let first = buf.sample(6, 777).expect("sample 1");
+        let second = buf.sample(6, 777).expect("sample 2");
+        assert_eq!(first, second, "same seed must yield an identical batch");
     }
 
     #[test]
@@ -1372,6 +1598,16 @@ mod tests {
         assert!(close(stats.active_param_fraction, 1.0, 1e-6));
         // mean forgetting = 0.9 - 0.8 = 0.1
         assert!(close(stats.mean_forgetting, 0.1, 1e-5));
+        // Regression: backward_transfer must be the NEGATION of forgetting
+        // (BWT = acc_after - acc_before = cur - end = -(end - cur)), not a
+        // duplicate of it. Bug: the pair was destructured with swapped
+        // binding names, so the call computed `end - cur` — identical to
+        // forgetting — instead of `cur - end`.
+        assert!(
+            close(stats.backward_transfer, -0.1, 1e-5),
+            "backward_transfer should be -0.1 (negation of forgetting), got {}",
+            stats.backward_transfer
+        );
     }
 
     #[test]
@@ -1380,5 +1616,32 @@ mod tests {
         let replay = ReplayBuffer::new(5);
         let stats = compute_cl_stats(&reg, &[1.0], &[], &replay, None).expect("stats");
         assert!(close(stats.active_param_fraction, 1.0, 1e-6));
+    }
+
+    #[test]
+    fn test_compute_cl_stats_backward_transfer_is_negation_of_forgetting() {
+        // General regression (not tied to one specific pair): for any
+        // non-degenerate set of `task_accuracies`, `backward_transfer` must
+        // equal `-mean_forgetting` exactly, per each function's own
+        // doc-commented definition (`forgetting = end - cur`,
+        // `BWT = cur - end`). A sign-swap bug would make them equal instead
+        // of opposite.
+        let reg = EwcRegularizer::new(EwcConfig::default()).expect("ok");
+        let replay = ReplayBuffer::new(1);
+        let task_accuracies = [
+            (0.95_f32, 0.70_f32),
+            (0.80_f32, 0.60_f32),
+            (0.5_f32, 0.5_f32),
+        ];
+        let stats = compute_cl_stats(&reg, &[1.0], &task_accuracies, &replay, None).expect("stats");
+        assert!(
+            close(stats.mean_forgetting, -stats.backward_transfer, 1e-6),
+            "mean_forgetting ({}) should equal -backward_transfer ({})",
+            stats.mean_forgetting,
+            stats.backward_transfer
+        );
+        // Non-degenerate: forgetting must actually be nonzero here so the
+        // assertion above cannot pass vacuously via 0.0 == -0.0.
+        assert!(stats.mean_forgetting.abs() > 1e-3);
     }
 }

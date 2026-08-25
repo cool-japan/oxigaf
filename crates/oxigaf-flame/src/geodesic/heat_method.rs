@@ -94,14 +94,22 @@ impl SparseSym {
 /// Computed as `cos/sin = dot(u, v) / ‖u × v‖` with `u = b − a`, `v = c − a`,
 /// which is numerically stable and avoids an `acos`. Degenerate triangles
 /// (zero cross-product) contribute nothing.
-fn cot_at(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> f32 {
-    let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
-    let v = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
-    let dot = u[0] * v[0] + u[1] * v[1] + u[2] * v[2];
+fn cot_at(vertex_a: [f32; 3], vertex_b: [f32; 3], vertex_c: [f32; 3]) -> f32 {
+    let edge_u = [
+        vertex_b[0] - vertex_a[0],
+        vertex_b[1] - vertex_a[1],
+        vertex_b[2] - vertex_a[2],
+    ];
+    let edge_v = [
+        vertex_c[0] - vertex_a[0],
+        vertex_c[1] - vertex_a[1],
+        vertex_c[2] - vertex_a[2],
+    ];
+    let dot = edge_u[0] * edge_v[0] + edge_u[1] * edge_v[1] + edge_u[2] * edge_v[2];
     let cross = [
-        u[1] * v[2] - u[2] * v[1],
-        u[2] * v[0] - u[0] * v[2],
-        u[0] * v[1] - u[1] * v[0],
+        edge_u[1] * edge_v[2] - edge_u[2] * edge_v[1],
+        edge_u[2] * edge_v[0] - edge_u[0] * edge_v[2],
+        edge_u[0] * edge_v[1] - edge_u[1] * edge_v[0],
     ];
     let cross_norm = (cross[0] * cross[0] + cross[1] * cross[1] + cross[2] * cross[2]).sqrt();
     if cross_norm < 1e-20 {
@@ -112,13 +120,21 @@ fn cot_at(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> f32 {
 }
 
 /// Twice the area of triangle `(a, b, c)`.
-fn double_area(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> f32 {
-    let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
-    let v = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+fn double_area(vertex_a: [f32; 3], vertex_b: [f32; 3], vertex_c: [f32; 3]) -> f32 {
+    let edge_u = [
+        vertex_b[0] - vertex_a[0],
+        vertex_b[1] - vertex_a[1],
+        vertex_b[2] - vertex_a[2],
+    ];
+    let edge_v = [
+        vertex_c[0] - vertex_a[0],
+        vertex_c[1] - vertex_a[1],
+        vertex_c[2] - vertex_a[2],
+    ];
     let cross = [
-        u[1] * v[2] - u[2] * v[1],
-        u[2] * v[0] - u[0] * v[2],
-        u[0] * v[1] - u[1] * v[0],
+        edge_u[1] * edge_v[2] - edge_u[2] * edge_v[1],
+        edge_u[2] * edge_v[0] - edge_u[0] * edge_v[2],
+        edge_u[0] * edge_v[1] - edge_u[1] * edge_v[0],
     ];
     (cross[0] * cross[0] + cross[1] * cross[1] + cross[2] * cross[2]).sqrt()
 }
@@ -220,64 +236,76 @@ fn build_cotangent_operators(mesh: &GeodesicMesh, regularisation: f32) -> (Spars
 /// residual norm drops below `tol · ‖b‖` or after `max_iter` steps; the best
 /// iterate is returned either way, since the heat method tolerates a partially
 /// converged solve far better than it tolerates a failure.
-fn solve_cg(a: &SparseSym, b: &[f32], max_iter: usize, tol: f32) -> Vec<f32> {
-    let n = a.n();
-    let mut x = vec![0.0f32; n];
-    let mut r = b.to_vec();
+fn solve_cg(matrix: &SparseSym, rhs: &[f32], max_iter: usize, tol: f32) -> Vec<f32> {
+    let dim = matrix.n();
+    let mut solution = vec![0.0f32; dim];
+    let mut residual = rhs.to_vec();
 
     // Jacobi preconditioner: M⁻¹ = 1 / diag(A), guarded against zero pivots.
-    let inv_diag: Vec<f32> = a
+    let inv_diag: Vec<f32> = matrix
         .diagonal
         .iter()
         .map(|&d| if d.abs() > 1e-20 { 1.0 / d } else { 1.0 })
         .collect();
 
-    let mut z: Vec<f32> = r
+    let mut precond_residual: Vec<f32> = residual
         .iter()
         .zip(inv_diag.iter())
         .map(|(&ri, &m)| ri * m)
         .collect();
-    let mut p = z.clone();
-    let mut rz: f32 = r.iter().zip(z.iter()).map(|(&ri, &zi)| ri * zi).sum();
+    let mut search_dir = precond_residual.clone();
+    let mut rz: f32 = residual
+        .iter()
+        .zip(precond_residual.iter())
+        .map(|(&ri, &zi)| ri * zi)
+        .sum();
 
-    let b_norm: f32 = b.iter().map(|&v| v * v).sum::<f32>().sqrt();
-    let threshold = if b_norm > 0.0 { tol * b_norm } else { tol };
+    let rhs_norm: f32 = rhs.iter().map(|&v| v * v).sum::<f32>().sqrt();
+    let threshold = if rhs_norm > 0.0 { tol * rhs_norm } else { tol };
 
-    let mut ap = vec![0.0f32; n];
+    let mut mat_search_dir = vec![0.0f32; dim];
 
     for _ in 0..max_iter {
-        let r_norm: f32 = r.iter().map(|&v| v * v).sum::<f32>().sqrt();
-        if r_norm <= threshold || !r_norm.is_finite() {
+        let residual_norm: f32 = residual.iter().map(|&v| v * v).sum::<f32>().sqrt();
+        if residual_norm <= threshold || !residual_norm.is_finite() {
             break;
         }
 
-        a.mul_into(&p, &mut ap);
-        let p_ap: f32 = p.iter().zip(ap.iter()).map(|(&pi, &api)| pi * api).sum();
-        if p_ap.abs() < 1e-30 || !p_ap.is_finite() {
+        matrix.mul_into(&search_dir, &mut mat_search_dir);
+        let search_dir_dot_ap: f32 = search_dir
+            .iter()
+            .zip(mat_search_dir.iter())
+            .map(|(&pi, &api)| pi * api)
+            .sum();
+        if search_dir_dot_ap.abs() < 1e-30 || !search_dir_dot_ap.is_finite() {
             break;
         }
 
-        let alpha = rz / p_ap;
-        for i in 0..n {
-            x[i] += alpha * p[i];
-            r[i] -= alpha * ap[i];
+        let alpha = rz / search_dir_dot_ap;
+        for i in 0..dim {
+            solution[i] += alpha * search_dir[i];
+            residual[i] -= alpha * mat_search_dir[i];
         }
 
-        for i in 0..n {
-            z[i] = r[i] * inv_diag[i];
+        for i in 0..dim {
+            precond_residual[i] = residual[i] * inv_diag[i];
         }
-        let rz_new: f32 = r.iter().zip(z.iter()).map(|(&ri, &zi)| ri * zi).sum();
+        let rz_new: f32 = residual
+            .iter()
+            .zip(precond_residual.iter())
+            .map(|(&ri, &zi)| ri * zi)
+            .sum();
         if rz.abs() < 1e-30 || !rz_new.is_finite() {
             break;
         }
         let beta = rz_new / rz;
-        for i in 0..n {
-            p[i] = z[i] + beta * p[i];
+        for i in 0..dim {
+            search_dir[i] = precond_residual[i] + beta * search_dir[i];
         }
         rz = rz_new;
     }
 
-    x
+    solution
 }
 
 /// Mean edge length over all triangle edges — the natural length scale for the
@@ -297,24 +325,9 @@ fn mean_edge_length(mesh: &GeodesicMesh) -> f32 {
     }
 }
 
-/// Run the heat method from `sources`, returning per-vertex geodesic distances.
-///
-/// `time_step` is the backward-Euler `t`; when `None` the standard heuristic
-/// `t = mean_edge_length²` is used. `n_iter` bounds the conjugate-gradient
-/// iterations for each of the two linear solves.
-///
-/// # Errors
-///
-/// Returns [`GeodesicError::NumericalError`] when the mesh has zero total area
-/// (every triangle degenerate), which leaves no metric to measure distance in.
-pub(super) fn heat_distances(
-    mesh: &GeodesicMesh,
-    sources: &[usize],
-    time_step: Option<f32>,
-    n_iter: usize,
-) -> Result<Vec<f32>, GeodesicError> {
-    let n = mesh.n_vertices();
-
+/// Validate `time_step` (or derive the standard `t = mean_edge_length²`
+/// heuristic) for the heat method.
+fn resolve_time_step(mesh: &GeodesicMesh, time_step: Option<f32>) -> Result<f32, GeodesicError> {
     let h = mean_edge_length(mesh);
     if h <= 0.0 || !h.is_finite() {
         return Err(GeodesicError::NumericalError(
@@ -322,15 +335,25 @@ pub(super) fn heat_distances(
         ));
     }
 
-    let t = match time_step {
-        Some(t) if t > 0.0 && t.is_finite() => t,
-        Some(t) => {
-            return Err(GeodesicError::InvalidConfig(format!(
-                "time_step must be positive and finite, got {t}"
-            )))
-        }
-        None => h * h,
-    };
+    match time_step {
+        Some(t) if t > 0.0 && t.is_finite() => Ok(t),
+        Some(t) => Err(GeodesicError::InvalidConfig(format!(
+            "time_step must be positive and finite, got {t}"
+        ))),
+        None => Ok(h * h),
+    }
+}
+
+/// Step 1: solve `(M + t·Lc) u = δ_source` for the heat distribution `u`,
+/// returning it together with the cotangent Laplacian and lumped mass matrix
+/// (both reused by steps 2 and 3).
+fn solve_heat_diffusion(
+    mesh: &GeodesicMesh,
+    sources: &[usize],
+    t: f32,
+    n_iter: usize,
+) -> Result<(Vec<f32>, SparseSym, Vec<f32>), GeodesicError> {
+    let n = mesh.n_vertices();
 
     // A small multiple of the mean weight keeps both systems positive definite
     // despite the constant nullspace, without perceptibly biasing the solution.
@@ -343,7 +366,6 @@ pub(super) fn heat_distances(
         ));
     }
 
-    // --- Step 1: (M + t·Lc) u = δ ------------------------------------------
     // `build_cotangent_operators` returns Lc in the positive-semidefinite
     // convention, so the backward-Euler operator is M + t·Lc.  Both sides are
     // divided through by t — giving (Lc + M/t) u = δ/t — because with the
@@ -358,10 +380,15 @@ pub(super) fn heat_distances(
     }
     let u = solve_cg(&heat_op, &rhs, n_iter, 1e-8);
 
-    // --- Step 2: X = −∇u / ‖∇u‖ , per face ---------------------------------
-    // For a linear function on triangle (i, j, k) with unit normal N and area A,
-    //   ∇u = ( u_i (N × e_i) + u_j (N × e_j) + u_k (N × e_k) ) / (2A),
-    // where e_i is the edge opposite vertex i.
+    Ok((u, laplacian, mass))
+}
+
+/// Step 2: `X = −∇u / ‖∇u‖`, per face.
+///
+/// For a linear function on triangle (i, j, k) with unit normal N and area A,
+///   `∇u = ( u_i (N × e_i) + u_j (N × e_j) + u_k (N × e_k) ) / (2A)`,
+/// where `e_i` is the edge opposite vertex `i`.
+fn compute_face_gradient_field(mesh: &GeodesicMesh, u: &[f32]) -> Vec<[f32; 3]> {
     let mut face_field: Vec<[f32; 3]> = Vec::with_capacity(mesh.n_faces());
     for face in &mesh.faces {
         let [ia, ib, ic] = *face;
@@ -418,22 +445,17 @@ pub(super) fn heat_distances(
             face_field.push([-grad[0] / norm, -grad[1] / norm, -grad[2] / norm]);
         }
     }
+    face_field
+}
 
-    // --- Step 3: solve for φ with ∇φ ≈ X -----------------------------------
-    // The integrated divergence at vertex i, summed over incident faces, is
-    //   (∇·X)_i = ½ Σ_f ( cot θ₁ (e₁ · X_f) + cot θ₂ (e₂ · X_f) ),
-    // with e₁, e₂ the two edges of f emanating from i and θ₁, θ₂ the angles
-    // opposite them.
-    //
-    // Sign convention: for a piecewise-linear φ with X = ∇φ, an edge dotted
-    // with the gradient is just the endpoint difference (e_ij · ∇φ = φ_j − φ_i),
-    // so the formula above collapses to Σ_j w_ij (φ_j − φ_i) — the Laplacian in
-    // the *negative*-semidefinite convention.  `laplacian` here is the positive
-    // one (diagonal +Σw, off-diagonal −w), i.e. its negation, so the Poisson
-    // system to solve is `laplacian · φ = −∇·X`, not `+∇·X`.  Getting this
-    // backwards yields φ = −distance, which the non-negativity clamp below then
-    // flattens to all zeros.
-    let mut divergence = vec![0.0f32; n];
+/// Step 3: the integrated divergence of `X` at each vertex.
+///
+/// The integrated divergence at vertex i, summed over incident faces, is
+///   `(∇·X)_i = ½ Σ_f ( cot θ₁ (e₁ · X_f) + cot θ₂ (e₂ · X_f) )`,
+/// with `e₁, e₂` the two edges of `f` emanating from `i` and `θ₁, θ₂` the
+/// angles opposite them.
+fn compute_divergence(mesh: &GeodesicMesh, face_field: &[[f32; 3]]) -> Vec<f32> {
+    let mut divergence = vec![0.0f32; mesh.n_vertices()];
     for (f_idx, face) in mesh.faces.iter().enumerate() {
         let x_f = face_field[f_idx];
         if x_f == [0.0; 3] {
@@ -466,13 +488,30 @@ pub(super) fn heat_distances(
         // At c: edges ca (opposite b) and cb (opposite a).
         divergence[ic] += 0.5 * (cot_b * dot(ca) + cot_a * dot(cb));
     }
+    divergence
+}
 
-    // Negate per the sign convention noted above: `laplacian` is the positive
-    // -semidefinite operator, so `laplacian · φ = −∇·X`.
+/// Sign convention: for a piecewise-linear φ with X = ∇φ, an edge dotted with
+/// the gradient is just the endpoint difference (`e_ij` · ∇φ = `φ_j` − `φ_i`), so
+/// the divergence formula collapses to `Σ_j` `w_ij` (`φ_j` − `φ_i`) — the Laplacian
+/// in the *negative*-semidefinite convention.  `laplacian` here is the
+/// positive one (diagonal +Σw, off-diagonal −w), i.e. its negation, so the
+/// Poisson system to solve is `laplacian · φ = −∇·X`, not `+∇·X`.  Getting
+/// this backwards yields φ = −distance, which the non-negativity clamp below
+/// then flattens to all zeros.
+///
+/// This also shifts φ so the nearest source sits at exactly 0, then clamps
+/// away solver noise and marks isolated vertices as unreachable.
+fn solve_and_normalize_phi(
+    laplacian: &SparseSym,
+    divergence: &[f32],
+    sources: &[usize],
+    mass: &[f32],
+    n_iter: usize,
+) -> Vec<f32> {
     let neg_divergence: Vec<f32> = divergence.iter().map(|&d| -d).collect();
-    let mut phi = solve_cg(&laplacian, &neg_divergence, n_iter, 1e-8);
+    let mut phi = solve_cg(laplacian, &neg_divergence, n_iter, 1e-8);
 
-    // --- Shift so the nearest source sits at exactly 0 ---------------------
     let source_min = sources
         .iter()
         .map(|&s| phi[s])
@@ -497,6 +536,29 @@ pub(super) fn heat_distances(
     for &s in sources {
         phi[s] = 0.0;
     }
+    phi
+}
 
+/// Run the heat method from `sources`, returning per-vertex geodesic distances.
+///
+/// `time_step` is the backward-Euler `t`; when `None` the standard heuristic
+/// `t = mean_edge_length²` is used. `n_iter` bounds the conjugate-gradient
+/// iterations for each of the two linear solves.
+///
+/// # Errors
+///
+/// Returns [`GeodesicError::NumericalError`] when the mesh has zero total area
+/// (every triangle degenerate), which leaves no metric to measure distance in.
+pub(super) fn heat_distances(
+    mesh: &GeodesicMesh,
+    sources: &[usize],
+    time_step: Option<f32>,
+    n_iter: usize,
+) -> Result<Vec<f32>, GeodesicError> {
+    let t = resolve_time_step(mesh, time_step)?;
+    let (u, laplacian, mass) = solve_heat_diffusion(mesh, sources, t, n_iter)?;
+    let face_field = compute_face_gradient_field(mesh, &u);
+    let divergence = compute_divergence(mesh, &face_field);
+    let phi = solve_and_normalize_phi(&laplacian, &divergence, sources, &mass, n_iter);
     Ok(phi)
 }

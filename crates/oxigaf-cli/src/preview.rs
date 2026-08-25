@@ -559,28 +559,36 @@ mod tests {
     #[test]
     fn test_f1_f2_pan_opposite_directions_f3_dollies_opposite_of_e() {
         let bindings = KeyBindings::default();
-        let Some(CameraAction::Pan {
-            delta_x: left_dx, ..
-        }) = bindings.action_for_key(KeyCode::F1)
-        else {
-            panic!("F1 should map to a Pan action");
-        };
-        let Some(CameraAction::Pan {
-            delta_x: right_dx, ..
-        }) = bindings.action_for_key(KeyCode::F2)
-        else {
-            panic!("F2 should map to a Pan action");
-        };
+        let left_dx = bindings
+            .action_for_key(KeyCode::F1)
+            .and_then(|a| match a {
+                CameraAction::Pan { delta_x, .. } => Some(delta_x),
+                _ => None,
+            })
+            .expect("F1 should map to a Pan action");
+        let right_dx = bindings
+            .action_for_key(KeyCode::F2)
+            .and_then(|a| match a {
+                CameraAction::Pan { delta_x, .. } => Some(delta_x),
+                _ => None,
+            })
+            .expect("F2 should map to a Pan action");
         assert!(left_dx < 0.0 && right_dx > 0.0 && (left_dx + right_dx).abs() < 1e-9);
 
-        let Some(CameraAction::Dolly { delta: in_delta }) = bindings.action_for_key(KeyCode::E)
-        else {
-            panic!("E should map to a Dolly action");
-        };
-        let Some(CameraAction::Dolly { delta: out_delta }) = bindings.action_for_key(KeyCode::F3)
-        else {
-            panic!("F3 should map to a Dolly action");
-        };
+        let in_delta = bindings
+            .action_for_key(KeyCode::E)
+            .and_then(|a| match a {
+                CameraAction::Dolly { delta } => Some(delta),
+                _ => None,
+            })
+            .expect("E should map to a Dolly action");
+        let out_delta = bindings
+            .action_for_key(KeyCode::F3)
+            .and_then(|a| match a {
+                CameraAction::Dolly { delta } => Some(delta),
+                _ => None,
+            })
+            .expect("F3 should map to a Dolly action");
         assert!(
             in_delta < 0.0 && out_delta > 0.0,
             "E zooms in, F3 zooms out"

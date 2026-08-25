@@ -292,6 +292,48 @@ impl UniformBuffer {
     }
 }
 
+/// Host-side staging of one model's attribute buffers.
+///
+/// Shared by [`GaussianBuffers::from_model`] (which uploads it at creation)
+/// and [`GaussianBuffers::write_model`] (which rewrites the existing
+/// allocations in place), so the two can never disagree about padding or
+/// element order.
+struct PackedAttributes {
+    positions: Vec<[f32; 4]>,
+    rotations: Vec<[f32; 4]>,
+    scales: Vec<[f32; 4]>,
+    opacities: Vec<f32>,
+    sh_coeffs: Vec<f32>,
+}
+
+impl PackedAttributes {
+    fn of(model: &GaussianModel) -> Self {
+        let n = model.len();
+        Self {
+            // Positions/scales are padded to vec4 for 16-byte alignment.
+            positions: model
+                .gaussians
+                .iter()
+                .map(|g| [g.position[0], g.position[1], g.position[2], 0.0])
+                .collect(),
+            rotations: model.gaussians.iter().map(|g| g.rotation).collect(),
+            scales: model
+                .gaussians
+                .iter()
+                .map(|g| [g.scale[0], g.scale[1], g.scale[2], 0.0])
+                .collect(),
+            opacities: model.gaussians.iter().map(|g| g.opacity).collect(),
+            // A model without SH data still needs a non-empty, correctly
+            // sized buffer: degree-0 black.
+            sh_coeffs: if model.sh_coeffs.is_empty() {
+                vec![0.0f32; n.max(1) * 3]
+            } else {
+                model.sh_coeffs.clone()
+            },
+        }
+    }
+}
+
 impl GaussianBuffers {
     /// Upload Gaussian model data to the GPU.
     ///
@@ -301,23 +343,13 @@ impl GaussianBuffers {
     /// GPU memory alignment (16 bytes per element).
     pub fn from_model(device: &wgpu::Device, model: &GaussianModel) -> Self {
         let n = model.len();
-
-        // Positions: extract from GaussianAttributes, pad to [f32; 4]
-        let positions_data: Vec<[f32; 4]> = model
-            .gaussians
-            .iter()
-            .map(|g| [g.position[0], g.position[1], g.position[2], 0.0])
-            .collect();
-
-        let rotations_data: Vec<[f32; 4]> = model.gaussians.iter().map(|g| g.rotation).collect();
-
-        let scales_data: Vec<[f32; 4]> = model
-            .gaussians
-            .iter()
-            .map(|g| [g.scale[0], g.scale[1], g.scale[2], 0.0])
-            .collect();
-
-        let opacities_data: Vec<f32> = model.gaussians.iter().map(|g| g.opacity).collect();
+        let PackedAttributes {
+            positions: positions_data,
+            rotations: rotations_data,
+            scales: scales_data,
+            opacities: opacities_data,
+            sh_coeffs: sh_data,
+        } = PackedAttributes::of(model);
 
         let positions = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("gaussian_positions"),
@@ -343,13 +375,6 @@ impl GaussianBuffers {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
-        // SH coefficients: ensure minimum size
-        let sh_data = if model.sh_coeffs.is_empty() {
-            vec![0.0f32; n.max(1) * 3]
-        } else {
-            model.sh_coeffs.clone()
-        };
-
         let sh_coeffs = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("gaussian_sh"),
             contents: bytemuck::cast_slice(&sh_data),
@@ -364,6 +389,59 @@ impl GaussianBuffers {
             sh_coeffs,
             count: n as u32,
         }
+    }
+
+    /// Rewrite these buffers' *contents* from `model`, reusing the existing
+    /// allocations.
+    ///
+    /// This is the in-place counterpart of [`from_model`](Self::from_model):
+    /// a training loop that pushes updated parameters every step would
+    /// otherwise destroy and recreate five GPU buffers (plus every buffer and
+    /// bind group that depends on them) per step. The packing is shared with
+    /// `from_model`, so the layout cannot drift.
+    ///
+    /// `model` must describe the same allocation the buffers were created for
+    /// — same Gaussian count and same SH stride. Anything larger is rejected
+    /// rather than silently truncated.
+    ///
+    /// # Errors
+    ///
+    /// * [`RenderError::MismatchedBufferSizes`] when `model.len()` differs
+    ///   from [`count`](Self::count).
+    /// * [`RenderError::BufferOverflow`] when the packed SH coefficients no
+    ///   longer fit the allocated SH buffer.
+    pub fn write_model(
+        &self,
+        queue: &wgpu::Queue,
+        model: &GaussianModel,
+    ) -> Result<(), RenderError> {
+        if model.len() != self.count as usize {
+            return Err(RenderError::MismatchedBufferSizes {
+                expected: self.count as usize,
+                actual: model.len(),
+            });
+        }
+        let packed = PackedAttributes::of(model);
+
+        let sh_bytes = std::mem::size_of_val(packed.sh_coeffs.as_slice()) as u64;
+        if sh_bytes > self.sh_coeffs.size() {
+            return Err(RenderError::BufferOverflow {
+                buffer_name: "gaussian_sh".to_string(),
+                max_size: self.sh_coeffs.size(),
+                requested: sh_bytes,
+            });
+        }
+
+        if !packed.positions.is_empty() {
+            queue.write_buffer(&self.positions, 0, bytemuck::cast_slice(&packed.positions));
+            queue.write_buffer(&self.rotations, 0, bytemuck::cast_slice(&packed.rotations));
+            queue.write_buffer(&self.scales, 0, bytemuck::cast_slice(&packed.scales));
+            queue.write_buffer(&self.opacities, 0, bytemuck::cast_slice(&packed.opacities));
+        }
+        if !packed.sh_coeffs.is_empty() {
+            queue.write_buffer(&self.sh_coeffs, 0, bytemuck::cast_slice(&packed.sh_coeffs));
+        }
+        Ok(())
     }
 }
 
@@ -1052,5 +1130,59 @@ mod tests {
     fn test_estimate_max_pairs_does_not_overflow() {
         let pairs = IntermediateBuffers::estimate_max_pairs(2_000_000_000, 8, 100_000);
         assert_eq!(pairs, u32::MAX);
+    }
+
+    // --- Attribute packing (shared by from_model and write_model) ---
+
+    fn packing_model(n: usize) -> GaussianModel {
+        use crate::gaussian::GaussianAttributes;
+        GaussianModel {
+            gaussians: (0..n)
+                .map(|i| GaussianAttributes {
+                    position: [i as f32, i as f32 + 0.5, i as f32 + 0.25],
+                    _pad0: 0.0,
+                    rotation: [0.1, 0.2, 0.3, 0.4],
+                    scale: [-1.0, -2.0, -3.0],
+                    opacity: 0.75,
+                })
+                .collect(),
+            sh_coeffs: vec![1.0; n * 3],
+            sh_degree: 0,
+            face_indices: vec![0; n],
+            barycentric: vec![[1.0, 0.0, 0.0]; n],
+            local_offsets: vec![[0.0; 3]; n],
+            is_rigid: vec![false; n],
+        }
+    }
+
+    /// `write_model` reuses this packing, so the vec4 padding and element
+    /// order it produces must be exactly what `from_model` uploaded.
+    #[test]
+    fn test_packed_attributes_pads_to_vec4() {
+        let model = packing_model(2);
+        let packed = PackedAttributes::of(&model);
+        assert_eq!(packed.positions.len(), 2);
+        assert_eq!(packed.positions[1], [1.0, 1.5, 1.25, 0.0]);
+        assert_eq!(packed.scales[0], [-1.0, -2.0, -3.0, 0.0]);
+        assert_eq!(packed.rotations[0], [0.1, 0.2, 0.3, 0.4]);
+        assert_eq!(packed.opacities, vec![0.75, 0.75]);
+        assert_eq!(packed.sh_coeffs.len(), 6);
+    }
+
+    /// A model with no SH data must still pack a correctly sized buffer:
+    /// a zero-length storage buffer is a wgpu validation error, and an
+    /// in-place rewrite must not shrink what `from_model` allocated.
+    #[test]
+    fn test_packed_attributes_substitutes_missing_sh() {
+        let mut model = packing_model(4);
+        model.sh_coeffs.clear();
+        let packed = PackedAttributes::of(&model);
+        assert_eq!(packed.sh_coeffs.len(), 4 * 3);
+        assert!(packed.sh_coeffs.iter().all(|v| *v == 0.0));
+
+        // ...including for an empty model, where the buffer still needs one
+        // element of room.
+        let empty = packing_model(0);
+        assert_eq!(PackedAttributes::of(&empty).sh_coeffs.len(), 3);
     }
 }

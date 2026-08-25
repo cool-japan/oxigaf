@@ -609,7 +609,15 @@ impl StylePalette {
             });
         }
         let weight_sum: f32 = weights.iter().sum();
-        if !(weight_sum > 0.0) {
+        // `weight_sum.is_nan() || weight_sum <= 0.0` (rather than the
+        // clippy-flagged `!(weight_sum > 0.0)`) is deliberate, not just a
+        // style swap: `NaN <= 0.0` is `false`, so a bare `<= 0.0` rewrite
+        // would let a NaN sum (e.g. from a NaN weight) fall through to the
+        // divide below and silently poison `blended_means`/`blended_stds`
+        // with NaN. The explicit `is_nan()` check keeps NaN rejected, same
+        // as the original negated-comparison form (`NaN > 0.0` is `false`,
+        // so `!(NaN > 0.0)` was already `true` and errored).
+        if weight_sum.is_nan() || weight_sum <= 0.0 {
             return Err(StyleTransferError::InvalidConfig(format!(
                 "blend_styles weights must sum to a positive value, got {weight_sum}"
             )));
@@ -1181,6 +1189,27 @@ mod tests {
 
         let result = palette.blend_styles(&[1.0, -1.0]);
         assert!(matches!(result, Err(StyleTransferError::InvalidConfig(_))));
+    }
+
+    #[test]
+    fn test_style_palette_blend_styles_nan_weight_sum_err() {
+        // Regression for the clippy `neg_cmp_op_on_partial_ord` fix: the
+        // check used to read `!(weight_sum > 0.0)`. The naive rewrite
+        // `weight_sum <= 0.0` is NOT behavior-preserving for NaN, because
+        // `NaN <= 0.0` is `false` in IEEE 754 — it would let a NaN weight
+        // sum fall through to the divide and silently poison
+        // `blended_means`/`blended_stds` with NaN instead of erroring. A NaN
+        // weight sum must still be rejected, exactly as it was before.
+        let mut palette = StylePalette::new(1);
+        palette.push_style(vec![2.0], vec![4.0], "a").unwrap();
+        palette.push_style(vec![6.0], vec![8.0], "b").unwrap();
+
+        let result = palette.blend_styles(&[f32::NAN, 1.0]);
+        assert!(
+            matches!(result, Err(StyleTransferError::InvalidConfig(_))),
+            "a NaN weight sum must be rejected, not silently propagated into \
+             the blended output: {result:?}"
+        );
     }
 
     #[test]

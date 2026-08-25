@@ -47,8 +47,9 @@ pub enum SubdivisionError {
         estimated: usize,
         max: usize,
     },
-    /// All three vertices of a face share the same index.
-    #[error("Degenerate face {idx}: all three vertices are identical")]
+    /// A face has a repeated vertex index (any two of its three indices
+    /// are equal), collapsing at least one edge to a point.
+    #[error("Degenerate face {idx}: face has a repeated vertex index")]
     DegenerateFace { idx: usize },
 }
 
@@ -195,12 +196,29 @@ fn identify_boundary_edges(faces: &[[u32; 3]]) -> HashSet<(u32, u32)> {
         .collect()
 }
 
-/// Return `true` if vertex `v_idx` is a boundary vertex
-/// (i.e., it belongs to at least one boundary edge).
-fn is_boundary_vertex(v_idx: u32, boundary_edges: &HashSet<(u32, u32)>) -> bool {
-    boundary_edges
-        .iter()
-        .any(|&(a, b)| a == v_idx || b == v_idx)
+/// Classify every vertex `0..n_vertices` as boundary or interior, and for
+/// each boundary vertex, list the vertices it shares a boundary edge with.
+///
+/// Runs in a single O(B) pass over `boundary_edges` (B = number of boundary
+/// edges), unlike a per-vertex linear scan which would cost O(V·B).
+///
+/// Returns `(is_boundary, boundary_neighbors)` where `is_boundary[v]` is
+/// `true` iff vertex `v` touches at least one boundary edge, and
+/// `boundary_neighbors[v]` lists the vertices joined to `v` by a boundary
+/// edge (normally exactly 2 for a manifold boundary vertex).
+fn classify_boundary_vertices(
+    boundary_edges: &HashSet<(u32, u32)>,
+    n_vertices: usize,
+) -> (Vec<bool>, Vec<Vec<u32>>) {
+    let mut is_boundary = vec![false; n_vertices];
+    let mut boundary_neighbors: Vec<Vec<u32>> = vec![Vec::new(); n_vertices];
+    for &(a, b) in boundary_edges {
+        is_boundary[a as usize] = true;
+        is_boundary[b as usize] = true;
+        boundary_neighbors[a as usize].push(b);
+        boundary_neighbors[b as usize].push(a);
+    }
+    (is_boundary, boundary_neighbors)
 }
 
 /// Compute the Loop subdivision β weight for an interior vertex with `n` neighbors.
@@ -219,14 +237,27 @@ fn compute_loop_vertex_weight(n_neighbors: usize) -> f32 {
 
 /// Compute the updated position of an original vertex using the Loop rule.
 ///
-/// - Interior vertex: `(1 − n·β) · v + β · Σ neighbors`
-/// - Boundary vertex (simplified): `(3/4) · v + (1/4) · avg(neighbors)`
+/// - Interior vertex (`boundary_neighbors: None`): `(1 − n·β) · v + β · Σ neighbors`,
+///   using the full 1-ring in `neighbors`.
+/// - Boundary vertex (`boundary_neighbors: Some((prev, next))`):
+///   `(3/4) · v + (1/8) · (prev + next)`, using ONLY the two vertices
+///   joined to `v` by a boundary edge. `neighbors` is ignored in this case.
 fn update_vertex_loop(
     v: &na::Point3<f32>,
     neighbors: &[u32],
     vertices: &[na::Point3<f32>],
-    is_boundary: bool,
+    boundary_neighbors: Option<(u32, u32)>,
 ) -> na::Point3<f32> {
+    if let Some((prev, next)) = boundary_neighbors {
+        // True Loop boundary rule: 3/4*v + 1/8*(prev + next), using only the
+        // two neighbours joined to `v` by boundary edges — NOT the full
+        // 1-ring, which would pull the boundary toward the mesh interior.
+        let edge_sum = add_points(&vertices[prev as usize], &vertices[next as usize]);
+        let part_v = scale_point(v, 0.75);
+        let part_nb = scale_point(&edge_sum, 0.125);
+        return add_points(&part_v, &part_nb);
+    }
+
     let n = neighbors.len();
     if n == 0 {
         return *v;
@@ -238,22 +269,14 @@ fn update_vertex_loop(
         neighbor_sum = add_points(&neighbor_sum, &vertices[nb as usize]);
     }
 
-    if is_boundary {
-        // Simplified boundary rule: 3/4 * v + 1/4 * avg(neighbors)
-        let avg = scale_point(&neighbor_sum, 1.0 / n as f32);
-        let part_v = scale_point(v, 0.75);
-        let part_nb = scale_point(&avg, 0.25);
-        add_points(&part_v, &part_nb)
-    } else {
-        // Interior Loop rule
-        let beta = compute_loop_vertex_weight(n);
-        let n_beta = beta * n as f32;
-        // (1 - n*beta) * v
-        let part_v = scale_point(v, 1.0 - n_beta);
-        // beta * sum(neighbors)
-        let part_nb = scale_point(&neighbor_sum, beta);
-        add_points(&part_v, &part_nb)
-    }
+    // Interior Loop rule
+    let beta = compute_loop_vertex_weight(n);
+    let n_beta = beta * n as f32;
+    // (1 - n*beta) * v
+    let part_v = scale_point(v, 1.0 - n_beta);
+    // beta * sum(neighbors)
+    let part_nb = scale_point(&neighbor_sum, beta);
+    add_points(&part_v, &part_nb)
 }
 
 /// Compute the Loop edge-midpoint vertex position.
@@ -356,8 +379,11 @@ pub fn validate_mesh_for_subdivision(mesh: &Mesh) -> Result<(), SubdivisionError
             }
         }
 
-        // Check for degenerate faces (all three vertices identical)
-        if face[0] == face[1] && face[1] == face[2] {
+        // Check for degenerate faces (any two vertices identical). A face
+        // like [0, 1, 1] would otherwise pass, produce a self-edge (1, 1)
+        // in `edge_opposite`, and silently propagate/multiply degeneracies
+        // through every subsequent subdivision level.
+        if face[0] == face[1] || face[1] == face[2] || face[0] == face[2] {
             return Err(SubdivisionError::DegenerateFace { idx });
         }
     }
@@ -453,13 +479,25 @@ pub fn subdivide_once(mesh: &Mesh, config: &SubdivisionConfig) -> Result<Mesh, S
     if config.update_vertices {
         let boundary_edges = identify_boundary_edges(faces);
         let vertex_neighbors = build_vertex_neighbors(faces, n_orig_verts);
+        // Single O(B) pass instead of an O(V·B) per-vertex scan.
+        let (is_boundary, boundary_neighbor_lists) =
+            classify_boundary_vertices(&boundary_edges, n_orig_verts);
 
         for vi in 0..n_orig_verts {
             let v = &mesh.vertices[vi];
+            if is_boundary[vi] {
+                // Use ONLY the two boundary-edge neighbours, per the Loop
+                // boundary rule. A boundary-neighbour count other than 2
+                // indicates a non-manifold boundary vertex; leave it
+                // unmoved rather than guess at a rule for it.
+                if let [prev, next] = boundary_neighbor_lists[vi].as_slice() {
+                    new_vertices[vi] =
+                        update_vertex_loop(v, &[], &mesh.vertices, Some((*prev, *next)));
+                }
+                continue;
+            }
             let neighbors = &vertex_neighbors[vi];
-            let is_boundary = is_boundary_vertex(vi as u32, &boundary_edges);
-            let updated = update_vertex_loop(v, neighbors, &mesh.vertices, is_boundary);
-            new_vertices[vi] = updated;
+            new_vertices[vi] = update_vertex_loop(v, neighbors, &mesh.vertices, None);
         }
     }
 
@@ -805,6 +843,28 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_partially_degenerate_face_rejected() {
+        // Only two of the three indices are identical: [0, 1, 1]. A
+        // three-way-identical-only check would miss this, then
+        // `subdivide_once` would compute a self-edge (1, 1) whose
+        // "midpoint" equals vertex 1 itself.
+        let vertices = vec![
+            na::Point3::new(0.0f32, 0.0, 0.0),
+            na::Point3::new(1.0f32, 0.0, 0.0),
+        ];
+        let mesh = Mesh {
+            normals: vec![na::Vector3::zeros(); 2],
+            vertices,
+            faces: vec![[0, 1, 1]],
+            uv_coords: vec![],
+        };
+        assert!(matches!(
+            validate_mesh_for_subdivision(&mesh),
+            Err(SubdivisionError::DegenerateFace { idx: 0 })
+        ));
+    }
+
+    #[test]
     fn test_validate_valid_mesh_ok() {
         let mesh = single_triangle();
         assert!(validate_mesh_for_subdivision(&mesh).is_ok());
@@ -933,26 +993,57 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // 7. is_boundary_vertex
+    // 7. classify_boundary_vertices
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_is_boundary_vertex_lone_triangle() {
+    fn test_classify_boundary_vertices_lone_triangle() {
         // All vertices of a lone triangle are boundary
         let faces = vec![[0u32, 1, 2]];
         let be = identify_boundary_edges(&faces);
-        assert!(is_boundary_vertex(0, &be));
-        assert!(is_boundary_vertex(1, &be));
-        assert!(is_boundary_vertex(2, &be));
+        let (is_boundary, boundary_neighbors) = classify_boundary_vertices(&be, 3);
+        assert!(is_boundary[0]);
+        assert!(is_boundary[1]);
+        assert!(is_boundary[2]);
+        // Each vertex of a lone triangle has exactly 2 boundary neighbours
+        // (the triangle's other two vertices).
+        for (i, nbrs) in boundary_neighbors.iter().enumerate() {
+            assert_eq!(
+                nbrs.len(),
+                2,
+                "vertex {i} should have 2 boundary neighbours"
+            );
+        }
     }
 
     #[test]
-    fn test_is_boundary_vertex_interior_vertex() {
+    fn test_classify_boundary_vertices_interior_vertex() {
         // [0,1,2], [0,2,3], [0,3,1]: vertex 0 is surrounded, so interior
         let faces = vec![[0u32, 1, 2], [0, 2, 3], [0, 3, 1]];
         let be = identify_boundary_edges(&faces);
+        let (is_boundary, boundary_neighbors) = classify_boundary_vertices(&be, 4);
         // vertex 0 is not on any boundary edge (all its edges appear twice)
-        assert!(!is_boundary_vertex(0, &be));
+        assert!(!is_boundary[0]);
+        assert!(boundary_neighbors[0].is_empty());
+    }
+
+    #[test]
+    fn test_classify_boundary_vertices_fan_hub_ignores_interior_edges() {
+        // Fan: [0,1,2],[0,2,3],[0,3,4]. Vertex 0 (the hub) has 4 total
+        // 1-ring neighbours (1,2,3,4) but only 2 boundary-edge neighbours
+        // (1 and 4); edges (0,2) and (0,3) are interior (shared by two
+        // fan faces).
+        let faces = vec![[0u32, 1, 2], [0, 2, 3], [0, 3, 4]];
+        let be = identify_boundary_edges(&faces);
+        let (is_boundary, boundary_neighbors) = classify_boundary_vertices(&be, 5);
+        assert!(is_boundary[0]);
+        let mut hub_neighbors = boundary_neighbors[0].clone();
+        hub_neighbors.sort_unstable();
+        assert_eq!(
+            hub_neighbors,
+            vec![1, 4],
+            "hub's boundary neighbours must exclude the interior-edge vertices 2 and 3"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -997,7 +1088,7 @@ mod tests {
         ];
         let neighbors = vec![1u32, 2, 3];
         let v = &vertices[0];
-        let updated = update_vertex_loop(v, &neighbors, &vertices, false);
+        let updated = update_vertex_loop(v, &neighbors, &vertices, None);
         // Beta for n=3: 3/16; n*beta = 9/16
         // new_v = (1 - 9/16)*[0,0,0] + 3/16*(1+0-1, 0+1+0, 0) = 3/16*(0, 1, 0)
         // = [0, 3/16, 0] = [0, 0.1875, 0]
@@ -1006,23 +1097,49 @@ mod tests {
     }
 
     #[test]
-    fn test_update_vertex_loop_boundary_moves_toward_neighbors() {
+    fn test_update_vertex_loop_boundary_uses_prev_and_next() {
         let vertices = vec![
             na::Point3::new(0.0f32, 0.0, 0.0), // v0 (updating)
-            na::Point3::new(4.0f32, 0.0, 0.0), // neighbor
+            na::Point3::new(4.0f32, 0.0, 0.0), // prev boundary neighbour
+            na::Point3::new(0.0f32, 4.0, 0.0), // next boundary neighbour
         ];
-        let neighbors = vec![1u32];
         let v = &vertices[0];
-        let updated = update_vertex_loop(v, &neighbors, &vertices, true);
-        // 3/4*[0,0,0] + 1/4*[4,0,0] = [1, 0, 0]
-        assert!((updated.x - 1.0).abs() < 1e-5, "x = {}", updated.x);
+        let updated = update_vertex_loop(v, &[], &vertices, Some((1, 2)));
+        // 3/4*[0,0,0] + 1/8*([4,0,0]+[0,4,0]) = [0.5, 0.5, 0]
+        assert!((updated.x - 0.5).abs() < 1e-5, "x = {}", updated.x);
+        assert!((updated.y - 0.5).abs() < 1e-5, "y = {}", updated.y);
+    }
+
+    #[test]
+    fn test_update_vertex_loop_boundary_ignores_non_boundary_neighbors() {
+        // Regression test: the boundary rule must use ONLY the two
+        // boundary-edge neighbours (prev, next), not the full 1-ring.
+        // v2 and v3 are extra 1-ring neighbours (e.g. across an interior
+        // edge) with wildly different positions; they must not influence
+        // the result at all.
+        let vertices = vec![
+            na::Point3::new(0.0f32, 0.0, 0.0),     // v0 (updating)
+            na::Point3::new(1.0f32, 0.0, 0.0),     // v1: boundary neighbour (prev)
+            na::Point3::new(1000.0f32, 0.0, 0.0),  // v2: non-boundary neighbour (must be ignored)
+            na::Point3::new(-1000.0f32, 0.0, 0.0), // v3: non-boundary neighbour (must be ignored)
+            na::Point3::new(3.0f32, 0.0, 0.0),     // v4: boundary neighbour (next)
+        ];
+        let v = &vertices[0];
+        let full_ring = [1u32, 2, 3, 4];
+        let updated = update_vertex_loop(v, &full_ring, &vertices, Some((1, 4)));
+        // Expected: 3/4*v0 + 1/8*(v1 + v4) = 1/8*(1+3, 0, 0) = (0.5, 0, 0)
+        assert!(
+            (updated.x - 0.5).abs() < 1e-5,
+            "boundary rule must average only the two boundary neighbours (expected x = 0.5), got x = {}",
+            updated.x
+        );
     }
 
     #[test]
     fn test_update_vertex_loop_no_neighbors_returns_original() {
         let vertices = vec![na::Point3::new(3.0f32, 7.0, 2.0)];
         let v = &vertices[0];
-        let updated = update_vertex_loop(v, &[], &vertices, false);
+        let updated = update_vertex_loop(v, &[], &vertices, None);
         assert!((updated.x - v.x).abs() < 1e-7);
         assert!((updated.y - v.y).abs() < 1e-7);
     }
@@ -1118,6 +1235,40 @@ mod tests {
                 assert!((idx as usize) < n_verts, "face index {idx} out of bounds");
             }
         }
+    }
+
+    #[test]
+    fn test_subdivide_once_boundary_hub_matches_two_neighbor_rule() {
+        // End-to-end regression for the Loop boundary-vertex rule, exercised
+        // through the full `subdivide_once` pipeline (not just the isolated
+        // `update_vertex_loop` helper). Fan mesh: [0,1,2],[0,2,3],[0,3,4].
+        // Vertex 0 (the hub) has 4 total 1-ring neighbours (1,2,3,4) but
+        // only 2 boundary-edge neighbours (1 and 4) — edges (0,2) and (0,3)
+        // are interior, shared by two fan faces.
+        let vertices = vec![
+            na::Point3::new(0.0f32, 0.0, 0.0),
+            na::Point3::new(1.0f32, 0.0, 0.0),
+            na::Point3::new(1000.0f32, 0.0, 0.0),
+            na::Point3::new(-1000.0f32, 0.0, 0.0),
+            na::Point3::new(3.0f32, 0.0, 0.0),
+        ];
+        let faces = vec![[0u32, 1, 2], [0, 2, 3], [0, 3, 4]];
+        let mesh = Mesh::new(vertices, faces);
+        let config = SubdivisionConfig {
+            recompute_normals: false,
+            ..Default::default()
+        };
+        let subdivided = subdivide_once(&mesh, &config).expect("subdivision should succeed");
+        // Expected: 3/4*v0 + 1/8*(v1 + v4) = 1/8*(1+3, 0, 0) = (0.5, 0, 0).
+        // The buggy "average all 4 neighbours" rule would give
+        // 3/4*0 + 1/4*mean(1,1000,-1000,3) = 0.25*1 = 0.25, which is a
+        // different (and, for real meshes, badly wrong) value.
+        let updated_hub = &subdivided.vertices[0];
+        assert!(
+            (updated_hub.x - 0.5).abs() < 1e-4,
+            "boundary hub must move using only its 2 boundary neighbours, got x = {}",
+            updated_hub.x
+        );
     }
 
     #[test]

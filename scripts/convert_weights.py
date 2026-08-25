@@ -1,23 +1,33 @@
 #!/usr/bin/env python3
 """Convert GAF / ImageDream PyTorch weights to SafeTensors for Candle loading.
 
+DEPRECATED as of 0.1.2 — superseded by a pure-Rust implementation.
+
+    cargo run -p oxigaf-bridge --example convert_pytorch -- \
+        --checkpoint <checkpoint.pt> --output-dir <output_dir/> --precision fp16
+
+`oxigaf_bridge::convert_pytorch_checkpoint` now reads `.pt` checkpoints
+directly: `oxigaf-bridge/src/pickle/` implements a non-executing pickle
+reader plus the ZIP-container and tensor-rebuild handling a `torch.save`
+file needs, so no Python, no PyTorch, and no `torch.load` is involved.
+It reproduces this script's behaviour exactly — the same component prefixes,
+the same partitioning into unet/vae/clip/other — with two improvements:
+`--precision` is optional (this script always forced FP16), and
+non-contiguous tensor views (e.g. a `.t()` transpose) are materialized in
+row-major order rather than being copied verbatim.
+
+That closes the last Python dependency in the pipeline: OxiGAF is now Pure
+Rust end to end, including the first-mile asset conversion.
+
+This script is kept as a reference and an escape hatch for exotic
+checkpoints (e.g. the legacy pre-1.6 `torch.save` format, which is a bare
+pickle rather than a ZIP archive and which the Rust reader rejects with an
+explicit message). Nothing in the OxiGAF pipeline requires it.
+
 Usage:
     python convert_weights.py <checkpoint.pt> <output_dir/>
 
 Requires: torch, safetensors
-
-Scope note: this is a one-time, offline asset-conversion step, not part of
-the OxiGAF Pure Rust runtime. It exists because PyTorch `.pt` checkpoints
-are pickle-serialized; reading them requires `torch.load`, which is why this
-script depends on Python + PyTorch. The OxiGAF crates themselves (oxigaf,
-oxigaf-bridge, etc.) have no Python or C/C++ dependency in their default
-build — that claim is about the Rust runtime, not about how you get a
-third-party `.pt` checkpoint into `.safetensors` form in the first place.
-`oxigaf-bridge` currently reads/writes `.safetensors` only; it does not yet
-ingest raw `.pt`/`.pkl` pickle files, so this script (and
-`convert_flame.py` for `.pkl` FLAME models) is still required for that
-first-mile conversion. Once you have `.safetensors` output, the rest of the
-pipeline is Pure Rust.
 """
 
 import sys

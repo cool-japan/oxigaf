@@ -15,12 +15,19 @@
 //
 // Dispatch dimensions
 // ───────────────────
-// 1D: same grid as prefix_sum phase 1. Each workgroup adds block_offsets[wid.x]
-// to its 512-element slice.
+// 1D: same grid as prefix_sum phase 1. Each workgroup adds the offset of all
+// *preceding* blocks to its 512-element slice.
 //
 // Math
 // ────
-// data[i] += block_offsets[wid.x]   for all i in [wid.x*512, (wid.x+1)*512).
+// `block_offsets` is the **inclusive** scan of the per-block totals produced by
+// phase 2 (prefix_sum.wgsl writes an inclusive scan). The amount that has to be
+// added in front of block `b` is therefore the total of blocks `0..b-1`, i.e.
+// the *exclusive* prefix — which is `block_offsets[b - 1]`, and 0 for block 0.
+// Adding `block_offsets[b]` instead would inflate every block by its own total.
+//
+// data[i] += (wid.x == 0 ? 0 : block_offsets[wid.x - 1])
+//     for all i in [wid.x*512, (wid.x+1)*512).
 
 @group(0) @binding(0) var<storage, read_write> data: array<u32>;
 @group(0) @binding(1) var<storage, read> block_offsets: array<u32>;
@@ -34,7 +41,14 @@ fn prefix_sum_add(
 ) {
     let n = params.x;
     let offset_base = wid.x * 512u;
-    let block_offset = block_offsets[wid.x];
+
+    // Exclusive prefix of the block totals: block 0 gets nothing, block b gets
+    // the inclusive scan value of block b-1.  Indexing `block_offsets[wid.x]`
+    // here would add each block's own total to itself.
+    var block_offset = 0u;
+    if wid.x > 0u {
+        block_offset = block_offsets[wid.x - 1u];
+    }
 
     // Each thread handles two elements (matching the scan's 512 per workgroup)
     let ai = offset_base + lid.x;

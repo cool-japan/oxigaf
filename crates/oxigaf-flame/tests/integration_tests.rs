@@ -106,8 +106,64 @@ fn test_camera_construction() {
     assert!(camera.focal_x > 0.0);
     assert!(camera.focal_y > 0.0);
 
-    // Check default front camera has identity rotation
-    assert_eq!(camera.rotation, na::Matrix3::identity());
+    // The rotation is NOT identity.  Per the `Camera` doc comment the
+    // world-to-camera convention is `p_cam = rotation · p_world + translation`
+    // with `+Z_cam` forward and `+Y_cam` DOWN the screen, while FLAME meshes
+    // are `+Y` up and `+Z` out of the face; `Camera::default_front` therefore
+    // documents `rotation = diag(1, -1, -1)`.  Identity would put the camera
+    // centre at `-Rᵀt = (0, 0, -0.6)` — behind the head, looking at the back
+    // of the skull — and mirror the image vertically.
+    //
+    // Assert the two properties that derivation exists to guarantee, rather
+    // than the matrix literal, so this test tracks the contract and not the
+    // implementation.
+
+    // 1. `+Z_cam` forward: the world origin (the centre of the head) is in
+    //    front of the camera, i.e. on the visible side of the near plane.
+    let origin_cam = camera.world_to_cam(&na::Point3::origin());
+    assert!(
+        origin_cam.z > 0.0,
+        "world origin must sit in front of the default_front camera, got z = {}",
+        origin_cam.z
+    );
+
+    // 2. `+Y_cam` down: world "up" must land higher on screen (a SMALLER
+    //    pixel row) than world "down".  This is the assertion that actually
+    //    exercises the `-1` in the Y slot — with identity rotation the image
+    //    would be flipped and this comparison would reverse.
+    let above = camera.project(&camera.world_to_cam(&na::Point3::new(0.0, 0.1, 0.0)));
+    let below = camera.project(&camera.world_to_cam(&na::Point3::new(0.0, -0.1, 0.0)));
+    assert!(
+        above[1] < below[1],
+        "world +Y (up) must project to a smaller pixel row than world -Y (down); \
+         got v_up = {}, v_down = {}",
+        above[1],
+        below[1]
+    );
+
+    // 3. The camera sits at world `(0, 0, 0.6)` looking back along world `-Z`.
+    //    FLAME's `+Z` is out of the face, so a point in front of the face must
+    //    come out NEARER (smaller `z_cam`) than the mirrored point behind it.
+    //    Assertion 1 cannot see this — the world origin has `z = 0`, so the
+    //    matrix's Z entry is multiplied out of it — and this is the only
+    //    check that would catch a `diag(1, -1, +1)`, which would put the
+    //    camera behind the head with the depth order reversed.
+    let front_of_face = camera.world_to_cam(&na::Point3::new(0.0, 0.0, 0.2)).z;
+    let back_of_head = camera.world_to_cam(&na::Point3::new(0.0, 0.0, -0.2)).z;
+    assert!(
+        front_of_face < back_of_head,
+        "the face (world +Z) must be nearer the camera than the back of the head; \
+         got z_front = {front_of_face}, z_back = {back_of_head}"
+    );
+
+    // 4. The camera is centred on the image, so a point on the world Y axis
+    //    stays on the vertical centre line.
+    let cx = camera.cx;
+    assert!(
+        (above[0] - cx).abs() < 1e-3,
+        "a point on the world Y axis must project to the principal x, got {}",
+        above[0]
+    );
 }
 
 #[test]
@@ -184,7 +240,8 @@ fn test_mesh_sampling() {
     let mesh = Mesh::new(vertices, faces);
 
     let mut rng = rand::rngs::StdRng::seed_from_u64(42);
-    let samples = oxigaf_flame::sample_mesh_surface(&mesh, 1000, &mut rng);
+    let samples = oxigaf_flame::sample_mesh_surface(&mesh, 1000, &mut rng)
+        .expect("a mesh built by Mesh::new is well-formed");
 
     assert_eq!(samples.len(), 1000);
 
@@ -209,7 +266,10 @@ fn test_mesh_sampling_empty() {
 
     let mesh = Mesh::new(vec![], vec![]);
     let mut rng = rand::rngs::StdRng::seed_from_u64(42);
-    let samples = oxigaf_flame::sample_mesh_surface(&mesh, 100, &mut rng);
+    // A face-less mesh is well-formed, just empty: that is a successful
+    // sample of zero points, not a malformed-mesh error.
+    let samples = oxigaf_flame::sample_mesh_surface(&mesh, 100, &mut rng)
+        .expect("an empty mesh is well-formed");
 
     // Should return empty for empty mesh
     assert_eq!(samples.len(), 0);
@@ -229,10 +289,12 @@ fn test_mesh_sampling_deterministic() {
 
     // Same seed should give same results
     let mut rng1 = rand::rngs::StdRng::seed_from_u64(123);
-    let samples1 = oxigaf_flame::sample_mesh_surface(&mesh, 50, &mut rng1);
+    let samples1 = oxigaf_flame::sample_mesh_surface(&mesh, 50, &mut rng1)
+        .expect("a mesh built by Mesh::new is well-formed");
 
     let mut rng2 = rand::rngs::StdRng::seed_from_u64(123);
-    let samples2 = oxigaf_flame::sample_mesh_surface(&mesh, 50, &mut rng2);
+    let samples2 = oxigaf_flame::sample_mesh_surface(&mesh, 50, &mut rng2)
+        .expect("a mesh built by Mesh::new is well-formed");
 
     assert_eq!(samples1.len(), samples2.len());
     for (s1, s2) in samples1.iter().zip(samples2.iter()) {

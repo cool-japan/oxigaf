@@ -63,7 +63,6 @@ impl CacheMetadata {
     }
 
     /// Update access timestamp and count for a cache entry
-    #[allow(dead_code)]
     pub fn update_access(&mut self, name: &str) {
         if let Some(entry) = self.entries.iter_mut().find(|e| e.name == name) {
             entry.last_accessed = current_timestamp();
@@ -78,9 +77,22 @@ impl CacheMetadata {
 
     /// Insert a new entry, or overwrite the existing entry for the same
     /// `path` in place (preserving position/order for everything else).
+    ///
+    /// The incoming entry describes a *download*, so it carries no usage
+    /// history: its `access_count` is 0 and its `last_accessed` is "now".
+    /// Any history already recorded for that path is carried across rather
+    /// than clobbered — re-downloading a corrupted file must not silently
+    /// reset the access count that `cache clean`'s age policy and `cache
+    /// list`'s usage column are derived from. `last_accessed` keeps
+    /// whichever timestamp is later, since a fresh download *is* a fresh
+    /// touch of the file but must never move a newer access backwards.
     fn upsert(&mut self, entry: CacheEntry) {
         if let Some(existing) = self.entries.iter_mut().find(|e| e.path == entry.path) {
+            let access_count = existing.access_count.max(entry.access_count);
+            let last_accessed = existing.last_accessed.max(entry.last_accessed);
             *existing = entry;
+            existing.access_count = access_count;
+            existing.last_accessed = last_accessed;
         } else {
             self.entries.push(entry);
         }
@@ -97,15 +109,22 @@ fn current_timestamp() -> u64 {
 
 /// Record (or refresh) a [`CacheEntry`] for a downloaded asset.
 ///
-/// `assets::setup_cache` currently writes asset files straight into the
-/// cache directory without registering them here (that is why `cache.json`
-/// otherwise stays empty forever — see [`discover_untracked_assets`] for the
-/// directory-scan fallback that covers that gap in the meantime). Once the
-/// download path is wired to call this function right after each successful
-/// download, `cache list`/`verify`/`clean` get a precise `downloaded_at`
-/// timestamp and an immediately-known checksum instead of having to infer
-/// them from filesystem metadata on next use.
-#[allow(dead_code)]
+/// The download paths in [`crate::assets`] call this immediately after each
+/// successful transfer ([`crate::assets::setup_cache_with_options`] for
+/// manifest assets, [`crate::assets::download_with_progress`] for
+/// HuggingFace Hub files), so `cache.json` carries a precise
+/// `downloaded_at` timestamp — and, when the asset had a published checksum
+/// that was actually verified, that checksum — instead of having to infer
+/// both from filesystem metadata later.
+///
+/// `discover_untracked_assets` remains as the fallback for asset files
+/// that appeared in the cache directory by some other route (a manual copy,
+/// a download by an older build).
+///
+/// Entries are keyed by `path`, so re-recording the same file overwrites its
+/// entry in place rather than accumulating duplicates — while preserving the
+/// usage history already recorded for it (`CacheMetadata::upsert` carries
+/// `access_count` and the later `last_accessed` across).
 pub fn record_download(
     cache_dir: &Path,
     name: &str,
@@ -134,12 +153,14 @@ pub fn record_download(
 /// Adopt asset files that already exist on disk but have no matching
 /// [`CacheEntry`] in `metadata`.
 ///
-/// Nothing in the download path currently calls [`record_download`] (or
-/// `CacheMetadata::save` at all, outside of [`clean_cache`]), so relying
-/// solely on `cache.json` would make every `cache` subcommand report an
-/// empty cache no matter how many gigabytes had actually been downloaded.
-/// This scans the well-known asset paths from [`crate::assets`] and adopts
-/// any that are present on disk.
+/// The download paths do call [`record_download`] now, but asset files can
+/// still reach the cache directory by other routes — a manual copy of a
+/// hand-downloaded release artifact, or a download performed by an older
+/// build that predates the recording. Relying solely on `cache.json` would
+/// make every `cache` subcommand report an empty cache in those cases, no
+/// matter how many gigabytes were actually on disk. This scans the
+/// well-known asset paths from [`crate::assets`] and adopts any that are
+/// present.
 ///
 /// `last_accessed` is seeded to *now*, not to the file's mtime: we have no
 /// real access history for a file we are only just noticing, and mtime is
@@ -194,10 +215,11 @@ fn discover_untracked_assets(cache_dir: &Path, metadata: &mut CacheMetadata) -> 
 /// List all cached assets with details.
 ///
 /// Assets that exist on disk but are not yet recorded in `cache.json` are
-/// adopted for this listing (see [`discover_untracked_assets`]) so a cache
-/// directory populated by `assets::setup_cache` doesn't always report as
-/// empty — but `list` is read-only and does not persist the discovery
-/// itself; run `cache verify` (or `cache clean`) to make it durable.
+/// adopted for this listing (see `discover_untracked_assets`) so a cache
+/// directory populated outside the recorded download path — a manual copy,
+/// or an older build — doesn't report as empty. `list` is read-only and does
+/// not persist the discovery itself; run `cache verify` (or `cache clean`)
+/// to make it durable.
 pub fn list_cache(cache_dir: &Path) -> Result<()> {
     let mut metadata = CacheMetadata::load(cache_dir)?;
     discover_untracked_assets(cache_dir, &mut metadata)?;
@@ -233,13 +255,81 @@ pub fn list_cache(cache_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Clean old cached assets.
+/// Machine-readable outcome of a [`clean_cache_report`] run.
+///
+/// The cleaner returns this instead of writing straight to stdout so a
+/// caller can either render it as a human report (via [`clean_cache`]) or
+/// serialize it for `--json` — the report is the single source of truth for
+/// both, so the two can never drift apart.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CleanReport {
+    /// Cache directory the run operated on.
+    pub cache_dir: PathBuf,
+    /// Age threshold the run was given, in days.
+    pub max_age_days: u64,
+    /// Whether this was a dry run: nothing deleted, nothing persisted.
+    pub dry_run: bool,
+    /// Entries that were removed — or, for a dry run, that would be.
+    pub removed: Vec<CacheEntry>,
+    /// Stale entries deliberately *kept* because their file lives outside
+    /// `cache_dir` — see [`clean_cache_report`] for why.
+    pub retained_external: Vec<CacheEntry>,
+    /// Bytes freed — or, for a dry run, that would be freed.
+    pub bytes_freed: u64,
+}
+
+impl CleanReport {
+    /// Number of entries removed (or that would be removed).
+    #[must_use]
+    pub fn removed_count(&self) -> usize {
+        self.removed.len()
+    }
+}
+
+/// Whether `path` resolves to a location inside `root`.
+///
+/// When both sides resolve, the *canonical* forms are compared: on macOS
+/// `std::env::temp_dir()` alone is enough to make the literal forms
+/// (`/var/...` vs `/private/var/...`) disagree, and a symlink inside the
+/// cache pointing at a file elsewhere must not count as contained just
+/// because its literal path has the right prefix. When either side cannot be
+/// resolved — most often because the file has already been deleted — the
+/// literal, component-wise comparison is the fallback.
+///
+/// This gates a destructive operation, so it errs toward *not* contained:
+/// mistakenly retaining a cache file wastes disk, mistakenly deleting one
+/// outside the cache destroys another tool's data.
+fn is_contained(root: &Path, path: &Path) -> bool {
+    match (std::fs::canonicalize(root), std::fs::canonicalize(path)) {
+        (Ok(canonical_root), Ok(canonical_path)) => canonical_path.starts_with(canonical_root),
+        _ => path.starts_with(root),
+    }
+}
+
+/// Compute — and, unless `dry_run`, apply — a cache cleaning pass.
 ///
 /// Newly discovered (previously unrecorded) assets are adopted first — see
-/// [`discover_untracked_assets`] — with `last_accessed` seeded to *now*, so
+/// `discover_untracked_assets` — with `last_accessed` seeded to *now*, so
 /// a file this process is only just noticing can never be immediately swept
-/// up as stale by the age check below.
-pub fn clean_cache(cache_dir: &Path, max_age_days: u64, dry_run: bool) -> Result<()> {
+/// up as stale by the age check.
+///
+/// Entries whose file lives outside `cache_dir` are never deleted, even when
+/// stale: `record_download` can legitimately register a path in another
+/// cache root (a HuggingFace Hub download lands in `~/.cache/huggingface`),
+/// and a cache cleaner must not reach outside its own directory to delete
+/// another tool's files. Those entries are returned in
+/// [`CleanReport::retained_external`] instead.
+///
+/// Nothing is printed; see [`clean_cache`] for the human-facing wrapper.
+///
+/// # Errors
+///
+/// Propagates metadata load/save failures and any file removal that fails.
+pub fn clean_cache_report(
+    cache_dir: &Path,
+    max_age_days: u64,
+    dry_run: bool,
+) -> Result<CleanReport> {
     let mut metadata = CacheMetadata::load(cache_dir)?;
     let discovered = discover_untracked_assets(cache_dir, &mut metadata)?;
 
@@ -249,63 +339,116 @@ pub fn clean_cache(cache_dir: &Path, max_age_days: u64, dry_run: bool) -> Result
     // a tiny cutoff that deletes everything).
     let cutoff = current_timestamp().saturating_sub(max_age_days.saturating_mul(86_400));
 
-    let to_remove: Vec<_> = metadata
+    let (to_remove, retained_external): (Vec<CacheEntry>, Vec<CacheEntry>) = metadata
         .entries
         .iter()
         .filter(|e| e.last_accessed < cutoff)
         .cloned()
-        .collect();
+        .partition(|e| is_contained(cache_dir, &e.path));
 
-    if to_remove.is_empty() {
-        if discovered && !dry_run {
-            metadata.save(cache_dir)?;
-        }
-        println!(
-            "✅ No assets to clean (all accessed within {} days)",
-            max_age_days
-        );
-        return Ok(());
+    let bytes_freed: u64 = to_remove.iter().map(|e| e.size_bytes).sum();
+
+    let report = CleanReport {
+        cache_dir: cache_dir.to_path_buf(),
+        max_age_days,
+        dry_run,
+        removed: to_remove,
+        retained_external,
+        bytes_freed,
+    };
+
+    if dry_run {
+        // A dry run must leave the filesystem exactly as it found it —
+        // including `cache.json`, so a discovery made only to compute this
+        // plan is not silently persisted.
+        return Ok(report);
     }
 
-    println!("🗑️  Will remove {} assets:", to_remove.len());
+    for entry in &report.removed {
+        if entry.path.exists() {
+            std::fs::remove_file(&entry.path)
+                .with_context(|| format!("Failed to remove file: {}", entry.path.display()))?;
+        }
+    }
+    if !report.removed.is_empty() {
+        // Drop the removed entries by `path`, the key `upsert` uses: two
+        // distinct assets can share a display name, and retaining by name
+        // would evict the survivor along with the casualty.
+        metadata
+            .entries
+            .retain(|e| !report.removed.iter().any(|removed| removed.path == e.path));
+    }
+    if discovered || !report.removed.is_empty() {
+        metadata.save(cache_dir)?;
+    }
 
-    let mut total_freed = 0u64;
-    for entry in &to_remove {
+    // The removal loop tolerates an already-missing file, so the report
+    // describes exactly the entries that are gone from the cache now.
+    Ok(report)
+}
+
+/// Clean old cached assets, printing a human-readable report to stdout.
+///
+/// Thin wrapper over [`clean_cache_report`]; see that function for the
+/// deletion policy.
+///
+/// # Errors
+///
+/// Propagates [`clean_cache_report`].
+pub fn clean_cache(cache_dir: &Path, max_age_days: u64, dry_run: bool) -> Result<()> {
+    let report = clean_cache_report(cache_dir, max_age_days, dry_run)?;
+    print_clean_report(&report);
+    Ok(())
+}
+
+/// Render a [`CleanReport`] as the human-readable `cache clean` output.
+fn print_clean_report(report: &CleanReport) {
+    for entry in &report.retained_external {
+        println!(
+            "⚠️  {} is stale but lives outside the cache directory ({}); left in place.",
+            entry.name,
+            entry.path.display()
+        );
+    }
+
+    if report.removed.is_empty() {
+        println!(
+            "✅ No assets to clean (all accessed within {} days)",
+            report.max_age_days
+        );
+        return;
+    }
+
+    if report.dry_run {
+        println!("🗑️  Will remove {} assets:", report.removed.len());
+    } else {
+        println!("🗑️  Removed {} assets:", report.removed.len());
+    }
+
+    for entry in &report.removed {
         println!(
             "  - {} ({:.1} MB)",
             entry.name,
             entry.size_bytes as f64 / 1_000_000.0
         );
-        total_freed += entry.size_bytes;
     }
 
     println!(
-        "\nTotal space to free: {:.1} MB",
-        total_freed as f64 / 1_000_000.0
+        "\nTotal space {}: {:.1} MB",
+        if report.dry_run { "to free" } else { "freed" },
+        report.bytes_freed as f64 / 1_000_000.0
     );
 
-    if dry_run {
+    if report.dry_run {
         println!("\n(Dry run - no files deleted)");
-        return Ok(());
+    } else {
+        println!("\n✅ Cleaned {} assets", report.removed.len());
     }
-
-    for entry in &to_remove {
-        if entry.path.exists() {
-            std::fs::remove_file(&entry.path)
-                .with_context(|| format!("Failed to remove file: {}", entry.path.display()))?;
-        }
-        metadata.entries.retain(|e| e.name != entry.name);
-    }
-
-    metadata.save(cache_dir)?;
-    println!("\n✅ Cleaned {} assets", to_remove.len());
-
-    Ok(())
 }
 
 /// Verify cache integrity.
 ///
-/// Newly discovered assets are adopted (see [`discover_untracked_assets`]),
+/// Newly discovered assets are adopted (see `discover_untracked_assets`),
 /// and any entry without a recorded checksum has one computed and saved now
 /// ("trust on first verify"), so a *subsequent* run can actually detect
 /// corruption instead of only ever checking existence and size.
@@ -344,7 +487,14 @@ pub fn verify_cache(cache_dir: &Path) -> Result<()> {
         match metadata.entries[idx].checksum.clone() {
             Some(expected_checksum) => {
                 let actual_checksum = compute_sha256(&path)?;
-                if actual_checksum != expected_checksum {
+                // Case-insensitive, matching `assets::is_cached` and
+                // `assets::finalize_download`: a recorded checksum can
+                // originate from the `ASSETS` manifest, whose hex digests are
+                // hand-entered from a published release and may be
+                // upper-case. Comparing those byte-for-byte against
+                // `compute_sha256`'s always-lower-case output would report
+                // CHECKSUM MISMATCH on a perfectly intact file.
+                if !actual_checksum.eq_ignore_ascii_case(&expected_checksum) {
                     println!("❌ CHECKSUM MISMATCH");
                     issues += 1;
                     continue;
@@ -377,13 +527,21 @@ pub fn verify_cache(cache_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Compute the SHA-256 checksum of a file.
+/// Compute the lowercase-hex SHA-256 checksum of a file.
 ///
 /// Streams the file through a fixed-size buffer instead of reading it
 /// entirely into memory — the manifest's largest asset is a ~1.7 GB
 /// diffusion U-Net, and `Sha256::digest(&std::fs::read(path)?)` would
 /// resident that whole file just to hash it.
-fn compute_sha256(path: &Path) -> Result<String> {
+///
+/// This is the crate's single checksum implementation: [`crate::assets`]
+/// used to carry a `sha256_hex` twin that differed only by slurping the
+/// whole file, and now calls this instead.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be opened or read.
+pub(crate) fn compute_sha256(path: &Path) -> Result<String> {
     use sha2::{Digest, Sha256};
     use std::fmt::Write as _;
     use std::io::{BufReader, Read};
@@ -561,6 +719,292 @@ mod tests {
         assert_eq!(metadata.entries.len(), 1);
         assert_eq!(metadata.entries[0].path, expected_paths[0]);
         assert!(metadata.entries[0].checksum.is_some());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Write a `cache.json` whose single entry was last accessed
+    /// `days_ago` days ago, so age-based cleaning has something to bite on.
+    fn seed_stale_entry(cache_dir: &Path, name: &str, path: &Path, days_ago: u64) {
+        let size_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        let stale = current_timestamp().saturating_sub(days_ago * 86_400);
+        let metadata = CacheMetadata {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            entries: vec![CacheEntry {
+                name: name.to_string(),
+                path: path.to_path_buf(),
+                size_bytes,
+                downloaded_at: stale,
+                last_accessed: stale,
+                access_count: 0,
+                checksum: None,
+            }],
+        };
+        metadata.save(cache_dir).expect("seed metadata should save");
+    }
+
+    #[test]
+    fn verify_cache_accepts_an_uppercase_recorded_checksum() {
+        // A checksum recorded from the `ASSETS` manifest is hand-entered hex
+        // and may be upper-case, while `compute_sha256` always emits
+        // lower-case. A byte-for-byte comparison would report CHECKSUM
+        // MISMATCH on an intact file.
+        let dir = unique_temp_dir("case_checksum");
+        let path = dir.join("payload.bin");
+        std::fs::write(&path, b"hello world").expect("failed to write asset");
+        let digest = compute_sha256(&path).expect("compute_sha256 should succeed");
+        assert_eq!(digest, digest.to_lowercase(), "digests are lower-case hex");
+
+        record_download(&dir, "Payload", &path, Some(digest.to_uppercase()))
+            .expect("record_download should succeed");
+        verify_cache(&dir).expect("verify_cache should succeed");
+
+        // An intact file must keep its recorded checksum: a mismatch would
+        // have left it untouched *and* counted an issue, so the surviving
+        // value being the original upper-case one proves the OK branch ran.
+        let metadata = CacheMetadata::load(&dir).expect("metadata should reload");
+        assert_eq!(
+            metadata.entries[0].checksum.as_deref(),
+            Some(digest.to_uppercase().as_str())
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn record_download_preserves_existing_usage_history() {
+        // Re-downloading a file (say, after `verify` found it corrupt) must
+        // not reset the access history that `cache clean`'s age policy and
+        // `cache list`'s usage column read.
+        let dir = unique_temp_dir("history");
+        let path = dir.join("thing.bin");
+        std::fs::write(&path, b"v1").expect("failed to write asset");
+        record_download(&dir, "Thing", &path, None).expect("record_download should succeed");
+
+        // Simulate real usage accumulating against the entry.
+        let mut metadata = CacheMetadata::load(&dir).expect("load should succeed");
+        for _ in 0..5 {
+            metadata.update_access("Thing");
+        }
+        let future = current_timestamp() + 3_600;
+        metadata.entries[0].last_accessed = future;
+        metadata.save(&dir).expect("save should succeed");
+
+        std::fs::write(&path, b"v2-longer").expect("failed to rewrite asset");
+        record_download(&dir, "Thing", &path, Some("abc".to_string()))
+            .expect("second record_download should succeed");
+
+        let metadata = CacheMetadata::load(&dir).expect("load should succeed");
+        assert_eq!(metadata.entries.len(), 1);
+        assert_eq!(
+            metadata.entries[0].access_count, 5,
+            "a re-download must not reset the access count"
+        );
+        assert_eq!(
+            metadata.entries[0].last_accessed, future,
+            "a re-download must not move a newer access timestamp backwards"
+        );
+        // The download-derived fields still refresh.
+        assert_eq!(metadata.entries[0].checksum.as_deref(), Some("abc"));
+        assert_eq!(metadata.entries[0].size_bytes, b"v2-longer".len() as u64);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn is_contained_resolves_symlinked_roots_and_rejects_outsiders() {
+        let root = unique_temp_dir("contained_root");
+        let outside = unique_temp_dir("contained_outside");
+
+        let inside_path = root.join("inside.bin");
+        std::fs::write(&inside_path, b"in").expect("failed to write inside file");
+        let outside_path = outside.join("outside.bin");
+        std::fs::write(&outside_path, b"out").expect("failed to write outside file");
+
+        assert!(is_contained(&root, &inside_path));
+        assert!(!is_contained(&root, &outside_path));
+
+        // On macOS `std::env::temp_dir()` is itself a symlink
+        // (/var -> /private/var), so a literal-prefix comparison of a
+        // canonicalized entry path against a non-canonical root would call
+        // an in-cache file "external" and silently stop cleaning it.
+        let canonical_inside =
+            std::fs::canonicalize(&inside_path).expect("inside file should canonicalize");
+        assert!(is_contained(&root, &canonical_inside));
+
+        // A deleted file (nothing left to canonicalize) still classifies by
+        // its literal path, so a stale entry for an already-removed cache
+        // file is not misfiled as external.
+        std::fs::remove_file(&inside_path).expect("failed to remove inside file");
+        assert!(is_contained(&root, &inside_path));
+        assert!(!is_contained(&root, &outside_path.join("gone.bin")));
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn clean_cache_report_returns_the_removed_entries() {
+        let dir = unique_temp_dir("report");
+        let asset_path = dir.join("stale.bin");
+        std::fs::write(&asset_path, vec![7u8; 2048]).expect("failed to write asset");
+        seed_stale_entry(&dir, "Stale", &asset_path, 90);
+
+        let report =
+            clean_cache_report(&dir, 30, false).expect("clean_cache_report should succeed");
+
+        assert!(!report.dry_run);
+        assert_eq!(report.removed_count(), 1);
+        assert_eq!(report.removed[0].name, "Stale");
+        assert_eq!(report.bytes_freed, 2048);
+        assert!(report.retained_external.is_empty());
+        assert!(
+            !asset_path.exists(),
+            "a stale asset must actually be removed"
+        );
+
+        // The report is what `cache clean --json` serializes, so it must be
+        // serializable without losing the removal list.
+        let value = serde_json::to_value(&report).expect("report should serialize");
+        assert_eq!(value["removed"].as_array().map(Vec::len), Some(1));
+        assert_eq!(value["bytes_freed"].as_u64(), Some(2048));
+
+        let metadata = CacheMetadata::load(&dir).expect("metadata should reload");
+        assert!(
+            metadata.entries.is_empty(),
+            "the removed entry must be dropped from cache.json"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clean_cache_dry_run_deletes_nothing_and_writes_nothing() {
+        let dir = unique_temp_dir("dryrun");
+        // A discoverable asset with no cache.json at all: the dry run has to
+        // adopt it to build a plan, and must not persist that adoption.
+        let expected_paths = assets::expected_asset_paths(&dir);
+        std::fs::write(&expected_paths[0], b"untracked").expect("failed to write fake asset");
+
+        let report = clean_cache_report(&dir, 30, true).expect("dry run should succeed");
+        assert!(report.dry_run);
+        assert!(expected_paths[0].exists(), "dry run must not delete");
+        assert!(
+            !dir.join("cache.json").exists(),
+            "dry run must not persist discovered entries"
+        );
+
+        // …and with something genuinely stale, the plan lists it without
+        // touching it.
+        let stale_path = dir.join("stale.bin");
+        std::fs::write(&stale_path, b"old").expect("failed to write asset");
+        seed_stale_entry(&dir, "Stale", &stale_path, 90);
+
+        let report = clean_cache_report(&dir, 30, true).expect("dry run should succeed");
+        assert_eq!(report.removed_count(), 1);
+        assert!(stale_path.exists(), "dry run must not delete");
+
+        let metadata = CacheMetadata::load(&dir).expect("metadata should reload");
+        assert_eq!(
+            metadata.entries.len(),
+            1,
+            "dry run must not rewrite cache.json"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clean_cache_never_deletes_files_outside_the_cache_directory() {
+        // `record_download` legitimately registers paths in other cache
+        // roots (a HuggingFace Hub download lands under ~/.cache/huggingface),
+        // and OxiGAF must not sweep another tool's files out from under it.
+        let dir = unique_temp_dir("external_cache");
+        let outside = unique_temp_dir("external_home");
+        let external_path = outside.join("someone_elses_model.safetensors");
+        std::fs::write(&external_path, b"not ours to delete").expect("failed to write asset");
+        seed_stale_entry(&dir, "external", &external_path, 900);
+
+        let report =
+            clean_cache_report(&dir, 30, false).expect("clean_cache_report should succeed");
+
+        assert!(
+            report.removed.is_empty(),
+            "nothing inside the cache is stale"
+        );
+        assert_eq!(report.retained_external.len(), 1);
+        assert_eq!(report.retained_external[0].name, "external");
+        assert_eq!(report.bytes_freed, 0);
+        assert!(
+            external_path.exists(),
+            "a stale entry outside the cache directory must be left on disk"
+        );
+
+        let metadata = CacheMetadata::load(&dir).expect("metadata should reload");
+        assert_eq!(
+            metadata.entries.len(),
+            1,
+            "a retained external entry stays tracked"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn clean_cache_removes_by_path_not_by_display_name() {
+        // `upsert` keys on `path`, so two distinct files can share a name.
+        // Removing the stale one must not evict the fresh namesake.
+        let dir = unique_temp_dir("samename");
+        let stale_path = dir.join("stale").join("model.bin");
+        let fresh_path = dir.join("fresh").join("model.bin");
+        for path in [&stale_path, &fresh_path] {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).expect("failed to create asset dir");
+            }
+            std::fs::write(path, b"payload").expect("failed to write asset");
+        }
+
+        let stale = current_timestamp().saturating_sub(90 * 86_400);
+        let now = current_timestamp();
+        let metadata = CacheMetadata {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            entries: vec![
+                CacheEntry {
+                    name: "model.bin".to_string(),
+                    path: stale_path.clone(),
+                    size_bytes: 7,
+                    downloaded_at: stale,
+                    last_accessed: stale,
+                    access_count: 0,
+                    checksum: None,
+                },
+                CacheEntry {
+                    name: "model.bin".to_string(),
+                    path: fresh_path.clone(),
+                    size_bytes: 7,
+                    downloaded_at: now,
+                    last_accessed: now,
+                    access_count: 0,
+                    checksum: None,
+                },
+            ],
+        };
+        metadata.save(&dir).expect("seed metadata should save");
+
+        let report =
+            clean_cache_report(&dir, 30, false).expect("clean_cache_report should succeed");
+        assert_eq!(report.removed_count(), 1);
+        assert!(!stale_path.exists());
+        assert!(fresh_path.exists(), "the fresh namesake must survive");
+
+        let metadata = CacheMetadata::load(&dir).expect("metadata should reload");
+        assert_eq!(
+            metadata.entries.len(),
+            1,
+            "only the stale entry may be dropped from cache.json"
+        );
+        assert_eq!(metadata.entries[0].path, fresh_path);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -536,27 +536,67 @@ mod tests_2 {
     }
     #[test]
     fn test_mirror_double_mirror_roundtrip() {
+        // `retar_mirror_expression` now takes an explicit coefficient-space
+        // mirror matrix (see `retar_build_expression_mirror_matrix`'s docs
+        // for why a fixed sign pattern can't represent it for a real FLAME
+        // basis) and returns a `Result`. Feed it a hand-built involution — a
+        // block-diagonal matrix of 3 swap blocks on a 6-dim state — so that
+        // applying it twice is guaranteed to reproduce the input exactly,
+        // independent of whether `retar_build_expression_mirror_matrix`
+        // itself is correct (that's covered separately in `functions.rs`).
+        let dim = 6;
+        let mut mirror = vec![0.0_f32; dim * dim];
+        for block in 0..dim / 2 {
+            let i0 = block * 2;
+            let i1 = block * 2 + 1;
+            mirror[i0 * dim + i1] = 1.0;
+            mirror[i1 * dim + i0] = 1.0;
+        }
         let s = ExpressionState::from_params(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let m = retar_mirror_expression(&s);
-        let mm = retar_mirror_expression(&m);
+        let m = retar_mirror_expression(&s, &mirror).expect("6x6 matrix on a 6-dim state");
+        let mm = retar_mirror_expression(&m, &mirror).expect("mirroring again");
         for (a, b) in s.expression_params.iter().zip(mm.expression_params.iter()) {
             assert!((a - b).abs() < 1e-6, "double mirror failed: {a} vs {b}");
         }
     }
     #[test]
-    fn test_mirror_negates_odd_dims() {
+    fn test_mirror_applies_a_diagonal_sign_matrix() {
+        // A diagonal matrix is the degenerate case where the general
+        // matrix-vector mirror reduces to per-coefficient signs — useful
+        // here as a simple, independently checkable input for the matrix
+        // application itself (not a claim that FLAME mirroring is diagonal
+        // in general; see `retar_build_expression_mirror_matrix`'s docs).
         let s = ExpressionState::from_params(vec![1.0, 1.0, 1.0, 1.0]);
-        let m = retar_mirror_expression(&s);
+        #[rustfmt::skip]
+        let mirror = vec![
+            1.0, 0.0, 0.0, 0.0,
+            0.0, -1.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+            0.0, 0.0, 0.0, -1.0,
+        ];
+        let m = retar_mirror_expression(&s, &mirror).expect("4x4 diagonal matrix on a 4-dim state");
         assert!((m.expression_params[0] - 1.0).abs() < 1e-6);
         assert!((m.expression_params[1] + 1.0).abs() < 1e-6);
         assert!((m.expression_params[2] - 1.0).abs() < 1e-6);
         assert!((m.expression_params[3] + 1.0).abs() < 1e-6);
     }
     #[test]
-    fn test_mirror_preserves_jaw() {
+    fn test_mirror_flips_jaw_yaw_and_roll_but_preserves_pitch() {
+        // Reflecting across the mid-sagittal plane (x = 0) conjugates the
+        // jaw rotation by diag(-1, 1, 1): pitch (index 0) is preserved, yaw
+        // and roll (indices 1, 2) are negated. The expression coefficients
+        // pass through an identity matrix unchanged so only the jaw-pose
+        // behavior is under test here.
         let s = ExpressionState::from_params_and_jaw(vec![1.0, 2.0], [0.1, 0.2, 0.3]);
-        let m = retar_mirror_expression(&s);
-        assert_eq!(m.jaw_pose, [0.1, 0.2, 0.3]);
+        let identity = vec![1.0, 0.0, 0.0, 1.0];
+        let m = retar_mirror_expression(&s, &identity).expect("2x2 identity on a 2-dim state");
+        assert_eq!(m.expression_params, vec![1.0, 2.0]);
+        assert!(
+            (m.jaw_pose[0] - 0.1).abs() < 1e-6,
+            "pitch must be preserved"
+        );
+        assert!((m.jaw_pose[1] + 0.2).abs() < 1e-6, "yaw must be negated");
+        assert!((m.jaw_pose[2] + 0.3).abs() < 1e-6, "roll must be negated");
     }
     #[test]
     fn test_blend_states_equal_weights() {

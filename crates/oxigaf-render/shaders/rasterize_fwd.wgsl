@@ -38,7 +38,25 @@
 //   power = −½ · (conic.x·dx² + 2·conic.y·dx·dy + conic.z·dy²)
 //   alpha = min(sigmoid(opacity) · exp(power), 0.99)
 //   color += T · alpha · c;  T *= (1 − alpha)
-// Loop stops when T < 1/255 (transmittance threshold).
+// Loop stops when T < uniforms.transmittance_threshold (RasterConfig::
+// transmittance_threshold, default 1/255), and the stopping index is published
+// as out_n_contrib so rasterize_bwd.wgsl can bound its reverse traversal by
+// exactly the entries this pixel blended (it clamps to `out_n_contrib` rather
+// than re-testing a threshold of its own, so raising the configured threshold
+// stays consistent between the two passes).
+//
+// The `alpha < 1/255` rejection below is a different, deliberately fixed
+// constant — the 8-bit quantisation floor of a colour contribution, not a
+// transmittance budget — and rasterize_bwd.wgsl repeats it verbatim so the two
+// passes accept the same set of Gaussians.
+//
+// Barrier uniformity
+// ──────────────────
+// Threads whose pixel lies outside the image (edge tiles at resolutions that
+// are not a multiple of 16) must NOT return early: the batch loop below
+// contains workgroupBarrier() calls that every thread of the workgroup has to
+// execute the same number of times.  They stay alive, take part in the
+// cooperative load, and only their final stores are suppressed.
 
 struct Uniforms {
     view: mat4x4<f32>,
@@ -113,9 +131,14 @@ fn rasterize_forward(
     let W = u32(uniforms.viewport.x);
     let H = u32(uniforms.viewport.y);
 
-    if px >= W || py >= H {
-        return;
-    }
+    // Do NOT return here. `range_start`/`range_end` below come from
+    // `tile_ranges[tile_id]` with `tile_id` derived from `wid`, so the batch
+    // loop's trip count is workgroup-uniform and every thread must reach both
+    // workgroupBarrier() calls. Returning early from the out-of-image threads
+    // of an edge tile is undefined behaviour, and in practice leaves the shared
+    // slots owned by those threads holding stale data that the surviving
+    // threads then blend as phantom Gaussians.
+    let in_bounds = px < W && py < H;
 
     let pixel_idx = py * W + px;
     let pixel_f = vec2<f32>(f32(px) + 0.5, f32(py) + 0.5);
@@ -134,9 +157,12 @@ fn rasterize_forward(
     var color = vec3<f32>(0.0);
     var depth_acc = 0.0f;
     var normal_acc = vec3<f32>(0.0);
-    var n_contrib = 0u;
     // Track the absolute stopping index so the backward pass knows
-    // exactly which sort entries were actually blended.
+    // exactly which sort entries were actually blended.  This is an INDEX into
+    // the tile's sort range, not a count of blended Gaussians — a count would
+    // not let the backward pass identify *which* entries were skipped, because
+    // the power/alpha rejections below are per-pixel and leave gaps.  The
+    // buffer it lands in is named `out_n_contrib` for historical reasons.
     var k_stop = range_end;
 
     // Flat thread index within the 16×16 workgroup; used to assign cooperative
@@ -151,8 +177,10 @@ fn rasterize_forward(
     //
     // Threads that have already crossed the transmittance threshold (done==true)
     // still participate in the load phase and barriers to keep the workgroup in
-    // sync — they just skip the inner processing loop.
-    var done = false;
+    // sync — they just skip the inner processing loop.  Out-of-image threads
+    // start out "done" for exactly the same reason: they must keep hitting the
+    // barriers, but there is no pixel for them to blend.
+    var done = !in_bounds;
     var k_base = range_start;
 
     while k_base < range_end {
@@ -176,7 +204,7 @@ fn rasterize_forward(
         // ── Per-pixel processing phase (read from shared memory) ──────────
         if !done {
             for (var b = 0u; b < batch_size; b++) {
-                if T < 1.0 / 255.0 {
+                if T < uniforms.transmittance_threshold {
                     k_stop = k_base + b;
                     done = true;
                     break;
@@ -211,7 +239,6 @@ fn rasterize_forward(
                 }
 
                 T *= (1.0 - alpha);
-                n_contrib++;
             }
         }
 
@@ -223,18 +250,22 @@ fn rasterize_forward(
     // Add background
     color += T * uniforms.background;
 
-    out_color[pixel_idx] = vec4<f32>(color, 1.0 - T);
-    out_depth[pixel_idx] = depth_acc;
-    out_transmittance[pixel_idx] = T;
-    // Store the stopping sort index (not count) so backward can limit its range.
-    // k_stop == range_end when no early termination; k_stop < range_end otherwise.
-    out_n_contrib[pixel_idx] = k_stop;
+    // Only the threads that own a real pixel store anything; the rest exist
+    // purely to keep the barriers above workgroup-uniform.
+    if in_bounds {
+        out_color[pixel_idx] = vec4<f32>(color, 1.0 - T);
+        out_depth[pixel_idx] = depth_acc;
+        out_transmittance[pixel_idx] = T;
+        // Store the stopping sort index (not count) so backward can limit its range.
+        // k_stop == range_end when no early termination; k_stop < range_end otherwise.
+        out_n_contrib[pixel_idx] = k_stop;
 
-    // Write normals if enabled
-    if (uniforms.output_flags & 2u) != 0u {
-        // Normalize accumulated normal (weighted sum)
-        let normal_len = length(normal_acc);
-        let final_normal = select(vec3<f32>(0.0, 0.0, 1.0), normal_acc / normal_len, normal_len > 0.0001);
-        out_normals[pixel_idx] = vec4<f32>(final_normal, 0.0);
+        // Write normals if enabled
+        if (uniforms.output_flags & 2u) != 0u {
+            // Normalize accumulated normal (weighted sum)
+            let normal_len = length(normal_acc);
+            let final_normal = select(vec3<f32>(0.0, 0.0, 1.0), normal_acc / normal_len, normal_len > 0.0001);
+            out_normals[pixel_idx] = vec4<f32>(final_normal, 0.0);
+        }
     }
 }

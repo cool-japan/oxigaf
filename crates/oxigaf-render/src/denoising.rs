@@ -32,6 +32,7 @@
 //! assert_eq!(result.len(), w * h * 3);
 //! ```
 
+use rayon::prelude::*;
 use thiserror::Error;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -193,43 +194,48 @@ pub fn bilateral_filter(
 
     let mut output = vec![0.0_f32; width * height * 3];
 
-    for cy in 0..height {
-        for cx in 0..width {
-            let ci = (cy * width + cx) * 3;
-            let center_lum = luminance(image[ci], image[ci + 1], image[ci + 2]);
+    // Each output row depends only on the read-only `image` buffer and is
+    // independent of every other row, so rows are computed in parallel.
+    output
+        .par_chunks_mut(width * 3)
+        .enumerate()
+        .for_each(|(cy, row)| {
+            for cx in 0..width {
+                let ci = (cy * width + cx) * 3;
+                let center_lum = luminance(image[ci], image[ci + 1], image[ci + 2]);
 
-            let mut sum_r = 0.0_f32;
-            let mut sum_g = 0.0_f32;
-            let mut sum_b = 0.0_f32;
-            let mut sum_w = 0.0_f32;
+                let mut sum_r = 0.0_f32;
+                let mut sum_g = 0.0_f32;
+                let mut sum_b = 0.0_f32;
+                let mut sum_w = 0.0_f32;
 
-            for dy in -r..=r {
-                let ny = clamp_coord(cy as i32 + dy, height);
-                for dx in -r..=r {
-                    let nx = clamp_coord(cx as i32 + dx, width);
+                for dy in -r..=r {
+                    let ny = clamp_coord(cy as i32 + dy, height);
+                    for dx in -r..=r {
+                        let nx = clamp_coord(cx as i32 + dx, width);
 
-                    let dist_sq = (dx * dx + dy * dy) as f32;
-                    let spatial_w = (-dist_sq / two_ss_sq).exp();
+                        let dist_sq = (dx * dx + dy * dy) as f32;
+                        let spatial_w = (-dist_sq / two_ss_sq).exp();
 
-                    let ni = (ny * width + nx) * 3;
-                    let neigh_lum = luminance(image[ni], image[ni + 1], image[ni + 2]);
+                        let ni = (ny * width + nx) * 3;
+                        let neigh_lum = luminance(image[ni], image[ni + 1], image[ni + 2]);
 
-                    let lum_diff = center_lum - neigh_lum;
-                    let range_w = (-(lum_diff * lum_diff) / two_sr_sq).exp();
+                        let lum_diff = center_lum - neigh_lum;
+                        let range_w = (-(lum_diff * lum_diff) / two_sr_sq).exp();
 
-                    let w = spatial_w * range_w;
-                    sum_r += w * image[ni];
-                    sum_g += w * image[ni + 1];
-                    sum_b += w * image[ni + 2];
-                    sum_w += w;
+                        let w = spatial_w * range_w;
+                        sum_r += w * image[ni];
+                        sum_g += w * image[ni + 1];
+                        sum_b += w * image[ni + 2];
+                        sum_w += w;
+                    }
                 }
-            }
 
-            output[ci] = sum_r / sum_w;
-            output[ci + 1] = sum_g / sum_w;
-            output[ci + 2] = sum_b / sum_w;
-        }
-    }
+                row[cx * 3] = sum_r / sum_w;
+                row[cx * 3 + 1] = sum_g / sum_w;
+                row[cx * 3 + 2] = sum_b / sum_w;
+            }
+        });
 
     Ok(output)
 }
@@ -279,41 +285,44 @@ pub fn joint_bilateral_filter(
 
     let mut output = vec![0.0_f32; width * height * 3];
 
-    for cy in 0..height {
-        for cx in 0..width {
-            let ci = (cy * width + cx) * 3;
-            let center_guide = guide[cy * width + cx];
+    // Row-independent given the read-only `image`/`guide` buffers.
+    output
+        .par_chunks_mut(width * 3)
+        .enumerate()
+        .for_each(|(cy, row)| {
+            for cx in 0..width {
+                let center_guide = guide[cy * width + cx];
 
-            let mut sum_r = 0.0_f32;
-            let mut sum_g = 0.0_f32;
-            let mut sum_b = 0.0_f32;
-            let mut sum_w = 0.0_f32;
+                let mut sum_r = 0.0_f32;
+                let mut sum_g = 0.0_f32;
+                let mut sum_b = 0.0_f32;
+                let mut sum_w = 0.0_f32;
 
-            for dy in -r..=r {
-                let ny = clamp_coord(cy as i32 + dy, height);
-                for dx in -r..=r {
-                    let nx = clamp_coord(cx as i32 + dx, width);
+                for dy in -r..=r {
+                    let ny = clamp_coord(cy as i32 + dy, height);
+                    for dx in -r..=r {
+                        let nx = clamp_coord(cx as i32 + dx, width);
 
-                    let dist_sq = (dx * dx + dy * dy) as f32;
-                    let spatial_w = (-dist_sq / two_ss_sq).exp();
+                        let dist_sq = (dx * dx + dy * dy) as f32;
+                        let spatial_w = (-dist_sq / two_ss_sq).exp();
 
-                    let guide_diff = center_guide - guide[ny * width + nx];
-                    let range_w = (-(guide_diff * guide_diff) / two_sr_sq).exp();
+                        let guide_diff = center_guide - guide[ny * width + nx];
+                        let range_w = (-(guide_diff * guide_diff) / two_sr_sq).exp();
 
-                    let w = spatial_w * range_w;
-                    let ni = (ny * width + nx) * 3;
-                    sum_r += w * image[ni];
-                    sum_g += w * image[ni + 1];
-                    sum_b += w * image[ni + 2];
-                    sum_w += w;
+                        let w = spatial_w * range_w;
+                        let ni = (ny * width + nx) * 3;
+                        sum_r += w * image[ni];
+                        sum_g += w * image[ni + 1];
+                        sum_b += w * image[ni + 2];
+                        sum_w += w;
+                    }
                 }
-            }
 
-            output[ci] = sum_r / sum_w;
-            output[ci + 1] = sum_g / sum_w;
-            output[ci + 2] = sum_b / sum_w;
-        }
-    }
+                row[cx * 3] = sum_r / sum_w;
+                row[cx * 3 + 1] = sum_g / sum_w;
+                row[cx * 3 + 2] = sum_b / sum_w;
+            }
+        });
 
     Ok(output)
 }
@@ -368,37 +377,46 @@ pub fn median_filter(
     let median_idx = kernel_area / 2;
 
     let mut output = vec![0.0_f32; width * height * 3];
-    let mut buf_r = Vec::with_capacity(kernel_area);
-    let mut buf_g = Vec::with_capacity(kernel_area);
-    let mut buf_b = Vec::with_capacity(kernel_area);
 
-    for cy in 0..height {
-        for cx in 0..width {
-            buf_r.clear();
-            buf_g.clear();
-            buf_b.clear();
+    // Row-independent given the read-only `image` buffer. Each parallel
+    // task gets its own scratch buffers (they cannot be shared across
+    // threads); still only one allocation per row rather than per pixel.
+    output
+        .par_chunks_mut(width * 3)
+        .enumerate()
+        .for_each(|(cy, row)| {
+            let mut buf_r = Vec::with_capacity(kernel_area);
+            let mut buf_g = Vec::with_capacity(kernel_area);
+            let mut buf_b = Vec::with_capacity(kernel_area);
 
-            for dy in -r..=r {
-                let ny = clamp_coord(cy as i32 + dy, height);
-                for dx in -r..=r {
-                    let nx = clamp_coord(cx as i32 + dx, width);
-                    let ni = (ny * width + nx) * 3;
-                    buf_r.push(image[ni]);
-                    buf_g.push(image[ni + 1]);
-                    buf_b.push(image[ni + 2]);
+            for cx in 0..width {
+                buf_r.clear();
+                buf_g.clear();
+                buf_b.clear();
+
+                for dy in -r..=r {
+                    let ny = clamp_coord(cy as i32 + dy, height);
+                    for dx in -r..=r {
+                        let nx = clamp_coord(cx as i32 + dx, width);
+                        let ni = (ny * width + nx) * 3;
+                        buf_r.push(image[ni]);
+                        buf_g.push(image[ni + 1]);
+                        buf_b.push(image[ni + 2]);
+                    }
                 }
+
+                buf_r
+                    .sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                buf_g
+                    .sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                buf_b
+                    .sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+                row[cx * 3] = buf_r[median_idx];
+                row[cx * 3 + 1] = buf_g[median_idx];
+                row[cx * 3 + 2] = buf_b[median_idx];
             }
-
-            buf_r.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            buf_g.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            buf_b.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-
-            let oi = (cy * width + cx) * 3;
-            output[oi] = buf_r[median_idx];
-            output[oi + 1] = buf_g[median_idx];
-            output[oi + 2] = buf_b[median_idx];
-        }
-    }
+        });
 
     Ok(output)
 }
@@ -481,56 +499,61 @@ pub fn non_local_means(
 
     let mut output = vec![0.0_f32; width * height * 3];
 
-    for cy in 0..height {
-        for cx in 0..width {
-            let mut sum_r = 0.0_f32;
-            let mut sum_g = 0.0_f32;
-            let mut sum_b = 0.0_f32;
-            let mut sum_w = 0.0_f32;
+    // This is the most expensive filter in the module
+    // (O(W×H×search_radius²×patch_radius²)); rows are independent given
+    // the read-only `image` buffer, so parallelize the outer loop.
+    output
+        .par_chunks_mut(width * 3)
+        .enumerate()
+        .for_each(|(cy, row)| {
+            for cx in 0..width {
+                let mut sum_r = 0.0_f32;
+                let mut sum_g = 0.0_f32;
+                let mut sum_b = 0.0_f32;
+                let mut sum_w = 0.0_f32;
 
-            // For each candidate pixel q in the search window
-            for sy in -sr..=sr {
-                let qy = clamp_coord(cy as i32 + sy, height);
-                for sx in -sr..=sr {
-                    let qx = clamp_coord(cx as i32 + sx, width);
+                // For each candidate pixel q in the search window
+                for sy in -sr..=sr {
+                    let qy = clamp_coord(cy as i32 + sy, height);
+                    for sx in -sr..=sr {
+                        let qx = clamp_coord(cx as i32 + sx, width);
 
-                    // Compute normalised patch similarity between p and q
-                    let mut patch_dist_sq = 0.0_f32;
-                    for py in -pr..=pr {
-                        let pay = clamp_coord(cy as i32 + py, height);
-                        let pby = clamp_coord(qy as i32 + py, height);
-                        for px in -pr..=pr {
-                            let pax = clamp_coord(cx as i32 + px, width);
-                            let pbx = clamp_coord(qx as i32 + px, width);
+                        // Compute normalised patch similarity between p and q
+                        let mut patch_dist_sq = 0.0_f32;
+                        for py in -pr..=pr {
+                            let pay = clamp_coord(cy as i32 + py, height);
+                            let pby = clamp_coord(qy as i32 + py, height);
+                            for px in -pr..=pr {
+                                let pax = clamp_coord(cx as i32 + px, width);
+                                let pbx = clamp_coord(qx as i32 + px, width);
 
-                            let ai = (pay * width + pax) * 3;
-                            let bi = (pby * width + pbx) * 3;
+                                let ai = (pay * width + pax) * 3;
+                                let bi = (pby * width + pbx) * 3;
 
-                            let dr = image[ai] - image[bi];
-                            let dg = image[ai + 1] - image[bi + 1];
-                            let db = image[ai + 2] - image[bi + 2];
-                            patch_dist_sq += dr * dr + dg * dg + db * db;
+                                let dr = image[ai] - image[bi];
+                                let dg = image[ai + 1] - image[bi + 1];
+                                let db = image[ai + 2] - image[bi + 2];
+                                patch_dist_sq += dr * dr + dg * dg + db * db;
+                            }
                         }
+
+                        // Normalise by patch element count so h is scale-independent
+                        let patch_dist_norm = patch_dist_sq / patch_norm;
+                        let w = (-patch_dist_norm / h_sq).exp();
+
+                        let qi = (qy * width + qx) * 3;
+                        sum_r += w * image[qi];
+                        sum_g += w * image[qi + 1];
+                        sum_b += w * image[qi + 2];
+                        sum_w += w;
                     }
-
-                    // Normalise by patch element count so h is scale-independent
-                    let patch_dist_norm = patch_dist_sq / patch_norm;
-                    let w = (-patch_dist_norm / h_sq).exp();
-
-                    let qi = (qy * width + qx) * 3;
-                    sum_r += w * image[qi];
-                    sum_g += w * image[qi + 1];
-                    sum_b += w * image[qi + 2];
-                    sum_w += w;
                 }
-            }
 
-            let oi = (cy * width + cx) * 3;
-            output[oi] = sum_r / sum_w;
-            output[oi + 1] = sum_g / sum_w;
-            output[oi + 2] = sum_b / sum_w;
-        }
-    }
+                row[cx * 3] = sum_r / sum_w;
+                row[cx * 3 + 1] = sum_g / sum_w;
+                row[cx * 3 + 2] = sum_b / sum_w;
+            }
+        });
 
     Ok(output)
 }
@@ -594,47 +617,53 @@ pub fn gaussian_denoise(
     let kernel = gaussian_1d_kernel(config.radius, config.sigma)?;
     let r = config.radius as i32;
 
-    // Horizontal pass: convolve along X, store in tmp
+    // Horizontal pass: convolve along X, store in tmp. Rows are independent
+    // given the read-only `image` buffer, so parallelize the outer loop.
     let mut tmp = vec![0.0_f32; width * height * 3];
-    for cy in 0..height {
-        for cx in 0..width {
-            let mut acc_r = 0.0_f32;
-            let mut acc_g = 0.0_f32;
-            let mut acc_b = 0.0_f32;
-            for (ki, &kv) in kernel.iter().enumerate() {
-                let nx = clamp_coord(cx as i32 + ki as i32 - r, width);
-                let ni = (cy * width + nx) * 3;
-                acc_r += kv * image[ni];
-                acc_g += kv * image[ni + 1];
-                acc_b += kv * image[ni + 2];
+    tmp.par_chunks_mut(width * 3)
+        .enumerate()
+        .for_each(|(cy, row)| {
+            for cx in 0..width {
+                let mut acc_r = 0.0_f32;
+                let mut acc_g = 0.0_f32;
+                let mut acc_b = 0.0_f32;
+                for (ki, &kv) in kernel.iter().enumerate() {
+                    let nx = clamp_coord(cx as i32 + ki as i32 - r, width);
+                    let ni = (cy * width + nx) * 3;
+                    acc_r += kv * image[ni];
+                    acc_g += kv * image[ni + 1];
+                    acc_b += kv * image[ni + 2];
+                }
+                row[cx * 3] = acc_r;
+                row[cx * 3 + 1] = acc_g;
+                row[cx * 3 + 2] = acc_b;
             }
-            let oi = (cy * width + cx) * 3;
-            tmp[oi] = acc_r;
-            tmp[oi + 1] = acc_g;
-            tmp[oi + 2] = acc_b;
-        }
-    }
+        });
 
-    // Vertical pass: convolve along Y, store in output
+    // Vertical pass: convolve along Y, store in output. Rows are
+    // independent given the (now fully populated, read-only) `tmp`
+    // buffer, so parallelize the outer loop here too.
     let mut output = vec![0.0_f32; width * height * 3];
-    for cy in 0..height {
-        for cx in 0..width {
-            let mut acc_r = 0.0_f32;
-            let mut acc_g = 0.0_f32;
-            let mut acc_b = 0.0_f32;
-            for (ki, &kv) in kernel.iter().enumerate() {
-                let ny = clamp_coord(cy as i32 + ki as i32 - r, height);
-                let ni = (ny * width + cx) * 3;
-                acc_r += kv * tmp[ni];
-                acc_g += kv * tmp[ni + 1];
-                acc_b += kv * tmp[ni + 2];
+    output
+        .par_chunks_mut(width * 3)
+        .enumerate()
+        .for_each(|(cy, row)| {
+            for cx in 0..width {
+                let mut acc_r = 0.0_f32;
+                let mut acc_g = 0.0_f32;
+                let mut acc_b = 0.0_f32;
+                for (ki, &kv) in kernel.iter().enumerate() {
+                    let ny = clamp_coord(cy as i32 + ki as i32 - r, height);
+                    let ni = (ny * width + cx) * 3;
+                    acc_r += kv * tmp[ni];
+                    acc_g += kv * tmp[ni + 1];
+                    acc_b += kv * tmp[ni + 2];
+                }
+                row[cx * 3] = acc_r;
+                row[cx * 3 + 1] = acc_g;
+                row[cx * 3 + 2] = acc_b;
             }
-            let oi = (cy * width + cx) * 3;
-            output[oi] = acc_r;
-            output[oi + 1] = acc_g;
-            output[oi + 2] = acc_b;
-        }
-    }
+        });
 
     Ok(output)
 }
@@ -662,9 +691,20 @@ pub struct NoiseStats {
 /// ```text
 /// sigma ≈ sqrt(π/2) × mean(|Laplacian|) / 6
 /// ```
-/// where the Laplacian kernel is `[[0,1,0],[1,-4,1],[0,1,0]]` applied to
-/// luminance.  The mean gradient is computed from finite-difference Gx/Gy
-/// magnitudes.
+/// where the Laplacian is the difference-of-Laplacians mask from the
+/// original paper,
+/// ```text
+/// [[ 1, -2,  1],
+///  [-2,  4, -2],
+///  [ 1, -2,  1]]
+/// ```
+/// (its squared-coefficient sum is 36, which is where the `/ 6` comes
+/// from), applied to luminance over the image interior only — no
+/// clamp-to-edge extrapolation — and averaged over
+/// `(width - 2) * (height - 2)` interior pixels, exactly as in the paper
+/// (not the full `width * height`). The mean gradient is a separate,
+/// unrelated statistic computed from finite-difference Gx/Gy magnitudes
+/// over the whole image (clamp-to-edge).
 pub fn estimate_noise(
     image: &[f32],
     width: usize,
@@ -683,35 +723,53 @@ pub fn estimate_noise(
     // Mean luminance
     let mean_lum: f32 = lum.iter().sum::<f32>() / n as f32;
 
-    // Laplacian kernel [[0,1,0],[1,-4,1],[0,1,0]]
-    let mut laplacian_vals = Vec::with_capacity(n);
+    // Immerkær (1996) difference-of-Laplacians mask (see doc comment above).
+    // Only defined on the strict interior (no pixel here reads outside the
+    // image), so images narrower/shorter than 3 px in either dimension have
+    // no interior and fall back to sigma = 0 below.
+    let interior_w = width.saturating_sub(2);
+    let interior_h = height.saturating_sub(2);
+    let interior_n = interior_w * interior_h;
+
+    let mut laplacian_vals = Vec::with_capacity(interior_n);
     let mut laplacian_sum_abs = 0.0_f32;
-    for cy in 0..height {
-        for cx in 0..width {
-            let center = lum[cy * width + cx];
-            let north = lum[clamp_coord(cy as i32 - 1, height) * width + cx];
-            let south = lum[clamp_coord(cy as i32 + 1, height) * width + cx];
-            let west = lum[cy * width + clamp_coord(cx as i32 - 1, width)];
-            let east = lum[cy * width + clamp_coord(cx as i32 + 1, width)];
-            let lap = north + south + west + east - 4.0 * center;
+    let px = |y: usize, x: usize| lum[y * width + x];
+    for cy in 1..height.saturating_sub(1) {
+        for cx in 1..width.saturating_sub(1) {
+            let lap = px(cy - 1, cx - 1) - 2.0 * px(cy - 1, cx) + px(cy - 1, cx + 1)
+                - 2.0 * px(cy, cx - 1)
+                + 4.0 * px(cy, cx)
+                - 2.0 * px(cy, cx + 1)
+                + px(cy + 1, cx - 1)
+                - 2.0 * px(cy + 1, cx)
+                + px(cy + 1, cx + 1);
             laplacian_sum_abs += lap.abs();
             laplacian_vals.push(lap);
         }
     }
 
-    let mean_abs_lap = laplacian_sum_abs / n as f32;
+    let mean_abs_lap = if interior_n > 0 {
+        laplacian_sum_abs / interior_n as f32
+    } else {
+        0.0
+    };
     // Immerkær 1996: sigma ≈ sqrt(π/2) × mean(|L|) / 6
     let estimated_sigma = (std::f32::consts::PI / 2.0_f32).sqrt() * mean_abs_lap / 6.0;
 
-    // Laplacian variance
-    let lap_mean: f32 = laplacian_vals.iter().sum::<f32>() / n as f32;
-    let laplacian_variance: f32 = laplacian_vals
-        .iter()
-        .map(|&v| (v - lap_mean) * (v - lap_mean))
-        .sum::<f32>()
-        / n as f32;
+    // Laplacian variance, over the same interior region the estimator uses.
+    let laplacian_variance: f32 = if interior_n > 0 {
+        let lap_mean: f32 = laplacian_vals.iter().sum::<f32>() / interior_n as f32;
+        laplacian_vals
+            .iter()
+            .map(|&v| (v - lap_mean) * (v - lap_mean))
+            .sum::<f32>()
+            / interior_n as f32
+    } else {
+        0.0
+    };
 
-    // Mean gradient magnitude (finite difference)
+    // Mean gradient magnitude (finite difference) — a separate statistic
+    // from the Immerkær estimator above, unaffected by this fix.
     let mut grad_sum = 0.0_f32;
     for cy in 0..height {
         for cx in 0..width {
@@ -1290,6 +1348,44 @@ mod tests {
             stats.snr_estimate > 1.0,
             "SNR should be positive, got {}",
             stats.snr_estimate
+        );
+    }
+
+    #[test]
+    fn estimate_noise_recovers_known_gaussian_sigma() {
+        // Regression guard for the Immerkær formula/normalisation: a flat
+        // mid-gray field with additive i.i.d. Gaussian noise of a *known*
+        // sigma should have its sigma recovered to within a small relative
+        // error. The previous (wrong 5-point-Laplacian, full-image-average)
+        // implementation under-estimated sigma by ~25-30% on this exact
+        // scenario, so this also catches a regression to that formula.
+        use rand::{RngExt, SeedableRng};
+
+        let w = 64;
+        let h = 64;
+        let true_sigma = 0.05_f32;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+
+        let mut img = vec![0.0f32; w * h * 3];
+        for px in img.chunks_exact_mut(3) {
+            // Box–Muller transform: two uniform samples → one standard
+            // normal sample, scaled by the target sigma.
+            let u1: f32 = rng.random::<f32>().max(1e-10);
+            let u2: f32 = rng.random::<f32>();
+            let noise =
+                true_sigma * (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos();
+            let v = (0.5 + noise).clamp(0.0, 1.0);
+            px[0] = v;
+            px[1] = v;
+            px[2] = v;
+        }
+
+        let stats = estimate_noise(&img, w, h).unwrap();
+        let rel_err = (stats.estimated_sigma - true_sigma).abs() / true_sigma;
+        assert!(
+            rel_err < 0.2,
+            "expected sigma close to {true_sigma}, got {} (rel err {rel_err})",
+            stats.estimated_sigma
         );
     }
 

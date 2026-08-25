@@ -14,6 +14,12 @@
 //! is evicted (FIFO) in O(1) time. Profiling can be disabled at runtime so that
 //! `push` calls become true no-ops with zero allocation.
 //!
+//! A collector built via [`ProfilingCollector::with_config`] owns its
+//! [`ProfilingConfig`] settings and enforces them itself — the phase
+//! allow-list is applied inside `push`, so an excluded phase never consumes a
+//! ring-buffer slot and callers do not have to re-implement
+//! [`ProfilingConfig::should_track`] at their own boundary.
+//!
 //! Statistics (mean, std, percentiles) are computed on demand when
 //! [`ProfilingCollector::build_report`] is called. The module never uses
 //! external statistical libraries, `unwrap`, or `rand`.
@@ -444,10 +450,25 @@ impl ProfilingReport {
 ///
 /// Internally uses a [`VecDeque`] as a ring buffer with O(1) FIFO eviction.
 /// When `enabled` is `false`, all operations are no-ops.
+///
+/// A collector built with [`ProfilingCollector::with_config`] carries its
+/// [`ProfilingConfig`]'s phase allow-list and applies it inside [`push`], so
+/// callers never have to re-implement [`ProfilingConfig::should_track`] at
+/// their own boundary. Collectors built with [`ProfilingCollector::new`],
+/// [`ProfilingCollector::disabled`], or `Default` carry an empty allow-list,
+/// which tracks every phase.
+///
+/// [`push`]: ProfilingCollector::push
 pub struct ProfilingCollector {
     records: VecDeque<PhaseRecord>,
     max_records: usize,
     enabled: bool,
+    /// Phase allow-list copied from the originating [`ProfilingConfig`].
+    /// Empty means "track every phase".
+    phases_to_track: Vec<String>,
+    /// Number of records rejected by `phases_to_track` since construction (or
+    /// since the last [`ProfilingCollector::clear`]).
+    skipped: usize,
 }
 
 impl Default for ProfilingCollector {
@@ -456,18 +477,60 @@ impl Default for ProfilingCollector {
             records: VecDeque::new(),
             max_records: 100_000,
             enabled: true,
+            phases_to_track: Vec::new(),
+            skipped: 0,
         }
     }
 }
 
 impl ProfilingCollector {
     /// Create a new collector capped at `max_records` entries.
+    ///
+    /// The collector tracks every phase name. Use
+    /// [`ProfilingCollector::with_config`] to apply a phase allow-list.
     pub fn new(max_records: usize) -> Self {
         Self {
             records: VecDeque::with_capacity(max_records.min(4096)),
             max_records,
             enabled: true,
+            phases_to_track: Vec::new(),
+            skipped: 0,
         }
+    }
+
+    /// Create a collector that honours every field of `config`.
+    ///
+    /// - `config.enabled == false` yields a disabled collector whose `push`
+    ///   calls are no-ops.
+    /// - `config.max_records` becomes the ring-buffer capacity.
+    /// - `config.phases_to_track` becomes the allow-list consulted by
+    ///   [`ProfilingCollector::push`] via [`ProfilingConfig::should_track`],
+    ///   so records for other phases are dropped at the source instead of
+    ///   occupying ring-buffer slots that a tracked phase could have used.
+    ///
+    /// `config.report_interval_steps` describes *when a caller should emit a
+    /// report*, not what the collector stores, so it is deliberately not
+    /// consulted here; drive [`ProfilingCollector::build_report_for_range`]
+    /// with it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProfilingError::InvalidConfig`] when `config` fails
+    /// [`ProfilingConfig::validate`] — that is, when `max_records` is zero.
+    /// A disabled config is still validated, so a caller cannot smuggle an
+    /// invalid capacity past this constructor by turning profiling off.
+    pub fn with_config(config: &ProfilingConfig) -> Result<Self, ProfilingError> {
+        config.validate()?;
+        if !config.enabled {
+            return Ok(Self::disabled());
+        }
+        Ok(Self {
+            records: VecDeque::with_capacity(config.max_records.min(4096)),
+            max_records: config.max_records,
+            enabled: true,
+            phases_to_track: config.phases_to_track.clone(),
+            skipped: 0,
+        })
     }
 
     /// Create a disabled collector. All `push` calls are no-ops.
@@ -476,10 +539,38 @@ impl ProfilingCollector {
             records: VecDeque::new(),
             max_records: 0,
             enabled: false,
+            phases_to_track: Vec::new(),
+            skipped: 0,
         }
     }
 
+    /// Whether this collector stores records for `phase_name`.
+    ///
+    /// Mirrors [`ProfilingConfig::should_track`] against the allow-list this
+    /// collector was constructed with; always `true` for a collector built
+    /// without a config.
+    pub fn tracks_phase(&self, phase_name: &str) -> bool {
+        self.phases_to_track.is_empty() || self.phases_to_track.iter().any(|p| p == phase_name)
+    }
+
+    /// The phase allow-list this collector applies. Empty means "track all".
+    pub fn phases_to_track(&self) -> &[String] {
+        &self.phases_to_track
+    }
+
+    /// Number of records rejected by the phase allow-list since construction
+    /// (or since the last [`ProfilingCollector::clear`]).
+    ///
+    /// Records dropped because the collector is disabled are not counted:
+    /// disabling profiling is not a filtering decision about a phase.
+    pub fn skipped(&self) -> usize {
+        self.skipped
+    }
+
     /// Add a record. No-op if the collector is disabled.
+    ///
+    /// Records whose phase name is excluded by the collector's allow-list are
+    /// dropped and counted in [`ProfilingCollector::skipped`].
     ///
     /// When at capacity, the oldest record is evicted (FIFO) before insertion.
     pub fn push(&mut self, record: PhaseRecord) {
@@ -487,6 +578,10 @@ impl ProfilingCollector {
             return;
         }
         if self.max_records == 0 {
+            return;
+        }
+        if !self.tracks_phase(&record.name) {
+            self.skipped = self.skipped.saturating_add(1);
             return;
         }
         if self.records.len() >= self.max_records {
@@ -510,9 +605,11 @@ impl ProfilingCollector {
         self.records.is_empty()
     }
 
-    /// Remove all records.
+    /// Remove all records and reset the [`ProfilingCollector::skipped`]
+    /// counter. The phase allow-list is retained.
     pub fn clear(&mut self) {
         self.records.clear();
+        self.skipped = 0;
     }
 
     /// All records for a specific phase name, in insertion order.
@@ -818,6 +915,11 @@ impl ProfilingConfig {
     ///
     /// Returns `true` if `phases_to_track` is empty (track all) or the name
     /// is explicitly listed.
+    ///
+    /// A [`ProfilingCollector`] built with
+    /// [`ProfilingCollector::with_config`] applies this predicate itself on
+    /// every [`ProfilingCollector::push`], so callers normally do not need to
+    /// call it directly.
     pub fn should_track(&self, phase_name: &str) -> bool {
         if self.phases_to_track.is_empty() {
             return true;
@@ -1051,10 +1153,11 @@ mod tests {
     #[test]
     fn test_build_phase_stats_no_records_returns_empty_data() {
         let c = ProfilingCollector::default();
-        match c.build_phase_stats("missing") {
-            Err(ProfilingError::EmptyData) => {}
-            other => panic!("expected EmptyData, got {:?}", other),
-        }
+        let result = c.build_phase_stats("missing");
+        assert!(
+            matches!(result, Err(ProfilingError::EmptyData)),
+            "expected EmptyData, got {result:?}"
+        );
     }
 
     #[test]
@@ -1095,10 +1198,11 @@ mod tests {
     #[test]
     fn test_build_report_empty_returns_empty_data() {
         let c = ProfilingCollector::default();
-        match c.build_report() {
-            Err(ProfilingError::EmptyData) => {}
-            other => panic!("expected EmptyData, got {:?}", other),
-        }
+        let result = c.build_report();
+        assert!(
+            matches!(result, Err(ProfilingError::EmptyData)),
+            "expected EmptyData, got {result:?}"
+        );
     }
 
     #[test]
@@ -1261,6 +1365,135 @@ mod tests {
         assert!(!cfg.should_track("optimizer"));
     }
 
+    // --- ProfilingCollector honours its own ProfilingConfig ---
+    // Regression: `push` used to ignore `ProfilingConfig::should_track`
+    // entirely, forcing every caller to re-apply the filter itself.
+
+    #[test]
+    fn test_with_config_push_applies_phase_allow_list() {
+        let cfg = ProfilingConfig {
+            phases_to_track: vec!["render".to_string(), "diffusion".to_string()],
+            ..Default::default()
+        };
+        let mut c = ProfilingCollector::with_config(&cfg).expect("valid config");
+        c.push(PhaseRecord::new("render", 0, 10.0));
+        c.push(PhaseRecord::new("optimizer", 0, 5.0));
+        c.push(PhaseRecord::new("diffusion", 0, 7.0));
+        c.push(PhaseRecord::new("backward", 0, 3.0));
+
+        assert_eq!(c.len(), 2, "only allow-listed phases may be stored");
+        assert_eq!(c.skipped(), 2, "excluded records must be counted");
+        assert_eq!(c.phase_names(), vec!["diffusion", "render"]);
+        assert!(c.records_for_phase("optimizer").is_empty());
+    }
+
+    #[test]
+    fn test_with_config_empty_allow_list_tracks_every_phase() {
+        let cfg = ProfilingConfig::default();
+        let mut c = ProfilingCollector::with_config(&cfg).expect("valid config");
+        c.push(PhaseRecord::new("render", 0, 10.0));
+        c.push(PhaseRecord::new("optimizer", 0, 5.0));
+        assert_eq!(c.len(), 2);
+        assert_eq!(c.skipped(), 0);
+        assert!(c.tracks_phase("anything"));
+        assert!(c.phases_to_track().is_empty());
+    }
+
+    #[test]
+    fn test_with_config_disabled_yields_noop_collector() {
+        let cfg = ProfilingConfig {
+            enabled: false,
+            phases_to_track: vec!["render".to_string()],
+            ..Default::default()
+        };
+        let mut c = ProfilingCollector::with_config(&cfg).expect("valid config");
+        assert!(!c.is_enabled());
+        c.push(PhaseRecord::new("render", 0, 10.0));
+        assert_eq!(c.len(), 0);
+        // Disabling profiling is not a per-phase filtering decision, so it
+        // must not inflate the skipped counter.
+        assert_eq!(c.skipped(), 0);
+    }
+
+    #[test]
+    fn test_with_config_rejects_invalid_config() {
+        let cfg = ProfilingConfig {
+            max_records: 0,
+            ..Default::default()
+        };
+        let result = ProfilingCollector::with_config(&cfg);
+        assert!(
+            matches!(&result, Err(ProfilingError::InvalidConfig(_))),
+            "expected InvalidConfig, got {:?}",
+            result.map(|c| c.len())
+        );
+    }
+
+    #[test]
+    fn test_with_config_rejects_invalid_config_even_when_disabled() {
+        let cfg = ProfilingConfig {
+            enabled: false,
+            max_records: 0,
+            ..Default::default()
+        };
+        assert!(
+            ProfilingCollector::with_config(&cfg).is_err(),
+            "an invalid capacity must not slip through a disabled config"
+        );
+    }
+
+    #[test]
+    fn test_with_config_honours_max_records_capacity() {
+        let cfg = ProfilingConfig {
+            max_records: 3,
+            ..Default::default()
+        };
+        let mut c = ProfilingCollector::with_config(&cfg).expect("valid config");
+        for i in 0..5_usize {
+            c.push(PhaseRecord::new("p", i, i as f64));
+        }
+        assert_eq!(c.len(), 3);
+        let steps: Vec<usize> = c.records.iter().map(|r| r.step).collect();
+        assert_eq!(steps, vec![2, 3, 4]);
+    }
+
+    #[test]
+    fn test_filtered_records_do_not_consume_ring_buffer_slots() {
+        // The point of filtering at the source: an excluded phase must not
+        // evict a tracked one. With a 3-slot buffer and 3 tracked records
+        // interleaved with 3 excluded ones, all three tracked records survive.
+        let cfg = ProfilingConfig {
+            max_records: 3,
+            phases_to_track: vec!["render".to_string()],
+            ..Default::default()
+        };
+        let mut c = ProfilingCollector::with_config(&cfg).expect("valid config");
+        for i in 0..3_usize {
+            c.push(PhaseRecord::new("render", i, i as f64));
+            c.push(PhaseRecord::new("optimizer", i, 99.0));
+        }
+        assert_eq!(c.len(), 3);
+        assert_eq!(c.skipped(), 3);
+        let steps: Vec<usize> = c.records.iter().map(|r| r.step).collect();
+        assert_eq!(
+            steps,
+            vec![0, 1, 2],
+            "excluded records must never displace tracked ones"
+        );
+    }
+
+    #[test]
+    fn test_collector_new_tracks_all_phases_unchanged() {
+        // `new` must keep its historical "no filter" behaviour so existing
+        // callers are unaffected by the allow-list.
+        let mut c = ProfilingCollector::new(10);
+        c.push(PhaseRecord::new("render", 0, 1.0));
+        c.push(PhaseRecord::new("anything-at-all", 0, 1.0));
+        assert_eq!(c.len(), 2);
+        assert_eq!(c.skipped(), 0);
+        assert!(c.tracks_phase("unlisted"));
+    }
+
     // --- Clear ---
 
     #[test]
@@ -1273,5 +1506,24 @@ mod tests {
         c.clear();
         assert_eq!(c.len(), 0);
         assert!(c.is_empty());
+    }
+
+    #[test]
+    fn test_collector_clear_resets_skipped_but_keeps_filter() {
+        let cfg = ProfilingConfig {
+            phases_to_track: vec!["render".to_string()],
+            ..Default::default()
+        };
+        let mut c = ProfilingCollector::with_config(&cfg).expect("valid config");
+        c.push(PhaseRecord::new("render", 0, 1.0));
+        c.push(PhaseRecord::new("optimizer", 0, 1.0));
+        assert_eq!(c.skipped(), 1);
+        c.clear();
+        assert_eq!(c.len(), 0);
+        assert_eq!(c.skipped(), 0);
+        assert!(
+            !c.tracks_phase("optimizer"),
+            "clear() must not drop the allow-list"
+        );
     }
 }

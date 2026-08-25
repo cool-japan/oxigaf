@@ -718,7 +718,7 @@ impl SceneReport {
 
     /// Hand-rolled JSON representation of the report (no serde dependency).
     ///
-    /// Every `f32` field is routed through [`json_num`], which maps NaN/Inf
+    /// Every `f32` field is routed through `json_num`, which maps NaN/Inf
     /// to `null` — `SceneData::validate` already rejects non-finite inputs,
     /// but this keeps `to_json`'s output valid JSON even if some derived
     /// statistic (e.g. a 0/0 ratio) turns non-finite despite finite inputs.
@@ -1453,17 +1453,45 @@ mod tests {
         report.color.mean_r = f32::NEG_INFINITY;
 
         let json = report.to_json();
-        assert!(
-            !json.to_ascii_lowercase().contains("nan"),
-            "JSON must not contain a bare NaN token: {json}"
-        );
-        assert!(
-            !json.to_ascii_lowercase().contains("inf"),
-            "JSON must not contain a bare inf token: {json}"
-        );
-        assert!(json.contains("\"quality_score\": null"));
-        assert!(json.contains("\"scene_diameter\": null"));
-        assert!(json.contains("\"mean_r\": null"));
+
+        // Parse rather than substring-scan the raw text. A bare `NaN`/`inf`
+        // token is exactly what no JSON parser accepts, so a successful
+        // parse *is* the property under test — and a text scan cannot state
+        // it: an earlier version of this test asserted the document contains
+        // no "nan" anywhere and therefore always failed on the perfectly
+        // valid key `mean_lumi(nan)ce`.
+        let parsed: serde_json::Value = serde_json::from_str(&json)
+            .map_err(|e| format!("{e} — document was: {json}"))
+            .expect("to_json must emit parseable JSON");
+        let object = parsed
+            .as_object()
+            .expect("to_json must emit a JSON object at the top level");
+
+        const NON_FINITE: [&str; 3] = ["quality_score", "scene_diameter", "mean_r"];
+        for key in NON_FINITE {
+            assert_eq!(
+                object.get(key),
+                Some(&serde_json::Value::Null),
+                "non-finite {key} must be emitted as null: {json}"
+            );
+        }
+        // Every other leaf must still be a finite number, so `null` marks
+        // genuinely non-finite statistics and nothing else.
+        for (key, value) in object {
+            let acceptable = match value {
+                serde_json::Value::Null => NON_FINITE.contains(&key.as_str()),
+                serde_json::Value::Number(n) => n.as_f64().is_some_and(f64::is_finite),
+                serde_json::Value::Array(items) => items
+                    .iter()
+                    .all(|item| item.as_f64().is_some_and(f64::is_finite)),
+                _ => false,
+            };
+            assert!(
+                acceptable,
+                "every field must be a finite number (or null only where the statistic \
+                 really is non-finite); {key} is {value}: {json}"
+            );
+        }
     }
 
     #[test]

@@ -19,25 +19,12 @@
 
 use thiserror::Error;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Private PRNG helpers (not re-exported — module-local only)
-// ─────────────────────────────────────────────────────────────────────────────
-
-#[allow(dead_code)]
-fn xorshift64(state: &mut u64) -> u64 {
-    *state ^= *state << 13;
-    *state ^= *state >> 7;
-    *state ^= *state << 17;
-    if *state == 0 {
-        *state = 1;
-    }
-    *state
-}
-
-#[allow(dead_code)]
-fn xorshift_f32(state: &mut u64) -> f32 {
-    xorshift64(state) as f32 / u64::MAX as f32
-}
+// This module used to carry two private `xorshift64` / `xorshift_f32`
+// helpers, suppressed with `#[allow(dead_code)]` because nothing called them:
+// every operation here — lerp, slerp, masks, harmonisation, frequency and
+// trajectory blending — is deterministic, and none of the public API takes a
+// seed. A seeded generator lives in `pipeline::support::seeded_normal_tensor`
+// for the code that actually needs one.
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Error type

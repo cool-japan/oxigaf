@@ -65,8 +65,17 @@ fn rand_in_range(state: &mut u64, min: f32, max: f32) -> f32 {
 /// Compute the n-th element of the Van der Corput sequence in the given base.
 ///
 /// Returns a value in `[0.0, 1.0)`.
+///
+/// # Precondition
+///
+/// `base` must be `>= 2`; `base == 0` would panic (remainder by zero) and
+/// `base == 1` would loop forever (`n % 1 == 0` and `n /= 1` never changes
+/// `n`), so both are guarded here and return `0.0` instead.
 #[must_use]
 pub fn van_der_corput(n: usize, base: usize) -> f32 {
+    if base < 2 {
+        return 0.0;
+    }
     let mut q = 0f64;
     let mut bk = 1.0 / base as f64;
     let mut n = n;
@@ -292,6 +301,36 @@ impl FlameParamsSpace {
     #[must_use]
     pub fn total_dims(&self) -> usize {
         self.shape_dims + self.expression_dims + self.pose_dims + self.translation_dims
+    }
+
+    /// Number of pose dimensions actually sampled from `pose_dims`.
+    ///
+    /// Pose is filled in 3-dimension blocks (global rotation, neck, jaw,
+    /// left eye, right eye — see `sample_pose_random`/`sample_pose_grid`),
+    /// so only 0, 3, 6, 9, 12, or 15 of a configured `pose_dims` are ever
+    /// actually read: e.g. `pose_dims: 14` behaves exactly like
+    /// `pose_dims: 12`. Grid sizing must use this (not raw `pose_dims`), or
+    /// the unread dimensions get allocated grid resolution that produces
+    /// duplicate samples.
+    fn quantized_pose_dims(&self) -> usize {
+        let pd = self.pose_dims;
+        let mut consumed = 0;
+        if pd >= 3 {
+            consumed += 3;
+        }
+        if pd >= 6 {
+            consumed += 3;
+        }
+        if pd >= 9 {
+            consumed += 3;
+        }
+        if pd >= 12 {
+            consumed += 3;
+        }
+        if pd == 15 {
+            consumed += 3;
+        }
+        consumed
     }
 
     /// Validate the parameter space configuration.
@@ -598,7 +637,14 @@ impl FlameParamsSampler {
     // ------------------------------------------------------------------
 
     fn sample_batch_grid(&self, n: usize) -> Vec<FlameParams> {
-        let total = self.space.total_dims();
+        let sp = &self.space;
+        // Use the QUANTIZED pose dimension count, not raw `pose_dims`: pose
+        // is only ever filled in 0/3/6/9/12/15-dim blocks (see
+        // `quantized_pose_dims`), so sizing the grid on the raw count would
+        // allocate grid resolution to dimensions nothing ever reads,
+        // producing duplicate samples.
+        let total =
+            sp.shape_dims + sp.expression_dims + sp.quantized_pose_dims() + sp.translation_dims;
         if total == 0 {
             return vec![FlameParams::default(); n];
         }
@@ -613,7 +659,6 @@ impl FlameParamsSampler {
 
         // Generate grid coordinates in [0,1] for each dimension, then map to range.
         // We enumerate in a flat, lexicographic order.
-        let sp = &self.space;
         let mut out: Vec<FlameParams> = Vec::with_capacity(n);
         let mut grid_index: usize = 0;
         let total_grid = pts_per_dim.saturating_pow(total as u32);
@@ -663,8 +708,11 @@ impl FlameParamsSampler {
                 .collect();
 
             // Pose (full 15-element vector; grid samples mapped to the relevant dims).
-            let pose = self.sample_pose_grid(&dim_indices, d, pts_per_dim, &mut rng_state);
-            d += sp.pose_dims;
+            // Advance `d` by what was ACTUALLY consumed (0/3/6/9/12/15), not
+            // by raw `pose_dims` -- see `quantized_pose_dims`.
+            let (pose, consumed) =
+                self.sample_pose_grid(&dim_indices, d, pts_per_dim, &mut rng_state);
+            d += consumed;
 
             // Translation.
             let tx = if d < total {
@@ -713,13 +761,17 @@ impl FlameParamsSampler {
     }
 
     /// Build a 15-element pose vector using grid coordinates for the sampled dims.
+    /// Returns `(pose, consumed)`, where `consumed` is the number of grid
+    /// dimensions actually read starting at `base_dim` (0, 3, 6, 9, 12, or
+    /// 15 — see `quantized_pose_dims`). Callers must advance their
+    /// dimension cursor by `consumed`, NOT by raw `pose_dims`.
     fn sample_pose_grid(
         &self,
         dim_indices: &[usize],
         base_dim: usize,
         pts_per_dim: usize,
         rng_state: &mut u64,
-    ) -> Vec<f32> {
+    ) -> (Vec<f32>, usize) {
         let sp = &self.space;
         let mut pose = vec![0.0f32; FlameParams::NUM_JOINTS * 3];
 
@@ -769,9 +821,9 @@ impl FlameParamsSampler {
                 d += 1;
             }
         }
-        let _ = d;
+        let consumed = d - base_dim;
 
-        pose
+        (pose, consumed)
     }
 
     // ------------------------------------------------------------------
@@ -1290,6 +1342,51 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_quantized_pose_dims_only_takes_3_6_9_12_15() {
+        // pose is filled in 3-dim blocks, so anything between block
+        // boundaries must quantize DOWN to the previous block.
+        for (pose_dims, expected) in [
+            (0, 0),
+            (2, 0),
+            (3, 3),
+            (5, 3),
+            (6, 6),
+            (8, 6),
+            (9, 9),
+            (11, 9),
+            (12, 12),
+            (14, 12), // the finding's example: 14 behaves like 12
+            (15, 15),
+        ] {
+            let mut sp = FlameParamsSpace::default_space();
+            sp.pose_dims = pose_dims;
+            assert_eq!(
+                sp.quantized_pose_dims(),
+                expected,
+                "pose_dims={pose_dims} should quantize to {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_sample_pose_grid_consumed_matches_quantized() {
+        // Regression: the caller in `sample_batch_grid` must advance its
+        // dimension cursor by what `sample_pose_grid` ACTUALLY consumed,
+        // not by raw `pose_dims` -- otherwise unread grid dimensions get
+        // allocated resolution that produces duplicate samples.
+        let mut sp = FlameParamsSpace::default_space();
+        sp.pose_dims = 14;
+        let sampler = FlameParamsSampler::new(sp, SamplingStrategy::Grid, 0);
+        let dim_indices = vec![0usize; 20];
+        let mut state = 1u64;
+        let (_pose, consumed) = sampler.sample_pose_grid(&dim_indices, 0, 2, &mut state);
+        assert_eq!(
+            consumed, 12,
+            "pose_dims=14 must consume exactly 12 grid dimensions"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Neutral variants
     // -----------------------------------------------------------------------
@@ -1414,6 +1511,20 @@ mod tests {
         assert!((van_der_corput(2, 2) - 0.25).abs() < eps, "vdc(2,2)");
         assert!((van_der_corput(3, 2) - 0.75).abs() < eps, "vdc(3,2)");
         assert!((van_der_corput(4, 2) - 0.125).abs() < eps, "vdc(4,2)");
+    }
+
+    #[test]
+    fn test_van_der_corput_base_0_returns_promptly() {
+        // base=0 must not panic (remainder by zero) -- guarded, returns 0.0.
+        assert_eq!(van_der_corput(5, 0), 0.0);
+    }
+
+    #[test]
+    fn test_van_der_corput_base_1_returns_promptly() {
+        // base=1 must not loop forever (n%1==0, n/=1 never changes n) --
+        // guarded, returns 0.0. This test itself is the regression check:
+        // it hangs under the pre-fix implementation instead of completing.
+        assert_eq!(van_der_corput(5, 1), 0.0);
     }
 
     // -----------------------------------------------------------------------

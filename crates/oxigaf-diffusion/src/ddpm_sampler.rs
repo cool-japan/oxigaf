@@ -1022,7 +1022,7 @@ mod tests {
         let betas = sigmoid_beta_schedule(100, -3.0, 3.0, 1.0, 0.0001, 0.02);
         for &b in &betas {
             assert!(
-                b >= 0.0001 - 1e-6 && b <= 0.02 + 1e-6,
+                (0.0001 - 1e-6..=0.02 + 1e-6).contains(&b),
                 "beta={b} out of expected [beta_start, beta_end] range"
             );
         }

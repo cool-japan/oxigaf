@@ -17,7 +17,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 use crate::cli::CompareArgs;
-use crate::info::{parse_ply_header_info, sh_degree_from_rest};
+use crate::info::{parse_ply_header_info, sh_degree_from_rest, MAX_INITIAL_VERTEX_CAPACITY};
 
 // ---------------------------------------------------------------------------
 // ModelStats
@@ -305,6 +305,26 @@ fn resolve_vertex_field_indices(properties: &[String]) -> Result<VertexFieldIndi
     })
 }
 
+/// Initial reservation for one per-vertex `Vec`, derived from — but never
+/// dictated by — an untrusted PLY header's `element vertex` count.
+///
+/// Nothing ties that number to the file's actual size, so a malformed or
+/// hostile header (`element vertex 999999999999`) used to become five
+/// enormous `Vec::with_capacity` requests before a single byte of body was
+/// read. Rust aborts the process on allocation failure — it is not a
+/// catchable `Result` — so that could crash a command whose whole job is to
+/// safely inspect untrusted files, and `vertex_count * 3` for the
+/// interleaved scale buffer could additionally overflow `usize` (a panic in
+/// debug, a nonsense capacity in release) before any cap applied. Capping
+/// first and multiplying afterwards fixes both: a genuinely larger file
+/// still reads correctly, since `Vec::push` grows the buffer as needed.
+///
+/// The cap itself is shared with [`crate::info`], which reserves from the
+/// same header field for the same reason.
+fn initial_vertex_capacity(vertex_count: usize) -> usize {
+    vertex_count.min(MAX_INITIAL_VERTEX_CAPACITY)
+}
+
 /// Read all vertex data from the body of a `binary_little_endian` PLY file.
 ///
 /// Every vertex property is assumed to be a 4-byte `float` (the universal
@@ -320,11 +340,14 @@ fn read_ply_vertex_data_binary(
     let idx = resolve_vertex_field_indices(properties)?;
     let stride = properties.len();
 
-    let mut xs = Vec::with_capacity(vertex_count);
-    let mut ys = Vec::with_capacity(vertex_count);
-    let mut zs = Vec::with_capacity(vertex_count);
-    let mut opacities = Vec::with_capacity(vertex_count);
-    let mut scales = Vec::with_capacity(vertex_count * 3);
+    // Capped, not driven directly by the untrusted header count — see
+    // `initial_vertex_capacity`.
+    let capacity = initial_vertex_capacity(vertex_count);
+    let mut xs = Vec::with_capacity(capacity);
+    let mut ys = Vec::with_capacity(capacity);
+    let mut zs = Vec::with_capacity(capacity);
+    let mut opacities = Vec::with_capacity(capacity);
+    let mut scales = Vec::with_capacity(capacity * 3);
 
     let mut record = vec![0f32; stride];
     let mut buf4 = [0u8; 4];
@@ -367,11 +390,14 @@ fn read_ply_vertex_data_ascii(
     let idx = resolve_vertex_field_indices(properties)?;
     let expected_fields = properties.len();
 
-    let mut xs = Vec::with_capacity(vertex_count);
-    let mut ys = Vec::with_capacity(vertex_count);
-    let mut zs = Vec::with_capacity(vertex_count);
-    let mut opacities = Vec::with_capacity(vertex_count);
-    let mut scales = Vec::with_capacity(vertex_count * 3);
+    // Capped, not driven directly by the untrusted header count — see
+    // `initial_vertex_capacity`.
+    let capacity = initial_vertex_capacity(vertex_count);
+    let mut xs = Vec::with_capacity(capacity);
+    let mut ys = Vec::with_capacity(capacity);
+    let mut zs = Vec::with_capacity(capacity);
+    let mut opacities = Vec::with_capacity(capacity);
+    let mut scales = Vec::with_capacity(capacity * 3);
 
     let mut line = String::new();
     for row in 0..vertex_count {
@@ -1557,11 +1583,21 @@ mod tests {
         Ok(())
     }
 
+    /// Regression: this used to write `test_compare_range_{a,b}.ply` at
+    /// fixed names directly under `env::temp_dir()`, which every concurrent
+    /// invocation of this test (a parallel `cargo test`/`nextest` run, or
+    /// simply this test racing another one that happens to touch the same
+    /// name) shares — one run's `write_test_ply` could truncate a file
+    /// another run had just opened for reading. A per-test `tempfile`
+    /// directory gives each invocation its own directory, so no name
+    /// collides across processes; its `Drop` impl also removes it, which is
+    /// why the explicit `fs::remove_file` cleanup this file's other tests
+    /// still do is unnecessary here.
     #[test]
     fn test_comparison_report_similarity_in_range() -> Result<()> {
-        let tmp_dir = env::temp_dir();
-        let path_a = tmp_dir.join("test_compare_range_a.ply");
-        let path_b = tmp_dir.join("test_compare_range_b.ply");
+        let tmp_dir = tempfile::tempdir().context("create temp dir")?;
+        let path_a = tmp_dir.path().join("test_compare_range_a.ply");
+        let path_b = tmp_dir.path().join("test_compare_range_b.ply");
 
         write_test_ply(&path_a, 100, 45, 0.0, Some(0.3), Some(0.005))?;
         write_test_ply(&path_b, 200, 9, 5.0, Some(0.8), Some(0.05))?;
@@ -1577,8 +1613,6 @@ mod tests {
             report.overall_similarity
         );
 
-        fs::remove_file(&path_a).ok();
-        fs::remove_file(&path_b).ok();
         Ok(())
     }
 
@@ -1779,11 +1813,96 @@ mod tests {
                 format: fmt.to_string(),
                 threshold: 0.8,
             };
-            run_compare(args).unwrap_or_else(|e| panic!("format '{fmt}' should be accepted: {e}"));
+            run_compare(args).with_context(|| format!("format '{fmt}' should be accepted"))?;
         }
 
         fs::remove_file(&path_a).ok();
         fs::remove_file(&path_b).ok();
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Untrusted `element vertex` counts must not drive the reservation.
+    // -----------------------------------------------------------------------
+
+    /// The seven properties both PLY readers require, in canonical order.
+    fn required_properties() -> Vec<String> {
+        ["x", "y", "z", "opacity", "scale_0", "scale_1", "scale_2"]
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect()
+    }
+
+    #[test]
+    fn initial_vertex_capacity_is_capped_but_exact_below_the_cap() {
+        // Ordinary files keep their exact one-shot reservation …
+        assert_eq!(initial_vertex_capacity(0), 0);
+        assert_eq!(initial_vertex_capacity(52_341), 52_341);
+        // … and anything above the cap is clamped, so `capacity * 3` for the
+        // interleaved scale buffer cannot overflow `usize` either.
+        assert_eq!(
+            initial_vertex_capacity(MAX_INITIAL_VERTEX_CAPACITY + 1),
+            MAX_INITIAL_VERTEX_CAPACITY
+        );
+        assert_eq!(
+            initial_vertex_capacity(usize::MAX),
+            MAX_INITIAL_VERTEX_CAPACITY
+        );
+        assert!(
+            MAX_INITIAL_VERTEX_CAPACITY.checked_mul(3).is_some(),
+            "the cap itself must leave room for the *3 scale reservation"
+        );
+    }
+
+    #[test]
+    fn read_ply_vertex_data_binary_huge_untrusted_count_does_not_abort() {
+        // Regression: `element vertex 999999999999` used to reach
+        // `Vec::with_capacity(vertex_count)` (and `* 3`) directly, asking
+        // for terabytes before a single body byte was read. Rust aborts the
+        // process on allocation failure rather than returning a catchable
+        // `Result`, so a malformed file could crash the command. With the
+        // reservation capped this must instead fail fast and cleanly on EOF,
+        // since the "body" here is empty.
+        let properties = required_properties();
+        let result =
+            read_ply_vertex_data_binary(&mut std::io::empty(), 999_999_999_999, &properties);
+        assert!(result.is_err(), "expected a clean EOF error, not a crash");
+    }
+
+    #[test]
+    fn read_ply_vertex_data_ascii_huge_untrusted_count_does_not_abort() {
+        // Same regression on the ASCII path, which reserved from the very
+        // same untrusted header field.
+        let properties = required_properties();
+        let mut empty_body = BufReader::new(std::io::empty());
+        let result = read_ply_vertex_data_ascii(&mut empty_body, 999_999_999_999, &properties);
+        let msg = result.err().map(|e| format!("{e:#}")).unwrap_or_default();
+        assert!(
+            msg.contains("EOF"),
+            "expected a clean EOF error, not a crash: {msg}"
+        );
+    }
+
+    #[test]
+    fn read_ply_vertex_data_still_reads_real_files_after_the_cap() -> Result<()> {
+        // The cap is an allocation hint only: a real file is still read in
+        // full, value for value.
+        let path = env::temp_dir().join("test_compare_capped_reservation.ply");
+        write_test_ply(&path, 4, 0, 0.0, Some(0.5), Some(0.25))?;
+        let stats = ModelStats::from_file(&path)?;
+        fs::remove_file(&path).ok();
+        assert_eq!(stats.gaussian_count, 4);
+        assert!(stats.stats_available);
+        assert!(
+            (stats.opacity_mean - 0.5).abs() < 1e-4,
+            "opacity_mean: {}",
+            stats.opacity_mean
+        );
+        assert!(
+            (stats.scale_mean - 0.25).abs() < 1e-4,
+            "scale_mean: {}",
+            stats.scale_mean
+        );
         Ok(())
     }
 }

@@ -40,7 +40,12 @@ fn build_small_model(n: usize) -> GaussianModel {
     let mut seed = 7919u64;
     let mut rng = || -> f32 {
         seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-        ((seed >> 33) as f32) / (u32::MAX as f32 / 2.0) - 1.0
+        // Use the top 32 bits (more random than the low bits of an LCG) as a
+        // full-range u32, then map to [-1, 1]. A `>> 33` shift here only
+        // yields 31 bits (range [0, 2^31)), which after the same divisor
+        // collapses to [-1, 0) instead of [-1, 1) — every "random" value
+        // would be non-positive.
+        ((seed >> 32) as f32) / (u32::MAX as f32 / 2.0) - 1.0
     };
 
     let mut gaussians = Vec::with_capacity(n);
@@ -312,4 +317,32 @@ fn main() {
     println!("  - restore_optimizer(&data, &mut)  replays Adam m/v/t, no warm-up needed");
     println!("  - restore_metrics(&data)          rebuilds MetricTracker with full history");
     println!("  - Trainer::from_checkpoint()      is the production API (requires live GPU)");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test for the LCG shift-by-33 bug: `seed >> 33` only ever
+    /// yields 31 bits (range `[0, 2^31)`), which after dividing by
+    /// `u32::MAX / 2.0` and subtracting 1.0 collapses to `[-1, 0)` — every
+    /// "random" value would be non-positive. With the correct `seed >> 32`
+    /// shift, values span the full `[-1, 1)` range, so across many Gaussians
+    /// at least one component must be positive.
+    #[test]
+    fn build_small_model_rng_produces_positive_values() {
+        let model = build_small_model(50);
+
+        let has_positive_attr = model.gaussians.iter().any(|g| {
+            g.position.iter().any(|&v| v > 0.0) || g.rotation[..3].iter().any(|&v| v > 0.0)
+        });
+        let has_positive_sh = model.sh_coeffs.iter().any(|&v| v > 0.0);
+
+        assert!(
+            has_positive_attr || has_positive_sh,
+            "expected at least one positive value across 50 Gaussians' \
+             positions/rotations/sh_coeffs — all-non-positive indicates the \
+             `seed >> 33` LCG bug has regressed"
+        );
+    }
 }

@@ -58,9 +58,14 @@ async fn run() -> Result<(), oxigaf_trainer::TrainerError> {
     let mesh = flame_model.forward(&oxigaf_flame::FlameParams::neutral());
 
     // Sample initial Gaussians on the mesh surface (rigid/flexible split,
-    // counts and SH degree come from `config.init`).
+    // counts and SH degree come from `config.init`). This returns a `Result`:
+    // a face-less mesh, malformed topology, or a mesh too small to place the
+    // requested number of Gaussians on is reported as an error rather than
+    // silently yielding an empty model. To plug in a different sampling
+    // strategy, use `initialize_with_sampler` with any `&dyn
+    // oxigaf_flame::MeshSurfaceSampler`.
     let mut init_rng = rand::rngs::StdRng::seed_from_u64(42);
-    let model = GaussianInitializer::initialize(&mesh, &config.init, &mut init_rng);
+    let model = GaussianInitializer::initialize(&mesh, &config.init, &mut init_rng)?;
 
     // `Trainer::new` needs an already-created wgpu device/queue (device
     // creation is async); request one from the default adapter.
@@ -183,6 +188,9 @@ fn main() -> Result<(), oxigaf_trainer::TrainerError> {
         w_normal: 0.05,        // Normal consistency (needs a FLAME mesh)
         w_gradient_penalty: 0.0,
         gradient_penalty_threshold: 100.0,
+        // World-space scale (post-`exp()`) above which `w_scale_reg` starts
+        // to charge; defaults to `oxigaf_trainer::loss::MAX_REASONABLE_WORLD_SCALE`.
+        w_scale_reg_max_scale: oxigaf_trainer::loss::MAX_REASONABLE_WORLD_SCALE,
     };
 
     let config = TrainingConfig {
@@ -741,6 +749,7 @@ TrainingConfig {
         w_normal: 0.05,
         w_gradient_penalty: 0.0,
         gradient_penalty_threshold: 100.0,
+        w_scale_reg_max_scale: oxigaf_trainer::loss::MAX_REASONABLE_WORLD_SCALE,
     },
 
     // Density control
@@ -765,6 +774,14 @@ TrainingConfig {
     tensorboard: TensorBoardConfig::default(),
     precision: TrainingPrecision::Float32,
     enable_profiling: false,
+
+    // Learning-rate schedule, gradient clipping, gradient accumulation, and
+    // EMA shadow weights are all opt-in (see "Opt-in components" in the
+    // crate docs) — disabled/no-op by default.
+    lr_schedule: LrScheduleConfig::Fixed,
+    gradient_clip: GradientClipConfig::Disabled,
+    gradient_accumulation_steps: 1,
+    ema_decay: None,
 }
 ```
 
@@ -786,8 +803,8 @@ Typical training times:
 
 ## Statistics
 
-- **Tests**: 244 (all passing)
-- **Key modules**: `trainer.rs` (923 lines), `loss.rs` (1,277 lines), `tensorboard.rs` (1,181 lines), `lpips.rs` (689 lines), `density.rs` (349 lines), `checkpoint.rs` (490 lines)
+- **Tests**: 3,174 `#[test]`-attributed tests in source (`src/` + `tests/`) — the count that actually compiles and runs depends on enabled features and platform
+- **Key modules**: `trainer.rs` (1,985 lines), `loss.rs` (1,604 lines), `tensorboard.rs` (1,290 lines), `lpips.rs` (806 lines), `density.rs` (624 lines), `checkpoint.rs` (1,029 lines)
 - **LPIPS**: Pure Rust VGG network (no Python/C dependencies)
 - **TensorBoard**: Native Rust implementation — scalar, image, histogram, graph logging
 

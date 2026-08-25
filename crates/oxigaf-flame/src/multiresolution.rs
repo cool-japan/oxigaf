@@ -4,7 +4,12 @@
 //! for producing multiple LoD levels from a base mesh. Each level is produced by
 //! collapsing the lowest-cost edge repeatedly until the target vertex count is reached.
 //!
-//! The FLAME head model has 5023 vertices. For `O(N²)` QEM this is very fast.
+//! The FLAME head model has 5023 vertices, and decimating it is fast because
+//! the collapse loop never rescans the whole mesh: edge costs live in a binary
+//! heap with lazy invalidation and each vertex keeps its incident-face list, so
+//! the cost is `O(E log E)` to build plus `O(deg · log E)` per collapse — not
+//! the `O(N²)` of a naive implementation that re-evaluates every edge after
+//! each collapse. See [`MeshDecimator`]'s `# Complexity` section.
 
 #![allow(clippy::doc_markdown)]
 

@@ -184,8 +184,12 @@ impl DepthCamera {
     /// Rough sphere-based frustum check.
     ///
     /// Returns `true` when the sphere `(center, radius)` might overlap the view
-    /// frustum.  False negatives are possible (conservative), but false positives
-    /// are not — a `false` result guarantees no part of the sphere is visible.
+    /// frustum. This is a **conservative** (over-inclusive) broad-phase test:
+    /// a `true` result does not guarantee the sphere is actually visible
+    /// (false positives are expected, and cheap to filter downstream), but a
+    /// `false` result must guarantee no part of the sphere can possibly be
+    /// visible — false negatives are never acceptable, since they would
+    /// silently drop a visible Gaussian from the depth map.
     pub fn in_frustum_approx(&self, center: [f32; 3], radius: f32) -> bool {
         // Transform sphere centre to camera space.
         let diff = [
@@ -221,20 +225,37 @@ impl DepthCamera {
             return false;
         }
 
-        // Project radius to pixel space.
-        let proj_radius_px = self.fx * radius / ref_depth;
+        // Project the sphere's true (tangent-line) angular radius rather than
+        // its flat center-plane radius: for a sphere of radius `r` whose
+        // centre is at distance `d` from the camera, the exact screen-space
+        // projected radius is `f * r / sqrt(d^2 - r^2)`, which is always
+        // *larger* than the naive `f * r / d` approximation. Using the naive
+        // formula understates the sphere's true screen extent (worse near
+        // the frustum edges) and can wrongly cull a sphere that is still
+        // partially visible — exactly the false negative this function must
+        // not produce. `ref_depth` is the camera-space Z depth rather than
+        // the full 3-D Euclidean distance to the centre; since depth is
+        // always <= the true distance, this only makes the result *more*
+        // conservative (an equal-or-larger projected radius), never less.
+        let denom = (ref_depth * ref_depth - radius * radius)
+            .max(1e-6_f32)
+            .sqrt();
+        let proj_radius_x = self.fx * radius / denom;
+        let proj_radius_y = self.fy * radius / denom;
 
-        // Check if the projected centre ± radius overlaps the image rectangle.
+        // Check if the projected centre ± radius overlaps the image
+        // rectangle, testing x against `fx` and y against `fy` separately —
+        // they differ for any non-square image (`fx = fy * aspect`).
         let px = self.fx * cam_x / ref_depth + self.cx;
         let py = -self.fy * cam_y / ref_depth + self.cy;
 
         let w = self.width as f32;
         let h = self.height as f32;
 
-        if px + proj_radius_px < 0.0 || px - proj_radius_px >= w {
+        if px + proj_radius_x < 0.0 || px - proj_radius_x >= w {
             return false;
         }
-        if py + proj_radius_px < 0.0 || py - proj_radius_px >= h {
+        if py + proj_radius_y < 0.0 || py - proj_radius_y >= h {
             return false;
         }
 
@@ -371,8 +392,12 @@ impl DepthMap {
 
     /// Normalise depth values to `[0, 1]` (min depth → 0, max depth → 1).
     ///
-    /// INFINITY pixels are mapped to `1.0`.  When all pixels are INFINITY (no
-    /// valid samples) every value is set to `0.0`.
+    /// `INFINITY` pixels (no contribution) are always mapped to `1.0`. When
+    /// there are no valid (finite) pixels, or every valid pixel shares the
+    /// same depth (a degenerate, zero-width range that cannot be divided
+    /// into), every *finite* pixel is instead set to `0.0`. This includes
+    /// the all-`INFINITY` case: with zero finite pixels, every output value
+    /// is therefore `1.0` (not `0.0`).
     pub fn normalized(&self) -> Vec<f32> {
         let finite_iter = self.depths.iter().copied().filter(|d| d.is_finite());
         let min_d = finite_iter.clone().fold(f32::INFINITY, f32::min);
@@ -520,6 +545,24 @@ pub fn render_depth_map(
     }
 }
 
+// ── Shared helpers ───────────────────────────────────────────────────────────
+
+/// Project a world-space bounding-sphere radius to separate x/y pixel-space
+/// half-extents for rasterisation, using `camera.fx` and `camera.fy`
+/// independently.
+///
+/// They differ for any non-square image (`DepthCamera::from_fov` sets
+/// `fx = fy * aspect`), so a single shared radius would over-splat one axis
+/// and under-splat the other. Both extents are floored at `1.0` pixel so a
+/// Gaussian always splats to at least its own pixel.
+#[inline]
+fn projected_radius_px(camera: &DepthCamera, radius: f32, depth: f32) -> (f32, f32) {
+    (
+        (camera.fx * radius / depth).max(1.0),
+        (camera.fy * radius / depth).max(1.0),
+    )
+}
+
 // ── Nearest ──────────────────────────────────────────────────────────────────
 
 fn render_nearest(
@@ -541,8 +584,8 @@ fn render_nearest(
             None => continue,
         };
 
-        let proj_r = (camera.fx * gaussian.radius / depth).max(1.0);
-        splat_nearest(px_f, py_f, depth, proj_r, w, h, &mut depths);
+        let (proj_rx, proj_ry) = projected_radius_px(camera, gaussian.radius, depth);
+        splat_nearest(px_f, py_f, depth, proj_rx, proj_ry, (w, h), &mut depths);
     }
 
     let mut map = DepthMap::new(camera.width, camera.height, DepthMode::Nearest);
@@ -556,15 +599,15 @@ fn splat_nearest(
     px_f: f32,
     py_f: f32,
     depth: f32,
-    radius: f32,
-    w: usize,
-    h: usize,
+    radius_x: f32,
+    radius_y: f32,
+    (w, h): (usize, usize),
     depths: &mut [f32],
 ) {
-    let x_min = (px_f - radius).floor() as i32;
-    let x_max = (px_f + radius).floor() as i32;
-    let y_min = (py_f - radius).floor() as i32;
-    let y_max = (py_f + radius).floor() as i32;
+    let x_min = (px_f - radius_x).floor() as i32;
+    let x_max = (px_f + radius_x).floor() as i32;
+    let y_min = (py_f - radius_y).floor() as i32;
+    let y_max = (py_f + radius_y).floor() as i32;
 
     for iy in y_min..=y_max {
         if iy < 0 || iy >= h as i32 {
@@ -604,13 +647,13 @@ fn render_alpha_weighted(
             None => continue,
         };
 
-        let proj_r = (camera.fx * gaussian.radius / depth).max(1.0);
+        let (proj_rx, proj_ry) = projected_radius_px(camera, gaussian.radius, depth);
         let alpha = gaussian.opacity;
 
-        let x_min = (px_f - proj_r).floor() as i32;
-        let x_max = (px_f + proj_r).floor() as i32;
-        let y_min = (py_f - proj_r).floor() as i32;
-        let y_max = (py_f + proj_r).floor() as i32;
+        let x_min = (px_f - proj_rx).floor() as i32;
+        let x_max = (px_f + proj_rx).floor() as i32;
+        let y_min = (py_f - proj_ry).floor() as i32;
+        let y_max = (py_f + proj_ry).floor() as i32;
 
         for iy in y_min..=y_max {
             if iy < 0 || iy >= h as i32 {
@@ -662,13 +705,13 @@ fn render_max_opacity(
             None => continue,
         };
 
-        let proj_r = (camera.fx * gaussian.radius / depth).max(1.0);
+        let (proj_rx, proj_ry) = projected_radius_px(camera, gaussian.radius, depth);
         let alpha = gaussian.opacity;
 
-        let x_min = (px_f - proj_r).floor() as i32;
-        let x_max = (px_f + proj_r).floor() as i32;
-        let y_min = (py_f - proj_r).floor() as i32;
-        let y_max = (py_f + proj_r).floor() as i32;
+        let x_min = (px_f - proj_rx).floor() as i32;
+        let x_max = (px_f + proj_rx).floor() as i32;
+        let y_min = (py_f - proj_ry).floor() as i32;
+        let y_max = (py_f + proj_ry).floor() as i32;
 
         for iy in y_min..=y_max {
             if iy < 0 || iy >= h as i32 {
@@ -704,8 +747,15 @@ fn render_median(
     h: usize,
     n_pixels: usize,
 ) -> Result<DepthMap, DepthMapError> {
-    // Per-pixel sample buckets (up to MEDIAN_MAX_SAMPLES each).
-    let mut buckets: Vec<Vec<f32>> = vec![Vec::new(); n_pixels];
+    // Flat, fixed-size per-pixel sample storage. MEDIAN_MAX_SAMPLES is a
+    // compile-time constant, so a `Vec<Vec<f32>>` (one 24-byte Vec header
+    // per pixel whether touched or not, plus an individual heap allocation
+    // — and reallocations as it grows — the first time each pixel receives
+    // a sample) is unnecessary heap traffic. `samples` holds all
+    // `n_pixels * MEDIAN_MAX_SAMPLES` slots in a single allocation;
+    // `counts` tracks how many of each pixel's slots are filled.
+    let mut samples = vec![0.0f32; n_pixels * MEDIAN_MAX_SAMPLES];
+    let mut counts = vec![0u8; n_pixels];
 
     for gaussian in gaussians {
         if !camera.in_frustum_approx(gaussian.center, gaussian.radius) {
@@ -716,12 +766,12 @@ fn render_median(
             None => continue,
         };
 
-        let proj_r = (camera.fx * gaussian.radius / depth).max(1.0);
+        let (proj_rx, proj_ry) = projected_radius_px(camera, gaussian.radius, depth);
 
-        let x_min = (px_f - proj_r).floor() as i32;
-        let x_max = (px_f + proj_r).floor() as i32;
-        let y_min = (py_f - proj_r).floor() as i32;
-        let y_max = (py_f + proj_r).floor() as i32;
+        let x_min = (px_f - proj_rx).floor() as i32;
+        let x_max = (px_f + proj_rx).floor() as i32;
+        let y_min = (py_f - proj_ry).floor() as i32;
+        let y_max = (py_f + proj_ry).floor() as i32;
 
         for iy in y_min..=y_max {
             if iy < 0 || iy >= h as i32 {
@@ -732,22 +782,26 @@ fn render_median(
                     continue;
                 }
                 let idx = iy as usize * w + ix as usize;
-                if buckets[idx].len() < MEDIAN_MAX_SAMPLES {
-                    buckets[idx].push(depth);
+                let cnt = counts[idx] as usize;
+                if cnt < MEDIAN_MAX_SAMPLES {
+                    samples[idx * MEDIAN_MAX_SAMPLES + cnt] = depth;
+                    counts[idx] = (cnt + 1) as u8;
                 }
             }
         }
     }
 
-    // Resolve each pixel to its median.
+    // Resolve each pixel to the median of its (in-place sorted) sample prefix.
     let mut depths = vec![f32::INFINITY; n_pixels];
-    for (i, bucket) in buckets.iter_mut().enumerate() {
-        if bucket.is_empty() {
+    for i in 0..n_pixels {
+        let cnt = counts[i] as usize;
+        if cnt == 0 {
             continue;
         }
-        bucket.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let mid = bucket.len() / 2;
-        depths[i] = bucket[mid];
+        let base = i * MEDIAN_MAX_SAMPLES;
+        let slot = &mut samples[base..base + cnt];
+        slot.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        depths[i] = slot[cnt / 2];
     }
 
     let mut map = DepthMap::new(camera.width, camera.height, DepthMode::Median);
@@ -1205,5 +1259,139 @@ mod tests {
         assert!(map.pixel_depth(100, 100).is_infinite());
         assert!(map.pixel_depth(4, 0).is_infinite());
         assert!(map.pixel_depth(0, 4).is_infinite());
+    }
+
+    // ── Test 23: in_frustum_approx must not produce false negatives ──────────
+    #[test]
+    fn test_in_frustum_approx_large_sphere_near_edge_not_culled() {
+        // Regression test for the conservativeness bug: `in_frustum_approx`
+        // must never return `false` (cull) for a sphere that genuinely still
+        // overlaps the frustum. A sphere whose radius is close to its
+        // distance from the camera has a true projected screen radius of
+        // `f * r / sqrt(d^2 - r^2)`, far larger than the naive `f * r / d` -
+        // using the naive formula wrongly culled spheres like this one, which
+        // are still visible near the image edge.
+        let cam = DepthCamera::from_fov(
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0], // identity rotation
+            64,
+            64,
+            std::f32::consts::FRAC_PI_2, // fx = fy = 32 for a square 64×64 image
+            0.01,
+            1000.0,
+        )
+        .unwrap();
+
+        // depth = 1.1, radius = 1.0 (camera nearly grazes the sphere
+        // surface): naive proj radius ≈ 29.1px, true proj radius ≈ 69.8px.
+        let radius = 1.0_f32;
+        let depth = 1.1_f32;
+        // Solve for a world x that projects to px = 100 (i.e. 36px past the
+        // right edge of the 64px-wide image): cam_x = (px - cx) * depth / fx.
+        let cam_x = (100.0 - cam.cx) * depth / cam.fx;
+        let center = [cam_x, 0.0, -depth];
+
+        assert!(
+            cam.in_frustum_approx(center, radius),
+            "a sphere whose true projected extent still overlaps the image \
+             must not be culled by the conservative frustum check"
+        );
+    }
+
+    // ── Test 24: normalized() on an all-INFINITY map ──────────────────────────
+    #[test]
+    fn test_normalized_all_infinity_maps_to_one() {
+        // Regression test: an all-INFINITY map (no Gaussian contributed to
+        // any pixel) must normalize every value to 1.0, matching the general
+        // "INFINITY → 1.0" contract - not 0.0.
+        let map = DepthMap::new(4, 4, DepthMode::Nearest);
+        let norm = map.normalized();
+        assert!(
+            norm.iter().all(|&v| (v - 1.0).abs() < 1e-6),
+            "all-INFINITY map should normalize to all 1.0, got {norm:?}"
+        );
+    }
+
+    // ── Test 25: splat radius tracks fx/fy independently ──────────────────────
+    #[test]
+    fn test_render_splat_extent_respects_aspect_ratio() {
+        // Regression test: the projected splat radius must use `fx` for the
+        // x-extent and `fy` for the y-extent independently - using `fx` for
+        // both (as the pre-fix code did) makes every splat's vertical extent
+        // as wide as its horizontal one regardless of aspect ratio.
+        let cam = DepthCamera::from_fov(
+            [0.0, 0.0, 5.0],
+            [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+            128,
+            32,
+            std::f32::consts::FRAC_PI_2, // fy = 16, fx = fy * (128/32) = 64
+            0.1,
+            100.0,
+        )
+        .unwrap();
+        assert!((cam.fx - 64.0).abs() < 1e-3, "fx = {}", cam.fx);
+        assert!((cam.fy - 16.0).abs() < 1e-3, "fy = {}", cam.fy);
+
+        // Gaussian at world z = 1.0 → depth = 4.0, radius = 1.0:
+        // proj_rx = fx*r/depth = 16px, proj_ry = fy*r/depth = 4px.
+        let gaussians = vec![GaussianDepthData {
+            center: [0.0, 0.0, 1.0],
+            radius: 1.0,
+            opacity: 0.9,
+        }];
+        let map = render_depth_map(&cam, &gaussians, DepthMode::Nearest).unwrap();
+
+        let touched_rows: Vec<usize> = (0..32usize)
+            .filter(|&row| {
+                (0..128usize).any(|col| map.pixel_depth(col as u32, row as u32).is_finite())
+            })
+            .collect();
+        let min_row = *touched_rows.first().expect("some row should be touched");
+        let max_row = *touched_rows.last().expect("some row should be touched");
+        let row_span = max_row - min_row + 1;
+
+        // Correct behaviour splats roughly rows [12, 20] (9 rows, ≈ 2*proj_ry).
+        // The pre-fix bug (using fx=64 for the y-extent too) would splat
+        // rows [0, 31] - the full 32-row image height.
+        assert!(
+            row_span <= 14,
+            "vertical splat extent should track fy (~9 rows), not fx (~32 \
+             rows); got {row_span} rows spanning {min_row}..={max_row}"
+        );
+    }
+
+    // ── Test 26: Median mode resolves the true median depth ──────────────────
+    #[test]
+    fn test_render_median_resolves_median_depth() {
+        let cam = make_camera();
+        // Three Gaussians whose footprints all cover the centre pixel, with
+        // depths 2, 5, 8 - the centre pixel's resolved depth must be the
+        // median (5) regardless of Gaussian insertion order.
+        let gaussians = vec![
+            make_gaussian(3.0, 0.9),  // depth = 2
+            make_gaussian(0.0, 0.9),  // depth = 5
+            make_gaussian(-3.0, 0.9), // depth = 8
+        ];
+        let map = render_depth_map(&cam, &gaussians, DepthMode::Median).unwrap();
+        let d = map.pixel_depth(32, 32);
+        assert!(
+            (d - 5.0).abs() < 1e-3,
+            "median of {{2, 5, 8}} should be 5, got {d}"
+        );
+    }
+
+    // ── Test 27: Median mode caps sample count without panicking ─────────────
+    #[test]
+    fn test_render_median_caps_at_max_samples() {
+        // More than MEDIAN_MAX_SAMPLES (8) Gaussians covering the same pixel
+        // must not panic or corrupt the per-pixel sample count - the flat
+        // sample buffer simply stops accepting new samples once full.
+        let cam = make_camera();
+        let gaussians: Vec<GaussianDepthData> = (0..12)
+            .map(|i| make_gaussian(i as f32 * 0.1, 0.9))
+            .collect();
+        let map = render_depth_map(&cam, &gaussians, DepthMode::Median).unwrap();
+        let d = map.pixel_depth(32, 32);
+        assert!(d.is_finite(), "centre pixel should still resolve a depth");
     }
 }

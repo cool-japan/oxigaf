@@ -10,6 +10,22 @@
 //! - [`ImageMotionField`] — flat f32 per-pixel motion vector field
 //! - [`MotionStats`] — statistics over a motion field
 //! - [`BlurType`] — selects Linear / Radial / Rotational / PerPixel blur
+//!
+//! # Relationship to the sibling motion-blur modules
+//!
+//! This is the only one of the three CPU motion-blur modules that works on
+//! 8-bit RGBA and the only one offering radial / rotational shapes; the
+//! `f32`-RGB modules are [`crate::motion_blur`] (camera-path accumulation,
+//! simple gather blur) and [`crate::mb_pipeline`] (shutter-angle pipeline
+//! with depth-aware weights and jitter). See the module docs of
+//! [`crate::motion_blur`] for the full comparison table. Because the pixel
+//! format differs, the sampler here (`bilinear_sample_u8_rgba`) is genuinely
+//! distinct rather than a duplicate of the shared `f32`-RGB tap; the
+//! [`MotionBlurError`] type *is* shared.
+//!
+//! Note that [`apply_motion_blur`] here and
+//! [`crate::mb_pipeline::apply_motion_blur`] are different functions; the
+//! crate root re-exports the latter as `mb_apply_full_pipeline`.
 
 use crate::motion_blur::MotionBlurError;
 
@@ -257,8 +273,13 @@ struct MotionSample {
     dy: f32,
 }
 
-/// Sample `n_samples` equally-spaced points along the motion vector from
-/// `(ms.px, ms.py)` to `(ms.px + ms.dx, ms.py + ms.dy)` and return the RGBA average.
+/// Sample `n_samples` equally-spaced points centred on `(ms.px, ms.py)`,
+/// spanning from `(ms.px - ms.dx/2, ms.py - ms.dy/2)` to
+/// `(ms.px + ms.dx/2, ms.py + ms.dy/2)`, and return the RGBA average.
+///
+/// Centring the sample range on the source pixel (rather than trailing
+/// only forward from it) keeps the blur trail's centroid at the source
+/// pixel instead of shifting the whole image by half the motion vector.
 fn sample_along_motion(
     image: &[u8],
     width: u32,
@@ -269,7 +290,11 @@ fn sample_along_motion(
     let n = n_samples.max(1);
     let mut acc = [0.0_f32; 4];
     for i in 0..n {
-        let t = i as f32 / (n.saturating_sub(1).max(1)) as f32;
+        let t = if n == 1 {
+            0.0
+        } else {
+            i as f32 / (n - 1) as f32 - 0.5
+        };
         let s = bilinear_sample_u8_rgba(
             image,
             width,
@@ -547,10 +572,26 @@ pub fn apply_motion_blur(
     }
 }
 
-/// Estimate a per-pixel motion field from two RGBA frames via luminance-diff proxy.
+/// Block size (pixels) used for block-matching motion estimation in
+/// [`compute_motion_from_frames`].
+const MOTION_BLOCK_SIZE: usize = 8;
+
+/// Maximum search radius (pixels, along each of dx/dy) used for
+/// block-matching motion estimation in [`compute_motion_from_frames`].
+const MOTION_SEARCH_RADIUS: i32 = 4;
+
+/// Estimate a per-pixel motion field from two RGBA frames via block-matching.
 ///
-/// `dx = |lum_a - lum_b|`, `dy = 0.0` for all pixels.  Intentionally simple —
-/// real optical flow requires iterative search.
+/// `frame_a` is treated as the reference (earlier) frame and `frame_b` as
+/// the target (later) frame. The image is divided into
+/// `MOTION_BLOCK_SIZE`×`MOTION_BLOCK_SIZE` blocks; for each block, a full
+/// search over `[-MOTION_SEARCH_RADIUS, MOTION_SEARCH_RADIUS]²` finds the
+/// integer-pixel offset in `frame_b` that minimises the sum-of-absolute-
+/// differences (SAD) in luminance against the corresponding block in
+/// `frame_a`. All pixels in a block share that block's motion vector
+/// (nearest-block, no sub-pixel refinement) — a standard, if simple, block-
+/// matching optical-flow estimator with real directional correspondence
+/// search, not a magnitude-only luminance-difference proxy.
 ///
 /// # Errors
 /// [`MotionBlurError::InvalidDimensions`] when either frame has wrong length.
@@ -562,18 +603,94 @@ pub fn compute_motion_from_frames(
 ) -> Result<ImageMotionField, MotionBlurError> {
     validate_rgba(frame_a, width, height)?;
     validate_rgba(frame_b, width, height)?;
-    let n = (width as usize) * (height as usize);
-    let mut data = Vec::with_capacity(n * 2);
-    for i in 0..n {
-        let b = i * 4;
-        let lum = |f: &[u8]| {
-            0.299 * f.get(b).copied().unwrap_or(0) as f32 / 255.0
-                + 0.587 * f.get(b + 1).copied().unwrap_or(0) as f32 / 255.0
-                + 0.114 * f.get(b + 2).copied().unwrap_or(0) as f32 / 255.0
-        };
-        data.push((lum(frame_a) - lum(frame_b)).abs());
-        data.push(0.0);
+
+    let w = width as usize;
+    let h = height as usize;
+    let n = w * h;
+    let mut data = vec![0.0_f32; n * 2];
+
+    if w == 0 || h == 0 {
+        return Ok(ImageMotionField {
+            data,
+            width,
+            height,
+        });
     }
+
+    // Pre-compute luminance planes once, avoiding repeated u8 blends inside
+    // the O(blocks * search_window * block_area) matching loop below.
+    let lum_at = |frame: &[u8], x: usize, y: usize| -> f32 {
+        let b = (y * w + x) * 4;
+        0.299 * frame[b] as f32 + 0.587 * frame[b + 1] as f32 + 0.114 * frame[b + 2] as f32
+    };
+    let mut luma_a = vec![0.0_f32; n];
+    let mut luma_b = vec![0.0_f32; n];
+    for y in 0..h {
+        for x in 0..w {
+            let i = y * w + x;
+            luma_a[i] = lum_at(frame_a, x, y);
+            luma_b[i] = lum_at(frame_b, x, y);
+        }
+    }
+
+    let bs = MOTION_BLOCK_SIZE;
+    let mut by = 0usize;
+    while by < h {
+        let block_h = bs.min(h - by);
+        let mut bx = 0usize;
+        while bx < w {
+            let block_w = bs.min(w - bx);
+
+            let mut best_dx = 0i32;
+            let mut best_dy = 0i32;
+            let mut best_sad = f32::INFINITY;
+
+            for dy in -MOTION_SEARCH_RADIUS..=MOTION_SEARCH_RADIUS {
+                let by_shifted = by as i32 + dy;
+                if by_shifted < 0 || by_shifted + block_h as i32 > h as i32 {
+                    continue;
+                }
+                for dx in -MOTION_SEARCH_RADIUS..=MOTION_SEARCH_RADIUS {
+                    let bx_shifted = bx as i32 + dx;
+                    if bx_shifted < 0 || bx_shifted + block_w as i32 > w as i32 {
+                        continue;
+                    }
+
+                    let mut sad = 0.0_f32;
+                    for ly in 0..block_h {
+                        let a_row = (by + ly) * w;
+                        let b_row = (by_shifted as usize + ly) * w;
+                        for lx in 0..block_w {
+                            let a_val = luma_a[a_row + bx + lx];
+                            let b_val = luma_b[b_row + bx_shifted as usize + lx];
+                            sad += (a_val - b_val).abs();
+                        }
+                    }
+
+                    if sad < best_sad {
+                        best_sad = sad;
+                        best_dx = dx;
+                        best_dy = dy;
+                    }
+                }
+            }
+            // (dx=0, dy=0) is always a valid candidate since the block
+            // itself is always in bounds, so best_sad is always finite and
+            // best_dx/best_dy are always assigned by the loop above.
+
+            for ly in 0..block_h {
+                for lx in 0..block_w {
+                    let idx = ((by + ly) * w + (bx + lx)) * 2;
+                    data[idx] = best_dx as f32;
+                    data[idx + 1] = best_dy as f32;
+                }
+            }
+
+            bx += bs;
+        }
+        by += bs;
+    }
+
     Ok(ImageMotionField {
         data,
         width,
@@ -684,6 +801,21 @@ mod tests {
     }
     fn img(w: u32, h: u32, fill: u8) -> Vec<u8> {
         vec![fill; (w as usize) * (h as usize) * 4]
+    }
+
+    /// Fill an `w`-wide RGBA image's `bw x bh` sub-rectangle at `(x0, y0)`
+    /// with a solid `fill` value (test helper for block-matching tests).
+    fn set_block(image: &mut [u8], w: u32, x0: u32, y0: u32, bw: u32, bh: u32, fill: u8) {
+        let w = w as usize;
+        for y in y0..(y0 + bh) {
+            for x in x0..(x0 + bw) {
+                let b = ((y as usize) * w + (x as usize)) * 4;
+                image[b] = fill;
+                image[b + 1] = fill;
+                image[b + 2] = fill;
+                image[b + 3] = fill;
+            }
+        }
     }
 
     // ── MotionBlurConfig ──────────────────────────────────────────────────────
@@ -1136,6 +1268,32 @@ mod tests {
         assert_eq!(field.width, 5);
         assert_eq!(field.height, 3);
         assert_eq!(field.data.len(), 5 * 3 * 2);
+    }
+
+    #[test]
+    fn test_frames_block_matching_finds_known_shift() {
+        // 32x32 frames: uniform dark background, with an 8x8 bright block
+        // exactly aligned to the block-matcher's grid. In frame_b the same
+        // block is shifted by (dx=2, dy=-1), well within the search
+        // radius. The block-matcher must recover that directional
+        // displacement — the old implementation (a magnitude-only
+        // |luminance diff|, with dy always 0.0) could not.
+        let w = 32u32;
+        let h = 32u32;
+        let mut fa = img(w, h, 50);
+        let mut fb = img(w, h, 50);
+        set_block(&mut fa, w, 8, 8, 8, 8, 220);
+        set_block(&mut fb, w, 10, 7, 8, 8, 220);
+
+        let field = compute_motion_from_frames(&fa, &fb, w, h).unwrap();
+
+        // Sample the motion vector at the centre of the shifted block
+        // (pixel (12, 11) falls inside frame_a's block [8,16)x[8,16)).
+        let idx = ((11usize * w as usize) + 12) * 2;
+        let dx = field.data[idx];
+        let dy = field.data[idx + 1];
+        assert!((dx - 2.0).abs() < 1e-4, "expected dx=2.0, got {dx}");
+        assert!((dy + 1.0).abs() < 1e-4, "expected dy=-1.0, got {dy}");
     }
 
     // ── compute_image_motion_stats ────────────────────────────────────────────

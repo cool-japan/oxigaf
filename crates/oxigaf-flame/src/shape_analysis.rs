@@ -376,6 +376,12 @@ impl ShapeSpacePca {
     ///
     /// `num_components` is clamped to `min(num_components, num_dims, num_samples)`.
     ///
+    /// `max_iter` is a per-component power-iteration budget; each component
+    /// stops early once its direction converges (cosine similarity between
+    /// consecutive iterates within `1e-7`), so a generous value such as
+    /// `100`-`200` costs little when convergence is fast and only matters
+    /// for slow-converging (near-degenerate eigenvalue gap) data.
+    ///
     /// # Errors
     ///
     /// - [`ShapeAnalysisError::EmptyInput`] if `shapes` is empty.
@@ -595,16 +601,21 @@ fn power_iteration_pc(
     max_iter: usize,
     seed: u64,
 ) -> (Vec<f32>, f32) {
-    // Initialise v with small xorshift random perturbations around 1.0
+    // Initialise v with a fully isotropic random unit vector. (An
+    // all-ones-biased start converges slowly whenever the true dominant
+    // eigenvector is nearly orthogonal to the all-ones direction.)
     let mut rng_state = seed;
     let mut v: Vec<f32> = (0..num_dims)
-        .map(|_| 1.0_f32 + 0.01_f32 * (rand_f32(&mut rng_state) - 0.5_f32))
+        .map(|_| rand_f32(&mut rng_state) * 2.0_f32 - 1.0_f32)
         .collect();
     normalize_in_place(&mut v);
 
+    // Scratch buffer reused across iterations instead of reallocated.
+    let mut w = vec![0.0_f32; num_dims];
+
     for _ in 0..max_iter {
         // w = A^T A v  =  sum_i (sample_i · v) * sample_i
-        let mut w = vec![0.0_f32; num_dims];
+        w.fill(0.0);
         for sample in centered_data {
             let proj = dot_product(sample, &v);
             for (wi, si) in w.iter_mut().zip(sample.iter()) {
@@ -615,8 +626,20 @@ fn power_iteration_pc(
         if norm < 1e-12 {
             break;
         }
+        // Convergence check: the cosine between the previous iterate `v`
+        // and the new (about-to-be-written) iterate `w / norm`. Computed
+        // before overwriting `v` so no extra allocation is needed to keep
+        // the previous iterate around.
+        let cos_angle: f32 = v
+            .iter()
+            .zip(w.iter())
+            .map(|(vi, wi)| vi * (wi / norm))
+            .sum();
         for (vi, wi) in v.iter_mut().zip(w.iter()) {
             *vi = wi / norm;
+        }
+        if (1.0 - cos_angle.abs()) < 1e-7 {
+            break;
         }
     }
 
@@ -929,6 +952,40 @@ mod tests {
         let pc = &pca.principal_components[0];
         let dominant = pc[0].abs();
         assert!(dominant > 0.98, "first PC[0]={dominant}");
+    }
+
+    #[test]
+    fn test_power_iteration_pc_recovers_direction_orthogonal_to_all_ones() {
+        // Regression test for the power-iteration initialization bias: the
+        // dominant direction here, (1, -1, 0)/sqrt(2), is exactly
+        // orthogonal to the all-ones vector, and the data is exactly
+        // zero-mean (already "centered"). The old initialization
+        // (`1.0 + small jitter` per component) starts very close to
+        // all-ones, so its only overlap with this direction came from the
+        // tiny jitter term -- slow to amplify. The fixed isotropic random
+        // init has O(1) expected overlap with any fixed direction
+        // regardless of the data's orientation, and converges reliably
+        // within a modest iteration budget.
+        let data: Vec<Vec<f32>> = vec![
+            vec![10.0, -10.0, 0.0],
+            vec![-10.0, 10.0, 0.0],
+            vec![8.0, -8.0, 0.3],
+            vec![-8.0, 8.0, -0.3],
+        ];
+        let (v, eigenvalue) = power_iteration_pc(&data, 3, 60, 0x00C0_FFEE);
+        assert!(
+            eigenvalue > 0.0,
+            "eigenvalue should be positive, got {eigenvalue}"
+        );
+
+        // v should be (close to) +/-(1, -1, 0)/sqrt(2).
+        let expected = [1.0_f32 / 2.0_f32.sqrt(), -1.0 / 2.0_f32.sqrt(), 0.0];
+        let dot: f32 = v.iter().zip(expected.iter()).map(|(a, b)| a * b).sum();
+        assert!(
+            dot.abs() > 0.98,
+            "expected v aligned with (1,-1,0)/sqrt(2), got v={v:?} (|dot|={})",
+            dot.abs()
+        );
     }
 
     #[test]

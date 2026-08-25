@@ -164,46 +164,51 @@ impl StereoConfig {
 
     /// Compute left and right 4×4 view matrices from a centre view matrix.
     ///
-    /// `center_view` is a row-major 4×4 matrix stored as `[f32; 16]`.
+    /// `center_view` is stored row-major (`index = row*4+col`) and follows
+    /// the row-vector convention used throughout this module: a world-space
+    /// point `p` (as a row vector) is transformed into camera space via
+    /// `p_cam = p * center_view`, with the rotation block in rows 0-2 and
+    /// the translation in row 3 (indices 12, 13, 14) -- see
+    /// this module's private `mat4_mul_row_major` and `ry_rotation` helpers.
     ///
     /// Returns `(left_view, right_view)`.
     ///
     /// # Eye offset strategies
     ///
-    /// - **Parallel** / **OffAxis**: translate ±`ipd/2` along the camera's local right vector.
-    ///   The right vector is column 0 of the rotation part, i.e. `[m[0], m[4], m[8]]`.
-    /// - **ToeIn**: same translation as Parallel, then compose with a Y-axis rotation
-    ///   of ±`toe_in_angle_rad()`.  Left eye rotates by `+angle`, right by `-angle`.
+    /// - **Parallel** / **OffAxis**: shift the camera by `ipd/2` along its
+    ///   own local right (+X) axis, per [`Self::left_eye_offset`] /
+    ///   [`Self::right_eye_offset`]. For a row-vector view matrix, applying
+    ///   a pure local-+X translation *after* `center_view` (i.e.
+    ///   post-composing) only ever changes the translation row's X
+    ///   component (index 12) -- the rotation block is structurally
+    ///   untouched by such a composition for *any* rotation, so no
+    ///   extraction of a world-space right vector is needed (this can be
+    ///   verified by expanding `center_view * translate(delta, 0, 0)`).
+    ///   The left eye moves toward local -X, which is the mirror
+    ///   transform: every point's *camera-space* X shifts by `+ipd/2` (an
+    ///   eye moving left makes the world appear to shift right); the right
+    ///   eye shifts camera-space X by `-ipd/2`.
+    /// - **ToeIn**: same translation, then post-multiplied -- i.e. applied
+    ///   in the eye's own local space, after the translation, not in world
+    ///   space -- by a Y-axis rotation of ±`toe_in_angle_rad()`. Left eye
+    ///   rotates by `+angle`, right by `-angle`.
     pub fn stereo_view_matrices(&self, center_view: &[f32; 16]) -> ([f32; 16], [f32; 16]) {
         let half_ipd = self.ipd / 2.0;
 
-        // Extract camera right vector from columns 0 of the upper 3×3 rotation block.
-        // Row-major layout: row i, col j → index i*4+j.
-        //   right = (m[0][0], m[1][0], m[2][0]) = (m[0], m[4], m[8])
-        let rx = center_view[0];
-        let ry = center_view[4];
-        let rz = center_view[8];
-
-        // Build the two translated views (works for Parallel, OffAxis, and the translation
-        // part of ToeIn).
         let mut left = *center_view;
         let mut right = *center_view;
 
-        // Translation lives in row 3 (indices 12, 13, 14) for row-major.
-        left[12] -= half_ipd * rx;
-        left[13] -= half_ipd * ry;
-        left[14] -= half_ipd * rz;
-
-        right[12] += half_ipd * rx;
-        right[13] += half_ipd * ry;
-        right[14] += half_ipd * rz;
+        // Local +X translation row (index 12); see the doc comment above.
+        left[12] += half_ipd;
+        right[12] -= half_ipd;
 
         if self.offset_mode == EyeOffsetMode::ToeIn {
             let angle = self.toe_in_angle_rad();
 
-            // Left eye: rotate +angle around Y; right eye: -angle around Y.
-            left = mat4_mul_row_major(&ry_rotation(angle), &left);
-            right = mat4_mul_row_major(&ry_rotation(-angle), &right);
+            // Post-multiply: apply the translation first, then rotate in
+            // the resulting eye-local space, not in world space.
+            left = mat4_mul_row_major(&left, &ry_rotation(angle));
+            right = mat4_mul_row_major(&right, &ry_rotation(-angle));
         }
 
         (left, right)
@@ -346,7 +351,7 @@ pub enum AnaglyphMode {
 /// |-----------------|----------------------------------------|----------------------------------------|------------------------------------|
 /// | `RedCyan`       | left.r                                 | right.g                                | right.b                            |
 /// | `GreenMagenta`  | right.r                                | left.g                                 | right.b                            |
-/// | `AmberBlue`     | left.r×0.45 + left.g×0.55             | 0.0                                    | right.b                            |
+/// | `AmberBlue`     | amber = left.r×0.45 + left.g×0.55      | amber (same value as out.r)            | right.b                            |
 /// | `Optimized`     | Dubois R formula (clamped to \[0,1\])  | Dubois G formula (clamped to \[0,1\])  | Dubois B formula (clamped to \[0,1\])|
 pub fn compose_anaglyph(
     left: &StereoImage,
@@ -376,7 +381,15 @@ pub fn compose_anaglyph(
 
                 AnaglyphMode::GreenMagenta => [r[0], l[1], r[2]],
 
-                AnaglyphMode::AmberBlue => [l[0] * 0.45 + l[1] * 0.55, 0.0, r[2]],
+                AnaglyphMode::AmberBlue => {
+                    // Amber is a red+green mixture: write the left eye's
+                    // amber luma to BOTH R and G. Zeroing G (as a previous
+                    // version of this code did) turns the result into a
+                    // plain red-blue anaglyph and defeats the colour
+                    // preservation this mode exists for.
+                    let amber = l[0] * 0.45 + l[1] * 0.55;
+                    [amber, amber, r[2]]
+                }
 
                 AnaglyphMode::Optimized => {
                     // Dubois red-cyan coefficients.
@@ -882,6 +895,44 @@ mod tests {
         assert_ne!(right, center, "ToeIn right must differ from center");
     }
 
+    #[test]
+    fn test_stereo_view_matrices_left_eye_sees_point_further_right() {
+        // Regression test: a world point directly ahead of an identity
+        // camera must map to a larger camera-space X in the left-eye view
+        // than in the right-eye view, for every offset mode (an eye that
+        // moves left sees the world shift right). The previous
+        // implementation extracted the wrong matrix axis and applied the
+        // shift with the sign flipped, which produced the opposite
+        // (physically wrong) ordering.
+        let center = [
+            1.0_f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+        ];
+        let world_point = [5.0_f32, 0.0, 0.0, 1.0]; // world +X, homogeneous w=1
+
+        // Row-vector transform: p_cam[j] = sum_i p_world[i] * m[i*4 + j].
+        // We only need camera-space X (j = 0).
+        let transform_x =
+            |m: &[f32; 16]| -> f32 { (0..4).map(|i| world_point[i] * m[i * 4]).sum() };
+
+        for mode in [
+            EyeOffsetMode::Parallel,
+            EyeOffsetMode::OffAxis,
+            EyeOffsetMode::ToeIn,
+        ] {
+            let cfg = StereoConfig {
+                offset_mode: mode.clone(),
+                ..Default::default()
+            };
+            let (left, right) = cfg.stereo_view_matrices(&center);
+            let left_x = transform_x(&left);
+            let right_x = transform_x(&right);
+            assert!(
+                left_x > right_x,
+                "{mode:?}: left-eye camera-space X ({left_x}) must exceed right-eye's ({right_x})"
+            );
+        }
+    }
+
     // ── StereoImage tests ─────────────────────────────────────────────────────
 
     #[test]
@@ -966,6 +1017,50 @@ mod tests {
                 assert!(
                     approx_eq(op[1], rp[1], 1e-6),
                     "RedCyan out.g != right.g at ({x},{y})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_anaglyph_amber_blue_writes_amber_to_red_and_green() {
+        // Regression test: AmberBlue must write the left eye's amber luma
+        // to BOTH the red and green output channels (amber = red + green).
+        // A previous version zeroed the green channel, which silently
+        // turned this mode into a plain red-blue anaglyph.
+        let mut left = StereoImage::zeros(4, 4);
+        let mut right = StereoImage::zeros(4, 4);
+        for y in 0..4 {
+            for x in 0..4 {
+                // Distinct R/G values so a zeroed-G bug is observable.
+                left.set_pixel(x, y, [0.8, 0.6, 0.1]);
+                right.set_pixel(x, y, [0.2, 0.35, 0.4]);
+            }
+        }
+
+        let out = compose_anaglyph(&left, &right, AnaglyphMode::AmberBlue)
+            .expect("compose_anaglyph failed");
+
+        let expected_amber = 0.8_f32 * 0.45 + 0.6_f32 * 0.55;
+        assert!(expected_amber > 0.0, "sanity: amber luma should be nonzero");
+
+        for y in 0..4 {
+            for x in 0..4 {
+                let op = out.pixel(x, y);
+                assert!(
+                    approx_eq(op[0], expected_amber, 1e-6),
+                    "AmberBlue out.r should be the amber luma at ({x},{y}), got {}",
+                    op[0]
+                );
+                assert!(
+                    approx_eq(op[1], expected_amber, 1e-6),
+                    "AmberBlue out.g must equal out.r (amber), got {} vs {}",
+                    op[1],
+                    op[0]
+                );
+                assert!(
+                    approx_eq(op[2], 0.4, 1e-6),
+                    "AmberBlue out.b should be right.b at ({x},{y})"
                 );
             }
         }

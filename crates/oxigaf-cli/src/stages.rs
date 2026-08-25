@@ -221,6 +221,40 @@ fn f32_to_rgb(data: &[f32], width: u32, height: u32) -> Result<image::RgbImage> 
     Ok(img)
 }
 
+/// Convert rendered normal maps into the per-view conditioning buffers the
+/// diffusion target generator consumes.
+///
+/// Each map must already be at the pipeline's `width`×`height`; a mismatch is
+/// an error rather than something to resample here, because it means the
+/// camera set and the diffusion configuration have drifted apart and the
+/// resulting conditioning would not correspond to the views being generated.
+///
+/// # Errors
+///
+/// Returns an error when `normal_maps` is empty, or when any map's dimensions
+/// differ from `width`×`height`.
+fn normal_map_conditioning(
+    normal_maps: &[image::RgbImage],
+    width: u32,
+    height: u32,
+) -> Result<Vec<Vec<f32>>> {
+    if normal_maps.is_empty() {
+        anyhow::bail!("No normal maps were rendered — diffusion has nothing to condition on");
+    }
+    let mut out = Vec::with_capacity(normal_maps.len());
+    for (i, map) in normal_maps.iter().enumerate() {
+        if map.width() != width || map.height() != height {
+            anyhow::bail!(
+                "Normal map {i} is {}×{}, expected {width}×{height}",
+                map.width(),
+                map.height(),
+            );
+        }
+        out.push(rgb_to_f32(map));
+    }
+    Ok(out)
+}
+
 /// Derive a foreground mask from a rendered normal map.
 ///
 /// `NormalMapRenderer` leaves untouched pixels black, so any non-black pixel is
@@ -307,7 +341,7 @@ fn orbit_camera(
 /// every usable detector is a trained neural network.  OxiGAF ships no such
 /// weights, so this stage consumes *already tracked* parameters: a FLAME
 /// sequence JSON, or a directory containing one (see
-/// [`TRACKING_FILE_CANDIDATES`]).  Raw video or an image folder is rejected
+/// `TRACKING_FILE_CANDIDATES`).  Raw video or an image folder is rejected
 /// with an explicit message instead of silently producing an empty sequence.
 pub struct TrackingStage {
     video_path: PathBuf,
@@ -593,7 +627,7 @@ impl PipelineStage for DiffusionStage {
             .iter()
             .map(|cam| NormalMapRenderer::render(&mesh, cam))
             .collect();
-        let conditioning: Vec<Vec<f32>> = normal_maps.iter().map(rgb_to_f32).collect();
+        let conditioning = normal_map_conditioning(&normal_maps, width, height)?;
         self.progress = 0.35;
 
         // 5. Run the diffusion pipeline.  `warmup_iterations = 0` so the
@@ -613,8 +647,31 @@ impl PipelineStage for DiffusionStage {
 
         // Iteration 1 is past the zero-length warmup, so the generator denoises
         // rather than echoing its conditioning input back.
+        //
+        // `conditioning` is passed **twice**, deliberately — this is not a
+        // copy-paste slip:
+        //
+        // * as `normal_maps`, it is VAE-encoded into the geometry latents the
+        //   U-Net concatenates onto its input. Passing `None` here (as this
+        //   call used to) left those channels zero-filled, so the generated
+        //   views were untied from the tracked FLAME geometry and the
+        //   generator logged its one-shot "geometry conditioning is
+        //   zero-filled" warning on every run.
+        // * as `rendered`, it supplies the CLIP identity reference (the first
+        //   view) and the warmup pass-through. At this point in the pipeline
+        //   no Gaussian model exists yet — that is what these targets are
+        //   about to be used to fit — so the normal maps are the only
+        //   image-space signal available. `TrainingStage` later drives the
+        //   generator with genuine renders.
         let targets = generator
-            .generate_targets(&conditioning, &cameras, 1, width, height)
+            .generate_targets_with_normals(
+                &conditioning,
+                &cameras,
+                Some(&conditioning),
+                1,
+                width,
+                height,
+            )
             .context("Multi-view diffusion generation failed")?;
         if targets.len() < self.num_views {
             anyhow::bail!(
@@ -1243,12 +1300,12 @@ mod tests {
         // Positions must round-trip — not collapse to the origin.
         for (i, g) in loaded.gaussians.iter().enumerate() {
             let expected = [i as f32 * 0.1, i as f32 * 0.2, i as f32 * 0.3];
-            for k in 0..3 {
+            for (k, exp) in expected.iter().copied().enumerate() {
                 assert!(
-                    (g.position[k] - expected[k]).abs() < 1e-4,
+                    (g.position[k] - exp).abs() < 1e-4,
                     "gaussian {i} axis {k}: got {}, expected {}",
                     g.position[k],
-                    expected[k]
+                    exp
                 );
             }
         }
@@ -1328,6 +1385,57 @@ mod tests {
         let mask = coverage_mask(&img);
         assert_eq!(mask.get_pixel(0, 0), &image::Luma([255]));
         assert_eq!(mask.get_pixel(1, 1), &image::Luma([0]));
+    }
+
+    // -----------------------------------------------------------------------
+    // normal_map_conditioning
+    //
+    // Regression coverage for: the diffusion call site rendered normal maps
+    // and then handed them only as the `rendered` argument, passing nothing
+    // as `normal_maps` -- so the U-Net's geometry conditioning channels were
+    // zero-filled and the generated views were untied from the tracked FLAME
+    // mesh. The conversion is extracted here so it is testable without the
+    // trained weights the full stage requires.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_normal_map_conditioning_converts_every_view() {
+        let mut a = image::RgbImage::new(2, 2);
+        a.put_pixel(0, 0, image::Rgb([255, 0, 0]));
+        let b = image::RgbImage::new(2, 2);
+
+        let conditioning =
+            normal_map_conditioning(&[a, b], 2, 2).expect("matching dimensions must convert");
+        assert_eq!(
+            conditioning.len(),
+            2,
+            "one conditioning buffer per rendered view"
+        );
+        for buffer in &conditioning {
+            assert_eq!(buffer.len(), 2 * 2 * 3, "flat HWC RGB layout");
+        }
+        // Real normal data must survive, normalised to [0, 1] -- an
+        // all-zeroes buffer here is exactly the bug being guarded against.
+        assert!((conditioning[0][0] - 1.0).abs() < 1e-6);
+        assert!(
+            conditioning[0].iter().any(|v| *v > 0.0),
+            "conditioning must not be zero-filled"
+        );
+    }
+
+    #[test]
+    fn test_normal_map_conditioning_rejects_mismatched_sizes() {
+        let wrong = image::RgbImage::new(4, 4);
+        let err = normal_map_conditioning(&[wrong], 2, 2)
+            .expect_err("a size mismatch must not be silently conditioned on");
+        let msg = err.to_string();
+        assert!(msg.contains("4×4"), "must report the actual size: {msg}");
+        assert!(msg.contains("2×2"), "must report the expected size: {msg}");
+    }
+
+    #[test]
+    fn test_normal_map_conditioning_rejects_empty_input() {
+        assert!(normal_map_conditioning(&[], 2, 2).is_err());
     }
 
     #[test]

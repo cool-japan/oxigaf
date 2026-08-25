@@ -32,6 +32,249 @@
 //! has **no** effect on [`Trainer::train_step`] — using it means driving it from
 //! your own loop.  The `pub mod` block below is split into the two groups so the
 //! distinction is visible at a glance.
+//!
+//! # Examples
+//!
+//! These mirror `README.md` and are compiled on every `cargo test`, so a README
+//! example cannot silently rot into code that no longer builds.  The ones that
+//! need a GPU or files on disk are `no_run`: they are type-checked, not
+//! executed.
+//!
+//! ## Basic training loop
+//!
+//! ```no_run
+//! use oxigaf_render::RasterConfig;
+//! use oxigaf_trainer::init::GaussianInitializer;
+//! use oxigaf_trainer::{LossConfig, OptimizerConfig, Trainer, TrainingConfig};
+//! use rand::SeedableRng;
+//!
+//! # async fn run() -> Result<(), oxigaf_trainer::TrainerError> {
+//! let config = TrainingConfig {
+//!     total_iterations: 1000,
+//!     checkpoint_interval: 100,
+//!     optimizer: OptimizerConfig::default(),
+//!     loss: LossConfig::default(),
+//!     ..Default::default()
+//! };
+//! config.validate()?;
+//!
+//! // Load a FLAME model and sample the initial Gaussians on its surface.
+//! let flame_model = oxigaf_flame::FlameModel::load("path/to/flame/model")?;
+//! let mesh = flame_model.forward(&oxigaf_flame::FlameParams::neutral());
+//! let mut init_rng = rand::rngs::StdRng::seed_from_u64(42);
+//! let model = GaussianInitializer::initialize(&mesh, &config.init, &mut init_rng)?;
+//!
+//! // `Trainer::new` takes an already-created wgpu device/queue.
+//! let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+//! let adapter = instance
+//!     .request_adapter(&wgpu::RequestAdapterOptions::default())
+//!     .await
+//!     .map_err(|e| oxigaf_trainer::TrainerError::Init(format!("no GPU adapter: {e}")))?;
+//! let (device, queue) = adapter
+//!     .request_device(&wgpu::DeviceDescriptor::default())
+//!     .await
+//!     .map_err(|e| oxigaf_trainer::TrainerError::Init(e.to_string()))?;
+//!
+//! let raster_config = RasterConfig::new()
+//!     .with_sh_degree(config.init.sh_degree)
+//!     .with_resolution(512, 512);
+//! let mut trainer = Trainer::new(config.clone(), model, raster_config, device, queue, 42)?;
+//!
+//! for _ in 0..config.total_iterations {
+//!     let output = trainer.train_step()?;
+//!     if output.iteration.is_multiple_of(config.log_interval) {
+//!         println!(
+//!             "Iteration {}: loss={:.4}, {} Gaussians",
+//!             output.iteration, output.loss.total, output.num_gaussians
+//!         );
+//!     }
+//! }
+//! trainer.save_checkpoint(std::path::Path::new("final_model.json"))?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## Custom learning rates
+//!
+//! ```
+//! use oxigaf_trainer::{OptimizerConfig, TrainingConfig};
+//!
+//! # fn main() -> Result<(), oxigaf_trainer::TrainerError> {
+//! let optimizer = OptimizerConfig {
+//!     lr_position: 1.6e-4,
+//!     lr_position_final: 1.6e-6,
+//!     lr_rotation: 1e-3,
+//!     lr_scale: 5e-3,
+//!     lr_opacity: 5e-2,
+//!     lr_sh: 2.5e-3,
+//!     lr_offset: 1e-4,
+//!     beta1: 0.9,
+//!     beta2: 0.999,
+//!     epsilon: 1e-15,
+//!     position_lr_decay_steps: 30_000,
+//! };
+//! let config = TrainingConfig {
+//!     optimizer,
+//!     ..Default::default()
+//! };
+//! config.validate()?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## Custom loss weights
+//!
+//! ```
+//! use oxigaf_trainer::{LossConfig, TrainingConfig};
+//!
+//! # fn main() -> Result<(), oxigaf_trainer::TrainerError> {
+//! let loss = LossConfig {
+//!     w_l1: 0.8,
+//!     w_ssim: 0.2,
+//!     w_ms_ssim: 0.0,
+//!     w_lpips: 0.05,
+//!     w_position_reg: 0.01,
+//!     w_scale_reg: 0.01,
+//!     w_opacity_reg: 0.001,
+//!     w_normal: 0.05,
+//!     w_gradient_penalty: 0.0,
+//!     gradient_penalty_threshold: 100.0,
+//!     // World-space scale above which `w_scale_reg` starts to charge.
+//!     w_scale_reg_max_scale: oxigaf_trainer::loss::MAX_REASONABLE_WORLD_SCALE,
+//! };
+//! let config = TrainingConfig {
+//!     loss,
+//!     ..Default::default()
+//! };
+//! config.validate()?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## Adaptive density control
+//!
+//! ```
+//! use oxigaf_trainer::{DensityConfig, TrainingConfig};
+//!
+//! # fn main() -> Result<(), oxigaf_trainer::TrainerError> {
+//! let density = DensityConfig {
+//!     grad_threshold: 0.0002,
+//!     min_opacity: 0.005,
+//!     max_screen_size: 20.0,
+//!     split_scale_threshold: 0.01,
+//!     max_gaussians: 500_000,
+//! };
+//! let config = TrainingConfig {
+//!     density,
+//!     density_control_start: 1_000,
+//!     density_control_end: 12_000,
+//!     density_control_interval: 500,
+//!     ..Default::default()
+//! };
+//! config.validate()?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## Optional loop components
+//!
+//! Learning-rate scheduling, gradient clipping, micro-batch accumulation and
+//! EMA shadow weights are all off by default and switched on from the config.
+//!
+//! ```
+//! use oxigaf_trainer::config::{GradientClipConfig, LrScheduleConfig};
+//! use oxigaf_trainer::TrainingConfig;
+//!
+//! # fn main() -> Result<(), oxigaf_trainer::TrainerError> {
+//! let config = TrainingConfig {
+//!     total_iterations: 15_000,
+//!     lr_schedule: LrScheduleConfig::WarmupCosine {
+//!         warmup_steps: 500,
+//!         total_steps: 0, // 0 = use `total_iterations`
+//!         min_factor: 0.05,
+//!     },
+//!     gradient_clip: GradientClipConfig::GlobalNorm { max_norm: 1.0 },
+//!     gradient_accumulation_steps: 4,
+//!     ema_decay: Some(0.999),
+//!     ..Default::default()
+//! };
+//! config.validate()?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## Checkpoints
+//!
+//! ```no_run
+//! use oxigaf_render::RasterConfig;
+//! use oxigaf_trainer::checkpoint::try_load_checkpoint_with_fallback;
+//! use oxigaf_trainer::{Trainer, TrainingConfig};
+//! use std::path::Path;
+//!
+//! # fn save(trainer: &Trainer, iteration: u32) -> Result<(), oxigaf_trainer::TrainerError> {
+//! let path = format!("checkpoints/training_{iteration:06}.json");
+//! trainer.save_checkpoint(Path::new(&path))?;
+//! # Ok(())
+//! # }
+//! # fn resume(
+//! #     config: TrainingConfig,
+//! #     checkpoint_path: &Path,
+//! #     raster_config: RasterConfig,
+//! #     device: wgpu::Device,
+//! #     queue: wgpu::Queue,
+//! # ) -> Result<(), oxigaf_trainer::TrainerError> {
+//! // Reads the primary file, falling back to `*.backup.json`.
+//! let checkpoint = try_load_checkpoint_with_fallback(checkpoint_path)?;
+//! println!("resuming from iteration {}", checkpoint.iteration);
+//!
+//! let mut trainer =
+//!     Trainer::from_checkpoint(config, checkpoint_path, raster_config, device, queue, 42)?;
+//! trainer.run(Some(Path::new("checkpoints")))?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## TensorBoard logging
+//!
+//! ```
+//! use oxigaf_trainer::{TensorBoardConfig, TrainingConfig};
+//!
+//! # fn main() -> Result<(), oxigaf_trainer::TrainerError> {
+//! let config = TrainingConfig {
+//!     tensorboard: TensorBoardConfig::new(std::env::temp_dir().join("runs/experiment_1"))
+//!         .with_run_name("run1"),
+//!     ..Default::default()
+//! };
+//! config.validate()?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## LPIPS perceptual loss
+//!
+//! ```no_run
+//! use oxigaf_trainer::loss::LossComputer;
+//! use oxigaf_trainer::{LossConfig, LpipsLossComputer};
+//! use std::path::Path;
+//!
+//! # fn main() -> Result<(), oxigaf_trainer::TrainerError> {
+//! let loss_config = LossConfig {
+//!     w_l1: 0.75,
+//!     w_lpips: 0.05,
+//!     ..Default::default()
+//! };
+//! let computer = LossComputer::new(loss_config);
+//!
+//! // LPIPS needs VGG weights on disk; it is reported as `0.0` until loaded.
+//! let mut lpips = LpipsLossComputer::new();
+//! lpips.init_uniform(Path::new("weights/vgg16.safetensors"))?;
+//! assert!(lpips.is_initialized());
+//!
+//! // The differentiated objective is always the one this computer reports.
+//! assert_eq!(computer.config().w_lpips, 0.05);
+//! # Ok(())
+//! # }
+//! ```
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 #![cfg_attr(not(test), deny(clippy::expect_used))]
@@ -55,6 +298,7 @@ pub mod checkpoint;
 pub mod config;
 pub mod density;
 pub mod diffusion_target;
+pub mod image_gradient;
 pub mod init;
 pub mod loss;
 pub mod lpips;
@@ -106,6 +350,13 @@ pub mod loss_landscape;
 pub mod loss_reweighting;
 pub mod lr_scheduler;
 pub mod meta_learning;
+/// A [`meta_learning::MetaModel`] over a real Gaussian avatar.
+///
+/// Lives at `src/meta_learning/avatar.rs`; it is attached here rather than
+/// declared inside [`meta_learning`] so that module needs no edit.  Read it as
+/// `meta_learning::avatar` — the path is the only difference.
+#[path = "meta_learning/avatar.rs"]
+pub mod meta_learning_avatar;
 pub mod multi_resolution_loss;
 pub mod noise_injection;
 pub mod ohem;
@@ -329,7 +580,10 @@ pub use contrastive_learning::{
     cl_supcon_loss,
     // Triplet loss
     cl_triplet_loss,
+    cl_triplet_loss_from_config,
     cl_uniformity,
+    cl_uniformity_sampled,
+    cl_update_geometry_stats,
     cl_update_stats,
     // Error type
     ContrastiveError,
@@ -363,7 +617,7 @@ pub use contrastive_loss::{
     TripletIndex,
 };
 pub use convergence_analysis::{
-    compute_loss_percentile, compute_loss_slope, compute_oscillation_score,
+    compute_loss_percentile, compute_loss_slope, compute_loss_slope_xy, compute_oscillation_score,
     compute_relative_improvement, detect_convergence_phase, detect_phase_transitions,
     ema_smooth_losses, estimate_steps_to_convergence, format_convergence_report,
     generate_convergence_report, loss_improvement_rate, ConvergenceAnalyzer, ConvergenceConfig,
@@ -386,7 +640,10 @@ pub use data_augmentation::{
     vertical_flip, xorshift64, xorshift_f32, AugImageStats, AugmentConfig, AugmentError, AugmentOp,
     ImageAugmenter,
 };
-pub use data_parallel::{DataParallelConfig, GradientAggregator, SyncMode, SyncReport};
+pub use data_parallel::{
+    compress_gradients, ring_all_reduce_bytes, run_parallel_step, DataParallelConfig,
+    GradientAggregator, GradientBucket, StepOutcome, SyncMode, SyncReport, DEFAULT_BUCKET_SIZE_MB,
+};
 pub use diagnostics::{
     DensityStats, EmaTracker, GradientNormTracker, LossTracker, TrainingDiagnostics,
 };
@@ -410,9 +667,9 @@ pub use feature_bank::{
 pub use few_shot_adaptation::{
     fsa_class_indices, fsa_compute_stats, fsa_episode_accuracy, fsa_format_config,
     fsa_format_result, fsa_format_stats, fsa_inner_gradient, fsa_inner_loss, fsa_lora_apply,
-    fsa_maml_adapt, fsa_maml_query_loss, fsa_proto_accuracy, fsa_proto_loss, fsa_sample_episode,
-    AdaptationResult, Episode, FewShotConfig, FewShotError, FewShotStats, LoraAdapter, MamlState,
-    PrototypicalNet, QuerySet, SupportSet,
+    fsa_maml_adapt, fsa_maml_query_loss, fsa_proto_accuracy, fsa_proto_loss, fsa_run_episodes,
+    fsa_sample_episode, AdaptationResult, Episode, FewShotConfig, FewShotError, FewShotStats,
+    LoraAdapter, MamlState, PrototypicalNet, QuerySet, SupportSet,
 };
 pub use gradient_accumulation::{
     gradients_have_inf, gradients_have_nan, scale_loss, unscale_gradients, AccumulationConfig,
@@ -447,8 +704,9 @@ pub use knowledge_distillation::{
 };
 pub use layer_freezing::{
     apply_frozen_mask, back_frozen_mask, check_frozen_gradients_zeroed, front_frozen_mask,
-    frozen_compute_savings, progressive_mask, split_into_groups, unfreeze_fraction, FreezeConfig,
-    FreezingError, FrozenMask, GaussianParamGroup, ParameterFreezer, ProgressiveUnfreezeSchedule,
+    frozen_compute_savings, non_empty_group_sizes, progressive_mask, unfreeze_fraction,
+    FreezeConfig, FreezingError, FrozenMask, GaussianParamGroup, ParameterFreezer,
+    ProgressiveUnfreezeSchedule,
 };
 pub use loss::LpipsLossComputer;
 pub use loss_landscape::{
@@ -601,11 +859,12 @@ pub use trainer::{StepOutput, Trainer};
 pub use training_config::{TrainingProfile, TrainingProfileConfig};
 pub use uncertainty_estimation::{
     aggregate_region_uncertainty, apply_dropout_mask, bald_score, compute_calibration,
-    decompose_uncertainty, ensemble_variance, high_uncertainty_indices, mc_dropout_stats,
-    per_gaussian_position_uncertainty, prediction_entropy, reliability_diagram_points,
-    stable_softmax, temperature_scale, uncertainty_weighted_loss, variance_to_confidence,
-    CalibrationResult, ConfidenceMap, PredictionUncertainty, RegionUncertainty, UncertaintyConfig,
-    UncertaintyDecomposition, UncertaintyError,
+    decompose_uncertainty, decompose_uncertainty_with_variances, ensemble_variance,
+    high_uncertainty_indices, mc_dropout_stats, per_gaussian_position_uncertainty,
+    prediction_entropy, reliability_diagram_points, stable_softmax, temperature_scale,
+    uncertainty_weighted_loss, variance_to_confidence, CalibrationResult, ConfidenceMap,
+    PredictionUncertainty, RegionUncertainty, UncertaintyConfig, UncertaintyDecomposition,
+    UncertaintyError,
 };
 pub use validation_split::{
     DataSplit, EarlyStopper, EarlyStopperConfig, MonitorMetric, SplitError, SplitStrategy,

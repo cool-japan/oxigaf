@@ -16,6 +16,7 @@ use candle_core::{DType, Device, Result, Tensor};
 use candle_nn as nn;
 use candle_nn::Module;
 
+use crate::pipeline::seeded_normal_tensor;
 use crate::scheduler::{DdimScheduler, PredictionType};
 use crate::DiffusionError;
 
@@ -25,6 +26,27 @@ const UPSAMPLER_LATENT_CHANNELS: usize = 4;
 /// U-Net input channels: noisy target-resolution latents concatenated with the
 /// nearest-upsampled conditioning latents.
 const UPSAMPLER_UNET_IN_CHANNELS: usize = UPSAMPLER_LATENT_CHANNELS * 2;
+
+/// Training timestep count of the upsampler's DDIM scheduler.
+///
+/// Named rather than inlined so [`LatentUpsampler::load`] and
+/// [`LatentUpsampler::sdx2_from_var_builder`] cannot drift apart.
+const UPSAMPLER_TRAIN_TIMESTEPS: usize = 1000;
+
+/// Seed [`LatentUpsampler::upsample`] uses when the caller supplies none.
+///
+/// Any fixed value makes the plain `upsample` entry point reproducible; use
+/// [`LatentUpsampler::upsample_with_seed`] to vary it.
+const DEFAULT_UPSAMPLER_SEED: u64 = 0;
+
+/// Mixed into the caller's seed before drawing the upsampler's init noise.
+///
+/// The pipeline keys both its initial latents and (through
+/// [`LatentUpsampler::upsample_with_seed`]) the upsampler's noise off the same
+/// run seed. Without a salt the two would be prefixes of one identical sample
+/// stream; XOR-ing this constant gives the upsampler an independent sub-stream
+/// while keeping the whole run a pure function of the run seed.
+const UPSAMPLER_NOISE_SALT: u64 = 0x5DEE_CE66_D5B2_1B0F;
 
 // ---------------------------------------------------------------------------
 // Upsampler mode
@@ -366,7 +388,7 @@ fn bilinear_upsample2d(xs: &Tensor, out_h: usize, out_w: usize) -> Result<Tensor
     let out = p00.broadcast_mul(&w00)?;
     let out = (out + p10.broadcast_mul(&w10)?)?;
     let out = (out + p01.broadcast_mul(&w01)?)?;
-    (out + p11.broadcast_mul(&w11)?)
+    out + p11.broadcast_mul(&w11)?
 }
 
 // ---------------------------------------------------------------------------
@@ -620,30 +642,48 @@ impl LatentUpsampler {
         weights_path: &std::path::Path,
         device: &Device,
     ) -> std::result::Result<Self, DiffusionError> {
-        let unet = match mode {
+        match mode {
             UpsamplerMode::SdX2 => {
-                let dtype = DType::F32;
                 let safetensors_path = weights_path.join("diffusion_pytorch_model.safetensors");
                 let data = std::fs::read(&safetensors_path).map_err(|e| {
                     DiffusionError::ModelLoad(format!("Failed to read upsampler weights: {e}"))
                 })?;
-                let vb = nn::VarBuilder::from_buffered_safetensors(data, dtype, device)
+                let vb = nn::VarBuilder::from_buffered_safetensors(data, DType::F32, device)
                     .map_err(|e| DiffusionError::ModelLoad(format!("Upsampler VarBuilder: {e}")))?;
-                Some(
-                    UpsamplerUNet::new(vb, UPSAMPLER_UNET_IN_CHANNELS).map_err(|e| {
-                        DiffusionError::ModelLoad(format!("Upsampler U-Net build: {e}"))
-                    })?,
-                )
+                Self::sdx2_from_var_builder(vb, device)
             }
-            UpsamplerMode::BilinearVae => None,
-        };
+            // Pure interpolation: no parameters, nothing to read.
+            UpsamplerMode::BilinearVae => Ok(Self {
+                mode,
+                unet: None,
+                scheduler: DdimScheduler::new(UPSAMPLER_TRAIN_TIMESTEPS, PredictionType::Epsilon),
+                device: device.clone(),
+            }),
+        }
+    }
 
-        let scheduler = DdimScheduler::new(1000, PredictionType::Epsilon);
-
+    /// Build an [`UpsamplerMode::SdX2`] upsampler from an already-open
+    /// [`nn::VarBuilder`].
+    ///
+    /// [`Self::load`] is this plus a `std::fs::read`. Keeping the two apart
+    /// lets an in-process caller build the upsampler from weights that never
+    /// touch the filesystem — which is how [`crate::pipeline`]'s determinism
+    /// test assembles a whole pipeline without a weights directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DiffusionError::ModelLoad`] when `vb` cannot supply a tensor
+    /// the U-Net needs, or supplies one of the wrong shape.
+    pub(crate) fn sdx2_from_var_builder(
+        vb: nn::VarBuilder<'_>,
+        device: &Device,
+    ) -> std::result::Result<Self, DiffusionError> {
+        let unet = UpsamplerUNet::new(vb, UPSAMPLER_UNET_IN_CHANNELS)
+            .map_err(|e| DiffusionError::ModelLoad(format!("Upsampler U-Net build: {e}")))?;
         Ok(Self {
-            mode,
-            unet,
-            scheduler,
+            mode: UpsamplerMode::SdX2,
+            unet: Some(unet),
+            scheduler: DdimScheduler::new(UPSAMPLER_TRAIN_TIMESTEPS, PredictionType::Epsilon),
             device: device.clone(),
         })
     }
@@ -670,8 +710,32 @@ impl LatentUpsampler {
         latents: &Tensor,
         num_steps: usize,
     ) -> std::result::Result<Tensor, DiffusionError> {
+        self.upsample_with_seed(latents, num_steps, DEFAULT_UPSAMPLER_SEED)
+    }
+
+    /// Upsample latents by 2× from an explicit noise seed.
+    ///
+    /// `SdX2` mode starts its denoising loop from fresh Gaussian noise. That
+    /// noise used to come from candle's process-global RNG, which cannot be
+    /// seeded on CPU — so a pipeline run with an upsampler configured was not
+    /// reproducible even though every other stage was. It now comes from the
+    /// same dependency-free, device-independent xorshift + Box-Muller stream
+    /// [`crate::pipeline::MultiViewDiffusionPipeline::generate`] uses for its
+    /// initial latents, keyed by `seed`.
+    ///
+    /// `BilinearVae` mode is pure interpolation and ignores `seed` entirely.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::upsample`].
+    pub fn upsample_with_seed(
+        &mut self,
+        latents: &Tensor,
+        num_steps: usize,
+        seed: u64,
+    ) -> std::result::Result<Tensor, DiffusionError> {
         match self.mode {
-            UpsamplerMode::SdX2 => self.upsample_sdx2(latents, num_steps),
+            UpsamplerMode::SdX2 => self.upsample_sdx2(latents, num_steps, seed),
             UpsamplerMode::BilinearVae => self.upsample_bilinear(latents),
         }
     }
@@ -708,6 +772,7 @@ impl LatentUpsampler {
         &mut self,
         latents: &Tensor,
         num_steps: usize,
+        seed: u64,
     ) -> std::result::Result<Tensor, DiffusionError> {
         let (out_h, out_w) = Self::target_size(latents)?;
         let batch = latents
@@ -731,16 +796,21 @@ impl LatentUpsampler {
             .map_err(|e| DiffusionError::Inference(format!("Condition upsample: {e}")))?;
 
         // Initialize noise at the target resolution.
-        let mut current = Tensor::randn(
-            0f32,
-            1f32,
+        //
+        // Drawn from the crate's seeded xorshift + Box-Muller stream rather
+        // than `Tensor::randn` (candle's process-global RNG, unseedable on
+        // CPU), so an upsampled run reproduces bit-for-bit like every other
+        // stage of the pipeline.
+        let mut current = seeded_normal_tensor(
             (batch, UPSAMPLER_LATENT_CHANNELS, out_h, out_w),
+            seed ^ UPSAMPLER_NOISE_SALT,
             &self.device,
-        )
-        .map_err(|e| DiffusionError::Inference(format!("Noise init: {e}")))?;
+        )?;
 
-        // Set scheduler timesteps
-        self.scheduler.set_timesteps(num_steps);
+        // Set scheduler timesteps. `set_timesteps` rejects `0` (guarded above)
+        // and any count above the scheduler's 1000 training timesteps, which
+        // would otherwise collapse the schedule to repeated zero timesteps.
+        self.scheduler.set_timesteps(num_steps)?;
         let timesteps = self.scheduler.timesteps().to_vec();
 
         // DDIM denoising loop
@@ -973,11 +1043,126 @@ mod tests {
         Ok(())
     }
 
+    /// Regression: the SdX2 loop initialised its latents with
+    /// `Tensor::randn`, i.e. candle's process-global RNG, which cannot be
+    /// seeded on CPU — so an upsampled pipeline run was irreproducible even
+    /// though every other stage was deterministic.
+    #[test]
+    fn test_sdx2_is_reproducible_for_a_fixed_seed() -> Result<()> {
+        let device = Device::Cpu;
+        let varmap = nn::VarMap::new();
+        let vb = nn::VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        // One U-Net, reused: only the init noise may vary between runs.
+        let mut upsampler = LatentUpsampler {
+            mode: UpsamplerMode::SdX2,
+            unet: Some(UpsamplerUNet::new(vb, UPSAMPLER_UNET_IN_CHANNELS)?),
+            scheduler: DdimScheduler::new(1000, PredictionType::Epsilon),
+            device: device.clone(),
+        };
+
+        let latents = Tensor::randn(0f32, 1f32, (1, 4, 8, 8), &device)?;
+        let run = |up: &mut LatentUpsampler, seed: u64| -> Result<Vec<f32>> {
+            up.upsample_with_seed(&latents, 1, seed)
+                .map_err(|e| candle_core::Error::Msg(format!("{e}")))?
+                .flatten_all()?
+                .to_vec1::<f32>()
+        };
+
+        let first = run(&mut upsampler, 7)?;
+        let again = run(&mut upsampler, 7)?;
+        assert_eq!(first, again, "the same seed must reproduce bit-identically");
+
+        let other = run(&mut upsampler, 8)?;
+        assert_ne!(first, other, "a different seed must change the output");
+
+        // `upsample` itself must also be reproducible (fixed default seed).
+        let default_a = upsampler
+            .upsample(&latents, 1)
+            .map_err(|e| candle_core::Error::Msg(format!("{e}")))?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let default_b = upsampler
+            .upsample(&latents, 1)
+            .map_err(|e| candle_core::Error::Msg(format!("{e}")))?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        assert_eq!(default_a, default_b);
+        Ok(())
+    }
+
+    /// The upsampler's noise must not be a prefix-copy of the initial latents
+    /// the pipeline draws from the same run seed.
+    #[test]
+    fn test_upsampler_noise_salt_decorrelates_the_streams() -> Result<()> {
+        let device = Device::Cpu;
+        let seed = 4242u64;
+        let read = |s: u64| -> Result<Vec<f32>> {
+            seeded_normal_tensor((1, 4, 4, 4), s, &device)
+                .map_err(|e| candle_core::Error::Msg(format!("{e}")))?
+                .flatten_all()?
+                .to_vec1::<f32>()
+        };
+        // The pipeline keys its initial latents off the bare run seed; the
+        // upsampler salts it, so the two must not share a sample stream.
+        assert_ne!(read(seed)?, read(seed ^ UPSAMPLER_NOISE_SALT)?);
+        assert_ne!(UPSAMPLER_NOISE_SALT, 0);
+        Ok(())
+    }
+
     #[test]
     fn test_upsampler_unet_declares_eight_input_channels() {
         // The conditioning latents are concatenated onto the noisy latents.
         assert_eq!(UPSAMPLER_UNET_IN_CHANNELS, 2 * UPSAMPLER_LATENT_CHANNELS);
         assert_eq!(UPSAMPLER_UNET_IN_CHANNELS, 8);
+    }
+
+    /// `sdx2_from_var_builder` must produce exactly what the file-backed
+    /// [`LatentUpsampler::load`] would: `SdX2` mode, a U-Net, and the same
+    /// 1000-timestep epsilon schedule.
+    #[test]
+    fn test_sdx2_from_var_builder_matches_the_loaded_shape() -> Result<()> {
+        let device = Device::Cpu;
+        let varmap = nn::VarMap::new();
+        let vb = nn::VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let mut upsampler = LatentUpsampler::sdx2_from_var_builder(vb, &device)
+            .map_err(|e| candle_core::Error::Msg(format!("{e}")))?;
+
+        assert_eq!(upsampler.mode, UpsamplerMode::SdX2);
+        assert!(upsampler.unet.is_some());
+        // `set_timesteps` rejects a count above the training timesteps, which
+        // pins the schedule at `UPSAMPLER_TRAIN_TIMESTEPS` without needing an
+        // accessor the scheduler does not expose.
+        assert!(upsampler
+            .scheduler
+            .set_timesteps(UPSAMPLER_TRAIN_TIMESTEPS)
+            .is_ok());
+        assert!(upsampler
+            .scheduler
+            .set_timesteps(UPSAMPLER_TRAIN_TIMESTEPS + 1)
+            .is_err());
+
+        let latents = Tensor::randn(0f32, 1f32, (1, 4, 8, 8), &device)?;
+        let out = upsampler
+            .upsample_with_seed(&latents, 1, 5)
+            .map_err(|e| candle_core::Error::Msg(format!("{e}")))?;
+        assert_eq!(out.dims(), &[1, 4, 16, 16]);
+        Ok(())
+    }
+
+    /// `BilinearVae` has no parameters, so `load` must not go near the
+    /// filesystem for it — the weights directory need not even exist.
+    #[test]
+    fn test_load_bilinear_needs_no_weights_on_disk() -> Result<()> {
+        let device = Device::Cpu;
+        let missing = std::env::temp_dir().join("oxigaf_upsampler_weights_that_do_not_exist");
+        let upsampler = LatentUpsampler::load(UpsamplerMode::BilinearVae, &missing, &device)
+            .map_err(|e| candle_core::Error::Msg(format!("{e}")))?;
+        assert_eq!(upsampler.mode, UpsamplerMode::BilinearVae);
+        assert!(upsampler.unet.is_none());
+
+        // `SdX2` from the same directory must still fail: it does need weights.
+        assert!(LatentUpsampler::load(UpsamplerMode::SdX2, &missing, &device).is_err());
+        Ok(())
     }
 
     #[test]

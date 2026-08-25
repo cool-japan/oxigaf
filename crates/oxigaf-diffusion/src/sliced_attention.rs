@@ -284,20 +284,22 @@ impl SlicedAttention {
                     // Q chunk: [chunk_len, head_dim]
                     let q_chunk = &q[q_base + qi * head_dim..q_base + chunk_end * head_dim];
 
+                    let shape = ChunkShape {
+                        chunk_len,
+                        seq_len_k,
+                        head_dim,
+                    };
+
                     // Compute scores = Q_chunk @ K^T / sqrt(d): [chunk_len, seq_len_k]
                     let scores = &mut scores_buf[..chunk_len * seq_len_k];
-                    compute_qkt_into(
-                        q_chunk, k_tile, chunk_len, seq_len_k, head_dim, scale, scores,
-                    );
+                    compute_qkt_into(q_chunk, k_tile, shape, scale, scores);
 
                     // Softmax weights (kernel chosen by `precision`) and apply to V.
                     let out_chunk = &mut out_buf[..chunk_len * head_dim];
                     softmax_and_weighted_v_into(
                         scores,
                         v_tile,
-                        chunk_len,
-                        seq_len_k,
-                        head_dim,
+                        shape,
                         precision,
                         &mut exp_buf,
                         out_chunk,
@@ -321,6 +323,22 @@ impl SlicedAttention {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
+/// Geometry of one query chunk within a `(batch, head)` attention tile.
+///
+/// The three extents travel together through every kernel below — separating
+/// them into positional `usize` arguments is what pushed
+/// [`softmax_and_weighted_v_into`] over `clippy::too_many_arguments`, and made
+/// `seq_len_k` and `head_dim` interchangeable at a call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ChunkShape {
+    /// Queries in this chunk: rows of `scores` and of `out`.
+    chunk_len: usize,
+    /// Keys/values attended over: columns of `scores`, rows of `v_tile`.
+    seq_len_k: usize,
+    /// Width of one attention head: columns of `out` and of `v_tile`.
+    head_dim: usize,
+}
+
 /// Compute `Q_chunk @ K^T * scale` into a caller-provided buffer.
 ///
 /// `q` has shape `[chunk_len, head_dim]` (row-major),
@@ -328,15 +346,12 @@ impl SlicedAttention {
 /// Writes `scores` with shape `[chunk_len, seq_len_k]`; `scores.len()` must
 /// be exactly `chunk_len * seq_len_k` (callers pass a tight sub-slice of a
 /// larger reusable buffer so no allocation happens per chunk).
-fn compute_qkt_into(
-    q: &[f32],
-    k: &[f32],
-    chunk_len: usize,
-    seq_len_k: usize,
-    head_dim: usize,
-    scale: f32,
-    scores: &mut [f32],
-) {
+fn compute_qkt_into(q: &[f32], k: &[f32], shape: ChunkShape, scale: f32, scores: &mut [f32]) {
+    let ChunkShape {
+        chunk_len,
+        seq_len_k,
+        head_dim,
+    } = shape;
     for qi in 0..chunk_len {
         let q_row = &q[qi * head_dim..(qi + 1) * head_dim];
         for ki in 0..seq_len_k {
@@ -363,17 +378,19 @@ fn compute_qkt_into(
 /// an un-upcasted low-precision kernel), while
 /// [`AttentionPrecision::UpcastedSoftmax`] / [`AttentionPrecision::FullUpcast`]
 /// use the numerically stable log-sum-exp form.
-#[allow(clippy::too_many_arguments)]
 fn softmax_and_weighted_v_into(
     scores: &[f32],
     v_tile: &[f32],
-    chunk_len: usize,
-    seq_len_k: usize,
-    head_dim: usize,
+    shape: ChunkShape,
     precision: AttentionPrecision,
     exp_row: &mut [f32],
     out: &mut [f32],
 ) {
+    let ChunkShape {
+        chunk_len,
+        seq_len_k,
+        head_dim,
+    } = shape;
     for qi in 0..chunk_len {
         let score_row = &scores[qi * seq_len_k..(qi + 1) * seq_len_k];
 
@@ -435,20 +452,35 @@ mod tests {
         (q, k, v)
     }
 
-    /// Run forward with given slice_size and return output.
-    #[allow(clippy::too_many_arguments)]
-    fn run_forward(
-        q: &[f32],
-        k: &[f32],
-        v: &[f32],
+    /// The tensor geometry one test runs at.
+    ///
+    /// Field names match the locals every test destructures, so call sites can
+    /// use field-init shorthand and stop passing five same-typed `usize`s
+    /// positionally.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct TestDims {
         batch: usize,
-        num_heads: usize,
+        heads: usize,
         seq_q: usize,
         seq_k: usize,
         head_dim: usize,
+    }
+
+    /// Run forward with the given slice size and return the output.
+    fn run_forward(
+        qkv: (&[f32], &[f32], &[f32]),
+        dims: TestDims,
         slice_size: Option<usize>,
     ) -> Result<Vec<f32>, DiffusionError> {
-        let cfg = SlicedAttentionConfig::new(slice_size, num_heads, head_dim);
+        let (q, k, v) = qkv;
+        let TestDims {
+            batch,
+            heads,
+            seq_q,
+            seq_k,
+            head_dim,
+        } = dims;
+        let cfg = SlicedAttentionConfig::new(slice_size, heads, head_dim);
         let attn = SlicedAttention::new(cfg)?;
         attn.forward(q, k, v, batch, seq_q, seq_k)
     }
@@ -524,7 +556,17 @@ mod tests {
     fn test_output_shape_single_token_q() -> Result<(), DiffusionError> {
         let (batch, heads, seq_q, seq_k, head_dim) = (1, 2, 1, 8, 16);
         let (q, k, v) = make_tensors(batch, heads, seq_q, seq_k, head_dim);
-        let out = run_forward(&q, &k, &v, batch, heads, seq_q, seq_k, head_dim, None)?;
+        let out = run_forward(
+            (&q, &k, &v),
+            TestDims {
+                batch,
+                heads,
+                seq_q,
+                seq_k,
+                head_dim,
+            },
+            None,
+        )?;
         assert_eq!(out.len(), batch * heads * seq_q * head_dim);
         Ok(())
     }
@@ -533,7 +575,17 @@ mod tests {
     fn test_output_shape_batch2() -> Result<(), DiffusionError> {
         let (batch, heads, seq_q, seq_k, head_dim) = (2, 4, 6, 8, 16);
         let (q, k, v) = make_tensors(batch, heads, seq_q, seq_k, head_dim);
-        let out = run_forward(&q, &k, &v, batch, heads, seq_q, seq_k, head_dim, Some(2))?;
+        let out = run_forward(
+            (&q, &k, &v),
+            TestDims {
+                batch,
+                heads,
+                seq_q,
+                seq_k,
+                head_dim,
+            },
+            Some(2),
+        )?;
         assert_eq!(out.len(), batch * heads * seq_q * head_dim);
         Ok(())
     }
@@ -547,16 +599,26 @@ mod tests {
         let (batch, heads, seq_q, seq_k, head_dim) = (1, 2, 4, 4, 8);
         let (q, k, v) = make_tensors(batch, heads, seq_q, seq_k, head_dim);
 
-        let out_none = run_forward(&q, &k, &v, batch, heads, seq_q, seq_k, head_dim, None)?;
+        let out_none = run_forward(
+            (&q, &k, &v),
+            TestDims {
+                batch,
+                heads,
+                seq_q,
+                seq_k,
+                head_dim,
+            },
+            None,
+        )?;
         let out_full = run_forward(
-            &q,
-            &k,
-            &v,
-            batch,
-            heads,
-            seq_q,
-            seq_k,
-            head_dim,
+            (&q, &k, &v),
+            TestDims {
+                batch,
+                heads,
+                seq_q,
+                seq_k,
+                head_dim,
+            },
             Some(seq_q),
         )?;
         let diff = max_abs_diff(&out_none, &out_full);
@@ -569,8 +631,28 @@ mod tests {
         let (batch, heads, seq_q, seq_k, head_dim) = (1, 2, 6, 8, 16);
         let (q, k, v) = make_tensors(batch, heads, seq_q, seq_k, head_dim);
 
-        let out_none = run_forward(&q, &k, &v, batch, heads, seq_q, seq_k, head_dim, None)?;
-        let out_s1 = run_forward(&q, &k, &v, batch, heads, seq_q, seq_k, head_dim, Some(1))?;
+        let out_none = run_forward(
+            (&q, &k, &v),
+            TestDims {
+                batch,
+                heads,
+                seq_q,
+                seq_k,
+                head_dim,
+            },
+            None,
+        )?;
+        let out_s1 = run_forward(
+            (&q, &k, &v),
+            TestDims {
+                batch,
+                heads,
+                seq_q,
+                seq_k,
+                head_dim,
+            },
+            Some(1),
+        )?;
         let diff = max_abs_diff(&out_none, &out_s1);
         assert!(diff < 1e-5, "None vs slice_size=1 diff={diff}");
         Ok(())
@@ -581,8 +663,28 @@ mod tests {
         let (batch, heads, seq_q, seq_k, head_dim) = (1, 2, 4, 4, 8);
         let (q, k, v) = make_tensors(batch, heads, seq_q, seq_k, head_dim);
 
-        let out_none = run_forward(&q, &k, &v, batch, heads, seq_q, seq_k, head_dim, None)?;
-        let out_s2 = run_forward(&q, &k, &v, batch, heads, seq_q, seq_k, head_dim, Some(2))?;
+        let out_none = run_forward(
+            (&q, &k, &v),
+            TestDims {
+                batch,
+                heads,
+                seq_q,
+                seq_k,
+                head_dim,
+            },
+            None,
+        )?;
+        let out_s2 = run_forward(
+            (&q, &k, &v),
+            TestDims {
+                batch,
+                heads,
+                seq_q,
+                seq_k,
+                head_dim,
+            },
+            Some(2),
+        )?;
         let diff = max_abs_diff(&out_none, &out_s2);
         assert!(diff < 1e-5, "None vs slice_size=2 diff={diff}");
         Ok(())
@@ -594,8 +696,28 @@ mod tests {
         let (batch, heads, seq_q, seq_k, head_dim) = (1, 1, 3, 5, 8);
         let (q, k, v) = make_tensors(batch, heads, seq_q, seq_k, head_dim);
 
-        let out_none = run_forward(&q, &k, &v, batch, heads, seq_q, seq_k, head_dim, None)?;
-        let out_large = run_forward(&q, &k, &v, batch, heads, seq_q, seq_k, head_dim, Some(1000))?;
+        let out_none = run_forward(
+            (&q, &k, &v),
+            TestDims {
+                batch,
+                heads,
+                seq_q,
+                seq_k,
+                head_dim,
+            },
+            None,
+        )?;
+        let out_large = run_forward(
+            (&q, &k, &v),
+            TestDims {
+                batch,
+                heads,
+                seq_q,
+                seq_k,
+                head_dim,
+            },
+            Some(1000),
+        )?;
         let diff = max_abs_diff(&out_none, &out_large);
         assert!(diff < 1e-5, "None vs large slice_size diff={diff}");
         Ok(())
@@ -609,7 +731,17 @@ mod tests {
     fn test_output_is_finite() -> Result<(), DiffusionError> {
         let (batch, heads, seq_q, seq_k, head_dim) = (1, 1, 8, 8, 4);
         let (q, k, v) = make_tensors(batch, heads, seq_q, seq_k, head_dim);
-        let out = run_forward(&q, &k, &v, batch, heads, seq_q, seq_k, head_dim, Some(3))?;
+        let out = run_forward(
+            (&q, &k, &v),
+            TestDims {
+                batch,
+                heads,
+                seq_q,
+                seq_k,
+                head_dim,
+            },
+            Some(3),
+        )?;
         for (i, &x) in out.iter().enumerate() {
             assert!(x.is_finite(), "output[{i}] = {x} is not finite");
         }
@@ -631,7 +763,17 @@ mod tests {
             .flat_map(|ki| (0..head_dim).map(move |d| ki as f32 + d as f32 * 0.1))
             .collect();
 
-        let out = run_forward(&q, &k, &v, batch, heads, seq_q, seq_k, head_dim, None)?;
+        let out = run_forward(
+            (&q, &k, &v),
+            TestDims {
+                batch,
+                heads,
+                seq_q,
+                seq_k,
+                head_dim,
+            },
+            None,
+        )?;
 
         // Expected: mean of V rows
         let v_mean: Vec<f32> = (0..head_dim)
@@ -671,7 +813,17 @@ mod tests {
         // V = identity same as K
         let v = k.clone();
 
-        let out = run_forward(&q, &k, &v, batch, heads, seq_q, seq_k, head_dim, None)?;
+        let out = run_forward(
+            (&q, &k, &v),
+            TestDims {
+                batch,
+                heads,
+                seq_q,
+                seq_k,
+                head_dim,
+            },
+            None,
+        )?;
         assert_eq!(out.len(), batch * heads * seq_q * head_dim);
         for (i, &x) in out.iter().enumerate() {
             assert!(x.is_finite(), "output[{i}] = {x} is not finite");
@@ -683,7 +835,17 @@ mod tests {
     fn test_standard_attention_shape_b1h1s8k8d4() -> Result<(), DiffusionError> {
         let (batch, heads, seq_q, seq_k, head_dim) = (1, 1, 8, 8, 4);
         let (q, k, v) = make_tensors(batch, heads, seq_q, seq_k, head_dim);
-        let out = run_forward(&q, &k, &v, batch, heads, seq_q, seq_k, head_dim, None)?;
+        let out = run_forward(
+            (&q, &k, &v),
+            TestDims {
+                batch,
+                heads,
+                seq_q,
+                seq_k,
+                head_dim,
+            },
+            None,
+        )?;
         assert_eq!(out.len(), batch * heads * seq_q * head_dim);
         Ok(())
     }
@@ -692,7 +854,17 @@ mod tests {
     fn test_sliced_attention_shape_b1h1s8k8d4() -> Result<(), DiffusionError> {
         let (batch, heads, seq_q, seq_k, head_dim) = (1, 1, 8, 8, 4);
         let (q, k, v) = make_tensors(batch, heads, seq_q, seq_k, head_dim);
-        let out = run_forward(&q, &k, &v, batch, heads, seq_q, seq_k, head_dim, Some(3))?;
+        let out = run_forward(
+            (&q, &k, &v),
+            TestDims {
+                batch,
+                heads,
+                seq_q,
+                seq_k,
+                head_dim,
+            },
+            Some(3),
+        )?;
         assert_eq!(out.len(), batch * heads * seq_q * head_dim);
         Ok(())
     }
@@ -705,7 +877,17 @@ mod tests {
         // All V values are in [-1, 1], so output must also be in [-1, 1].
         let max_v = v.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
         let min_v = v.iter().cloned().fold(f32::INFINITY, f32::min);
-        let out = run_forward(&q, &k, &v, batch, heads, seq_q, seq_k, head_dim, Some(4))?;
+        let out = run_forward(
+            (&q, &k, &v),
+            TestDims {
+                batch,
+                heads,
+                seq_q,
+                seq_k,
+                head_dim,
+            },
+            Some(4),
+        )?;
         for (i, &x) in out.iter().enumerate() {
             assert!(
                 x >= min_v - 1e-4 && x <= max_v + 1e-4,
@@ -735,8 +917,28 @@ mod tests {
         let (batch, heads, seq_q, seq_k, head_dim) = (1, 2, 8, 6, 16);
         let (q, k, v) = make_tensors(batch, heads, seq_q, seq_k, head_dim);
 
-        let out_none = run_forward(&q, &k, &v, batch, heads, seq_q, seq_k, head_dim, None)?;
-        let out_s3 = run_forward(&q, &k, &v, batch, heads, seq_q, seq_k, head_dim, Some(3))?;
+        let out_none = run_forward(
+            (&q, &k, &v),
+            TestDims {
+                batch,
+                heads,
+                seq_q,
+                seq_k,
+                head_dim,
+            },
+            None,
+        )?;
+        let out_s3 = run_forward(
+            (&q, &k, &v),
+            TestDims {
+                batch,
+                heads,
+                seq_q,
+                seq_k,
+                head_dim,
+            },
+            Some(3),
+        )?;
         let diff = max_abs_diff(&out_none, &out_s3);
         assert!(
             diff < 1e-5,
@@ -834,7 +1036,17 @@ mod tests {
         // `Standard`.
         let (batch, heads, seq_q, seq_k, head_dim) = (1, 2, 4, 4, 8);
         let (q, k, v) = make_tensors(batch, heads, seq_q, seq_k, head_dim);
-        let out_default = run_forward(&q, &k, &v, batch, heads, seq_q, seq_k, head_dim, None)?;
+        let out_default = run_forward(
+            (&q, &k, &v),
+            TestDims {
+                batch,
+                heads,
+                seq_q,
+                seq_k,
+                head_dim,
+            },
+            None,
+        )?;
 
         let cfg = SlicedAttentionConfig::new(None, heads, head_dim)
             .with_attention_precision(AttentionPrecision::UpcastedSoftmax);

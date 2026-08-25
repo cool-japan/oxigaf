@@ -183,24 +183,31 @@ fn main() -> oxigaf::Result<()> {
     }
 
     // =========================================================================
-    // Step 7: Export placeholder (guarded by output_dir existence)
+    // Step 7: Export demonstration (guarded by output_dir existence)
     // =========================================================================
     //
-    // export() validates that the model file exists and records the target
-    // format. Actual serialisation is performed by the render subsystem once
-    // a GPU runtime is available.  We guard the call with an existence check
-    // so this example never panics on a clean machine.
+    // export() reads the model at model_path (parsed by its `.ply` or
+    // `.safetensors` extension) and re-serialises it to output_path in the
+    // given format. This is a real, synchronous CPU-side write — it does not
+    // require a GPU runtime. We guard the call with an existence check so
+    // this example never panics on a clean machine, and export to `.obj`
+    // (not `.safetensors`, which export() only ever reads, never writes) so
+    // the output extension actually matches ExportFormat::Obj.
 
     println!();
     println!("Step 7: Demonstrating export API...");
 
     let model_ply = output_dir.join("model.ply");
-    let export_safetensors = output_dir.join("model.safetensors");
+    let export_obj = output_dir.join("model.obj");
 
     if model_ply.exists() {
-        match oxigaf::export(&model_ply, &export_safetensors, oxigaf::ExportFormat::Ply) {
-            Ok(()) => println!("  Export validated successfully."),
-            Err(e) => println!("  Export validation: {} (expected without real model)", e),
+        match oxigaf::export(&model_ply, &export_obj, oxigaf::ExportFormat::Obj) {
+            Ok(()) => println!(
+                "  Exported {} -> {}",
+                model_ply.display(),
+                export_obj.display()
+            ),
+            Err(e) => println!("  Export failed: {} (expected without real model)", e),
         }
     } else {
         println!(
@@ -242,9 +249,66 @@ fn main() -> oxigaf::Result<()> {
     println!("  - check_gpu()             enumerates wgpu adapters (may be empty on CI)");
     println!("  - detect_best_backend()   returns Metal/Vulkan/Dx12 based on OS");
     println!("  - quick_train(&p, &out)   validates config and resolves output path");
-    println!("  - export(&src, &dst, fmt) validates and records export request");
+    println!("  - export(&src, &dst, fmt) reads &src and re-serialises it to &dst in `fmt`");
     println!();
     println!("For a full GPU training loop, see the `training_loop` example.");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use oxigaf::render::gaussian::{GaussianAttributes, GaussianModel};
+
+    /// Regression test for the Step-7 format/extension pairing bug: exporting
+    /// with `ExportFormat::Obj` must write real OBJ text to the `.obj`
+    /// destination, not raw PLY bytes carried over under a mismatched
+    /// extension (which is what the previous `.safetensors` destination +
+    /// `ExportFormat::Ply` pairing would have produced).
+    #[test]
+    fn export_obj_writes_real_obj_not_raw_ply_bytes() {
+        let dir = std::env::temp_dir().join(format!(
+            "oxigaf_e2e_export_regression_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+
+        let model = GaussianModel {
+            gaussians: vec![GaussianAttributes {
+                position: [0.1, 0.2, 0.3],
+                _pad0: 0.0,
+                rotation: [0.0, 0.0, 0.0, 1.0],
+                scale: [-5.0, -5.0, -5.0],
+                opacity: -2.0,
+            }],
+            sh_coeffs: vec![0.1, 0.1, 0.1],
+            sh_degree: 0,
+            face_indices: vec![0],
+            barycentric: vec![[1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0]],
+            local_offsets: vec![[0.0, 0.0, 0.0]],
+            is_rigid: vec![true],
+        };
+
+        let model_ply = dir.join("model.ply");
+        model.save_ply(&model_ply).expect("save_ply should succeed");
+
+        let export_obj = dir.join("model.obj");
+        oxigaf::export(&model_ply, &export_obj, oxigaf::ExportFormat::Obj)
+            .expect("export to Obj should succeed");
+
+        let obj_bytes = std::fs::read(&export_obj).expect("read exported obj");
+        let obj_text = String::from_utf8(obj_bytes).expect("obj output should be UTF-8 text");
+
+        assert!(
+            obj_text.starts_with("# Wavefront OBJ"),
+            "expected OBJ output to start with the Wavefront OBJ comment header, got: {:?}",
+            &obj_text[..obj_text.len().min(40)]
+        );
+        assert!(
+            !obj_text.starts_with("ply\n") && !obj_text.starts_with("ply\r\n"),
+            "exported .obj file must not contain raw PLY bytes"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

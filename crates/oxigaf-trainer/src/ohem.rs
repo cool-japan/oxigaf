@@ -59,6 +59,12 @@ pub enum OhemError {
 
     #[error("Empty loss history for example {0}")]
     EmptyHistory(usize),
+
+    #[error("Invalid {field} {value}: must be in [0, 1]")]
+    InvalidFraction { field: &'static str, value: f32 },
+
+    #[error("Invalid priority_exponent {0}: must be finite")]
+    InvalidExponent(f32),
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -161,6 +167,7 @@ pub struct OhemStats {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Tracks per-example losses and selects hard examples for OHEM.
+#[derive(Debug)]
 pub struct OhemTracker {
     config: OhemConfig,
     records: Vec<ExampleRecord>,
@@ -173,12 +180,37 @@ impl OhemTracker {
     ///
     /// Returns [`OhemError::NoExamples`] if `num_examples == 0`.
     /// Returns [`OhemError::InvalidAlpha`] if `config.ema_alpha` is not in `(0, 1]`.
+    /// Returns [`OhemError::InvalidFraction`] if `config.exploration_fraction`
+    /// or `config.hard_fraction` is outside `[0, 1]`.
+    /// Returns [`OhemError::InvalidExponent`] if `config.priority_exponent`
+    /// is not finite.
     pub fn new(num_examples: usize, config: OhemConfig) -> Result<Self, OhemError> {
         if num_examples == 0 {
             return Err(OhemError::NoExamples);
         }
         if config.ema_alpha <= 0.0 || config.ema_alpha > 1.0 {
             return Err(OhemError::InvalidAlpha(config.ema_alpha));
+        }
+        // `OhemConfig` has all-`pub` fields, so a struct literal can bypass
+        // any single validating constructor; validate every field consulted
+        // by arithmetic elsewhere in this module (`suggest_batch` divides
+        // `batch_size` between exploration/hard counts derived from these
+        // fractions, and `compute_priority_weights` raises losses to
+        // `priority_exponent`).
+        if !(0.0..=1.0).contains(&config.exploration_fraction) {
+            return Err(OhemError::InvalidFraction {
+                field: "exploration_fraction",
+                value: config.exploration_fraction,
+            });
+        }
+        if !(0.0..=1.0).contains(&config.hard_fraction) {
+            return Err(OhemError::InvalidFraction {
+                field: "hard_fraction",
+                value: config.hard_fraction,
+            });
+        }
+        if !config.priority_exponent.is_finite() {
+            return Err(OhemError::InvalidExponent(config.priority_exponent));
         }
         let records = (0..num_examples).map(ExampleRecord::new).collect();
         Ok(Self {
@@ -355,9 +387,15 @@ impl OhemTracker {
             return Err(OhemError::NoExamples);
         }
 
-        let exploration_count =
-            (self.config.exploration_fraction * batch_size as f32).round() as usize;
-        let hard_count = batch_size - exploration_count;
+        // `OhemTracker::new` validates `exploration_fraction` is in [0, 1],
+        // but defend against a mismatched batch_size (or, prior to that
+        // validation, a config that skipped `new` entirely — see its
+        // comment) rounding `exploration_count` above `batch_size`, which
+        // would otherwise underflow the `usize` subtraction below.
+        let exploration_count = ((self.config.exploration_fraction * batch_size as f32).round()
+            as usize)
+            .min(batch_size);
+        let hard_count = batch_size.saturating_sub(exploration_count);
 
         let mut state = seed ^ 0xDEAD_BEEF;
         if state == 0 {
@@ -870,5 +908,45 @@ mod tests {
         for &idx in &batch {
             assert!(idx < 20, "batch index {idx} out of range");
         }
+    }
+
+    // 22. `OhemTracker::new` rejects exploration_fraction outside [0, 1].
+    #[test]
+    fn test_new_rejects_exploration_fraction_above_one() {
+        let config = OhemConfig {
+            exploration_fraction: 1.5,
+            ..OhemConfig::default()
+        };
+        let result = OhemTracker::new(2, config);
+        assert!(
+            matches!(
+                result,
+                Err(OhemError::InvalidFraction {
+                    field: "exploration_fraction",
+                    ..
+                })
+            ),
+            "expected InvalidFraction, got {result:?}"
+        );
+    }
+
+    // 23. `suggest_batch` never underflows batch_size even if a
+    // hand-constructed config (bypassing `new`'s validation via a struct
+    // literal on the private-but-same-module `OhemTracker`) somehow carried
+    // an out-of-range fraction through to this point.
+    #[test]
+    fn test_suggest_batch_no_underflow_with_extreme_exploration_fraction() {
+        let mut tracker = default_tracker(4);
+        for i in 0..4 {
+            tracker.record_loss(i, 0.5).unwrap();
+        }
+        // Directly mutate the (module-private, same-file-accessible) config
+        // to the exact pathological value the original bug report used:
+        // exploration_fraction=1.5 with batch_size=2 would previously
+        // compute exploration_count=3 and then `2 - 3`, underflowing.
+        tracker.config.exploration_fraction = 1.5;
+        let batch = tracker.suggest_batch(2, 7);
+        assert!(batch.is_ok(), "suggest_batch must not panic: {batch:?}");
+        assert_eq!(batch.unwrap().len(), 2);
     }
 }

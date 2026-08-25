@@ -76,7 +76,9 @@ pub enum BokehShape {
 pub struct DofConfig {
     /// Camera focal length in millimetres. Default: 85.0.
     pub focal_length: f32,
-    /// Distance to the in-focus plane in world units. Default: 1.0.
+    /// Distance to the in-focus plane in world units (assumed to be metres
+    /// for the purposes of the thin-lens CoC formula - see the
+    /// `MM_PER_WORLD_UNIT` constant in this module). Default: 1.0.
     pub focus_distance: f32,
     /// Aperture f-stop number (f/2.8 → aperture=2.8). Default: 2.8.
     pub aperture: f32,
@@ -89,6 +91,10 @@ pub struct DofConfig {
     /// Shape of the bokeh aperture. Default: Circular.
     pub bokeh_shape: BokehShape,
     /// Whether to blur pixels in front of the focal plane. Default: true.
+    ///
+    /// When `false`, every pixel with `depth < focus_distance` is forced to
+    /// `CoC = 0` by [`dof_compute_coc`] (so it is never itself blurred) and
+    /// [`dof_gather`] never lets it bleed into neighbouring pixels either.
     pub near_blur: bool,
     /// Overall DoF strength in [0, 1]. Default: 1.0.
     pub strength: f32,
@@ -181,12 +187,26 @@ fn xorshift_f32(state: &mut u64) -> f32 {
 // CoC computation
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Millimetres per world unit.
+///
+/// `DofConfig::focal_length` and `DofConfig::sensor_width_mm` are
+/// millimetres, but `DofConfig::focus_distance` and the incoming depth
+/// buffer are in "world units" - the scene-space units the rest of the
+/// crate (and a typical COLMAP/NeRF/3DGS scene) uses. This constant assumes
+/// the standard 3-D graphics convention that one world unit is one metre,
+/// and is used to convert world-unit distances into millimetres so the
+/// thin-lens formula in [`dof_compute_coc`] is dimensionally consistent.
+const MM_PER_WORLD_UNIT: f32 = 1000.0;
+
 /// Compute per-pixel circle-of-confusion radii from a depth buffer.
 ///
-/// Uses the thin-lens approximation:
+/// Uses the thin-lens approximation, with all lengths converted to a common
+/// millimetre scale (see the `MM_PER_WORLD_UNIT` constant in this module)
+/// before combining:
 /// ```text
-/// CoC_mm ≈ (focal_length² / (aperture × focus_distance))
-///          × |depth − focus_distance| / depth
+/// S_mm  = focus_distance × MM_PER_WORLD_UNIT
+/// CoC_mm ≈ (focal_length² / aperture)
+///          × |depth − focus_distance| / (depth × (S_mm − focal_length))
 /// CoC_pixels = CoC_mm × image_width / sensor_width_mm
 /// ```
 ///
@@ -226,12 +246,26 @@ pub fn dof_compute_coc(
         });
     }
 
-    // Thin-lens scale factor (in mm).
-    // CoC_mm = scale * |depth - focus_distance| / depth
+    // Thin-lens formula, in a common millimetre scale (see
+    // `MM_PER_WORLD_UNIT`):
+    //   CoC_mm = (f_mm^2 / N) * |D - S| / (D * (S_mm - f_mm))
+    // `focal_length` (f_mm) is already millimetres; `focus_distance` (S) and
+    // every depth sample (D) are world units and only `S` needs converting
+    // to millimetres (`fd_mm`) since `f_mm` and `S_mm` must share a scale
+    // for `(S_mm - f_mm)` to be meaningful, while `D` and `S` may stay in
+    // world units in the `|D - S| / D` factor (a dimensionless ratio once
+    // paired with a `D` of the same unit). The previous `fl*fl/(ap*fd)`
+    // scale mixed millimetres directly with a raw world-unit `fd` and
+    // omitted the `(S - f)` term entirely, giving a scale off by orders of
+    // magnitude for the module's own documented defaults (85mm/f2.8/1
+    // world-unit focus → scale ≈ 2580 "mm" instead of a physically
+    // sensible value), which clamped to `max_coc_pixels` almost everywhere.
     let fl = config.focal_length;
     let fd = config.focus_distance;
+    let fd_mm = fd * MM_PER_WORLD_UNIT;
     let ap = config.aperture;
-    let thin_lens_scale = (fl * fl) / (ap * fd);
+    let thin_lens_scale = (fl * fl) / ap;
+    let s_minus_f_mm = fd_mm - fl;
 
     // mm → pixels conversion factor.
     let mm_to_px = if config.sensor_width_mm > 0.0 {
@@ -252,12 +286,29 @@ pub fn dof_compute_coc(
             continue;
         }
 
+        let is_near_pixel = d < fd;
+        if is_near_pixel && !config.near_blur {
+            // Near-blur disabled: foreground pixels are always treated as
+            // perfectly in focus so they are never themselves blurred, and
+            // (via `is_near` + `coc == 0`) never satisfy `dof_gather`'s
+            // acceptance test either, so they cannot bleed into neighbours.
+            coc.push(0.0);
+            is_near.push(true);
+            continue;
+        }
+
         let diff = (d - fd).abs();
-        let coc_mm = thin_lens_scale * diff / d;
+        // `.abs()` guards the non-physical `focus_distance <= focal_length`
+        // regime (a focus distance shorter than the lens' own focal length,
+        // in millimetres) where `s_minus_f_mm` goes negative: without it, a
+        // background pixel there would compute a negative CoC that then
+        // clamps *down* to 0 (wrongly reporting "in focus") instead of
+        // clamping up to `max_r` ("very blurred").
+        let coc_mm = (thin_lens_scale * diff / (d * s_minus_f_mm)).abs();
         let coc_px = (coc_mm * mm_to_px).clamp(0.0, max_r);
 
         coc.push(coc_px);
-        is_near.push(d < fd);
+        is_near.push(is_near_pixel);
     }
 
     Ok(DofCocBuffer {
@@ -309,7 +360,12 @@ pub fn dof_hexagonal_kernel(n: usize, rng_state: &mut u64) -> Vec<f32> {
         let half_sector = sector_angle / 2.0;
         let theta_mod = ((angle % sector_angle) + sector_angle) % sector_angle - half_sector;
         let r_max = half_sector.cos() / theta_mod.cos().max(1e-6);
-        let r = xorshift_f32(rng_state) * r_max;
+        // Area-uniform radial sampling: a uniform `r` in `[0, r_max)` biases
+        // samples toward the centre (density ∝ 1/r for a fixed angular
+        // slice), washing out the hexagon's edges into a soft radial
+        // falloff indistinguishable from a circle. `sqrt(u) * r_max` makes
+        // the sample density uniform over the polygon's area instead.
+        let r = r_max * xorshift_f32(rng_state).sqrt();
         out.push(r * angle.cos());
         out.push(r * angle.sin());
     }
@@ -329,7 +385,8 @@ pub fn dof_pentagonal_kernel(n: usize, rng_state: &mut u64) -> Vec<f32> {
         let half_sector = sector_angle / 2.0;
         let theta_mod = ((angle % sector_angle) + sector_angle) % sector_angle - half_sector;
         let r_max = half_sector.cos() / theta_mod.cos().max(1e-6);
-        let r = xorshift_f32(rng_state) * r_max;
+        // Area-uniform radial sampling - see `dof_hexagonal_kernel` above.
+        let r = r_max * xorshift_f32(rng_state).sqrt();
         out.push(r * angle.cos());
         out.push(r * angle.sin());
     }
@@ -413,9 +470,22 @@ pub fn dof_bilinear_sample(image: &[f32], width: usize, height: usize, x: f32, y
 /// For each output pixel `(x, y)`:
 /// - If `CoC < 1 px` → copy pixel unchanged (in focus).
 /// - Otherwise: sample `n_samples` neighbours in the CoC disk using
-///   precomputed kernel offsets. A sample from `(nx, ny)` contributes when its
-///   CoC reaches the current pixel (`neighbour_coc ≥ dist`) or it is a
-///   near-plane pixel. Weight = neighbour CoC radius (larger blur → more weight).
+///   precomputed kernel offsets. A sample from `(nx, ny)` contributes when
+///   either:
+///   - its own CoC reaches the current pixel (`neighbour_coc ≥ dist`), which
+///     alone already covers a genuinely defocused near-plane neighbour
+///     (its CoC grows with distance from the focal plane exactly like a far
+///     neighbour's does); or
+///   - `config.near_blur` is enabled, the neighbour is on the near side of
+///     the focal plane, **and** it is itself already blurred
+///     (`neighbour_coc ≥ 1px`) - letting a defocused foreground object
+///     bleed over the background unconditionally within the gather disc,
+///     the classic foreground-bokeh look. A near-plane neighbour that is
+///     itself sharp never gets this relaxation, so in-focus foreground
+///     content cannot smear into neighbouring blurred pixels, and disabling
+///     `near_blur` removes the relaxation entirely.
+///
+///   Weight = neighbour CoC radius (larger blur → more weight).
 ///
 /// # Errors
 ///
@@ -424,7 +494,7 @@ pub fn dof_gather(
     image: &[f32],
     coc_buf: &DofCocBuffer,
     kernel: &[f32],
-    _config: &DofConfig,
+    config: &DofConfig,
 ) -> Result<Vec<f32>, DofError> {
     let n_pixels = coc_buf.width * coc_buf.height;
     let expected_img = n_pixels * 3;
@@ -491,10 +561,24 @@ pub fn dof_gather(
                 let n_coc = coc_buf.coc[nidx];
                 let n_is_near = coc_buf.is_near[nidx];
 
-                // Acceptance: neighbour's CoC must reach the current pixel
-                // (its CoC ≥ distance from centre), or it is a near-plane pixel.
+                // Acceptance: neighbour's own CoC must reach the current
+                // pixel (its CoC ≥ distance from centre) - this alone
+                // already lets a genuinely defocused near-plane neighbour
+                // bleed outward, since its CoC grows with distance from the
+                // focal plane the same way a far neighbour's does. The only
+                // extra relaxation is for a near-plane neighbour that is
+                // *itself already blurred* (`n_coc >= 1px`, matching the
+                // sharp/blurred threshold used elsewhere in this module),
+                // when `near_blur` is enabled: it may bleed unconditionally
+                // within the gather disc regardless of exact distance,
+                // matching classic foreground bokeh. A near-plane neighbour
+                // that is still sharp (`n_coc < 1px`, e.g. barely in front
+                // of the focal plane) never gets this relaxation - admitting
+                // it unconditionally would smear in-focus foreground detail
+                // into neighbouring blurred pixels.
                 let dist = ((sx - pxf).powi(2) + (sy - pyf).powi(2)).sqrt();
-                if n_coc >= dist || n_is_near {
+                let near_bleed = config.near_blur && n_is_near && n_coc >= 1.0;
+                if n_coc >= dist || near_bleed {
                     let weight = n_coc.max(1.0);
                     let colour = dof_bilinear_sample(image, w, h, sx_c, sy_c);
                     acc[0] += colour[0] * weight;
@@ -570,8 +654,12 @@ pub fn dof_separate_layers(
 /// Composite near-blurred, far-blurred, and in-focus layers.
 ///
 /// For each pixel:
-/// - `near_alpha = coc[pixel] / max_coc` for near pixels, else `0`.
-/// - `result = lerp(far_result, near_result, near_alpha)`.
+/// - `focus_weight = clamp(1 - coc[pixel], 0, 1)` - `1.0` for a perfectly
+///   sharp pixel (`coc == 0`), fading linearly to `0.0` once its CoC reaches
+///   the 1px sharp/blurred threshold used throughout this module.
+/// - The defocused component is `near_blurred[pixel]` when the pixel is on
+///   the near side of the focal plane, otherwise `far_blurred[pixel]`.
+/// - `result = lerp(defocused_component, in_focus[pixel], focus_weight)`.
 ///
 /// All input buffers must have length `width × height × 3`.
 ///
@@ -601,23 +689,21 @@ pub fn dof_composite_layers(
         let _ = name;
     }
 
-    let max_coc = coc_buf.coc.iter().cloned().fold(0.0_f32, f32::max);
-    let inv_max = if max_coc > 0.0 { 1.0 / max_coc } else { 0.0 };
-
     let mut result = vec![0.0_f32; expected];
 
     for i in 0..n_pixels {
         let base = i * 3;
-        let alpha = if coc_buf.is_near[i] {
-            (coc_buf.coc[i] * inv_max).clamp(0.0, 1.0)
+        let focus_weight = (1.0 - coc_buf.coc[i]).clamp(0.0, 1.0);
+        let defocused = if coc_buf.is_near[i] {
+            near_blurred
         } else {
-            0.0
+            far_blurred
         };
 
-        // lerp(far_blurred, near_blurred, alpha)
+        // lerp(defocused, in_focus, focus_weight)
         for c in 0..3 {
             result[base + c] =
-                far_blurred[base + c] + (near_blurred[base + c] - far_blurred[base + c]) * alpha;
+                defocused[base + c] + (in_focus[base + c] - defocused[base + c]) * focus_weight;
         }
     }
 
@@ -1328,7 +1414,8 @@ mod tests {
             height: h,
         };
         let out = dof_composite_layers(&near, &far, &focus, &coc).expect("composite ok");
-        // alpha = coc / max_coc = 1.0 → full near blending
+        // coc = 5.0 >= the 1px blurred threshold → focus_weight = 0 → fully
+        // defocused (near_blurred, since every pixel is on the near side).
         for chunk in out.chunks_exact(3) {
             assert!(approx_eq(chunk[0], 1.0, 1e-4), "R should be near=1.0");
             assert!(approx_eq(chunk[1], 0.0, 1e-4), "G should be near=0.0");
@@ -1633,6 +1720,258 @@ mod tests {
             };
             let result = apply_depth_of_field(&image, &depth, w, h, &cfg).expect("smoke ok");
             assert_eq!(result.image.len(), w * h * 3, "shape {:?}", shape);
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Regression tests
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_coc_ramp_is_smooth_not_a_step() {
+        // Regression test for the mm/world-unit unit-mixing bug: with the
+        // documented defaults (85mm f/2.8 lens focused at 1 world-unit) and
+        // a realistic image width, a depth just 5% beyond the focal plane
+        // must produce a small, smoothly-varying CoC - not an instant jump
+        // to `max_coc_pixels` (the pre-fix scale clamped for depths as
+        // little as ~0.44% away from focus).
+        let cfg = DofConfig::default();
+        // `dof_compute_coc` requires `depth_buf.len() == width * height`, so a
+        // "one pixel at depth d, at a realistic image width" probe is a
+        // single row of `width` identical samples (a 1-element buffer would
+        // just return `DimensionMismatch`).
+        let width = 512;
+        let probe = |d: f32| -> f32 {
+            let depth_row = vec![d; width];
+            dof_compute_coc(&depth_row, width, 1, &cfg)
+                .expect("coc ok")
+                .coc[0]
+        };
+
+        let coc_just_past_focus = probe(1.05);
+        assert!(
+            coc_just_past_focus < cfg.max_coc_pixels * 0.5,
+            "CoC 5% past focus should be far below the clamp ceiling, got {} (max {})",
+            coc_just_past_focus,
+            cfg.max_coc_pixels
+        );
+        assert!(
+            coc_just_past_focus > 0.0,
+            "CoC should be non-zero away from focus"
+        );
+
+        // The far side should still ramp up smoothly (not clamp everywhere)
+        // as depth increases further from the focal plane.
+        //
+        // Hand-derived expectation for the defaults (f=85mm, N=2.8, S=1
+        // world unit = 1000mm, sensor 36mm, width 512 -> 14.22 px/mm):
+        //   CoC_mm = (85^2/2.8) * |d-1| / (d * (1000-85))
+        //   d=1.05 -> 0.134mm -> 1.91px    d=1.2 -> 0.470mm ->  6.68px
+        //   d=1.5  -> 0.940mm -> 13.37px   d=2.0 -> 1.410mm -> 20.05px (clamps)
+        //   d=3.0  -> 1.880mm -> 26.74px (clamps)
+        // i.e. a monotone ramp that only reaches the 20px ceiling at the far
+        // end, which is exactly what this test asserts.
+        let depths = [1.05_f32, 1.2, 1.5, 2.0, 3.0];
+        let mut prev = 0.0_f32;
+        let mut clamped = 0usize;
+        for &d in &depths {
+            let c = probe(d);
+            assert!(
+                c >= prev - 1e-5,
+                "CoC should not decrease with depth: {c} < {prev}"
+            );
+            if c >= cfg.max_coc_pixels - 1e-4 {
+                clamped += 1;
+            }
+            prev = c;
+        }
+        assert!(
+            clamped < depths.len(),
+            "expected a smooth ramp, but every sampled depth clamped to max_coc_pixels: {depths:?}"
+        );
+    }
+
+    #[test]
+    fn test_hexagonal_kernel_radius_is_area_uniform() {
+        // Regression test: sampling `r` uniformly in `[0, r_max)` biases
+        // samples toward the centre (density ∝ 1/r), so a hexagon/pentagon
+        // kernel would look like a soft radial falloff indistinguishable
+        // from a circle. Area-uniform sampling (`r = r_max * sqrt(u)`) makes
+        // the *count* of samples falling in an annulus grow with its area,
+        // i.e. roughly with its radius.
+        let mut rng = 123u64;
+        let n = 20_000;
+        let k = dof_hexagonal_kernel(n, &mut rng);
+
+        // Bin samples by polar radius into 5 equal-width bands over [0, 1)
+        // (a regular hexagon inscribed in the unit circle has radius <= 1 in
+        // every direction, so every sample's polar radius is <= 1).
+        const BANDS: usize = 5;
+        let mut counts = [0usize; BANDS];
+        for pair in k.chunks_exact(2) {
+            let r = (pair[0] * pair[0] + pair[1] * pair[1])
+                .sqrt()
+                .min(0.999_999);
+            let band = ((r * BANDS as f32) as usize).min(BANDS - 1);
+            counts[band] += 1;
+        }
+
+        // Area-uniform sampling puts markedly more mass in the outer band
+        // than the inner one (annulus area grows with radius); uniform-in-r
+        // sampling would instead give roughly equal counts per band.
+        assert!(
+            counts[BANDS - 1] > counts[0] * 2,
+            "expected area-uniform radial sampling (outer band >> inner band), got {counts:?}"
+        );
+    }
+
+    #[test]
+    fn test_pentagonal_kernel_radius_is_area_uniform() {
+        // Same check as `test_hexagonal_kernel_radius_is_area_uniform`, for
+        // the pentagonal kernel.
+        let mut rng = 456u64;
+        let n = 20_000;
+        let k = dof_pentagonal_kernel(n, &mut rng);
+
+        const BANDS: usize = 5;
+        let mut counts = [0usize; BANDS];
+        for pair in k.chunks_exact(2) {
+            let r = (pair[0] * pair[0] + pair[1] * pair[1])
+                .sqrt()
+                .min(0.999_999);
+            let band = ((r * BANDS as f32) as usize).min(BANDS - 1);
+            counts[band] += 1;
+        }
+
+        assert!(
+            counts[BANDS - 1] > counts[0] * 2,
+            "expected area-uniform radial sampling (outer band >> inner band), got {counts:?}"
+        );
+    }
+
+    #[test]
+    fn test_near_blur_disabled_forces_zero_coc_and_leaves_pixels_untouched() {
+        // Regression test: `near_blur = false` must (a) make
+        // `dof_compute_coc` report CoC = 0 for every near-plane pixel, and
+        // (b) make the full pipeline leave those pixels completely
+        // untouched - previously `near_blur` was written only in `Default`
+        // and read nowhere, so it had no effect at all.
+        let cfg = DofConfig {
+            near_blur: false,
+            focus_distance: 5.0,
+            strength: 1.0,
+            n_samples: 16,
+            ..DofConfig::default()
+        };
+        // A realistic width (not the 1-pixel-wide buffers some other tests
+        // use) so the far half's CoC actually clears the 1px blur
+        // threshold - otherwise "still genuinely blurred" below wouldn't
+        // hold and this test would only exercise the trivial "both halves
+        // happen to be sharp" case.
+        let w = 256;
+        let h = 8;
+        let image: Vec<f32> = (0..w * h * 3).map(|i| (i % 7) as f32 / 10.0).collect();
+        // Top half is near (depth 0.5 < focus 5.0); bottom half is far
+        // (depth 20.0 > focus 5.0) so it is still genuinely blurred.
+        let mut depth = vec![20.0_f32; w * h];
+        for row in 0..h / 2 {
+            for col in 0..w {
+                depth[row * w + col] = 0.5;
+            }
+        }
+
+        let coc_buf = dof_compute_coc(&depth, w, h, &cfg).expect("coc ok");
+        for row in 0..h / 2 {
+            for col in 0..w {
+                let idx = row * w + col;
+                assert_eq!(
+                    coc_buf.coc[idx], 0.0,
+                    "near_blur=false must force near-pixel CoC to 0 at ({col},{row})"
+                );
+            }
+        }
+
+        let result = apply_depth_of_field(&image, &depth, w, h, &cfg).expect("dof ok");
+        for row in 0..h / 2 {
+            for col in 0..w {
+                let base = (row * w + col) * 3;
+                for c in 0..3 {
+                    assert!(
+                        approx_eq(image[base + c], result.image[base + c], 1e-5),
+                        "near pixel ({col},{row}) channel {c} should be untouched when near_blur=false"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_gather_sharp_near_pixel_does_not_bleed() {
+        // Regression test: a near-plane neighbour must only bleed into
+        // another pixel's blur when it is itself already blurred
+        // (`n_coc >= 1px`); a near-plane neighbour that is essentially in
+        // focus (small CoC) must not be admitted just because `is_near` is
+        // true - that was the foreground-bleed bug in the old
+        // `n_coc >= dist || n_is_near` acceptance test.
+        //
+        // 3 pixels in a row: [red destination (coc=1, blurred), green sharp
+        // near-plane pixel (coc=0.3, is_near), blue filler]. A single
+        // deterministic kernel sample offset by +1px (scaled by the
+        // destination's own coc_r=1.0) lands exactly on the green pixel.
+        let w = 3;
+        let h = 1;
+        let image = vec![
+            1.0, 0.0, 0.0, // pixel 0: red (destination)
+            0.0, 1.0, 0.0, // pixel 1: green, sharp near pixel
+            0.0, 0.0, 1.0, // pixel 2: blue filler
+        ];
+        let coc_buf = DofCocBuffer {
+            coc: vec![1.0, 0.3, 1.0],
+            is_near: vec![false, true, false],
+            width: w,
+            height: h,
+        };
+        let cfg = DofConfig {
+            near_blur: true,
+            ..DofConfig::default()
+        };
+        let kernel = vec![1.0_f32, 0.0_f32]; // single deterministic sample: +1px in x
+        let out = dof_gather(&image, &coc_buf, &kernel, &cfg).expect("gather ok");
+
+        // Destination pixel 0 must stay red: the sharp (coc=0.3 < 1px) near
+        // pixel it sampled must not have been admitted "for free".
+        assert!(
+            (out[0] - 1.0).abs() < 1e-5 && out[1] < 1e-5 && out[2] < 1e-5,
+            "sharp near pixel leaked into destination: got {:?}",
+            &out[0..3]
+        );
+    }
+
+    #[test]
+    fn test_composite_partial_coc_blends_toward_in_focus() {
+        // Regression test: `in_focus` must actually be used - a pixel whose
+        // CoC is between 0 and the 1px threshold should be a blend of its
+        // defocused layer and the in-focus layer, not just the defocused
+        // layer verbatim (which is what happened when `in_focus` was
+        // validated for size but never read).
+        let w = 1;
+        let h = 1;
+        let near = vec![0.0_f32, 0.0, 0.0]; // black
+        let far = vec![0.0_f32, 0.0, 0.0]; // black (unused: pixel is near)
+        let focus = vec![1.0_f32, 1.0, 1.0]; // white
+        let coc_buf = DofCocBuffer {
+            coc: vec![0.5], // halfway to the 1px blurred threshold
+            is_near: vec![true],
+            width: w,
+            height: h,
+        };
+        let out = dof_composite_layers(&near, &far, &focus, &coc_buf).expect("composite ok");
+        // focus_weight = 1 - 0.5 = 0.5 → result = lerp(near=black, focus=white, 0.5) = 0.5
+        for &v in &out {
+            assert!(
+                (v - 0.5).abs() < 1e-4,
+                "expected a 50/50 blend of near_blurred and in_focus, got {v}"
+            );
         }
     }
 }

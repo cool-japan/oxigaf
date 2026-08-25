@@ -511,6 +511,11 @@ impl BatchStats {
 /// Validates jobs and configuration on construction, computes a dependency-
 /// ordered execution plan, and runs each job through a caller-supplied
 /// [`JobExecutor`] callback.
+///
+/// `Debug` is derived (both fields are `Debug`) so `Result<BatchProcessor, _>`
+/// can be unwrapped in assertions; the [`JobExecutor`] closure is *not* held
+/// here — it is passed to [`execute`](Self::execute) — so nothing blocks it.
+#[derive(Debug)]
 pub struct BatchProcessor {
     jobs: Vec<BatchJob>,
     config: BatchConfig,

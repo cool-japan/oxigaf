@@ -13,7 +13,7 @@ This crate implements the multi-view diffusion pipeline for Gaussian Avatar Fram
 - **Classifier-Free Guidance (CFG)** — Quality improvement with configurable guidance scale (1.0–20.0)
 - **VAE decoding** — Decode latent representations to RGB images
 - **DDIM scheduling** — Fast sampling with 50-100 steps (vs 1000 for DDPM)
-- **Flash Attention** — Memory-efficient O(N) attention for large images
+- **Flash Attention** — Memory-efficient O(N) attention for large images (feature: `flash_attention`, opt-in)
 
 The pipeline takes a single input image and generates multiple novel views of
 the subject, which are then used to initialize and optimize 3D Gaussians.
@@ -37,21 +37,37 @@ oxigaf-diffusion = "0.1"
 
 | Feature | Description |
 |---------|-------------|
-| `default` | `["flash_attention"]` — CPU with memory-efficient attention |
-| `flash_attention` | Memory-efficient O(N) attention (enabled by default) |
-| `mixed_precision` | FP16/BF16 inference (planned, not yet implemented) |
+| `default` | `[]` — plain CPU build, no optional features (v0.1.2: `flash_attention` is opt-in, not part of `default`) |
+| `flash_attention` | Memory-efficient O(N) attention, opt-in — only above the score-matrix budget (see below) |
+| `mixed_precision` | FP32↔BF16/FP16 conversion utilities; not yet wired into the inference path (see below) |
 | `gpu_debug` | NaN/Inf debug hooks (`debug_hooks::assert_finite`, `DebugConfig`) |
 
 ### Feature Details
 
-- **`flash_attention`**: Block-based attention computation
-  - Reduces memory usage by 2-4× for large images
-  - Maintains quality while being faster
-  - Enabled by default (part of the `default` feature set)
+- **`flash_attention`**: Block-based attention computation. **Opt-in as of
+  v0.1.2** — not part of `default`; add
+  `features = ["flash_attention"]` to pull it in.
+  - `FlashAttention::forward` only runs the tiled O(N) kernel when the
+    un-tiled `(batch, heads, seq_q, seq_k)` score matrix would exceed the
+    64 MiB budget (`flash_attention::DEFAULT_SCORE_MATRIX_BUDGET`,
+    overridable via `FlashAttention::with_score_matrix_budget`). Below that
+    budget it transparently falls back to the same full-materialization
+    kernel standard attention uses, so **small sequences see no memory
+    benefit** from turning the feature on.
+  - Above the budget: reduces memory usage by 2-4× for large images while
+    maintaining quality
+  - `DiffusionConfig::use_flash_attention` still defaults to `true` *when
+    this feature is compiled in* (see `config.rs`) — the feature itself is
+    what is no longer default
 
-- **`mixed_precision`**: FP16/BF16 inference — the flag exists but the
-  implementation is not yet in place (see `Cargo.toml`: "currently a
-  placeholder")
+- **`mixed_precision`**: FP32↔BF16/FP16 conversion and precision-loss
+  simulation utilities (`mixed_precision.rs`) — real, tested code, not a
+  stub. The flag only changes the default `MixedPrecisionConfig::mode`
+  (`BFloat16` with the feature, `Float32` without). As of this writing,
+  nothing in `unet.rs`/`vae.rs`/`pipeline.rs` calls into this module, so
+  enabling the feature does **not** change what `generate()` computes — see
+  the "Reachability" section of `mixed_precision.rs`'s module docs for the
+  precise wiring that would be needed.
 
 - **`gpu_debug`**: Turns on NaN/Inf assertions (`debug_hooks::assert_finite`,
   configured via `DebugConfig`) during the diffusion forward pass, useful
@@ -269,6 +285,13 @@ fn main() {
 
 ### Memory-Efficient Inference with Flash Attention
 
+Requires the `flash_attention` feature (opt-in as of v0.1.2 — see
+"Features" above):
+
+```toml
+oxigaf-diffusion = { version = "0.1", features = ["flash_attention"] }
+```
+
 ```rust
 use candle_core::{DType, Device, Tensor};
 use oxigaf_diffusion::{DiffusionConfig, DiffusionError, MultiViewDiffusionPipeline};
@@ -318,7 +341,14 @@ fn main() -> Result<(), DiffusionError> {
 Extracts semantic features from input images using CLIP ViT-H/14 (Vision Transformer):
 
 - Input: RGB image (224×224)
-- Output: 1280-dimensional feature vector (`DiffusionConfig::clip_embed_dim`)
+- Tower hidden width: `DiffusionConfig::clip_embed_dim` (1280 by default).
+  `clip::build_clip_encoder` sizes the tower from this field via
+  `ClipVisionConfig::vit_h14_with_embed_dim`, so it must be a positive multiple
+  of 80 (ViT-H/14's head width) — `DiffusionConfig::validate` checks that.
+- Output: per-patch tokens `DiffusionConfig::ip_adapter_context_dim()` wide
+  (1024 by default), after IP-Adapter's projection. This is the *projection's*
+  width, not the tower's, and is the width the U-Net's `attn_ip`
+  cross-attention is built for — the two are deliberately one knob.
 - Loads externally-supplied pre-trained weights (`image_encoder/model.safetensors`)
 
 ### Multi-View U-Net
@@ -369,7 +399,15 @@ Fast sampling with fewer steps than DDPM:
 
 - **DDPM**: 1000 steps (slow)
 - **DDIM**: 50-100 steps (20× faster)
-- Deterministic sampling for reproducibility
+- Deterministic sampling for reproducibility — holds for the base
+  256×256 pipeline (`pipeline.rs` seeds the initial latents through a
+  dependency-free xorshift64 + Box-Muller stream specifically *because*
+  `candle`'s `Tensor::randn` cannot be seeded on CPU) and for
+  `upsampler_mode: Some(UpsamplerMode::BilinearVae)`. It does **not** hold
+  for `Some(UpsamplerMode::SdX2)`: `LatentUpsampler::upsample_sdx2` draws its
+  denoising noise with a plain, unseeded `Tensor::randn` call, so two
+  `generate()` runs with the same `seed` at 512×512 diverge once the
+  upsampler stage starts (see `upsampler.rs`)
 - Supports both ε-prediction and v-prediction
 
 ## Performance
@@ -394,6 +432,17 @@ Memory usage:
 |------------|-------------------|-----------------|
 | 512×512 | ~8 GB | ~4 GB |
 | 1024×1024 | ~24 GB | ~8 GB |
+
+These reductions only materialize once the un-tiled `(batch, heads, seq_q,
+seq_k)` score matrix at a given attention level exceeds the 64 MiB budget
+(`DEFAULT_SCORE_MATRIX_BUDGET` in `flash_attention.rs`); whether a
+configuration crosses it depends on view count, head count, and sequence
+length at *that* level — the deeper, lower-resolution U-Net stages stay well
+below it even when the overall run targets 512×512 or 1024×1024 output.
+Below the budget, `FlashAttention::forward` transparently runs the same
+full-materialization kernel as standard attention, so those levels see no
+memory reduction from turning the `flash_attention` feature on regardless of
+output resolution.
 
 ## Statistics
 

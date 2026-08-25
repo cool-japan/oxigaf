@@ -2,7 +2,7 @@
 //!
 //! This module handles conversion of layer names between PyTorch, OxiGAF, and ToRSh conventions.
 
-use crate::error::Result;
+use crate::error::{BridgeError, Result};
 use std::collections::HashMap;
 
 /// Naming convention for different frameworks
@@ -10,9 +10,10 @@ use std::collections::HashMap;
 pub enum NamingConvention {
     /// PyTorch: `unet.down_blocks.0.resnets.0.conv1.weight`
     PyTorch,
-    /// OxiGAF: `down__blocks_0_resnets_0_conv1_weight` (existing underscores
-    /// in the source name are doubled before dots are converted to single
-    /// underscores, so the two are distinguishable on the way back)
+    /// OxiGAF: `down_blocks.0.resnets.0.conv1.weight` -- the model-rooted,
+    /// dot-separated path `candle_nn::VarBuilder::pp` walks. This is the
+    /// *same* convention [`crate::gaf_layer_mapper::GafLayerMapper`]
+    /// produces from ToRSh names; the two bridges agree.
     OxiGAF,
     /// ToRSh: `down_blocks/0/resnets/0/conv1/weight`
     ToRSh,
@@ -68,11 +69,68 @@ impl LayerMapping {
         }
     }
 
-    /// Add a custom mapping from one name to another
+    /// Add a custom mapping from one name to another, replacing any mapping
+    /// already registered for `from`.
+    ///
+    /// Both directions stay consistent: re-registering `from` with a new
+    /// `to` also drops the *previous* `to`'s reverse entry, so
+    /// [`LayerMapping::oxigaf_to_pytorch`] can never resolve a superseded
+    /// target back to `from`. Registering two different `from` names with
+    /// the same `to` is last-insert-wins for the reverse direction (the
+    /// forward direction keeps both) and logs a warning, because that
+    /// collision makes the reverse mapping lossy; use
+    /// [`LayerMapping::add_custom_mapping_checked`] to reject it outright
+    /// instead.
     pub fn add_custom_mapping(&mut self, from: String, to: String) {
+        // Re-registering `from` with a different `to` used to leave the old
+        // `to` behind in the reverse map, so a name the forward mapping no
+        // longer produces still resolved backwards to `from`.
+        if let Some(previous_to) = self.custom_mappings.get(&from) {
+            if previous_to != &to {
+                let previous_to = previous_to.clone();
+                self.custom_mappings_reverse.remove(&previous_to);
+            }
+        }
+        if let Some(existing_from) = self.custom_mappings_reverse.get(&to) {
+            if existing_from != &from {
+                tracing::warn!(
+                    "Custom mapping target '{}' is already registered for '{}'; \
+                     '{}' now wins the reverse (OxiGAF -> PyTorch) lookup",
+                    to,
+                    existing_from,
+                    from
+                );
+            }
+        }
         self.custom_mappings_reverse
             .insert(to.clone(), from.clone());
         self.custom_mappings.insert(from, to);
+    }
+
+    /// Like [`LayerMapping::add_custom_mapping`], but refuses a `to` value
+    /// that is already the target of a *different* `from`, instead of
+    /// silently letting the newer mapping win the reverse lookup.
+    ///
+    /// Re-registering the same `from` (whatever its previous target) is
+    /// still allowed and is not a collision -- only two distinct sources
+    /// aiming at one target are, since that is what makes the OxiGAF ->
+    /// PyTorch direction lossy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BridgeError::LayerMapping`] if `to` is already registered
+    /// as the target of a different `from`. The mapping is left unchanged.
+    pub fn add_custom_mapping_checked(&mut self, from: String, to: String) -> Result<()> {
+        if let Some(existing_from) = self.custom_mappings_reverse.get(&to) {
+            if existing_from != &from {
+                return Err(BridgeError::LayerMapping(format!(
+                    "Custom mapping collision: '{}' and '{}' both map to '{}'",
+                    existing_from, from, to
+                )));
+            }
+        }
+        self.add_custom_mapping(from, to);
+        Ok(())
     }
 
     /// Look up a custom mapping by its exact `from` key, if one was
@@ -91,12 +149,32 @@ impl LayerMapping {
 
     /// Convert PyTorch name to OxiGAF name
     ///
-    /// Example: `unet.down_blocks.0.resnets.0.conv1.weight` → `down__blocks_0_resnets_0_conv1_weight`
+    /// Example: `unet.down_blocks.0.resnets.0.conv1.weight` →
+    /// `down_blocks.0.resnets.0.conv1.weight`
     ///
-    /// Existing underscores in the source name are doubled *before* dots are
-    /// replaced with single underscores, so `down_blocks` (one underscore)
-    /// and the dot-to-underscore conversion don't collide: only a single
-    /// underscore in the OxiGAF name ever originated from a dot.
+    /// The only transformation is stripping a recognized top-level prefix
+    /// (see [`detect_prefix`]); the dot-separated path itself is preserved
+    /// verbatim, because that is exactly the form
+    /// `candle_nn::VarBuilder::pp` walks and the form
+    /// [`crate::gaf_layer_mapper::GafLayerMapper`] produces from ToRSh
+    /// names.
+    ///
+    /// This *is* injective given the stripped prefix: the transform is the
+    /// identity on the remainder, so
+    /// `oxigaf_to_pytorch(pytorch_to_oxigaf(n), stripped_prefix) == n` for
+    /// every `n`, including names containing underscores, leading-underscore
+    /// path components (`_orig_mod.` from `torch.compile`), and consecutive
+    /// dots. `pytorch_to_oxigaf::convert` records the stripped prefix per
+    /// tensor in the output file's `__metadata__` so the reverse direction
+    /// can supply it.
+    ///
+    /// # Prior format
+    ///
+    /// Before 0.1.2 this produced a flat, double-underscore-escaped name
+    /// (`down__blocks_0_resnets_0_conv1_weight`). That form was not
+    /// `VarBuilder`-loadable and its escaping was not injective (`a._b` and
+    /// `a_.b` both encoded to `a___b`), so checkpoints written by an older
+    /// version of this crate must be re-converted from their PyTorch source.
     pub fn pytorch_to_oxigaf(&self, pytorch_name: &str) -> Result<String> {
         // Check custom mappings first
         if let Some(mapped) = self.custom_mappings.get(pytorch_name) {
@@ -108,22 +186,19 @@ impl LayerMapping {
             .map(|(_, remainder)| remainder)
             .unwrap_or(pytorch_name);
 
-        // Escape existing underscores (double them) so we can distinguish them from converted dots
-        let escaped = name.replace('_', "__");
-        // Replace dots with single underscores
-        let oxigaf_name = escaped.replace('.', "_");
-
-        Ok(oxigaf_name)
+        Ok(name.to_string())
     }
 
     /// Convert OxiGAF name to PyTorch name
     ///
-    /// Example: `down__blocks_0_resnets_0_conv1_weight` → `unet.down_blocks.0.resnets.0.conv1.weight`
+    /// Example: `down_blocks.0.resnets.0.conv1.weight` (with `prefix =
+    /// Some("unet")`) → `unet.down_blocks.0.resnets.0.conv1.weight`
     ///
-    /// Note: the underscore-escaping `pytorch_to_oxigaf` applies is not
-    /// injective -- `a._b` and `a_.b` both encode to `a___b` -- so a PyTorch
-    /// name with a leading-underscore path component (e.g. `torch.compile`'s
-    /// `_orig_mod.` wrapper) is not guaranteed to round-trip exactly.
+    /// The inverse of [`LayerMapping::pytorch_to_oxigaf`]: the dot-separated
+    /// path is preserved verbatim and `prefix`, when supplied, is prepended
+    /// with a separating dot. Passing the prefix that
+    /// `pytorch_to_oxigaf::convert` recorded for the tensor reproduces the
+    /// original PyTorch name exactly.
     pub fn oxigaf_to_pytorch(&self, oxigaf_name: &str, prefix: Option<&str>) -> Result<String> {
         // Reverse lookup in custom mappings (O(1) via the maintained reverse map).
         // The prefix is applied here too, same as the non-custom path below, so
@@ -135,18 +210,11 @@ impl LayerMapping {
             });
         }
 
-        // Replace single underscores with dots (these were from PyTorch dots)
-        // Replace double underscores with single underscores (these were original underscores)
-        let pytorch_name = oxigaf_name
-            .replace("__", "\x00")
-            .replace('_', ".")
-            .replace('\x00', "_");
-
         // Add prefix if provided
         if let Some(prefix) = prefix {
-            Ok(format!("{}.{}", prefix, pytorch_name))
+            Ok(format!("{}.{}", prefix, oxigaf_name))
         } else {
-            Ok(pytorch_name)
+            Ok(oxigaf_name.to_string())
         }
     }
 
@@ -214,13 +282,13 @@ mod tests {
         let test_cases = vec![
             (
                 "unet.down_blocks.0.resnets.0.conv1.weight",
-                "down__blocks_0_resnets_0_conv1_weight",
+                "down_blocks.0.resnets.0.conv1.weight",
             ),
             (
                 "model.encoder.layer.2.attention.self.query.bias",
-                "encoder_layer_2_attention_self_query_bias",
+                "encoder.layer.2.attention.self.query.bias",
             ),
-            ("simple.layer.weight", "simple_layer_weight"),
+            ("simple.layer.weight", "simple.layer.weight"),
         ];
 
         for (pytorch, expected_oxigaf) in test_cases {
@@ -232,16 +300,48 @@ mod tests {
     }
 
     #[test]
+    fn test_pytorch_to_oxigaf_produces_varbuilder_loadable_names() {
+        // Regression test for the architecture gap this convention change
+        // closed: `pytorch_to_oxigaf` used to emit a flat,
+        // double-underscore-escaped name (`down__blocks_0_..._weight`) that
+        // `candle_nn::VarBuilder::pp` cannot walk, while the ToRSh bridge's
+        // `GafLayerMapper` emitted the dot-nested form that it can. The two
+        // "OxiGAF" conventions must now agree, so a checkpoint from either
+        // path loads in `oxigaf-diffusion`'s `VarBuilder`-based model code.
+        let mapping = LayerMapping::new();
+        let mapper = crate::GafLayerMapper::new();
+
+        // Same logical layer, reached from each of the two source formats.
+        let via_pytorch = mapping
+            .pytorch_to_oxigaf("unet.down_blocks.0.resnets.0.conv1.weight")
+            .expect("test: layer mapping should succeed");
+        let via_torsh = mapper
+            .map_torsh_to_oxigaf("down_blocks/0/resnets/0/conv1/weight")
+            .expect("test: layer mapping should succeed");
+
+        assert_eq!(via_pytorch, via_torsh);
+        assert_eq!(via_pytorch, "down_blocks.0.resnets.0.conv1.weight");
+        assert!(!via_pytorch.contains('/'), "VarBuilder paths use dots");
+        // `VarBuilder::pp` splits on '.', so every path component the model
+        // code walks (`vs.pp("down_blocks").pp("0")...`) must be present.
+        let components: Vec<&str> = via_pytorch.split('.').collect();
+        assert_eq!(
+            components,
+            vec!["down_blocks", "0", "resnets", "0", "conv1", "weight"]
+        );
+    }
+
+    #[test]
     fn test_oxigaf_to_pytorch() {
         let mapping = LayerMapping::new();
 
         let test_cases = vec![
             (
-                "down__blocks_0_resnets_0_conv1_weight",
+                "down_blocks.0.resnets.0.conv1.weight",
                 "down_blocks.0.resnets.0.conv1.weight",
             ),
             (
-                "encoder_layer_2_attention_self_query_bias",
+                "encoder.layer.2.attention.self.query.bias",
                 "encoder.layer.2.attention.self.query.bias",
             ),
         ];
@@ -252,6 +352,15 @@ mod tests {
                 .expect("test: layer mapping should succeed");
             assert_eq!(result, expected_pytorch, "Failed for: {}", oxigaf);
         }
+    }
+
+    #[test]
+    fn test_oxigaf_to_pytorch_restores_prefix() {
+        let mapping = LayerMapping::new();
+        let result = mapping
+            .oxigaf_to_pytorch("down_blocks.0.conv.weight", Some("unet"))
+            .expect("test: layer mapping should succeed");
+        assert_eq!(result, "unet.down_blocks.0.conv.weight");
     }
 
     #[test]
@@ -401,6 +510,157 @@ mod tests {
                 "Round-trip failed for {}: got {}",
                 pytorch_name, reconstructed
             );
+        }
+    }
+
+    #[test]
+    fn test_round_trip_survives_leading_underscore_components() {
+        // Regression test: the old double-underscore escaping was not
+        // injective -- `a._b` and `a_.b` both encoded to `a___b` -- so a
+        // `torch.compile`-wrapped checkpoint (`_orig_mod.` components) could
+        // not round-trip. The dot-preserving convention is the identity on
+        // the un-prefixed remainder, so these must now come back exactly.
+        let mapping = LayerMapping::new();
+
+        for name in [
+            "a._b",
+            "a_.b",
+            "_orig_mod.down_blocks.0.conv.weight",
+            "down_blocks.0._extra_.weight",
+            "trailing_",
+            "__dunder__.weight",
+        ] {
+            let oxigaf = mapping
+                .pytorch_to_oxigaf(name)
+                .expect("test: layer mapping should succeed");
+            let back = mapping
+                .oxigaf_to_pytorch(&oxigaf, None)
+                .expect("test: layer mapping should succeed");
+            assert_eq!(back, name, "round-trip lost information for {}", name);
+        }
+    }
+
+    #[test]
+    fn test_oxigaf_torsh_agrees_with_gaf_layer_mapper() {
+        // The two bridges must produce the same OxiGAF names in both
+        // directions, or a checkpoint's provenance would decide whether it
+        // loads.
+        let mapping = LayerMapping::new();
+        let mapper = crate::GafLayerMapper::new();
+
+        for torsh in [
+            "time_embedding/linear_1/weight",
+            "down_blocks/0/resnets/0/norm1/weight",
+            "up_blocks/3/attentions/0/transformer_blocks/0/attn1/to_q/weight",
+            "conv_in/weight",
+        ] {
+            let via_layer_mapping = mapping
+                .torsh_to_oxigaf(torsh)
+                .expect("test: layer mapping should succeed");
+            let via_gaf_mapper = mapper
+                .map_torsh_to_oxigaf(torsh)
+                .expect("test: layer mapping should succeed");
+            assert_eq!(via_layer_mapping, via_gaf_mapper, "forward: {}", torsh);
+
+            let back = mapping
+                .oxigaf_to_torsh(&via_layer_mapping)
+                .expect("test: layer mapping should succeed");
+            assert_eq!(back, torsh, "reverse: {}", torsh);
+        }
+    }
+
+    #[test]
+    fn test_add_custom_mapping_drops_superseded_reverse_entry() {
+        // Regression test: re-registering a `from` with a new `to` left the
+        // *old* `to` behind in the reverse map, so a name the forward
+        // mapping no longer produces still resolved backwards to `from` --
+        // the two maps disagreed about what the mapping was.
+        let mut mapping = LayerMapping::new();
+        mapping.add_custom_mapping("a.weight".to_string(), "x".to_string());
+        mapping.add_custom_mapping("a.weight".to_string(), "y".to_string());
+
+        assert_eq!(mapping.lookup_custom("a.weight"), Some("y"));
+        assert_eq!(
+            mapping
+                .oxigaf_to_pytorch("y", None)
+                .expect("test: layer mapping should succeed"),
+            "a.weight"
+        );
+        // "x" is no longer produced by the forward mapping, so it must fall
+        // through to the mechanical path rather than resolving to "a.weight".
+        assert_eq!(
+            mapping
+                .oxigaf_to_pytorch("x", None)
+                .expect("test: layer mapping should succeed"),
+            "x"
+        );
+    }
+
+    #[test]
+    fn test_add_custom_mapping_checked_rejects_target_collision() {
+        let mut mapping = LayerMapping::new();
+        mapping
+            .add_custom_mapping_checked("a.weight".to_string(), "shared".to_string())
+            .expect("test: first registration should succeed");
+
+        // A different source aiming at the same target makes the reverse
+        // direction lossy and must be rejected.
+        let err = mapping.add_custom_mapping_checked("b.weight".to_string(), "shared".to_string());
+        assert!(err.is_err(), "colliding target must be rejected");
+
+        // ... and the rejected call must not have mutated anything.
+        assert_eq!(mapping.lookup_custom("b.weight"), None);
+        assert_eq!(
+            mapping
+                .oxigaf_to_pytorch("shared", None)
+                .expect("test: layer mapping should succeed"),
+            "a.weight"
+        );
+
+        // Re-registering the *same* source is not a collision.
+        mapping
+            .add_custom_mapping_checked("a.weight".to_string(), "shared".to_string())
+            .expect("test: idempotent re-registration should succeed");
+    }
+
+    proptest::proptest! {
+        /// `oxigaf_to_pytorch(pytorch_to_oxigaf(n), stripped_prefix) == n`
+        /// for arbitrary dot-separated names, including the underscore and
+        /// empty-component shapes the previous escaping mangled.
+        #[test]
+        fn prop_pytorch_oxigaf_round_trip(
+            name in "[a-z_.0-9]{0,40}"
+        ) {
+            let mapping = LayerMapping::new();
+            let prefix = detect_prefix(&name).map(|(prefix, _)| prefix);
+            let oxigaf = mapping
+                .pytorch_to_oxigaf(&name)
+                .expect("test: layer mapping should succeed");
+            let back = mapping
+                .oxigaf_to_pytorch(&oxigaf, prefix)
+                .expect("test: layer mapping should succeed");
+            proptest::prop_assert_eq!(back, name);
+        }
+
+        /// Names that carry a recognized prefix round-trip through the
+        /// prefix-restoring path, which is the one
+        /// `pytorch_to_oxigaf::convert` / `oxigaf_to_pytorch::convert` use
+        /// via the `__metadata__` prefix map.
+        #[test]
+        fn prop_prefixed_pytorch_oxigaf_round_trip(
+            prefix in proptest::sample::select(KNOWN_PYTORCH_PREFIXES.to_vec()),
+            rest in "[a-z_.0-9]{1,40}"
+        ) {
+            let mapping = LayerMapping::new();
+            let name = format!("{}.{}", prefix, rest);
+            let oxigaf = mapping
+                .pytorch_to_oxigaf(&name)
+                .expect("test: layer mapping should succeed");
+            proptest::prop_assert_eq!(&oxigaf, &rest);
+            let back = mapping
+                .oxigaf_to_pytorch(&oxigaf, Some(prefix))
+                .expect("test: layer mapping should succeed");
+            proptest::prop_assert_eq!(back, name);
         }
     }
 }

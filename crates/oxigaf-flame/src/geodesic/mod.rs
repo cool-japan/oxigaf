@@ -442,8 +442,8 @@ impl SearchGraph {
             if opps.len() != 2 {
                 continue;
             }
-            let (a, d) = (opps[0], opps[1]);
-            if a == d {
+            let (apex_a, apex_d) = (opps[0], opps[1]);
+            if apex_a == apex_d {
                 continue;
             }
 
@@ -454,23 +454,25 @@ impl SearchGraph {
             if edge_len < 1e-12 {
                 continue;
             }
-            let u = [axis[0] / edge_len, axis[1] / edge_len, axis[2] / edge_len];
+            let unit_axis = [axis[0] / edge_len, axis[1] / edge_len, axis[2] / edge_len];
 
             // Place both apexes in 2D: x along the shared edge, y the distance
             // from it. Unfolding lays them on opposite sides of the edge, which
             // is why the shortcut length below adds the two y values.
-            let planar = |v: usize| -> (f32, f32) {
-                let p = mesh.vertices[v];
-                let w = [p[0] - pb[0], p[1] - pb[1], p[2] - pb[2]];
-                let x = w[0] * u[0] + w[1] * u[1] + w[2] * u[2];
+            let planar = |vertex: usize| -> (f32, f32) {
+                let pos = mesh.vertices[vertex];
+                let rel = [pos[0] - pb[0], pos[1] - pb[1], pos[2] - pb[2]];
+                let proj_x = rel[0] * unit_axis[0] + rel[1] * unit_axis[1] + rel[2] * unit_axis[2];
                 // Clamp at zero: for a near-collinear triangle this difference
                 // of similar magnitudes can go slightly negative through
                 // rounding alone, and a degenerate apex simply sits on the edge.
-                let y_sq = ((w[0] * w[0] + w[1] * w[1] + w[2] * w[2]) - x * x).max(0.0);
-                (x, y_sq.sqrt())
+                let y_sq = ((rel[0] * rel[0] + rel[1] * rel[1] + rel[2] * rel[2])
+                    - proj_x * proj_x)
+                    .max(0.0);
+                (proj_x, y_sq.sqrt())
             };
-            let (xa, ya) = planar(a);
-            let (xd, yd) = planar(d);
+            let (xa, ya) = planar(apex_a);
+            let (xd, yd) = planar(apex_d);
             if ya + yd < 1e-12 {
                 // Both apexes lie on the shared edge: the "triangles" are
                 // degenerate slivers with no interior to cut across.
@@ -480,8 +482,8 @@ impl SearchGraph {
             // Where the unfolded straight line a—d crosses the shared edge.
             // Outside [0, edge_len] the true geodesic leaves through a
             // different edge, so this shortcut would be an over-shortcut.
-            let s = xa + (xd - xa) * ya / (ya + yd);
-            if s < -1e-6 || s > edge_len + 1e-6 {
+            let crossing = xa + (xd - xa) * ya / (ya + yd);
+            if crossing < -1e-6 || crossing > edge_len + 1e-6 {
                 continue;
             }
 
@@ -496,10 +498,10 @@ impl SearchGraph {
             // fan, say), this adds a parallel entry rather than replacing one.
             // That is harmless: `dijkstra_impl` relaxes every entry and keeps
             // whichever is shorter.
-            adjacency[a].push(d);
-            lengths[a].push(shortcut);
-            adjacency[d].push(a);
-            lengths[d].push(shortcut);
+            adjacency[apex_a].push(apex_d);
+            lengths[apex_a].push(shortcut);
+            adjacency[apex_d].push(apex_a);
+            lengths[apex_d].push(shortcut);
         }
 
         Self {

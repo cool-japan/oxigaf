@@ -22,13 +22,22 @@ pub struct InteractiveController {
     /// Pause/resume training. Read by the training loop's step gate.
     pub paused: Arc<AtomicBool>,
     /// Learning rate adjustment multiplier (100 = 1.0x, range: 10-200),
-    /// updated by the `[Up]`/`[Down]` keys. Public and ready for a training
-    /// loop to read, but as of this writing nothing does yet — see
+    /// updated by the `[Up]`/`[Down]` keys.
+    ///
+    /// Public and ready for a training loop to read, but **nothing applies
+    /// it yet**: [`oxigaf_trainer::GaussianOptimizer`] clones its
+    /// `OptimizerConfig` into a private field with no setter, so the per-step
+    /// learning rates cannot be scaled from outside the trainer. Mutating
+    /// `Trainer::config.optimizer` does not help — the optimiser never reads
+    /// it again after construction. Wiring this up needs a
+    /// `set_lr_scale`/`config_mut` accessor on `GaussianOptimizer` first; see
     /// [`InteractiveController::print_controls`].
     pub lr_adjustment: Arc<AtomicU8>,
-    /// Toggle verbose logging, flipped by the `[v]` key. Public and ready
-    /// for a training loop to read, but as of this writing nothing does
-    /// yet — see [`InteractiveController::print_controls`].
+    /// Toggle verbose logging, flipped by the `[v]` key.
+    ///
+    /// Read once per training step by `crate::pipeline::run_reconstruction`:
+    /// while set, every iteration is logged (whatever `log_interval` says,
+    /// including `0`) together with the individual loss terms.
     pub verbose_toggle: Arc<AtomicBool>,
     /// Request checkpoint save. Read (and cleared) by the training loop.
     pub save_requested: Arc<AtomicBool>,
@@ -119,21 +128,23 @@ impl InteractiveController {
 
     /// Print the interactive controls help message.
     ///
-    /// `[Up/Down]` and `[v]` are called out as "recorded" rather than
-    /// claimed outright: pressing them updates
-    /// [`lr_adjustment`](Self::lr_adjustment)/[`verbose_toggle`](Self::verbose_toggle)
-    /// (both public, readable by any training loop that holds this
-    /// controller) and prints a confirmation, but as of this writing
-    /// `pipeline.rs`'s training step does not yet read either atomic, so
-    /// they currently have no effect on the run in progress. `[Space]`,
-    /// `[s]`, and `[q]` (`paused`/`save_requested`/`quit_requested`) are
-    /// consumed by the training loop today.
+    /// `[Space]`, `[v]`, `[s]` and `[q]`
+    /// (`paused`/`verbose_toggle`/`save_requested`/`quit_requested`) are all
+    /// consumed by `pipeline.rs`'s training loop and take effect on the run
+    /// in progress.
+    ///
+    /// `[Up/Down]` is still called out as "recorded" rather than claimed
+    /// outright: pressing it updates [`lr_adjustment`](Self::lr_adjustment)
+    /// and prints a confirmation, but no training loop can act on it yet —
+    /// see that field's documentation for the trainer-side accessor it is
+    /// waiting on. Labelling it as working would be the worse failure: the
+    /// user would believe they had rescued a diverging run.
     pub fn print_controls(&self) {
         println!();
         println!("Interactive Controls:");
         println!("  [Space]    Pause/Resume training");
         println!("  [Up/Down]  Increase/Decrease learning rate (recorded; trainer wiring pending)");
-        println!("  [v]        Toggle verbose logging (recorded; trainer wiring pending)");
+        println!("  [v]        Toggle verbose logging");
         println!("  [s]        Save checkpoint now");
         println!("  [q]        Quit gracefully");
         println!();

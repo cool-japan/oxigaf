@@ -111,6 +111,16 @@ oxigaf convert \
   --version 2023
 ```
 
+This writes the 8 files `oxigaf_flame::load_flame_model` reads:
+`v_template.npy`, `shapedirs.npy`, `posedirs.npy`, `expressiondirs.npy`,
+`j_regressor.npy`, `kintree_table.npy`, `lbs_weights.npy`, `faces.npy` —
+plus `uv.npy`/`uv_faces.npy` when the source model carries UV data, and any
+landmark index/barycentric `.npy` files present in the source. There is no
+`parents.npy`: older releases wrote one (a verbatim copy of
+`kintree_table`), but the FLAME loader never read it and the converter no
+longer writes it — `oxigaf convert --force` over a directory from an older
+release leaves a stale one behind, which `oxigaf convert` flags as a hint.
+
 ### Inspect and Compare Models
 
 ```bash
@@ -139,6 +149,14 @@ oxigaf benchmark \
   --iterations 100 \
   --output benchmark_results.json
 ```
+
+Every target drives a real component — `flame` runs `FlameModel::forward` on
+the model at `--flame-model`, `raster`/`train` need a working GPU adapter,
+and `export` writes a real PLY to a temp directory. `--flame-model` is
+**required** to benchmark the `flame` target: with no explicit `--target`
+it is skipped (and noted in the report) when the flag is missing, but
+`--target flame` on its own turns a missing `--flame-model` into a hard
+error instead of a skip.
 
 ### Manage Configuration Files
 
@@ -232,13 +250,18 @@ The CLI supports project configuration files in TOML format (default path:
 `./oxigaf.toml`, overridable with `--config`). Run `oxigaf config-cmd init`
 to generate a fully-populated file; the excerpt below shows the real section
 structure with a few commonly-tuned fields (any field not listed keeps its
-built-in default):
+built-in default). The example paths below use the macOS cache directory —
+the actual default (when a path isn't set explicitly) comes from
+`dirs::cache_dir()`, which resolves to `~/Library/Caches/oxigaf` on macOS,
+`~/.cache/oxigaf` (or `$XDG_CACHE_HOME/oxigaf`) on Linux, and
+`%LOCALAPPDATA%\oxigaf` on Windows; override it with `OXIGAF_CACHE_DIR` on
+any platform:
 
 ```toml
 # oxigaf.toml
 [model]
-flame_model_path = "~/.cache/oxigaf/flame2023"
-diffusion_weights_dir = "~/.cache/oxigaf/weights"
+flame_model_path = "~/Library/Caches/oxigaf/flame2023"
+diffusion_weights_dir = "~/Library/Caches/oxigaf/weights"
 
 [device]
 backend = "vulkan"   # vulkan, metal, dx12, or gl

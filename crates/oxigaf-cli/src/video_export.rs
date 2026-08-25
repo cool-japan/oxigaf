@@ -359,17 +359,14 @@ impl FrameCollector {
         let delay = Delay::from_numer_denom_ms(1000, self.config.fps.max(1));
 
         for pixels in &self.gif_frame_buffers {
-            let rgba_image = image::RgbaImage::from_raw(
-                self.config.width,
-                self.config.height,
-                pixels.clone(),
-            )
-            .ok_or_else(|| {
-                CliError::VideoExport(format!(
+            let rgba_image =
+                image::RgbaImage::from_raw(self.config.width, self.config.height, pixels.clone())
+                    .ok_or_else(|| {
+                    CliError::VideoExport(format!(
                     "Failed to construct RgbaImage ({}x{}) for GIF frame: buffer may be too small",
                     self.config.width, self.config.height
                 ))
-            })?;
+                })?;
             let frame = GifAnimationFrame::from_parts(rgba_image, 0, 0, delay);
             encoder.encode_frame(frame).map_err(|e| {
                 CliError::VideoExport(format!(
@@ -837,10 +834,14 @@ mod tests {
         let cfg = VideoExportConfig::frame_sequence_png(128, 64, PathBuf::from("/tmp/x"));
         assert_eq!(cfg.width, 128);
         assert_eq!(cfg.height, 64);
-        match &cfg.format {
-            VideoFormat::FrameSequence { extension } => assert_eq!(extension, "png"),
-            other => panic!("unexpected format: {other:?}"),
-        }
+        assert!(
+            matches!(
+                &cfg.format,
+                VideoFormat::FrameSequence { extension } if extension == "png"
+            ),
+            "unexpected format: {:?}",
+            cfg.format
+        );
     }
 
     // ------------------------------------------------------------------

@@ -3,7 +3,9 @@
 //! This module provides validation for converted GAF checkpoints to ensure they are
 //! compatible with oxigaf-diffusion pipeline.
 
-use crate::{BridgeError, Result};
+#[cfg(any(feature = "test-fixtures", test))]
+use crate::BridgeError;
+use crate::Result;
 use std::path::Path;
 
 /// Validation report for a converted checkpoint
@@ -424,8 +426,20 @@ mod tests {
     }
 }
 
-/// Create a synthetic GAF checkpoint for testing (exposed for integration tests)
-#[cfg(feature = "torsh")]
+/// Create a synthetic GAF checkpoint for testing.
+///
+/// Gated behind the `test-fixtures` feature (which implies `torsh`) so it is
+/// not part of this crate's stable public surface: it is a test fixture, and
+/// changing what it generates must not be a semver-breaking change for
+/// ordinary consumers. This crate's own `#[cfg(test)]` modules and
+/// `tests/` targets reach it because `dev-dependencies`-style feature
+/// selection enables `test-fixtures` for test builds.
+///
+/// # Errors
+///
+/// Returns [`BridgeError::Conversion`] if the generated state cannot be
+/// serialized to `output`.
+#[cfg(any(feature = "test-fixtures", test))]
 pub fn create_synthetic_gaf_checkpoint(output: &Path) -> Result<()> {
     use torsh_nn::serialization::{ModelMetadata, ModelState, SerializableTensor};
 

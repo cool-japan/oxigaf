@@ -157,7 +157,7 @@ pub enum InterpolationMode {
 /// (exactly, magnitude included, for every mode — [`InterpolationMode::Slerp`]
 /// rescales its unit-sphere interpolation back to the linearly-interpolated
 /// magnitude of the two inputs, so it does not discontinuously collapse to
-/// unit norm; see [`slerp_interp`]).
+/// unit norm; see `slerp_interp`).
 pub fn interpolate_embeddings(
     start: &PromptEmbedding,
     end: &PromptEmbedding,
@@ -726,9 +726,31 @@ mod tests {
         PromptEmbedding::new(data, "test").expect("valid embedding")
     }
 
-    #[allow(dead_code)]
     fn zero_embed(dim: usize) -> PromptEmbedding {
         PromptEmbedding::zeros(dim, "zero")
+    }
+
+    // `PromptEmbedding::zeros` had no coverage at all: `zero_embed` was
+    // written for it, then suppressed as dead code rather than used. Its two
+    // documented promises — the `dim.max(1)` clamp, and a genuinely all-zero
+    // vector whose `norm()` is 0 and whose `normalize()` is a no-op — are the
+    // ones a caller relies on.
+    #[test]
+    fn test_embedding_zeros_is_all_zero_and_clamps_dim() {
+        let embed = zero_embed(4);
+        assert_eq!(embed.dim(), 4);
+        assert_eq!(embed.label, "zero");
+        assert!(embed.data.iter().all(|v| *v == 0.0));
+        assert_eq!(embed.norm(), 0.0);
+
+        // Unlike `new`, which rejects empty data, `zeros` clamps to 1.
+        assert_eq!(zero_embed(0).dim(), 1);
+
+        // Normalizing a zero vector must leave it alone rather than divide by
+        // its zero norm.
+        let mut zero = zero_embed(3);
+        zero.normalize();
+        assert!(zero.data.iter().all(|v| *v == 0.0));
     }
 
     // Test 1: new() with empty data → EmptyEmbedding error

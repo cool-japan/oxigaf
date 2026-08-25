@@ -561,3 +561,209 @@ pub struct RetargetConfig {
     /// Gaussian smoothing sigma (in frames) used by `retar_smooth_sequence`. Default: `2.0`.
     pub smoothing_sigma: f32,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // `retar_solve_ridge` is `pub(super)` in `functions.rs`, visible here
+    // since `types::tests` is a descendant of `expression_retargeting`.
+    use super::super::functions::retar_solve_ridge;
+
+    fn variance_stats(per_dim_variance: Vec<f32>) -> ExpressionVarianceStats {
+        let total_variance = per_dim_variance.iter().sum();
+        let mut top_k_dims: Vec<usize> = (0..per_dim_variance.len()).collect();
+        top_k_dims.sort_unstable_by(|&a, &b| {
+            per_dim_variance[b]
+                .partial_cmp(&per_dim_variance[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        ExpressionVarianceStats {
+            per_dim_variance,
+            total_variance,
+            top_k_dims,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // variance_scale
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_variance_scale_no_stats_is_identity() {
+        let scale = variance_scale(None, 4);
+        assert_eq!(scale, vec![1.0, 1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn test_variance_scale_uses_std_and_skips_low_variance() {
+        let stats = variance_stats(vec![4.0, 0.0, 1e-20]);
+        let scale = variance_scale(Some(&stats), 3);
+        assert!((scale[0] - 2.0).abs() < 1e-6, "scale[0]={}", scale[0]);
+        assert!(
+            (scale[1] - 1.0).abs() < 1e-6,
+            "zero variance must fall back to 1.0"
+        );
+        assert!(
+            (scale[2] - 1.0).abs() < 1e-6,
+            "near-zero variance must fall back to 1.0"
+        );
+    }
+
+    #[test]
+    fn test_variance_scale_dim_beyond_stats_defaults_to_one() {
+        // Simulates `include_jaw`: `dim` (feat_dim) exceeds
+        // `per_dim_variance.len()` (expr_dim); the extra (jaw) slots must
+        // stay unscaled.
+        let stats = variance_stats(vec![9.0, 4.0]);
+        let scale = variance_scale(Some(&stats), 5);
+        assert!((scale[0] - 3.0).abs() < 1e-6);
+        assert!((scale[1] - 2.0).abs() < 1e-6);
+        assert!((scale[2] - 1.0).abs() < 1e-6);
+        assert!((scale[3] - 1.0).abs() < 1e-6);
+        assert!((scale[4] - 1.0).abs() < 1e-6);
+    }
+
+    // -----------------------------------------------------------------------
+    // retar_solve_ridge_multi_rhs
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_retar_solve_ridge_multi_rhs_matches_single_column_solve() {
+        // `a`: 4 samples x 2 features, row-major.
+        let a = vec![1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 2.0, 1.0];
+        // Two right-hand-side columns, row-major [4 x 2].
+        let b_matrix = vec![1.0, 5.0, 2.0, 4.0, 3.0, 3.0, 4.0, 2.0];
+        let lambda = 0.1;
+
+        let batched =
+            retar_solve_ridge_multi_rhs(&a, &b_matrix, 4, 2, 2, lambda).expect("batched solve");
+
+        for col in 0..2 {
+            let b_col: Vec<f32> = (0..4).map(|i| b_matrix[i * 2 + col]).collect();
+            let expected = retar_solve_ridge(&a, &b_col, 4, 2, lambda).expect("single solve");
+            for row in 0..2 {
+                assert!(
+                    (batched[row * 2 + col] - expected[row]).abs() < 1e-4,
+                    "row={row} col={col}: batched={} expected={}",
+                    batched[row * 2 + col],
+                    expected[row]
+                );
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // LinearExpressionRetargeter::fit / retarget: scale_by_variance wiring
+    // -----------------------------------------------------------------------
+
+    fn anisotropic_pairs() -> Vec<RetargetPair> {
+        vec![
+            RetargetPair {
+                source: ExpressionState::from_params(vec![0.0, 0.0]),
+                target: ExpressionState::from_params(vec![0.0, 0.0]),
+            },
+            RetargetPair {
+                source: ExpressionState::from_params(vec![10.0, 0.1]),
+                target: ExpressionState::from_params(vec![1.0, 1.0]),
+            },
+            RetargetPair {
+                source: ExpressionState::from_params(vec![-10.0, -0.1]),
+                target: ExpressionState::from_params(vec![-1.0, -1.0]),
+            },
+            RetargetPair {
+                source: ExpressionState::from_params(vec![5.0, -0.2]),
+                target: ExpressionState::from_params(vec![0.5, -0.5]),
+            },
+        ]
+    }
+
+    #[test]
+    fn test_fit_scale_by_variance_changes_mapping() {
+        // Regression test: `scale_by_variance` previously had zero effect
+        // on the learned mapping. On anisotropically-scaled source data
+        // (dimension 0 varies far more than dimension 1), fitting with
+        // `scale_by_variance: true` vs `false` must produce different
+        // mappings.
+        let pairs = anisotropic_pairs();
+        let base_config = RetargetConfig {
+            expr_dim: 2,
+            include_jaw: false,
+            regularization: 1e-3,
+            ..RetargetConfig::default()
+        };
+        let scaled_config = RetargetConfig {
+            scale_by_variance: true,
+            ..base_config.clone()
+        };
+        let unscaled_config = RetargetConfig {
+            scale_by_variance: false,
+            ..base_config
+        };
+
+        let scaled = LinearExpressionRetargeter::fit(&pairs, scaled_config).expect("fit scaled");
+        let unscaled =
+            LinearExpressionRetargeter::fit(&pairs, unscaled_config).expect("fit unscaled");
+
+        assert!(scaled.source_variance.is_some());
+        assert!(unscaled.source_variance.is_none());
+
+        let differs = scaled
+            .mapping
+            .iter()
+            .zip(unscaled.mapping.iter())
+            .any(|(&a, &b)| (a - b).abs() > 1e-4);
+        assert!(
+            differs,
+            "scale_by_variance must change the learned mapping: scaled={:?} unscaled={:?}",
+            scaled.mapping, unscaled.mapping
+        );
+    }
+
+    #[test]
+    fn test_fit_and_retarget_roundtrip_with_scale_by_variance() {
+        // With `scale_by_variance: true`, `retarget` must apply the same
+        // per-dimension scale used during `fit`; a well-fit retargeter
+        // should still (approximately) recover a training pair's target.
+        let pairs = anisotropic_pairs();
+        let config = RetargetConfig {
+            expr_dim: 2,
+            include_jaw: false,
+            regularization: 1e-6,
+            scale_by_variance: true,
+            ..RetargetConfig::default()
+        };
+        let retargeter = LinearExpressionRetargeter::fit(&pairs, config).expect("fit");
+        let out = retargeter
+            .retarget(&ExpressionState::from_params(vec![10.0, 0.1]))
+            .expect("retarget");
+        assert!(
+            (out.expression_params[0] - 1.0).abs() < 0.2,
+            "got {:?}",
+            out.expression_params
+        );
+    }
+
+    #[test]
+    fn test_fit_scale_by_variance_false_matches_previous_behavior() {
+        // With `scale_by_variance: false`, behavior must be unchanged from
+        // before this fix (no scaling applied anywhere).
+        let pairs = anisotropic_pairs();
+        let config = RetargetConfig {
+            expr_dim: 2,
+            include_jaw: false,
+            regularization: 1e-6,
+            scale_by_variance: false,
+            ..RetargetConfig::default()
+        };
+        let retargeter = LinearExpressionRetargeter::fit(&pairs, config).expect("fit");
+        assert!(retargeter.source_variance.is_none());
+        let out = retargeter
+            .retarget(&ExpressionState::from_params(vec![10.0, 0.1]))
+            .expect("retarget");
+        assert!(
+            (out.expression_params[0] - 1.0).abs() < 0.2,
+            "got {:?}",
+            out.expression_params
+        );
+    }
+}

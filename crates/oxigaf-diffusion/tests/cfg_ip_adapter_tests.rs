@@ -336,17 +336,18 @@ fn test_spatial_transformer_with_ip_tokens() -> Result<()> {
     let num_groups = 8;
     let use_linear = true;
 
-    let transformer = oxigaf_diffusion::attention::MultiViewSpatialTransformer::new(
+    let transformer = oxigaf_diffusion::attention::MultiViewSpatialTransformer::with_spec(
         vs.pp("transformer"),
-        in_channels,
-        n_heads,
-        d_head,
-        depth,
-        context_dim,
-        ip_dim,
-        num_views,
-        num_groups,
-        use_linear,
+        &oxigaf_diffusion::attention::SpatialTransformerSpec {
+            in_channels,
+            depth,
+            context_dim,
+            ip_dim,
+            num_views,
+            num_groups,
+            use_linear_projection: use_linear,
+            attention: oxigaf_diffusion::attention::AttentionSpec::standard(n_heads, d_head),
+        },
     )?;
 
     let batch_views = 4;

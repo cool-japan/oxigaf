@@ -413,7 +413,12 @@ impl TrainingProfiler {
     /// Estimated training iterations per second based on the EMA of
     /// [`TrainingPhase::Total`].
     ///
-    /// Returns `0.0` if no `Total` data has been recorded.
+    /// Returns `0.0` if no `Total` data has been recorded. Note that this
+    /// profiler only records what its caller explicitly wraps in
+    /// [`scope`](Self::scope) or [`record`](Self::record) calls: if the
+    /// caller only times individual sub-phases and never wraps the whole
+    /// iteration in a `scope(TrainingPhase::Total)`, this will always
+    /// return `0.0` regardless of how much other phase data exists.
     pub fn iterations_per_second(&self) -> f64 {
         let stats = match self.stats(TrainingPhase::Total) {
             Some(s) if s.ema_us > 0.0 => s,
@@ -722,5 +727,73 @@ mod tests {
         // Verify generic return type forwarding.
         let s: String = p.time(TrainingPhase::Initialize, || String::from("hello"));
         assert_eq!(s, "hello");
+    }
+
+    // ---- Total phase drives iterations_per_second (F291) -------------------
+
+    #[test]
+    fn iterations_per_second_needs_the_total_phase_not_the_sub_phases() {
+        // Regression: `Trainer::train_step` timed every sub-phase but never
+        // recorded `Total`, so this always returned 0.0 no matter how much
+        // other data existed.  It is deliberately NOT a fallback sum of the
+        // sub-phase EMAs: those double-count nested scopes and miss the gaps
+        // between phases.
+        let profiler = TrainingProfiler::new(true);
+        for phase in [
+            TrainingPhase::Forward,
+            TrainingPhase::Backward,
+            TrainingPhase::Optimize,
+            TrainingPhase::DensityControl,
+            TrainingPhase::Metrics,
+        ] {
+            profiler.record(phase, 1_000);
+        }
+        assert_eq!(
+            profiler.iterations_per_second(),
+            0.0,
+            "sub-phases alone must not synthesise a rate"
+        );
+
+        // One 10 ms iteration → 100 it/s.
+        profiler.record(TrainingPhase::Total, 10_000);
+        let rate = profiler.iterations_per_second();
+        assert!(
+            (rate - 100.0).abs() < 1e-6,
+            "expected 100 it/s from a 10ms Total, got {rate}"
+        );
+    }
+
+    #[test]
+    fn every_phase_the_training_loop_records_shows_up_in_the_report() {
+        // The loop times these six explicitly; a phase silently missing from
+        // the report is how the `Total` gap went unnoticed in the first place.
+        let profiler = TrainingProfiler::new(true);
+        let recorded = [
+            TrainingPhase::Total,
+            TrainingPhase::Forward,
+            TrainingPhase::DiffusionTarget,
+            TrainingPhase::LossComputation,
+            TrainingPhase::Backward,
+            TrainingPhase::Optimize,
+            TrainingPhase::DensityControl,
+            TrainingPhase::Metrics,
+        ];
+        for (idx, phase) in recorded.iter().enumerate() {
+            profiler.record(*phase, 1_000 + idx as u64);
+        }
+        let report = profiler.format_report();
+        for phase in recorded {
+            assert!(
+                report.contains(phase.display_name()),
+                "{} missing from the report",
+                phase.display_name()
+            );
+        }
+        // `all_stats` sorts by total time descending, so `Total` is simply
+        // present rather than necessarily first; what matters is that it is
+        // recorded at all.
+        let stats = profiler.all_stats();
+        assert_eq!(stats.len(), recorded.len());
+        assert!(stats.iter().any(|(p, _)| *p == TrainingPhase::Total));
     }
 }

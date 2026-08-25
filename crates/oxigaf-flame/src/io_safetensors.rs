@@ -288,7 +288,18 @@ fn extract_model_slices<'a>(
     // format table.
     let mut kintree_i32: Vec<i32> = Vec::with_capacity(model.parents.len() * 2);
     kintree_i32.extend_from_slice(&model.parents);
-    kintree_i32.extend((0..model.n_joints).map(|j| j as i32));
+    let joint_indices: Vec<i32> = (0..model.n_joints)
+        .map(|j| {
+            i32::try_from(j).map_err(|_| FlameError::SafeTensorsSave {
+                path: path.to_path_buf(),
+                message: format!(
+                    "n_joints {} is too large to serialize as i32 indices",
+                    model.n_joints
+                ),
+            })
+        })
+        .collect::<Result<Vec<i32>, FlameError>>()?;
+    kintree_i32.extend(joint_indices);
 
     Ok(ModelDataSlices {
         v_template,
@@ -594,7 +605,7 @@ fn load_tensor_i32_2d(tensors: &SafeTensors, name: &str) -> Result<Array2<i32>, 
 /// for any alignment and lets a malformed length be reported as a
 /// [`FlameError`] instead of aborting the process.
 fn bytes_to_f32_vec(name: &str, data_bytes: &[u8]) -> Result<Vec<f32>, FlameError> {
-    if data_bytes.len() % 4 != 0 {
+    if !data_bytes.len().is_multiple_of(4) {
         return Err(FlameError::ShapeMismatch {
             name: name.to_string(),
             expected: "byte length that is a multiple of 4 (f32)".to_string(),
@@ -611,7 +622,7 @@ fn bytes_to_f32_vec(name: &str, data_bytes: &[u8]) -> Result<Vec<f32>, FlameErro
 /// for why a manual, alignment-independent decode is required here instead
 /// of `bytemuck::cast_slice`.
 fn bytes_to_i32_vec(name: &str, data_bytes: &[u8]) -> Result<Vec<i32>, FlameError> {
-    if data_bytes.len() % 4 != 0 {
+    if !data_bytes.len().is_multiple_of(4) {
         return Err(FlameError::ShapeMismatch {
             name: name.to_string(),
             expected: "byte length that is a multiple of 4 (i32)".to_string(),
@@ -692,7 +703,11 @@ fn validate_parents(parents: &[i32]) -> Result<(), FlameError> {
         )));
     }
     for (j, &p) in parents.iter().enumerate().skip(1) {
-        let j_i32 = j as i32;
+        let j_i32 = i32::try_from(j).map_err(|_| {
+            FlameError::InvalidParams(format!(
+                "parents has too many entries ({j}) to validate as ancestor indices"
+            ))
+        })?;
         if p < 0 || p >= j_i32 {
             return Err(FlameError::InvalidParams(format!(
                 "parents[{j}] = {p} is not a valid ancestor; expected 0 <= parents[{j}] < {j}"

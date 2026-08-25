@@ -160,7 +160,6 @@ impl MetricsWriter {
     /// # Errors
     ///
     /// Returns an error if flushing fails.
-    #[allow(dead_code)]
     pub fn flush(&mut self) -> Result<()> {
         self.writer
             .flush()

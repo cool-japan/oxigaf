@@ -22,7 +22,8 @@
 //! let config = registry.get("sd15").expect("sd15 config not found");
 //! assert_eq!(config.cross_attention_dim, 768);
 //!
-//! let family = ModelFamily::from_str("sdxl").expect("invalid family");
+//! // `ModelFamily` implements `FromStr`, so `.parse()` works too.
+//! let family: ModelFamily = "sdxl".parse().expect("invalid family");
 //! assert_eq!(family.native_resolution(), 1024);
 //! ```
 
@@ -72,18 +73,26 @@ pub enum ModelFamily {
     Custom,
 }
 
-impl ModelFamily {
-    /// Parse a family name from a string identifier.
-    ///
-    /// Recognized identifiers: `"sd1"`, `"sd1.5"`, `"sd2"`, `"sd2.1"`,
-    /// `"sdxl"`, `"zero123"`, `"custom"`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ModelVariantError::UnknownVariant`] if the string is not
-    /// a recognized identifier.
-    #[allow(clippy::should_implement_trait)]
-    pub fn from_str(s: &str) -> Result<Self, ModelVariantError> {
+/// Parse a family name from a string identifier.
+///
+/// Recognized identifiers (case-insensitive): `"sd1"` / `"sd1.5"` / `"sd1x"`,
+/// `"sd2"` / `"sd2.1"` / `"sd2x"`, `"sdxl"` / `"stable-diffusion-xl"`,
+/// `"zero123"` / `"zero-1-to-3"`, and `"custom"`.
+///
+/// This used to be an inherent `ModelFamily::from_str` shadowing the standard
+/// trait method of the same name — which meant `"sdxl".parse::<ModelFamily>()`
+/// did not compile and the type could not be used anywhere a `FromStr` bound
+/// was expected. `ModelFamily::from_str(s)` still resolves here (through the
+/// trait) wherever [`std::str::FromStr`] is in scope.
+///
+/// # Errors
+///
+/// Returns [`ModelVariantError::UnknownVariant`] if the string is not a
+/// recognized identifier.
+impl std::str::FromStr for ModelFamily {
+    type Err = ModelVariantError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_ascii_lowercase().as_str() {
             "sd1" | "sd1.5" | "sd1x" => Ok(Self::SD1),
             "sd2" | "sd2.1" | "sd2x" => Ok(Self::SD2),
@@ -93,7 +102,9 @@ impl ModelFamily {
             other => Err(ModelVariantError::UnknownVariant(other.to_string())),
         }
     }
+}
 
+impl ModelFamily {
     /// Return a canonical string representation of this family.
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -371,7 +382,7 @@ impl UNetVariantConfig {
     /// `transformer_depth` → `transformer_layers_per_block`,
     /// `cross_attention_dim`, `in_channels`/`out_channels`, and
     /// `use_linear_projection`/`use_flash_attention` directly. Per-level
-    /// attention head counts come from [`Self::head_counts_per_level`].
+    /// attention head counts come from `Self::head_counts_per_level`.
     /// `image_size`/`latent_size` are derived from `self.family`. Fields not
     /// captured by this configuration at all (guidance scale, inference step
     /// count, VAE normalization scale, offload strategy, ...) are taken from
@@ -861,6 +872,7 @@ pub fn fits_in_vram(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr;
 
     // 1. ModelFamily::from_str: "sd1.5" → SD1
     #[test]
@@ -882,6 +894,27 @@ mod tests {
         let result = ModelFamily::from_str("unknown");
         assert!(result.is_err());
         assert!(matches!(result, Err(ModelVariantError::UnknownVariant(_))));
+    }
+
+    // 3b. The parse the inherent `from_str` used to make impossible: with a
+    // real `FromStr` impl, `ModelFamily` works behind a `FromStr` bound and
+    // through `str::parse`, and round-trips against `as_str`.
+    #[test]
+    fn test_model_family_round_trips_through_parse() {
+        for family in [
+            ModelFamily::SD1,
+            ModelFamily::SD2,
+            ModelFamily::SDXL,
+            ModelFamily::Zero123,
+            ModelFamily::Custom,
+        ] {
+            let parsed: ModelFamily = family
+                .as_str()
+                .parse()
+                .expect("as_str must produce a parseable identifier");
+            assert_eq!(parsed, family);
+        }
+        assert!("nope".parse::<ModelFamily>().is_err());
     }
 
     // 4. ModelFamily::native_resolution: SD1→512, SDXL→1024

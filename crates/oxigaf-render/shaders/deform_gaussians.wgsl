@@ -6,9 +6,21 @@
 //
 // Bindings
 // ────────
-// See struct declarations below for the complete binding list.
-// Inputs:  local positions, rotations, scales, blend weights, FLAME vertex data.
-// Outputs: world-space positions, rotations, scales.
+// See the declarations below for the complete binding list.
+// Inputs  (group 0, read-only): gaussian_positions, gaussian_rotations,
+//         gaussian_face_indices, gaussian_barycentric, gaussian_local_offsets,
+//         gaussian_is_rigid, mesh_vertices, mesh_normals, mesh_faces;
+//         group 1 holds the DeformUniforms (num_gaussians, num_faces).
+// Outputs (group 0, read-write): out_positions, out_rotations.
+// There are NO scale bindings and no scale output: scales are pose-invariant
+// under this deformation and are left untouched by the kernel.
+// `gaussian_is_rigid` IS honoured by this kernel: a rigid Gaussian is
+// unaffected by the mesh binding and is written back with its own authored
+// position/rotation (see the early-out in `deform_gaussians`). Because the
+// kernel enforces that itself, `DeformPipeline::deform` (src/deform.rs)
+// does NOT post-process the readback, and `deform_cpu` — which skips rigid
+// Gaussians up front, in the same order — stays an exact oracle for this
+// kernel.
 //
 // Dispatch dimensions
 // ───────────────────
@@ -16,13 +28,14 @@
 //
 // Math
 // ────
-// For each Gaussian, interpolates the FLAME vertex frame (position + rotation)
-// using blend weights, then applies the local Gaussian offset in that frame.
-// Rotation composition uses quaternion multiplication.
-// Each Gaussian is bound to a mesh face via barycentric coordinates and a
-// learnable local offset in the face's TBN (Tangent-Bitangent-Normal) frame.
+// Each Gaussian is bound to a single mesh face via barycentric coordinates and
+// a learnable local offset in that face's TBN (Tangent-Bitangent-Normal) frame.
+// There are no blend weights and no per-vertex skinning: the frame comes from
+// one face, interpolated at the Gaussian's barycentric point.  Rotation
+// composition uses quaternion multiplication.
 //
 // Algorithm per Gaussian:
+//   0. Rigid Gaussians are written straight through (no mesh binding at all).
 //   1. Look up the face and barycentric coords for this Gaussian.
 //   2. Interpolate position p and normal n at the barycentric point.
 //   3. Build the TBN orthonormal frame from the face geometry.
@@ -166,11 +179,27 @@ fn deform_gaussians(
         return;
     }
 
+    // ---- Rigid Gaussians: not bound to the mesh at all ----
+    // A rigid Gaussian keeps its own authored position/rotation: the
+    // barycentric interpolation, the TBN local offset and the TBN rotation
+    // composition below must all be skipped for it. Checked before the face
+    // index so a rigid Gaussian with a stale/garbage `face_indices` entry is
+    // still passed through, matching `deform_cpu`'s ordering exactly.
+    if gaussian_is_rigid[gaussian_id] != 0u {
+        out_positions[gaussian_id] = vec4<f32>(gaussian_positions[gaussian_id].xyz, 1.0);
+        out_rotations[gaussian_id] = gaussian_rotations[gaussian_id];
+        return;
+    }
+
     // ---- Fetch Gaussian binding data ----
     let fi = gaussian_face_indices[gaussian_id];
     if fi >= uniforms.num_faces {
-        // Invalid face index: pass through unchanged.
-        out_positions[gaussian_id] = gaussian_positions[gaussian_id];
+        // Invalid face index: pass through unchanged. The w component is
+        // rewritten to 1.0 rather than copied: `gaussian_positions` is
+        // uploaded via `Vec4f32::from_xyz`, which pads w with 0.0, whereas
+        // every other write here (and `deform_cpu`'s pass-through) emits a
+        // homogeneous point with w = 1.0.
+        out_positions[gaussian_id] = vec4<f32>(gaussian_positions[gaussian_id].xyz, 1.0);
         out_rotations[gaussian_id] = gaussian_rotations[gaussian_id];
         return;
     }

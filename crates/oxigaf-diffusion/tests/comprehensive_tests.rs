@@ -74,7 +74,7 @@ fn scheduler_alpha_cumprod_is_strictly_decreasing() {
 fn scheduler_timestep_count_matches_requested_steps() {
     let mut sched = DdimScheduler::new(1000, PredictionType::Epsilon);
     for n in [1usize, 10, 25, 50] {
-        sched.set_timesteps(n);
+        sched.set_timesteps(n).expect("set_timesteps failed");
         assert_eq!(
             sched.timesteps().len(),
             n,
@@ -87,7 +87,7 @@ fn scheduler_timestep_count_matches_requested_steps() {
 #[test]
 fn scheduler_timesteps_are_descending() {
     let mut sched = DdimScheduler::new(1000, PredictionType::VPrediction);
-    sched.set_timesteps(20);
+    sched.set_timesteps(20).expect("set_timesteps failed");
     let ts = sched.timesteps();
     for i in 0..ts.len().saturating_sub(1) {
         assert!(
@@ -104,7 +104,7 @@ fn scheduler_timesteps_are_descending() {
 fn scheduler_timestep_bounds_within_train_range() {
     let train_steps = 1000usize;
     let mut sched = DdimScheduler::new(train_steps, PredictionType::Epsilon);
-    sched.set_timesteps(50);
+    sched.set_timesteps(50).expect("set_timesteps failed");
     for &t in sched.timesteps() {
         assert!(
             t < train_steps,
@@ -155,7 +155,7 @@ fn scheduler_add_noise_preserves_shape() {
 #[test]
 fn scheduler_step_epsilon_output_is_finite_and_correct_shape() {
     let mut sched = DdimScheduler::new(1000, PredictionType::Epsilon);
-    sched.set_timesteps(10);
+    sched.set_timesteps(10).expect("set_timesteps failed");
     let device = Device::Cpu;
     let t = sched.timesteps()[0];
     let sample = Tensor::randn(0f32, 1f32, (1, 4, 8, 8), &device).expect("randn failed");
@@ -173,7 +173,7 @@ fn scheduler_step_epsilon_output_is_finite_and_correct_shape() {
 #[test]
 fn scheduler_step_v_prediction_output_is_finite() {
     let mut sched = DdimScheduler::new(1000, PredictionType::VPrediction);
-    sched.set_timesteps(10);
+    sched.set_timesteps(10).expect("set_timesteps failed");
     let device = Device::Cpu;
     let t = sched.timesteps()[0];
     let sample = Tensor::randn(0f32, 1f32, (2, 4, 8, 8), &device).expect("randn failed");
@@ -206,9 +206,9 @@ fn scheduler_timestep_tensor_correct_value_and_shape() {
 #[test]
 fn scheduler_epsilon_and_vpred_produce_different_outputs() {
     let mut sched_eps = DdimScheduler::new(1000, PredictionType::Epsilon);
-    sched_eps.set_timesteps(10);
+    sched_eps.set_timesteps(10).expect("set_timesteps failed");
     let mut sched_vpred = DdimScheduler::new(1000, PredictionType::VPrediction);
-    sched_vpred.set_timesteps(10);
+    sched_vpred.set_timesteps(10).expect("set_timesteps failed");
 
     let device = Device::Cpu;
     let t = sched_eps.timesteps()[0];

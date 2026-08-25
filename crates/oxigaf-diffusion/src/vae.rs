@@ -3,6 +3,32 @@
 //! Encodes images to latent space and decodes latents back to pixel space.
 //! This is a simplified but functional VAE that mirrors the architecture
 //! used in Stable Diffusion 2.1.
+//!
+//! ## Weight naming
+//!
+//! Module paths follow the diffusers `AutoencoderKL` convention throughout
+//! (`encoder.down_blocks.{i}.resnets.{j}`, `mid_block.attentions.0`, etc.),
+//! matching [`crate::upsampler`]'s U-Net, which uses the same convention.
+//! Within that: `ResnetBlock`'s shortcut conv is named `conv_shortcut`
+//! (not the CompVis `nin_shortcut` name an earlier revision used — mixing
+//! the two conventions inside one diffusers-shaped tree made every
+//! shortcut-conv tensor name wrong for a real checkpoint); `Downsample`
+//! reproduces diffusers' asymmetric `(0,1,0,1)` padding before an unpadded
+//! stride-2 conv, rather than symmetric `padding=1` (the two select
+//! different input pixels, so they are not numerically interchangeable even
+//! when they happen to produce the same output size); and
+//! `AttentionBlock` uses separate `to_q`/`to_k`/`to_v`/`to_out` 1×1
+//! convolutions rather than one fused `to_qkv` (no released SD VAE
+//! checkpoint — CompVis or diffusers — stores a fused QKV projection).
+//!
+//! This module still parameterises attention with 1×1 convolutions (as the
+//! original CompVis LDM does) rather than diffusers' `Linear` layers over a
+//! `(B, HW, C)` sequence view; the two are mathematically equivalent but
+//! store weights in a different tensor rank, so loading real diffusers
+//! attention weights into this module still requires a reshape step the
+//! loader does not perform. Every other block (ResNet, GroupNorm,
+//! Downsample, Upsample) is shape- and name-compatible with a real
+//! diffusers `AutoencoderKL` checkpoint.
 
 use candle_core::{Result, Tensor};
 use candle_nn as nn;
@@ -74,7 +100,12 @@ impl ResnetBlock {
                 out_channels,
                 1,
                 Default::default(),
-                vs.pp("nin_shortcut"),
+                // diffusers name (not CompVis's "nin_shortcut") — matches
+                // the diffusers-style block paths this module already uses
+                // (encoder.down_blocks.{i}.resnets.{j}, ...) and
+                // crate::upsampler's U-Net, which names its own shortcut
+                // conv the same way.
+                vs.pp("conv_shortcut"),
             )?)
         } else {
             None
@@ -105,10 +136,19 @@ impl Module for ResnetBlock {
 }
 
 /// Self-attention block for the VAE mid-block.
+///
+/// Uses separate `to_q`/`to_k`/`to_v` 1×1 convolutions rather than one fused
+/// `to_qkv` — no released SD VAE checkpoint (CompVis or diffusers) stores a
+/// fused QKV projection, so a fused conv here could never load real weights
+/// regardless of what it was named. `to_out` is named `to_out.0` to match
+/// diffusers' `Attention` module, whose output projection is
+/// `to_out = nn.ModuleList([Linear, Dropout])` (weights live under index 0).
 #[derive(Debug)]
 struct AttentionBlock {
     group_norm: nn::GroupNorm,
-    to_qkv: nn::Conv2d,
+    to_q: nn::Conv2d,
+    to_k: nn::Conv2d,
+    to_v: nn::Conv2d,
     to_out: nn::Conv2d,
     channels: usize,
 }
@@ -116,17 +156,15 @@ struct AttentionBlock {
 impl AttentionBlock {
     fn new(vs: nn::VarBuilder, channels: usize) -> Result<Self> {
         let group_norm = nn::group_norm(32, channels, 1e-6, vs.pp("group_norm"))?;
-        let to_qkv = nn::conv2d(
-            channels,
-            channels * 3,
-            1,
-            Default::default(),
-            vs.pp("to_qkv"),
-        )?;
-        let to_out = nn::conv2d(channels, channels, 1, Default::default(), vs.pp("to_out"))?;
+        let to_q = nn::conv2d(channels, channels, 1, Default::default(), vs.pp("to_q"))?;
+        let to_k = nn::conv2d(channels, channels, 1, Default::default(), vs.pp("to_k"))?;
+        let to_v = nn::conv2d(channels, channels, 1, Default::default(), vs.pp("to_v"))?;
+        let to_out = nn::conv2d(channels, channels, 1, Default::default(), vs.pp("to_out.0"))?;
         Ok(Self {
             group_norm,
-            to_qkv,
+            to_q,
+            to_k,
+            to_v,
             to_out,
             channels,
         })
@@ -138,11 +176,9 @@ impl Module for AttentionBlock {
         let residual = xs;
         let (b, _c, h, w) = xs.dims4()?;
         let xs = self.group_norm.forward(xs)?;
-        let qkv = self.to_qkv.forward(&xs)?;
-        let qkv = qkv.reshape((b, 3, self.channels, h * w))?;
-        let q = qkv.narrow(1, 0, 1)?.squeeze(1)?;
-        let k = qkv.narrow(1, 1, 1)?.squeeze(1)?;
-        let v = qkv.narrow(1, 2, 1)?.squeeze(1)?;
+        let q = self.to_q.forward(&xs)?.reshape((b, self.channels, h * w))?;
+        let k = self.to_k.forward(&xs)?.reshape((b, self.channels, h * w))?;
+        let v = self.to_v.forward(&xs)?.reshape((b, self.channels, h * w))?;
 
         let scale = (self.channels as f64).powf(-0.5);
         let attn = (q.transpose(1, 2)?.matmul(&k)? * scale)?;
@@ -155,6 +191,14 @@ impl Module for AttentionBlock {
 }
 
 /// Downsample block (strided convolution).
+///
+/// diffusers' `Downsample2D` zero-pads asymmetrically — `F.pad(x, (0,1,0,1))`
+/// (right column and bottom row only) — before an *unpadded* stride-2 3×3
+/// conv, rather than a symmetric `padding=1`. The two select different
+/// input pixels for each output position (a one-pixel spatial shift), so
+/// they are not numerically interchangeable even on inputs where they
+/// happen to produce the same output size (e.g. any even `H`/`W`, which
+/// covers every latent size this module is actually used at).
 #[derive(Debug)]
 struct Downsample {
     conv: nn::Conv2d,
@@ -168,7 +212,7 @@ impl Downsample {
             3,
             nn::Conv2dConfig {
                 stride: 2,
-                padding: 1,
+                padding: 0,
                 ..Default::default()
             },
             vs.pp("conv"),
@@ -179,7 +223,13 @@ impl Downsample {
 
 impl Module for Downsample {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        self.conv.forward(xs)
+        // Asymmetric (0,1,0,1) zero-pad: bottom row (dim 2, height) then
+        // right column (dim 3, width), matching diffusers' Downsample2D —
+        // not the symmetric padding=1 an unpadded stride-2 conv would need
+        // to produce the same output size from a different set of pixels.
+        let xs = xs.pad_with_zeros(2, 0, 1)?;
+        let xs = xs.pad_with_zeros(3, 0, 1)?;
+        self.conv.forward(&xs)
     }
 }
 
@@ -503,6 +553,7 @@ impl Vae {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_core::{DType, Device};
 
     // 1. SCALING_FACTOR is the SD 2.1 standard value and is < 1.0
     #[test]
@@ -580,5 +631,53 @@ mod tests {
     #[test]
     fn spatial_compression_constant_is_eight() {
         assert_eq!(SPATIAL_COMPRESSION, 8);
+    }
+
+    /// Regression test for the weight-naming/attention/downsample fixes:
+    /// run a full encode+decode pass so a real `VarBuilder` actually
+    /// resolves every tensor this module constructs (`to_q`/`to_k`/`to_v`/
+    /// `to_out.0`, `conv_shortcut`, the unpadded stride-2 `Downsample` conv)
+    /// without shape errors, then check the registered tensor names
+    /// directly to confirm the diffusers-style names are the ones that
+    /// exist — not the fused `to_qkv` or CompVis `nin_shortcut` names an
+    /// earlier revision used.
+    #[test]
+    fn vae_forward_pass_runs_and_registers_diffusers_style_names() -> Result<()> {
+        let device = Device::Cpu;
+        let varmap = nn::VarMap::new();
+        let vb = nn::VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let vae = Vae::new(vb, LATENT_CHANNELS, SCALING_FACTOR as f64)?;
+
+        let image = Tensor::zeros((1, 3, 8, 8), DType::F32, &device)?;
+        let latents = vae.encode(&image)?;
+        assert_eq!(latents.dims4()?, (1, LATENT_CHANNELS, 1, 1));
+
+        let decoded = vae.decode(&latents)?;
+        assert_eq!(decoded.dims4()?, (1, 3, 8, 8));
+
+        let names: Vec<String> = varmap.data().lock().unwrap().keys().cloned().collect();
+        let has_suffix = |suffix: &str| names.iter().any(|n| n.ends_with(suffix));
+
+        assert!(has_suffix("to_q.weight"), "no to_q tensor registered");
+        assert!(has_suffix("to_k.weight"), "no to_k tensor registered");
+        assert!(has_suffix("to_v.weight"), "no to_v tensor registered");
+        assert!(
+            has_suffix("to_out.0.weight"),
+            "no to_out.0 tensor registered"
+        );
+        assert!(
+            !names.iter().any(|n| n.contains("to_qkv")),
+            "a fused to_qkv tensor should not exist, got names: {names:?}"
+        );
+        assert!(
+            has_suffix("conv_shortcut.weight"),
+            "no conv_shortcut tensor registered (expected on the first \
+             channel-changing ResnetBlock)"
+        );
+        assert!(
+            !names.iter().any(|n| n.contains("nin_shortcut")),
+            "the CompVis nin_shortcut name should not exist, got names: {names:?}"
+        );
+        Ok(())
     }
 }

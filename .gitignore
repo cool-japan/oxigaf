@@ -1,7 +1,10 @@
 # Rust build artifacts
 **/target/
 **/*.rs.bk
-Cargo.lock
+# Cargo.lock is intentionally tracked: this workspace ships a binary
+# (oxigaf-cli), so the lockfile belongs in version control (see TODO.md
+# "W0 — Pure Rust & workspace policy"). It is not yet `git add`ed as of this
+# pass — this line only stops .gitignore itself from re-hiding it.
 
 # IDE
 .vscode/

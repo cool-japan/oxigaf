@@ -5,7 +5,8 @@
 use rayon::prelude::*;
 
 use super::types::{
-    EvalComparison, EvalConfig, EvalError, EvalSuiteResult, EvalTestItem, ViewEvalResult,
+    EvalComparison, EvalConfig, EvalError, EvalMetricKind, EvalSuiteResult, EvalTestItem,
+    ViewEvalResult,
 };
 
 /// Build an 11×11 Gaussian kernel with σ = 1.5, normalised to sum ≈ 1.
@@ -141,11 +142,11 @@ pub fn eval_downsample_2x(image: &[f32], width: usize, height: usize) -> (Vec<f3
 pub fn eval_sobel(image: &[f32], width: usize, height: usize) -> Vec<f32> {
     let n = width * height;
     let mut gray = vec![0.0_f32; n];
-    for i in 0..n {
+    for (i, luma) in gray.iter_mut().enumerate() {
         let r = image.get(i * 3).copied().unwrap_or(0.0);
         let g = image.get(i * 3 + 1).copied().unwrap_or(0.0);
         let b = image.get(i * 3 + 2).copied().unwrap_or(0.0);
-        gray[i] = 0.299 * r + 0.587 * g + 0.114 * b;
+        *luma = 0.299 * r + 0.587 * g + 0.114 * b;
     }
     let gx_kernel: [f32; 9] = [-1.0, 0.0, 1.0, -2.0, 0.0, 2.0, -1.0, 0.0, 1.0];
     let gy_kernel: [f32; 9] = [-1.0, -2.0, -1.0, 0.0, 0.0, 0.0, 1.0, 2.0, 1.0];
@@ -423,8 +424,9 @@ pub fn eval_rmse(pred: &[f32], gt: &[f32]) -> Result<f32, EvalError> {
 ///
 /// Both `pred` and `gt` must have length `width * height * 3`. For images
 /// at least 11×11 the average excludes the border ring the window cannot
-/// fully cover without zero-padding (see [`ssim_components`]); smaller
-/// images fall back to averaging the full padded frame.
+/// fully cover without zero-padding (see the module-private
+/// `ssim_components`); smaller images fall back to averaging the full padded
+/// frame.
 pub fn eval_ssim(pred: &[f32], gt: &[f32], width: usize, height: usize) -> Result<f32, EvalError> {
     validate_rgb_pair(pred, gt, width, height, "SSIM")?;
     let (l_mean, cs_mean) = ssim_and_cs(pred, gt, width, height);
@@ -504,9 +506,9 @@ fn eval_ssim_ms_impl(
     ms_ssim
 }
 
-/// Multi-scale SSIM (Wang, Simoncelli & Bovik, 2003). See
-/// [`eval_ssim_ms_impl`] for the exact formulation and its resolution-
-/// dependent scale count.
+/// Multi-scale SSIM (Wang, Simoncelli & Bovik, 2003). See the module-private
+/// `eval_ssim_ms_impl` for the exact formulation and its resolution-dependent
+/// scale count.
 pub fn eval_ssim_ms(
     pred: &[f32],
     gt: &[f32],
@@ -556,11 +558,25 @@ pub fn eval_lpips_approx(
         / n as f64;
     Ok(l1 as f32)
 }
+/// Every metric this module can compute, in [`EvalMetricKind`] declaration
+/// order. Used as the default selection by [`eval_single_view`].
+const ALL_METRICS: [EvalMetricKind; 6] = [
+    EvalMetricKind::Psnr,
+    EvalMetricKind::Ssim,
+    EvalMetricKind::LpipsApprox,
+    EvalMetricKind::Mae,
+    EvalMetricKind::Rmse,
+    EvalMetricKind::SsimMs,
+];
+
 /// Compute all metrics for a single view pair.
 ///
 /// SSIM is computed once via the shared internal helper and its
 /// full-resolution components are reused as MS-SSIM's first scale, rather
 /// than recomputing the identical convolutions twice.
+///
+/// Equivalent to [`eval_single_view_with_metrics`] with every
+/// [`EvalMetricKind`] selected.
 pub fn eval_single_view(
     pred: &[f32],
     gt: &[f32],
@@ -568,14 +584,89 @@ pub fn eval_single_view(
     height: usize,
     view_id: &str,
 ) -> Result<ViewEvalResult, EvalError> {
+    eval_single_view_with_metrics(pred, gt, width, height, view_id, &ALL_METRICS)
+}
+
+/// Compute the selected `metrics` for a single view pair, leaving every
+/// unselected metric as `f32::NAN`.
+///
+/// Skipping a metric skips its work: omitting [`EvalMetricKind::Ssim`] *and*
+/// [`EvalMetricKind::SsimMs`] avoids the Gaussian-window convolutions
+/// entirely (by far the most expensive part of a full evaluation), and
+/// omitting [`EvalMetricKind::LpipsApprox`] avoids both Sobel passes.
+///
+/// # PSNR is unconditional
+///
+/// [`EvalMetricKind::Psnr`] is always computed, whether or not it appears in
+/// `metrics`. It is a single cheap pass over the buffers, and it is the
+/// ranking key that the rest of [`EvalSuiteResult`] is *defined* in terms of:
+/// `worst_views`, `best_views`, `std_psnr`, `min_psnr`/`max_psnr`,
+/// [`eval_psnr_histogram`] and [`eval_psnr_percentiles`] would all become
+/// meaningless — and, because `NaN` is not finite, would silently read as
+/// "every view is a pixel-perfect match" — if it were skipped. Listing it in
+/// `metrics` is therefore implied rather than required.
+///
+/// # NaN convention
+///
+/// An unselected metric is reported as `f32::NAN` rather than `0.0` so that a
+/// "not computed" value can never be mistaken for a real measurement: `0.0`
+/// is a legitimate MAE/RMSE/LPIPS reading (a perfect match) and a legitimate
+/// SSIM reading (no correlation), whereas `NaN` propagates visibly through
+/// any aggregate and serialises to JSON `null`.
+///
+/// # Errors
+///
+/// Returns [`EvalError::DimensionMismatch`] or [`EvalError::MetricFailed`]
+/// when `pred`/`gt` are not equal-length `width * height * 3` buffers.
+pub fn eval_single_view_with_metrics(
+    pred: &[f32],
+    gt: &[f32],
+    width: usize,
+    height: usize,
+    view_id: &str,
+    metrics: &[EvalMetricKind],
+) -> Result<ViewEvalResult, EvalError> {
     validate_rgb_pair(pred, gt, width, height, "eval_single_view")?;
+
+    // Unconditional: the ranking key for every aggregate in EvalSuiteResult.
     let psnr = eval_psnr(pred, gt)?;
-    let (ssim_l, ssim_cs) = ssim_and_cs(pred, gt, width, height);
-    let ssim = ssim_l * ssim_cs;
-    let lpips_approx = eval_lpips_approx(pred, gt, width, height)?;
-    let mae = eval_mae(pred, gt)?;
-    let rmse = eval_rmse(pred, gt)?;
-    let ssim_ms = eval_ssim_ms_impl(pred, gt, width, height, Some((ssim_l, ssim_cs)));
+
+    let wants = |kind: &EvalMetricKind| metrics.contains(kind);
+    let want_ssim = wants(&EvalMetricKind::Ssim);
+    let want_ssim_ms = wants(&EvalMetricKind::SsimMs);
+
+    // The full-resolution SSIM components are shared between plain SSIM and
+    // MS-SSIM's first scale, so compute them once if either is selected.
+    let scale0 = if want_ssim || want_ssim_ms {
+        Some(ssim_and_cs(pred, gt, width, height))
+    } else {
+        None
+    };
+    let ssim = match scale0 {
+        Some((l_mean, cs_mean)) if want_ssim => l_mean * cs_mean,
+        _ => f32::NAN,
+    };
+    let ssim_ms = if want_ssim_ms {
+        eval_ssim_ms_impl(pred, gt, width, height, scale0)
+    } else {
+        f32::NAN
+    };
+    let lpips_approx = if wants(&EvalMetricKind::LpipsApprox) {
+        eval_lpips_approx(pred, gt, width, height)?
+    } else {
+        f32::NAN
+    };
+    let mae = if wants(&EvalMetricKind::Mae) {
+        eval_mae(pred, gt)?
+    } else {
+        f32::NAN
+    };
+    let rmse = if wants(&EvalMetricKind::Rmse) {
+        eval_rmse(pred, gt)?
+    } else {
+        f32::NAN
+    };
+
     Ok(ViewEvalResult {
         view_id: view_id.to_string(),
         psnr,
@@ -596,6 +687,26 @@ pub fn eval_single_view(
 /// via `par_iter` is an indexed parallel iterator, so
 /// `collect::<Result<Vec<_>, _>>()` preserves input order and `per_view`
 /// stays aligned with `items`.
+///
+/// # Metric selection
+///
+/// Only the metrics named in [`EvalConfig::metrics`] are computed; the rest
+/// are reported as `f32::NAN` per view, and their aggregate means
+/// (`mean_ssim`, `mean_lpips`, `mean_mae`) are `NaN` in turn. PSNR is always
+/// computed because every ranking and distribution statistic in
+/// [`EvalSuiteResult`] is defined in terms of it — see
+/// [`eval_single_view_with_metrics`] for the full rationale and the `NaN`
+/// convention. The default [`EvalConfig`] selects every metric, so callers
+/// that do not narrow the list see no change.
+///
+/// # Errors
+///
+/// - [`EvalError::EmptyTestSet`] when `items` is empty.
+/// - [`EvalError::InvalidConfig`] when `config.metrics` is empty — that would
+///   request an evaluation with nothing in it, which is far more likely a
+///   caller bug than a deliberate "PSNR only" request (spell that as
+///   `vec![EvalMetricKind::Psnr]`).
+/// - Whatever [`eval_single_view_with_metrics`] returns for malformed buffers.
 pub fn eval_suite(
     items: &[EvalTestItem],
     config: &EvalConfig,
@@ -603,9 +714,25 @@ pub fn eval_suite(
     if items.is_empty() {
         return Err(EvalError::EmptyTestSet);
     }
+    if config.metrics.is_empty() {
+        return Err(EvalError::InvalidConfig(
+            "metrics must name at least one EvalMetricKind; use \
+             vec![EvalMetricKind::Psnr] for a PSNR-only run"
+                .to_string(),
+        ));
+    }
     let per_view: Vec<ViewEvalResult> = items
         .par_iter()
-        .map(|item| eval_single_view(&item.pred, &item.gt, item.width, item.height, &item.view_id))
+        .map(|item| {
+            eval_single_view_with_metrics(
+                &item.pred,
+                &item.gt,
+                item.width,
+                item.height,
+                &item.view_id,
+                &config.metrics,
+            )
+        })
         .collect::<Result<Vec<_>, _>>()?;
     let n = per_view.len();
     let mean_psnr = aggregate_mean_psnr(&per_view);
@@ -613,24 +740,37 @@ pub fn eval_suite(
     let mean_lpips: f32 = per_view.iter().map(|v| v.lpips_approx).sum::<f32>() / n as f32;
     let mean_mae: f32 = per_view.iter().map(|v| v.mae).sum::<f32>() / n as f32;
 
-    // Min/max/std are computed over only the finite (non-perfect) views, for
-    // the same reason as `aggregate_mean_psnr` below: folding a fabricated
-    // finite stand-in for "infinite" into these statistics would let a
-    // single pixel-perfect view dominate the spread.
+    // `std_psnr` is computed over only the finite (non-perfect) views, for the
+    // same reason as `aggregate_mean_psnr` below: a spread is undefined once
+    // an infinity enters it, and folding a fabricated finite stand-in for
+    // "infinite" into the statistic would let a single pixel-perfect view
+    // dominate it.
     let finite_psnrs: Vec<f32> = per_view
         .iter()
         .map(|v| v.psnr)
         .filter(|p| p.is_finite())
         .collect();
-    let (min_psnr, max_psnr, std_psnr) = if finite_psnrs.is_empty() {
+
+    // `max_psnr` ranges over *every* view, infinities included. A
+    // pixel-perfect view's PSNR is genuinely infinite rather than a stand-in
+    // for something finite, so reporting the best *imperfect* view instead
+    // would understate the maximum and contradict this field's own
+    // documentation ("Maximum PSNR across views"). Consumers already expect
+    // it: `analyze eval` pipes it through a `finite_or_null` helper because
+    // JSON cannot represent infinity.
+    let max_psnr = per_view
+        .iter()
+        .map(|v| v.psnr)
+        .fold(f32::NEG_INFINITY, f32::max);
+
+    // `min_psnr` is unaffected by the choice: an infinity is never the
+    // minimum unless *every* view is perfect, which the empty-finite branch
+    // below reports as an infinite minimum anyway.
+    let (min_psnr, std_psnr) = if finite_psnrs.is_empty() {
         // Every view is a pixel-perfect match.
-        (f32::INFINITY, f32::INFINITY, 0.0_f32)
+        (f32::INFINITY, 0.0_f32)
     } else {
         let min_psnr = finite_psnrs.iter().cloned().fold(f32::INFINITY, f32::min);
-        let max_psnr = finite_psnrs
-            .iter()
-            .cloned()
-            .fold(f32::NEG_INFINITY, f32::max);
         let variance: f32 = if finite_psnrs.len() > 1 {
             let mu = finite_psnrs.iter().sum::<f32>() / finite_psnrs.len() as f32;
             finite_psnrs
@@ -644,7 +784,7 @@ pub fn eval_suite(
         } else {
             0.0
         };
-        (min_psnr, max_psnr, variance.sqrt())
+        (min_psnr, variance.sqrt())
     };
 
     let n_worst = config.n_worst_views.min(n);
@@ -830,13 +970,19 @@ pub fn eval_psnr_percentiles(results: &EvalSuiteResult) -> [f32; 5] {
         percentile(95.0),
     ]
 }
-/// Format a single view result as a human-readable string.
-pub fn eval_format_view_result(result: &ViewEvalResult) -> String {
-    let psnr_str = if result.psnr.is_infinite() {
+/// Render a PSNR value for human-readable output, spelling a pixel-perfect
+/// match as `∞` rather than letting `{:.2}` print `inf`.
+fn format_psnr(value: f32) -> String {
+    if value.is_infinite() {
         "∞".to_string()
     } else {
-        format!("{:.2}", result.psnr)
-    };
+        format!("{:.2}", value)
+    }
+}
+
+/// Format a single view result as a human-readable string.
+pub fn eval_format_view_result(result: &ViewEvalResult) -> String {
+    let psnr_str = format_psnr(result.psnr);
     let flags = match (result.is_best, result.is_worst) {
         (true, _) => " [BEST]",
         (_, true) => " [WORST]",
@@ -850,17 +996,15 @@ pub fn eval_format_view_result(result: &ViewEvalResult) -> String {
 }
 /// Format the aggregate suite result as a multi-line report string.
 pub fn eval_format_suite_result(result: &EvalSuiteResult) -> String {
-    let mean_psnr_str = if result.mean_psnr.is_infinite() {
-        "∞".to_string()
-    } else {
-        format!("{:.2}", result.mean_psnr)
-    };
     let mut lines = vec![
         "=== Evaluation Suite Results ===".to_string(),
         format!("Views evaluated : {}", result.n_views),
         format!(
-            "Mean PSNR       : {} dB  (σ={:.2}, min={:.2}, max={:.2})",
-            mean_psnr_str, result.std_psnr, result.min_psnr, result.max_psnr
+            "Mean PSNR       : {} dB  (σ={:.2}, min={}, max={})",
+            format_psnr(result.mean_psnr),
+            result.std_psnr,
+            format_psnr(result.min_psnr),
+            format_psnr(result.max_psnr),
         ),
         format!("Mean SSIM       : {:.4}", result.mean_ssim),
         format!("Mean LPIPS      : {:.4}", result.mean_lpips),
@@ -1094,6 +1238,365 @@ mod tests {
             height: 16,
         };
         eval_suite(&[item], cfg).expect("ok")
+    }
+
+    // -----------------------------------------------------------------------
+    // max_psnr spans every view (regression: it was folded over the finite
+    // subset only, so one pixel-perfect view among imperfect ones reported
+    // the best *imperfect* PSNR as the maximum).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_max_psnr_is_infinite_when_any_view_is_perfect() {
+        let cfg = EvalConfig::default();
+        let identical = vec![0.5_f32; 16 * 16 * 3];
+        let items = vec![
+            EvalTestItem {
+                view_id: "perfect".to_string(),
+                pred: identical.clone(),
+                gt: identical,
+                width: 16,
+                height: 16,
+            },
+            EvalTestItem {
+                view_id: "imperfect".to_string(),
+                pred: vec![0.0_f32; 16 * 16 * 3],
+                gt: vec![0.1_f32; 16 * 16 * 3],
+                width: 16,
+                height: 16,
+            },
+        ];
+        let result = eval_suite(&items, &cfg).expect("ok");
+        assert!(
+            result.max_psnr.is_infinite() && result.max_psnr > 0.0,
+            "max_psnr must span every view, got {}",
+            result.max_psnr
+        );
+        // min and std still exclude the infinity: the minimum is the one
+        // imperfect view, and a spread over an infinity is undefined.
+        assert!(
+            result.min_psnr.is_finite(),
+            "min_psnr must stay finite while an imperfect view exists, got {}",
+            result.min_psnr
+        );
+        assert!(
+            result.std_psnr.is_finite() && !result.std_psnr.is_nan(),
+            "std_psnr must stay finite, got {}",
+            result.std_psnr
+        );
+    }
+
+    #[test]
+    fn test_max_psnr_is_ordinary_maximum_without_perfect_views() {
+        let cfg = EvalConfig::default();
+        let items = vec![
+            EvalTestItem {
+                view_id: "closer".to_string(),
+                pred: vec![0.0_f32; 16 * 16 * 3],
+                gt: vec![0.05_f32; 16 * 16 * 3],
+                width: 16,
+                height: 16,
+            },
+            EvalTestItem {
+                view_id: "further".to_string(),
+                pred: vec![0.0_f32; 16 * 16 * 3],
+                gt: vec![0.5_f32; 16 * 16 * 3],
+                width: 16,
+                height: 16,
+            },
+        ];
+        let result = eval_suite(&items, &cfg).expect("ok");
+        let psnrs: Vec<f32> = result.per_view.iter().map(|v| v.psnr).collect();
+        let expected_max = psnrs.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let expected_min = psnrs.iter().cloned().fold(f32::INFINITY, f32::min);
+        assert!((result.max_psnr - expected_max).abs() < 1e-3);
+        assert!((result.min_psnr - expected_min).abs() < 1e-3);
+        assert!(result.max_psnr > result.min_psnr);
+    }
+
+    #[test]
+    fn test_all_perfect_views_report_infinite_min_and_max() {
+        let cfg = EvalConfig::default();
+        let identical = vec![0.5_f32; 16 * 16 * 3];
+        let items = vec![EvalTestItem {
+            view_id: "v".to_string(),
+            pred: identical.clone(),
+            gt: identical,
+            width: 16,
+            height: 16,
+        }];
+        let result = eval_suite(&items, &cfg).expect("ok");
+        assert!(result.min_psnr.is_infinite());
+        assert!(result.max_psnr.is_infinite());
+        assert_eq!(result.std_psnr, 0.0);
+    }
+
+    #[test]
+    fn test_format_suite_result_spells_infinite_psnr_as_symbol() {
+        // `{:.2}` would print "inf" for a pixel-perfect maximum; the report
+        // uses the same ∞ spelling it already used for the mean.
+        let cfg = EvalConfig::default();
+        let identical = vec![0.5_f32; 16 * 16 * 3];
+        let items = vec![
+            EvalTestItem {
+                view_id: "perfect".to_string(),
+                pred: identical.clone(),
+                gt: identical,
+                width: 16,
+                height: 16,
+            },
+            EvalTestItem {
+                view_id: "imperfect".to_string(),
+                pred: vec![0.0_f32; 16 * 16 * 3],
+                gt: vec![0.1_f32; 16 * 16 * 3],
+                width: 16,
+                height: 16,
+            },
+        ];
+        let result = eval_suite(&items, &cfg).expect("ok");
+        let text = eval_format_suite_result(&result);
+        assert!(
+            text.contains("max=∞"),
+            "infinite maximum should render as ∞, got:\n{text}"
+        );
+        assert!(
+            !text.contains("inf"),
+            "raw `inf` must not leak into the report, got:\n{text}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // EvalConfig::metrics is honoured (regression: eval_suite used to compute
+    // every metric unconditionally, making the field inert).
+    // -----------------------------------------------------------------------
+
+    /// Two 16×16 views with differing content, enough for real metric values.
+    fn two_item_set() -> Vec<EvalTestItem> {
+        vec![
+            EvalTestItem {
+                view_id: "a".to_string(),
+                pred: (0..16 * 16 * 3).map(|i| (i % 7) as f32 / 7.0).collect(),
+                gt: (0..16 * 16 * 3).map(|i| (i % 5) as f32 / 5.0).collect(),
+                width: 16,
+                height: 16,
+            },
+            EvalTestItem {
+                view_id: "b".to_string(),
+                pred: vec![0.0_f32; 16 * 16 * 3],
+                gt: vec![0.25_f32; 16 * 16 * 3],
+                width: 16,
+                height: 16,
+            },
+        ]
+    }
+
+    #[test]
+    fn test_eval_suite_skips_unselected_metrics() {
+        let cfg = EvalConfig {
+            metrics: vec![EvalMetricKind::Psnr, EvalMetricKind::Mae],
+            ..EvalConfig::default()
+        };
+        let result = eval_suite(&two_item_set(), &cfg).expect("ok");
+        for view in &result.per_view {
+            assert!(
+                view.psnr.is_finite(),
+                "PSNR is unconditional, got {} for {}",
+                view.psnr,
+                view.view_id
+            );
+            assert!(
+                view.mae.is_finite(),
+                "MAE was selected, got {} for {}",
+                view.mae,
+                view.view_id
+            );
+            assert!(
+                view.ssim.is_nan(),
+                "unselected SSIM must be NaN, got {}",
+                view.ssim
+            );
+            assert!(
+                view.ssim_ms.is_nan(),
+                "unselected MS-SSIM must be NaN, got {}",
+                view.ssim_ms
+            );
+            assert!(
+                view.lpips_approx.is_nan(),
+                "unselected LPIPS must be NaN, got {}",
+                view.lpips_approx
+            );
+            assert!(
+                view.rmse.is_nan(),
+                "unselected RMSE must be NaN, got {}",
+                view.rmse
+            );
+        }
+        // The aggregate of an unselected metric is NaN in turn, which is what
+        // makes "not computed" impossible to mistake for a measurement.
+        assert!(result.mean_ssim.is_nan());
+        assert!(result.mean_lpips.is_nan());
+        assert!(result.mean_mae.is_finite());
+    }
+
+    #[test]
+    fn test_eval_suite_default_config_computes_every_metric() {
+        // The default selects everything, so existing callers are unaffected.
+        let result = eval_suite(&two_item_set(), &EvalConfig::default()).expect("ok");
+        for view in &result.per_view {
+            for (name, value) in [
+                ("psnr", view.psnr),
+                ("ssim", view.ssim),
+                ("lpips", view.lpips_approx),
+                ("mae", view.mae),
+                ("rmse", view.rmse),
+                ("ssim_ms", view.ssim_ms),
+            ] {
+                assert!(
+                    !value.is_nan(),
+                    "{name} must be computed under the default config, got NaN"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_selected_metrics_match_the_unfiltered_values() {
+        // Gating must skip work, never change a selected metric's value.
+        let items = two_item_set();
+        let full = eval_suite(&items, &EvalConfig::default()).expect("ok");
+        let cfg = EvalConfig {
+            metrics: vec![EvalMetricKind::Ssim, EvalMetricKind::Rmse],
+            ..EvalConfig::default()
+        };
+        let narrowed = eval_suite(&items, &cfg).expect("ok");
+        for (a, b) in full.per_view.iter().zip(narrowed.per_view.iter()) {
+            assert_eq!(a.view_id, b.view_id);
+            assert!(
+                (a.ssim - b.ssim).abs() < 1e-6,
+                "SSIM changed: {} vs {}",
+                a.ssim,
+                b.ssim
+            );
+            assert!(
+                (a.rmse - b.rmse).abs() < 1e-6,
+                "RMSE changed: {} vs {}",
+                a.rmse,
+                b.rmse
+            );
+            assert!(
+                (a.psnr - b.psnr).abs() < 1e-6,
+                "PSNR changed: {} vs {}",
+                a.psnr,
+                b.psnr
+            );
+        }
+    }
+
+    #[test]
+    fn test_ssim_ms_alone_still_reuses_scale_zero_correctly() {
+        // Selecting MS-SSIM without plain SSIM must still produce the same
+        // MS-SSIM value: the shared scale-0 components are computed for
+        // either selection, but only SSIM's own field is left NaN.
+        let items = two_item_set();
+        let cfg = EvalConfig {
+            metrics: vec![EvalMetricKind::SsimMs],
+            ..EvalConfig::default()
+        };
+        let narrowed = eval_suite(&items, &cfg).expect("ok");
+        let full = eval_suite(&items, &EvalConfig::default()).expect("ok");
+        for (a, b) in full.per_view.iter().zip(narrowed.per_view.iter()) {
+            assert!(b.ssim.is_nan(), "SSIM was not selected");
+            assert!(
+                (a.ssim_ms - b.ssim_ms).abs() < 1e-6,
+                "MS-SSIM changed: {} vs {}",
+                a.ssim_ms,
+                b.ssim_ms
+            );
+        }
+    }
+
+    #[test]
+    fn test_eval_suite_rejects_empty_metrics() {
+        let cfg = EvalConfig {
+            metrics: Vec::new(),
+            ..EvalConfig::default()
+        };
+        let result = eval_suite(&two_item_set(), &cfg);
+        assert!(
+            matches!(
+                &result,
+                Err(EvalError::InvalidConfig(msg)) if msg.contains("metrics")
+            ),
+            "expected InvalidConfig mentioning 'metrics', got {:?}",
+            result.map(|r| r.n_views)
+        );
+    }
+
+    #[test]
+    fn test_empty_test_set_outranks_empty_metrics() {
+        // An empty item list is reported as EmptyTestSet even when the config
+        // is also invalid, so the caller sees the more actionable error.
+        let cfg = EvalConfig {
+            metrics: Vec::new(),
+            ..EvalConfig::default()
+        };
+        assert!(matches!(
+            eval_suite(&[], &cfg),
+            Err(EvalError::EmptyTestSet)
+        ));
+    }
+
+    #[test]
+    fn test_eval_single_view_with_metrics_psnr_survives_omission() {
+        // PSNR is documented as unconditional; omitting it from the list must
+        // not yield NaN, which `is_finite()` filters would misread as
+        // "pixel-perfect" throughout the aggregates.
+        let pred: Vec<f32> = (0..16 * 16 * 3).map(|i| (i % 7) as f32 / 7.0).collect();
+        let gt: Vec<f32> = (0..16 * 16 * 3).map(|i| (i % 5) as f32 / 5.0).collect();
+        let view = eval_single_view_with_metrics(
+            &pred,
+            &gt,
+            16,
+            16,
+            "v",
+            &[EvalMetricKind::Mae, EvalMetricKind::Rmse],
+        )
+        .expect("ok");
+        let expected = eval_psnr(&pred, &gt).expect("psnr ok");
+        assert!(
+            (view.psnr - expected).abs() < 1e-6,
+            "PSNR must be computed regardless of selection, got {}",
+            view.psnr
+        );
+    }
+
+    #[test]
+    fn test_eval_single_view_matches_explicit_full_selection() {
+        let pred: Vec<f32> = (0..24 * 24 * 3).map(|i| (i % 9) as f32 / 9.0).collect();
+        let gt: Vec<f32> = (0..24 * 24 * 3).map(|i| (i % 4) as f32 / 4.0).collect();
+        let implicit = eval_single_view(&pred, &gt, 24, 24, "v").expect("ok");
+        let explicit = eval_single_view_with_metrics(
+            &pred,
+            &gt,
+            24,
+            24,
+            "v",
+            &[
+                EvalMetricKind::Psnr,
+                EvalMetricKind::Ssim,
+                EvalMetricKind::LpipsApprox,
+                EvalMetricKind::Mae,
+                EvalMetricKind::Rmse,
+                EvalMetricKind::SsimMs,
+            ],
+        )
+        .expect("ok");
+        assert!((implicit.psnr - explicit.psnr).abs() < 1e-6);
+        assert!((implicit.ssim - explicit.ssim).abs() < 1e-6);
+        assert!((implicit.ssim_ms - explicit.ssim_ms).abs() < 1e-6);
+        assert!((implicit.lpips_approx - explicit.lpips_approx).abs() < 1e-6);
+        assert!((implicit.mae - explicit.mae).abs() < 1e-6);
+        assert!((implicit.rmse - explicit.rmse).abs() < 1e-6);
     }
 
     #[test]

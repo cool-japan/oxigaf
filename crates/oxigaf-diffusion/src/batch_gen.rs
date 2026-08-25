@@ -1,8 +1,9 @@
 //! Batch generation API for multi-view diffusion inference.
 //!
 //! Provides a queue-based interface for processing multiple reference images
-//! through [`MultiViewDiffusionPipeline`], with a shared [`KVCache`] for
-//! cross-attention acceleration.
+//! through [`MultiViewDiffusionPipeline`], with a shared [`KVCache`] that the
+//! pipeline's IP-Adapter cross-attention layers use to skip re-projecting the
+//! (per-run constant) CLIP tokens at every denoising step.
 //!
 //! # Model weights are required
 //!
@@ -69,7 +70,7 @@ use crate::image_preprocessing::{
     normalize_image, resize_image, ImageDims, NormalizationMode, ResizeFilter,
 };
 use crate::kv_cache::{KVCache, KVCacheConfig};
-use crate::pipeline::MultiViewDiffusionPipeline;
+use crate::pipeline::{MultiViewDiffusionPipeline, MultiViewOutput};
 use crate::DiffusionError;
 
 // ---------------------------------------------------------------------------
@@ -126,10 +127,20 @@ pub struct GenerationRequest {
     /// baked into the model configuration rather than chosen per request.
     pub num_views: usize,
 
-    /// Guidance scale (overrides config default when `Some`).
+    /// Guidance scale for this request; `None` uses
+    /// [`BatchGenConfig::guidance_scale`].
+    ///
+    /// Applied to the loaded pipeline for the duration of this request only —
+    /// the pipeline's previous scale is restored afterwards, so one request
+    /// never leaks its guidance into the next. Must be finite and `>= 1.0`.
     pub guidance_scale: Option<f32>,
 
-    /// Number of denoising steps (overrides config default when `Some`).
+    /// Number of denoising steps for this request; `None` uses
+    /// [`BatchGenConfig::num_steps`].
+    ///
+    /// Passed straight to
+    /// [`MultiViewDiffusionPipeline::begin_session_with_steps`], so it applies
+    /// per request without reloading the pipeline. Must be `> 0`.
     pub num_steps: Option<usize>,
 
     /// Random seed for reproducibility.
@@ -185,9 +196,11 @@ pub struct GenerationResult {
     /// Cumulative number of cross-attention KV lookups served from the shared
     /// [`KVCache`].
     ///
-    /// The cache is owned and configured by the generator but is not yet
-    /// consulted inside the attention layers, so this currently reports `0`.
-    /// See [`BatchGenerator::kv_cache`].
+    /// The generator's cache is attached to the pipeline's U-Net, where every
+    /// IP-Adapter cross-attention layer consults it: the first denoising step
+    /// of a run misses and populates it, and every later step of that run hits.
+    /// A run of `n` steps over `L` attention layers therefore reports roughly
+    /// `(n - 1) * L` hits. See [`BatchGenerator::kv_cache`].
     pub num_cached_kv: usize,
 }
 
@@ -226,18 +239,22 @@ pub struct BatchGenConfig {
     /// Default: `4`.
     pub max_views_per_request: usize,
 
-    /// Default guidance scale applied when a request omits `guidance_scale`.
+    /// Default guidance scale applied when a request omits
+    /// [`GenerationRequest::guidance_scale`].
     ///
     /// Copied into the pipeline's `DiffusionConfig::guidance_scale` by
-    /// [`BatchGenerator::with_pipeline`], so it must be `>= 1.0`.
+    /// [`BatchGenerator::with_pipeline`], so it must be `>= 1.0`. A request
+    /// that supplies its own scale overrides it for that request only.
     ///
     /// Default: `3.0`.
     pub guidance_scale: f32,
 
-    /// Default number of denoising steps applied when a request omits `num_steps`.
+    /// Default number of denoising steps applied when a request omits
+    /// [`GenerationRequest::num_steps`].
     ///
     /// Copied into the pipeline's `DiffusionConfig::num_inference_steps` by
-    /// [`BatchGenerator::with_pipeline`], so it must be `> 0`.
+    /// [`BatchGenerator::with_pipeline`], so it must be `> 0`. A request that
+    /// supplies its own step count overrides it for that request only.
     ///
     /// Default: `20`.
     pub num_steps: usize,
@@ -296,8 +313,8 @@ pub struct BatchStats {
     /// Number of cross-attention KV lookups that were served from cache.
     ///
     /// Mirrors [`crate::kv_cache::CacheStats::hits`] on the generator's shared
-    /// cache as of the last successful request. The cache is not yet consulted
-    /// inside the attention layers, so this currently stays `0`.
+    /// cache as of the last successful request; the cache is consulted by every
+    /// IP-Adapter cross-attention layer of the loaded U-Net.
     pub cache_hits: u64,
 
     /// Number of cross-attention KV lookups that were cache misses.
@@ -425,13 +442,16 @@ impl BatchGenerator {
         diffusion_config.guidance_scale = config.guidance_scale as f64;
         diffusion_config.num_inference_steps = config.num_steps;
 
-        let pipeline =
+        let mut pipeline =
             MultiViewDiffusionPipeline::load(diffusion_config.clone(), weights_dir, device)?;
 
         let kv_cache = Arc::new(KVCache::new(KVCacheConfig {
             enabled: config.use_kv_cache,
             ..KVCacheConfig::default()
         }));
+        // Hand the shared cache to the U-Net's IP-Adapter cross-attention
+        // layers, so its hit/miss counters reflect real inference work.
+        pipeline.set_kv_cache(Some(Arc::clone(&kv_cache)));
 
         Ok(Self {
             config,
@@ -452,8 +472,11 @@ impl BatchGenerator {
 
     /// The shared cross-attention KV cache.
     ///
-    /// Exposed so the cache can be handed to the attention layers once they
-    /// accept one; its statistics are mirrored into [`BatchStats`].
+    /// [`BatchGenerator::with_pipeline`] attaches this to the loaded
+    /// pipeline's U-Net, so it is populated and consulted by the IP-Adapter
+    /// cross-attention layers during generation; its statistics are mirrored
+    /// into [`BatchStats`]. A generator built with [`BatchGenerator::new`] has
+    /// no pipeline, so its cache stays empty.
     pub fn kv_cache(&self) -> Arc<KVCache> {
         Arc::clone(&self.kv_cache)
     }
@@ -544,17 +567,23 @@ impl BatchGenerator {
     ///
     /// # Per-request overrides
     ///
-    /// `guidance_scale` and `num_steps` are pipeline-level settings fixed when
-    /// the pipeline was loaded (see [`BatchGenerator::with_pipeline`]). A
-    /// request that asks for a *different* value logs a `tracing` warning and is
-    /// generated with the loaded configuration instead of silently pretending
-    /// the override took effect.
+    /// [`GenerationRequest::guidance_scale`] and
+    /// [`GenerationRequest::num_steps`] are honoured for real. The step count
+    /// is handed to
+    /// [`MultiViewDiffusionPipeline::begin_session_with_steps`]; the guidance
+    /// scale is written into the pipeline with
+    /// [`MultiViewDiffusionPipeline::set_guidance_scale`] for the duration of
+    /// this request and restored afterwards — including when generation fails —
+    /// so an override cannot leak into the next request. A request that omits
+    /// either falls back to [`BatchGenConfig::guidance_scale`] /
+    /// [`BatchGenConfig::num_steps`].
     ///
     /// # Errors
     ///
     /// - [`DiffusionError::InvalidConfig`] when `request.num_views == 0`,
-    ///   `num_views > max_views_per_request`, or either image dimension is `0`
-    ///   or above 16384.
+    ///   `num_views > max_views_per_request`, either image dimension is `0`
+    ///   or above 16384, `guidance_scale` is `Some` and not a finite value
+    ///   `>= 1.0`, or `num_steps` is `Some(0)`.
     /// - [`DiffusionError::ShapeMismatch`] when `reference_image` does not hold
     ///   `image_width * image_height * 3` bytes.
     /// - [`DiffusionError::ModelLoad`] when no model weights were loaded.
@@ -590,26 +619,7 @@ impl BatchGenerator {
         }
 
         // --- Resolve per-request overrides ---------------------------------
-        let guidance = request.guidance_scale.unwrap_or(self.config.guidance_scale);
-        let steps = request.num_steps.unwrap_or(self.config.num_steps);
-        if (guidance as f64 - diffusion_config.guidance_scale).abs() > 1e-6 {
-            tracing::warn!(
-                request_id = %request.id,
-                requested = %guidance,
-                effective = %diffusion_config.guidance_scale,
-                "per-request guidance_scale override ignored: the loaded pipeline's \
-                 guidance scale is fixed at load time"
-            );
-        }
-        if steps != diffusion_config.num_inference_steps {
-            tracing::warn!(
-                request_id = %request.id,
-                requested = %steps,
-                effective = %diffusion_config.num_inference_steps,
-                "per-request num_steps override ignored: the loaded pipeline's step count \
-                 is fixed at load time"
-            );
-        }
+        let effective = EffectiveSettings::resolve(&request, &self.config);
 
         // --- Preprocess inputs ---------------------------------------------
         let reference = self.encode_reference(&request)?;
@@ -632,15 +642,27 @@ impl BatchGenerator {
             .map_err(|e| DiffusionError::Inference(format!("camera poses: {e}")))?;
 
         // --- Run the diffusion pipeline ------------------------------------
+        //
+        // The per-request guidance scale is applied to the pipeline for the
+        // duration of this run and restored afterwards (even on failure), so a
+        // request that overrides it cannot leak into the next one. The step
+        // count needs no such dance: `begin_session_with_steps` takes it as an
+        // argument.
         let generate_start = std::time::Instant::now();
         let output = {
             let mut guard = pipeline.lock().unwrap_or_else(|e| e.into_inner());
-            guard.generate(
+            let previous_scale = guard.config().guidance_scale;
+            guard.set_guidance_scale(effective.guidance_scale as f64);
+            let outcome = run_session(
+                &mut guard,
                 &reference,
                 &normal_map_latents,
                 &camera_poses,
                 request.seed.unwrap_or(0),
-            )?
+                effective.num_steps,
+            );
+            guard.set_guidance_scale(previous_scale);
+            outcome?
         };
         let generate_ms = generate_start.elapsed().as_secs_f64() * 1000.0;
         let per_view_ms = generate_ms / output.images.len().max(1) as f64;
@@ -706,6 +728,22 @@ impl BatchGenerator {
                 "image dimensions {}×{} exceed the maximum of {} per edge",
                 request.image_width, request.image_height, MAX_IMAGE_DIMENSION
             )));
+        }
+        // Per-request overrides are applied to the pipeline verbatim, so they
+        // face the same bounds `BatchGenerator::with_pipeline` enforces on the
+        // defaults — checked here so a bad override is rejected at `queue`
+        // time rather than deep inside `begin_session_with_steps`.
+        if let Some(guidance) = request.guidance_scale {
+            if !guidance.is_finite() || guidance < 1.0 {
+                return Err(DiffusionError::InvalidConfig(format!(
+                    "guidance_scale must be a finite value >= 1.0, got {guidance}"
+                )));
+            }
+        }
+        if request.num_steps == Some(0) {
+            return Err(DiffusionError::InvalidConfig(
+                "num_steps must be > 0".into(),
+            ));
         }
 
         // Widen before multiplying: `u32 * u32` overflows for large edges.
@@ -802,8 +840,62 @@ impl BatchGenerator {
 }
 
 // ---------------------------------------------------------------------------
+// Per-request settings
+// ---------------------------------------------------------------------------
+
+/// The guidance scale and step count a single request actually runs with.
+///
+/// Resolving this is pure arithmetic over the request and the batch defaults,
+/// kept separate from [`BatchGenerator::process_one`] so the override rules are
+/// testable without model weights.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct EffectiveSettings {
+    /// Classifier-free guidance scale applied to the pipeline for this request.
+    guidance_scale: f32,
+    /// Number of DDIM denoising steps for this request.
+    num_steps: usize,
+}
+
+impl EffectiveSettings {
+    /// A request's own value wins; otherwise the generator's default applies.
+    ///
+    /// Both are validated by [`BatchGenerator::validate_request`] before they
+    /// reach this point.
+    fn resolve(request: &GenerationRequest, defaults: &BatchGenConfig) -> Self {
+        Self {
+            guidance_scale: request.guidance_scale.unwrap_or(defaults.guidance_scale),
+            num_steps: request.num_steps.unwrap_or(defaults.num_steps),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Free helpers
 // ---------------------------------------------------------------------------
+
+/// Drive one full denoising run with an explicit step count.
+///
+/// [`MultiViewDiffusionPipeline::generate`] always uses the pipeline's
+/// configured `num_inference_steps`; this is the same loop expressed through
+/// the session API so a per-request step count can be honoured.
+fn run_session(
+    pipeline: &mut MultiViewDiffusionPipeline,
+    reference: &Tensor,
+    normal_map_latents: &Tensor,
+    camera_poses: &Tensor,
+    seed: u64,
+    num_steps: usize,
+) -> Result<MultiViewOutput, DiffusionError> {
+    let mut session = pipeline.begin_session_with_steps(
+        reference,
+        normal_map_latents,
+        camera_poses,
+        seed,
+        num_steps,
+    )?;
+    while pipeline.step_session(&mut session)? {}
+    pipeline.finish_session(&session)
+}
 
 /// Builds `num_views` camera extrinsics evenly spaced on a circular orbit.
 ///
@@ -1080,6 +1172,102 @@ mod tests {
             }
             other => panic!("Expected ShapeMismatch, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-request overrides
+    //
+    // Regression: `process_one` used to resolve these and then log a
+    // "override ignored" warning, generating with the load-time configuration
+    // instead. They are now applied for real.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_effective_settings_fall_back_to_batch_defaults() {
+        let defaults = BatchGenConfig::default();
+        let effective = EffectiveSettings::resolve(&make_request("a", 1), &defaults);
+        assert!((effective.guidance_scale - defaults.guidance_scale).abs() < f32::EPSILON);
+        assert_eq!(effective.num_steps, defaults.num_steps);
+    }
+
+    #[test]
+    fn test_effective_settings_prefer_the_request() {
+        let defaults = BatchGenConfig::default();
+        let request = GenerationRequest {
+            guidance_scale: Some(7.5),
+            num_steps: Some(3),
+            ..make_request("a", 1)
+        };
+        let effective = EffectiveSettings::resolve(&request, &defaults);
+        assert!((effective.guidance_scale - 7.5).abs() < f32::EPSILON);
+        assert_eq!(effective.num_steps, 3);
+    }
+
+    #[test]
+    fn test_effective_settings_mix_request_and_defaults() {
+        let defaults = BatchGenConfig::default();
+        let request = GenerationRequest {
+            guidance_scale: Some(5.0),
+            num_steps: None,
+            ..make_request("a", 1)
+        };
+        let effective = EffectiveSettings::resolve(&request, &defaults);
+        assert!((effective.guidance_scale - 5.0).abs() < f32::EPSILON);
+        assert_eq!(effective.num_steps, defaults.num_steps);
+    }
+
+    #[test]
+    fn test_request_guidance_below_one_is_rejected() {
+        let gen = BatchGenerator::new(BatchGenConfig::default());
+        let request = GenerationRequest {
+            guidance_scale: Some(0.5),
+            ..make_request("bad-guidance", 1)
+        };
+        match gen.queue(request.clone()) {
+            Err(DiffusionError::InvalidConfig(msg)) => {
+                assert!(msg.contains("guidance_scale"), "unexpected message: {msg}");
+            }
+            other => panic!("Expected InvalidConfig, got {other:?}"),
+        }
+        assert_eq!(gen.queue_len(), 0);
+        assert!(gen.process_one(request).is_err());
+    }
+
+    #[test]
+    fn test_request_non_finite_guidance_is_rejected() {
+        let gen = BatchGenerator::new(BatchGenConfig::default());
+        let request = GenerationRequest {
+            guidance_scale: Some(f32::NAN),
+            ..make_request("nan-guidance", 1)
+        };
+        assert!(gen.queue(request).is_err(), "NaN guidance must be rejected");
+    }
+
+    #[test]
+    fn test_request_zero_steps_is_rejected() {
+        let gen = BatchGenerator::new(BatchGenConfig::default());
+        let request = GenerationRequest {
+            num_steps: Some(0),
+            ..make_request("zero-steps", 1)
+        };
+        match gen.queue(request) {
+            Err(DiffusionError::InvalidConfig(msg)) => {
+                assert!(msg.contains("num_steps"), "unexpected message: {msg}");
+            }
+            other => panic!("Expected InvalidConfig, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_valid_request_overrides_are_accepted() {
+        let gen = BatchGenerator::new(BatchGenConfig::default());
+        let request = GenerationRequest {
+            guidance_scale: Some(1.0),
+            num_steps: Some(1),
+            ..make_request("edge-values", 1)
+        };
+        gen.queue(request).expect("boundary values must be allowed");
+        assert_eq!(gen.queue_len(), 1);
     }
 
     // -----------------------------------------------------------------------

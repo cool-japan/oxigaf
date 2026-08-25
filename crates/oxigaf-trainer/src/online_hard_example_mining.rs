@@ -17,29 +17,19 @@
 //! println!("Effective loss: {:.4}", result.effective_loss);
 //! ```
 
+use std::collections::VecDeque;
+
 use thiserror::Error;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// PRNG (xorshift64, no rand crate)
-// ─────────────────────────────────────────────────────────────────────────────
-
-#[allow(dead_code)]
-#[inline]
-fn xorshift64(state: &mut u64) -> u64 {
-    *state ^= *state << 13;
-    *state ^= *state >> 7;
-    *state ^= *state << 17;
-    if *state == 0 {
-        *state = 1;
-    }
-    *state
-}
-
-#[allow(dead_code)]
-#[inline]
-fn xorshift_f32(state: &mut u64) -> f32 {
-    xorshift64(state) as f32 / u64::MAX as f32
-}
+// NOTE: this module used to carry a private `xorshift64`/`xorshift_f32` pair
+// under a "PRNG (xorshift64, no rand crate)" banner, kept alive only by two
+// `#[allow(dead_code)]` attributes and by two tests of the generator itself.
+// All four mining strategies ([`OnlineMiningStrategy`]) are deterministic
+// selections over the batch losses — top-k, threshold, softmax weighting and
+// focal weighting — so nothing ever drew a number from it. The scaffolding was
+// removed rather than re-suppressed; a stochastic strategy (e.g. sampling easy
+// examples at random) should take an explicit seed through
+// [`OnlineMiningConfig`] rather than revive a module-private generator.
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Error type
@@ -667,11 +657,18 @@ pub struct OnlineMiningStats {
     pub ema_loss: f32,
 }
 
+/// Maximum number of [`OnlineMiningStats`] snapshots retained by
+/// [`OnlineMiningTracker::history`].
+pub const HISTORY_CAPACITY: usize = 1000;
+
 /// Tracks OHEM statistics over training.
 pub struct OnlineMiningTracker {
     config: OnlineMiningConfig,
-    /// Capped at 1000 entries.
-    history: Vec<OnlineMiningStats>,
+    /// Ring buffer capped at [`HISTORY_CAPACITY`] entries, oldest-first.
+    /// Using a `VecDeque` (rather than a `Vec` indexed by `step % CAP`)
+    /// means `back()` is always the truly most recent entry and iteration
+    /// order is always chronological, even after wraparound.
+    history: VecDeque<OnlineMiningStats>,
     ema_loss: f32,
     step: usize,
     sample_history: Option<SampleLossHistory>,
@@ -682,7 +679,7 @@ impl OnlineMiningTracker {
     pub fn new(config: OnlineMiningConfig) -> Self {
         Self {
             config,
-            history: Vec::new(),
+            history: VecDeque::new(),
             ema_loss: 0.0,
             step: 0,
             sample_history: None,
@@ -693,7 +690,7 @@ impl OnlineMiningTracker {
     pub fn with_sample_history(config: OnlineMiningConfig, n_samples: usize) -> Self {
         Self {
             config,
-            history: Vec::new(),
+            history: VecDeque::new(),
             ema_loss: 0.0,
             step: 0,
             sample_history: Some(SampleLossHistory::new(n_samples)),
@@ -743,13 +740,14 @@ impl OnlineMiningTracker {
             ema_loss: self.ema_loss,
         };
 
-        if self.history.len() < 1000 {
-            self.history.push(stats);
-        } else {
-            // Circular overwrite: drop oldest.
-            let idx = self.step % 1000;
-            self.history[idx] = stats;
+        if self.history.len() >= HISTORY_CAPACITY {
+            self.history.pop_front();
         }
+        self.history.push_back(stats);
+        // Keep the deque contiguous so `history()` can hand back a single
+        // `&[OnlineMiningStats]` slice covering the whole (chronologically
+        // ordered) buffer — see `history()`'s doc comment.
+        self.history.make_contiguous();
 
         Ok(result)
     }
@@ -766,12 +764,16 @@ impl OnlineMiningTracker {
 
     /// Most recent statistics snapshot, or `None` if no batch has been mined.
     pub fn stats(&self) -> Option<&OnlineMiningStats> {
-        self.history.last()
+        self.history.back()
     }
 
-    /// Full statistics history (up to 1000 entries).
+    /// Full statistics history (up to [`HISTORY_CAPACITY`] entries),
+    /// oldest-first.
     pub fn history(&self) -> &[OnlineMiningStats] {
-        &self.history
+        // `mine_batch` calls `make_contiguous()` after every push, so the
+        // back slice is always empty and the front slice covers the whole
+        // buffer in chronological order.
+        self.history.as_slices().0
     }
 
     /// Whether OHEM is active (past warmup period).
@@ -1406,6 +1408,33 @@ mod tests {
         assert_eq!(tracker.history().len(), 5);
     }
 
+    // ── 52b. OnlineMiningTracker: stats()/history() stay correct across the
+    // 1000-entry ring-buffer wraparound ─────────────────────────────────────
+    #[test]
+    fn test_tracker_history_and_stats_correct_after_wraparound() {
+        let mut tracker = OnlineMiningTracker::new(active_config());
+        // Push more than HISTORY_CAPACITY (1000) entries so the ring wraps.
+        for i in 0..1005usize {
+            tracker.mine_batch(&[i as f32 * 0.001; 4]).unwrap();
+            tracker.advance_step();
+        }
+        // Capped at 1000 entries.
+        assert_eq!(tracker.history().len(), 1000);
+        // `stats()` must be the truly most recent entry (step 1004) — with
+        // the old `Vec` + `step % 1000` overwrite scheme and `.last()`
+        // reader, this would instead have returned whichever step landed at
+        // index 999 (step 999), up to 999 steps stale.
+        let latest = tracker.stats().expect("history is non-empty");
+        assert_eq!(latest.step, 1004);
+        // `history()` must be chronological: oldest surviving entry first
+        // (step 5, since steps 0..5 were evicted), newest last.
+        let hist = tracker.history();
+        assert_eq!(hist.first().expect("non-empty").step, 5);
+        assert_eq!(hist.last().expect("non-empty").step, 1004);
+        // And strictly increasing throughout (no scrambled ring order).
+        assert!(hist.windows(2).all(|w| w[0].step < w[1].step));
+    }
+
     // ── 53. OnlineMiningTracker with_sample_history: update_sample works ──────
     #[test]
     fn test_tracker_with_sample_history_update() {
@@ -1445,23 +1474,52 @@ mod tests {
         assert!(matches!(err, OnlineMiningError::DimensionMismatch { .. }));
     }
 
-    // ── 58. xorshift64 PRNG: state advances and stays non-zero ───────────────
+    // ── 58/59. Mining is deterministic ───────────────────────────────────────
+    //
+    // Replaces the two tests that only exercised the removed module-private
+    // xorshift PRNG. The property that made that generator dead is the one
+    // worth pinning: every strategy is a deterministic selection over the
+    // batch losses, so the same batch must mine the same samples every time.
     #[test]
-    fn test_xorshift64_non_zero() {
-        let mut state = 42u64;
-        for _ in 0..100 {
-            let v = xorshift64(&mut state);
-            assert_ne!(v, 0, "xorshift64 should never produce 0");
-        }
-    }
-
-    // ── 59. xorshift_f32 produces values in [0,1) ────────────────────────────
-    #[test]
-    fn test_xorshift_f32_range() {
-        let mut state = 12345u64;
-        for _ in 0..1000 {
-            let v = xorshift_f32(&mut state);
-            assert!((0.0..=1.0).contains(&v), "v={v} out of range");
+    fn test_mining_is_deterministic_across_strategies() {
+        let losses = vec![0.1_f32, 0.8, 0.2, 0.5, 0.9, 0.05, 0.65, 0.3];
+        for strategy in [
+            OnlineMiningStrategy::TopK,
+            OnlineMiningStrategy::Threshold(0.4),
+            OnlineMiningStrategy::SoftWeighted,
+            OnlineMiningStrategy::FocalWeighted,
+        ] {
+            let config = OnlineMiningConfig {
+                warmup_steps: 0,
+                mining_strategy: strategy.clone(),
+                ..OnlineMiningConfig::default()
+            };
+            let first = ohem_mine(&losses, &config, 1000).unwrap();
+            for _ in 0..4 {
+                let again = ohem_mine(&losses, &config, 1000).unwrap();
+                assert_eq!(
+                    first.selected_indices, again.selected_indices,
+                    "{strategy:?}: hard-sample selection must be deterministic"
+                );
+                assert_eq!(
+                    first.effective_loss.to_bits(),
+                    again.effective_loss.to_bits(),
+                    "{strategy:?}: effective loss must be deterministic"
+                );
+                assert_eq!(
+                    first
+                        .weights
+                        .iter()
+                        .map(|w| w.to_bits())
+                        .collect::<Vec<_>>(),
+                    again
+                        .weights
+                        .iter()
+                        .map(|w| w.to_bits())
+                        .collect::<Vec<_>>(),
+                    "{strategy:?}: per-sample weights must be deterministic"
+                );
+            }
         }
     }
 

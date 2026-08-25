@@ -2,8 +2,22 @@
 //!
 //! **Pure Rust Gaussian Avatar Framework** — unified API for the OxiGAF ecosystem.
 //!
-//! OxiGAF implements [GAF (Gaussian Avatars Reconstructed from Multi-view Images using Feed-forward)](https://www.microsoft.com/en-us/research/project/gaf/)
-//! in pure Rust with no Python or C/C++ dependencies in the default build.
+//! OxiGAF implements [GAF: Gaussian Avatar Reconstruction from Monocular Videos
+//! via Multi-View Diffusion](https://arxiv.org/abs/2412.10209) (Tang et al.,
+//! CVPR 2025) in pure Rust.
+//!
+//! ## What "pure Rust" means here
+//!
+//! It describes the **Rust build and runtime**: the default feature set pulls
+//! in no C/C++/Fortran code and no Python interpreter, so building and running
+//! this crate needs nothing but a Rust toolchain.
+//!
+//! It does *not* mean the project is Python-free end to end. Turning the
+//! upstream FLAME `.pkl` and PyTorch `.pt` releases into the `.npy` /
+//! `.safetensors` files these crates read is still a one-time offline step run
+//! by `scripts/convert_flame.py` and `scripts/convert_weights.py`, which
+//! require Python and PyTorch. Once those converted files exist, nothing in
+//! the Rust runtime touches Python again.
 //!
 //! ## Key Features
 //!
@@ -118,21 +132,27 @@
 //! |---------|-------------|---------|
 //! | `simd` | SIMD-accelerated FLAME operations (requires nightly Rust) | 3-4× faster |
 //! | `parallel` | Parallel batch processing with rayon | Near-linear with cores |
-//! | `flash_attention` | Memory-efficient O(N) attention (enabled by default) | 2-4× less memory |
+//! | `flash_attention` | Memory-efficient O(N) attention (**off** by default: `oxigaf-diffusion`'s own `default` is empty, so `DiffusionConfig::use_flash_attention` starts `false` unless this feature is on) | 2-4× less memory |
 //! | `mixed_precision` | Switches the default `MixedPrecisionConfig::mode` to BF16 (rounding-simulation helpers only; nothing outside `oxigaf_diffusion::mixed_precision` reads this config yet, so no inference/training path is actually affected) | 2× faster on GPUs (once wired) |
+//!
+//! ### Data Format Features
+//!
+//! | Feature | Description |
+//! |---------|-------------|
+//! | `npz` | Forwards to `oxigaf-flame/npz`, which makes [`flame::FlameSequence::from_npz`] actually read `.npz` archives instead of returning `FlameError::InvalidParams("NPZ support not enabled…")`. Off by default because `.npz` is a niche input format whose reader is slated to be rebuilt on `oxiarc-archive`. Note it does **not** currently gate the `zip` crate: `ndarray-npy` is declared without `default-features = false`, and its own default set already activates `npz`, so `zip` is in the dependency graph either way. |
 //!
 //! ### Debug Features
 //!
 //! | Feature | Description |
 //! |---------|-------------|
-//! | `gpu_debug` | Enable GPU validation layers (adds 10-100× overhead) |
+//! | `gpu_debug` | Enable GPU validation layers (adds 10-100× overhead), and turn on `oxigaf-diffusion`'s NaN/Inf debug hooks (`debug_hooks::DebugConfig::default().enabled`) |
 //!
 //! ### Convenience Feature Bundles
 //!
 //! | Feature | Enables |
 //! |---------|---------|
 //! | `full_performance` | `simd`, `parallel`, `flash_attention` |
-//! | `all_features` | `simd`, `parallel`, `flash_attention`, `mixed_precision`, `gpu_debug` |
+//! | `all_features` | `simd`, `parallel`, `flash_attention`, `mixed_precision`, `gpu_debug`, `npz` |
 //!
 //! ### Examples
 //!
@@ -153,19 +173,17 @@
 //!
 //! | Component | Minimum Version | Tested Version |
 //! |-----------|-----------------|----------------|
-//! | Rust      | 1.85+           | 1.85.0         |
+//! | Rust      | 1.87+           | 1.87.0         |
 //! | wgpu      | 30.x            | 30.x           |
 //! | candle    | 0.11.x          | 0.11.x         |
 //! | nalgebra  | 0.35.x          | 0.35.x         |
 //! | glam      | 0.33.x          | 0.33.x         |
 //!
-//! Note: the workspace declares `rust-version = "1.85"`, but at the time of
-//! writing it also calls `usize::is_multiple_of` (stabilized in Rust 1.87)
-//! from `oxigaf-bridge/src/precision.rs` and from
-//! `oxigaf-render`'s gradient-verification tests — verified to fail to
-//! compile on 1.85.0/1.86.0 and succeed on 1.87.0. Until those call sites
-//! are replaced (e.g. with `% 2 == 0` / `% 4 == 0`) or `rust-version` is
-//! raised to match, 1.87 is the true floor.
+//! Note: the workspace declares `rust-version = "1.87"`, matching the true
+//! floor — it calls `usize::is_multiple_of` (stabilized in Rust 1.87) from
+//! `oxigaf-bridge/src/precision.rs` and from `oxigaf-render`'s
+//! gradient-verification tests, plus several `clippy::incompatible_msrv`-
+//! flagged APIs stabilized in 1.87.0 used across `oxigaf-flame`.
 //!
 //! ### GPU Requirements
 //!
@@ -272,7 +290,18 @@ pub enum OxigafError {
     #[error("path not found: {0}")]
     PathNotFound(String),
 
-    /// GPU / wgpu adapter error.
+    /// GPU / wgpu **adapter** error.
+    ///
+    /// This covers the one class of wgpu failure that [`render::RenderError`]
+    /// does not already own: enumerating or selecting an adapter, as done by
+    /// [`check_gpu`] and [`detect_best_backend`]. Device-creation failures
+    /// (`wgpu::RequestDeviceError`) travel as
+    /// [`RenderError::GpuInit`](render::RenderError::GpuInit) and reach this
+    /// enum through the [`OxigafError::Render`] variant instead, so a given
+    /// wgpu error always has exactly one route.
+    ///
+    /// Constructed automatically from [`wgpu::RequestAdapterError`] via the
+    /// [`From`] impl below, so adapter requests can be propagated with `?`.
     #[error("GPU error: {0}")]
     GpuError(String),
 
@@ -295,6 +324,22 @@ pub enum OxigafError {
         #[source]
         source: Box<OxigafError>,
     },
+}
+
+/// Adapter-request failures map onto [`OxigafError::GpuError`].
+///
+/// Written by hand rather than as `#[from]` because the variant carries a
+/// `String` payload (part of the published 0.1 API); the wgpu error's
+/// [`Display`](std::fmt::Display) text — which already names the active,
+/// requested and supported backends — is what gets stored.
+///
+/// Device-creation errors are deliberately *not* routed here; see the
+/// [`OxigafError::GpuError`] docs.
+impl From<wgpu::RequestAdapterError> for OxigafError {
+    #[inline]
+    fn from(err: wgpu::RequestAdapterError) -> Self {
+        OxigafError::GpuError(format!("no usable wgpu adapter: {err}"))
+    }
 }
 
 pub use pipeline::{
@@ -451,6 +496,8 @@ pub fn version() -> &'static str {
 /// - [`LossConfig`](crate::trainer::LossConfig) — Loss function weights
 /// - [`DensityConfig`](crate::trainer::DensityConfig) — Density control settings
 /// - [`InitConfig`](crate::trainer::InitConfig) — Gaussian initialization settings
+/// - [`MetricTracker`](crate::trainer::MetricTracker) — Rolling PSNR/SSIM/loss history; reachable as the public field `Trainer::n`
+/// - [`MetricEntry`](crate::trainer::MetricEntry) — One recorded step inside a [`MetricTracker`](crate::trainer::MetricTracker)
 /// - [`TrainerError`](crate::trainer::TrainerError) — Trainer-specific errors
 ///
 /// ## Unified Types
@@ -477,9 +524,12 @@ pub mod prelude {
     };
 
     // ---- Trainer types ----
+    // `MetricTracker` / `MetricEntry` are part of the `Trainer` surface (the
+    // public field `Trainer::n`), so callers that only import the prelude
+    // still need to be able to name them.
     pub use oxigaf_trainer::{
-        DensityConfig, InitConfig, LossConfig, OptimizerConfig, Trainer, TrainerError,
-        TrainingConfig,
+        DensityConfig, InitConfig, LossConfig, MetricEntry, MetricTracker, OptimizerConfig,
+        Trainer, TrainerError, TrainingConfig,
     };
 
     // ---- Unified types ----
@@ -543,6 +593,62 @@ mod tests {
         let _loss = LossConfig::default();
         let _density = DensityConfig::default();
         let _init = InitConfig::default();
+    }
+
+    /// Regression test for `MetricTracker` / `MetricEntry` being reachable
+    /// from the meta crate. They are part of the `Trainer` public surface
+    /// (the `Trainer::n` field), but before this they could only be named via
+    /// `oxigaf::trainer::…`, never through the prelude — so a caller that had
+    /// a `&Trainer` could not write down the type of `trainer.n`.
+    ///
+    /// The `use` list is deliberately explicit (not a glob) so the test fails
+    /// to compile if either re-export is dropped again.
+    #[test]
+    fn test_prelude_exports_metric_tracker() {
+        use prelude::{MetricEntry, MetricTracker};
+
+        let mut tracker = MetricTracker::new();
+        tracker.record(7, 30.5, 0.92, 0.041);
+
+        let latest: Option<&MetricEntry> = tracker.latest();
+        assert!(latest.is_some(), "recorded entry should be retrievable");
+        if let Some(entry) = latest {
+            assert_eq!(entry.iteration, 7);
+        }
+    }
+
+    /// Regression test for [`OxigafError::GpuError`] being *constructible*.
+    ///
+    /// The variant existed but nothing in the workspace ever produced it,
+    /// which made it dead public API. `wgpu::RequestAdapterError` — the one
+    /// wgpu failure `RenderError` does not already cover — now converts into
+    /// it, so adapter enumeration/selection can propagate with `?`.
+    #[test]
+    fn test_request_adapter_error_maps_to_gpu_error() {
+        let err: OxigafError = wgpu::RequestAdapterError::EnvNotSet.into();
+        assert!(
+            matches!(err, OxigafError::GpuError(_)),
+            "RequestAdapterError must land in GpuError, got: {err:?}"
+        );
+        let display = format!("{err}");
+        assert!(
+            display.contains("no usable wgpu adapter"),
+            "display was: {display}"
+        );
+        assert!(
+            display.contains("WGPU_ADAPTER_NAME not set"),
+            "the wgpu error text must be preserved; display was: {display}"
+        );
+    }
+
+    /// The two wgpu error families must not both reach `GpuError`: device
+    /// creation stays on the `RenderError` route so a caller matching on
+    /// `OxigafError` can tell "no adapter at all" from "adapter found, device
+    /// request failed".
+    #[test]
+    fn test_device_errors_stay_on_the_render_route() {
+        let err: OxigafError = render::RenderError::GpuInit("device request failed".into()).into();
+        assert!(matches!(err, OxigafError::Render(_)));
     }
 
     #[test]

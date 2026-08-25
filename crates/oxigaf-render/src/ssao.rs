@@ -8,15 +8,47 @@
 //! 1. Generate a hemisphere kernel of sample points (cosine-weighted, accelerating scale).
 //! 2. Generate an NxN rotation noise texture to jitter the kernel per-pixel.
 //! 3. For each pixel:
-//!   - Retrieve depth `d` and normal `n`.
-//!   - Look up the noise rotation for this pixel (modular tiling).
-//!   - For each kernel sample, apply the 2-D rotation, project to screen space,
-//!     and compare the sampled depth against the pixel depth.
+//!   - Retrieve depth `d` and normal `n`, and reconstruct the pixel's
+//!     view-space position from `d` via a pinhole unprojection.
+//!   - Look up the noise rotation for this pixel (modular tiling) and build
+//!     a per-pixel TBN basis from `n` and the noise vector (Gram-Schmidt),
+//!     so the hemisphere kernel is oriented around the actual surface
+//!     normal rather than always pointing along the view axis.
+//!   - For each kernel sample, transform it into view space through the
+//!     TBN, reproject to screen space using the sample's own depth, and
+//!     compare the real scene depth at that screen location against the
+//!     sample's implied depth.
 //!   - Accumulate occlusion.
 //! 4. Apply a power curve and optionally a separable box blur for denoising.
 //!
-//! The simplified 2-D path (no full TBN matrix) keeps the CPU implementation
-//! efficient while still producing visually plausible results.
+//! ## Normal convention
+//!
+//! `normal_map` normals are in the same camera/view space as `depth_map`
+//! (which increases with distance from the camera): a normal component of
+//! `+z` means "pointing back toward the camera" (i.e. `(0, 0, 1)` is a
+//! surface directly facing the camera -- see the tests' `flat_depth_normals`
+//! helper). Because depth increases *away* from the camera while `+normal`
+//! points *toward* it, offsetting a sample along `+normal` decreases its
+//! implied depth; the implementation accounts for this explicitly (see the
+//! comment on `view_offset` in [`compute_ssao`]).
+//!
+//! # Relationship to [`crate::ambient_occlusion`]
+//!
+//! Two CPU ambient-occlusion modules coexist in this crate:
+//!
+//! | Module | Normal input | Projection | Denoise |
+//! |---|---|---|---|
+//! | [`crate::ssao`] (this one) | `Vec<[f32; 3]>` normal map | fixed pinhole unprojection | separable box blur |
+//! | [`crate::ambient_occlusion`] | flat `[f32]` triples | caller-supplied [`crate::ambient_occlusion::AoProjParams`] | depth-aware bilateral blur |
+//!
+//! Prefer [`crate::ambient_occlusion`] when you need a custom projection or
+//! edge-preserving denoise; prefer this module for the simpler fixed-pinhole
+//! path. The shared vector maths (`dot3` / `cross3`) is a thin alias over
+//! that module's public [`crate::ambient_occlusion::ao_dot`] /
+//! [`crate::ambient_occlusion::ao_cross`] rather than a second copy. The two
+//! PRNGs are deliberately *not* shared: they differ in zero-state handling
+//! and in their `u64 → f32` mapping, so the sample patterns are not
+//! interchangeable.
 
 use thiserror::Error;
 
@@ -148,21 +180,26 @@ impl SsaoKernel {
         let mut samples = Vec::with_capacity(num_samples);
 
         for i in 0..num_samples {
-            // Hemisphere: x, y in [-1, 1]; z in [0, 1].
-            let x = 2.0 * xorshift64_f32(&mut state) - 1.0;
-            let y = 2.0 * xorshift64_f32(&mut state) - 1.0;
-            let z = xorshift64_f32(&mut state);
-
-            let mut sample = Self::normalize3([x, y, z]);
+            // Cosine-weighted hemisphere sampling via Malley's method:
+            // sample a unit disk (r = sqrt(u1), theta = 2*pi*u2) and project
+            // up onto the hemisphere with z = sqrt(1 - r^2). This is a
+            // genuine cosine-weighted distribution and, unlike rejection
+            // sampling or a naive "uniform box then normalize" scheme,
+            // needs no post-hoc normalization: x^2+y^2+z^2 == 1 exactly.
+            let u1 = xorshift64_f32(&mut state);
+            let u2 = xorshift64_f32(&mut state);
+            let r = u1.sqrt();
+            let theta = u2 * 2.0 * core::f32::consts::PI;
+            let mut sample = [r * theta.cos(), r * theta.sin(), (1.0 - u1).max(0.0).sqrt()];
 
             // Accelerating interpolation scale: more samples near origin.
             let t = i as f32 / num_samples.max(1) as f32;
             let scale = 0.1 + t * t * 0.9;
 
-            let r = xorshift64_f32(&mut state) * scale;
-            sample[0] *= r;
-            sample[1] *= r;
-            sample[2] *= r;
+            let s = xorshift64_f32(&mut state) * scale;
+            sample[0] *= s;
+            sample[1] *= s;
+            sample[2] *= s;
 
             samples.push(sample);
         }
@@ -179,6 +216,24 @@ impl SsaoKernel {
         let inv = 1.0 / len2.sqrt();
         [v[0] * inv, v[1] * inv, v[2] * inv]
     }
+}
+
+/// Dot product of two 3-vectors.
+///
+/// Thin alias for [`crate::ambient_occlusion::ao_dot`], the crate's public
+/// AO vector helper — the two AO modules share one implementation rather than
+/// keeping private copies that could drift.
+#[inline]
+fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
+    crate::ambient_occlusion::ao_dot(a, b)
+}
+
+/// Cross product of two 3-vectors.
+///
+/// Thin alias for [`crate::ambient_occlusion::ao_cross`]; see [`dot3`].
+#[inline]
+fn cross3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    crate::ambient_occlusion::ao_cross(a, b)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -211,14 +266,15 @@ pub fn generate_noise_texture(size: usize, seed: u64) -> Vec<[f32; 2]> {
 // compute_ssao
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Compute per-pixel ambient occlusion using a simplified 2-D SSAO algorithm.
+/// Compute per-pixel ambient occlusion using a normal-oriented (TBN) SSAO
+/// algorithm.
 ///
 /// # Parameters
 ///
 /// - `depth_map`: linear per-pixel depth in camera space, length `H × W`.
-/// - `normal_map`: per-pixel view-space normals, length `H × W × 3`.  The
-///   normals are expected to be unit-length but are normalised internally
-///   for robustness.
+/// - `normal_map`: per-pixel view-space normals, length `H × W × 3` (see the
+///   module docs for the sign convention). The normals are expected to be
+///   unit-length but are normalised internally for robustness.
 /// - `kernel`: pre-generated hemisphere kernel (see [`SsaoKernel::generate`]).
 /// - `config`: SSAO configuration.
 /// - `focal_length`: camera focal length in pixels.
@@ -279,6 +335,11 @@ pub fn compute_ssao(
 
     let mut ao_map = Vec::with_capacity(num_pixels);
 
+    // Principal point at the image centre (no separate intrinsics are
+    // passed in, so this is the standard assumption for a pinhole camera).
+    let cx = image_width as f32 * 0.5;
+    let cy = image_height as f32 * 0.5;
+
     for py in 0..image_height {
         for px in 0..image_width {
             let pixel_idx = py * image_width + px;
@@ -290,35 +351,109 @@ pub fn compute_ssao(
                 continue;
             }
 
-            // Fetch the rotation vector from the noise texture (tiled).
+            // Reconstruct this pixel's view-space position (pinhole
+            // unprojection: Δview = Δscreen * depth / focal, the inverse of
+            // the reprojection used below) so kernel samples can be offset
+            // from it in view space rather than only in screen space.
+            let view_pos = [
+                (px as f32 - cx) * pixel_depth / focal_length,
+                (py as f32 - cy) * pixel_depth / focal_length,
+                pixel_depth,
+            ];
+
+            // Surface normal at this pixel (see the module docs for the
+            // sign convention: +z means "facing the camera").
+            let normal = SsaoKernel::normalize3([
+                normal_map[pixel_idx * 3],
+                normal_map[pixel_idx * 3 + 1],
+                normal_map[pixel_idx * 3 + 2],
+            ]);
+
+            // Fetch the per-pixel random rotation vector from the noise
+            // texture (tiled) and build a per-pixel TBN basis via
+            // Gram-Schmidt, so the hemisphere kernel is oriented around the
+            // *actual* surface normal instead of always pointing along the
+            // view axis.
             let nx = px % noise_n;
             let ny = py % noise_n;
             let noise_entry = noise[ny * noise_n + nx];
-            let cos_r = noise_entry[0];
-            let sin_r = noise_entry[1];
+            let random_vec = [noise_entry[0], noise_entry[1], 0.0];
+
+            let raw_tangent = {
+                let d = dot3(random_vec, normal);
+                [
+                    random_vec[0] - normal[0] * d,
+                    random_vec[1] - normal[1] * d,
+                    random_vec[2] - normal[2] * d,
+                ]
+            };
+            let tangent = {
+                // Branch on the *squared length before normalizing*, not on
+                // whether the normalized result is the zero sentinel:
+                // `normalize3` only returns that sentinel when
+                // `len2 < 1e-12`, so a `raw_tangent` with, say,
+                // `len2 ~= 1e-11` would divide by a near-zero length and
+                // return an amplified-noise vector that is not actually
+                // orthogonal to `normal`, silently skipping this fallback.
+                if dot3(raw_tangent, raw_tangent) < 1e-6 {
+                    // `random_vec` was (near-)parallel to `normal`: fall
+                    // back to any axis not parallel to it.
+                    let fallback = if normal[0].abs() < 0.9 {
+                        [1.0, 0.0, 0.0]
+                    } else {
+                        [0.0, 1.0, 0.0]
+                    };
+                    let d = dot3(fallback, normal);
+                    SsaoKernel::normalize3([
+                        fallback[0] - normal[0] * d,
+                        fallback[1] - normal[1] * d,
+                        fallback[2] - normal[2] * d,
+                    ])
+                } else {
+                    // `len2 >= 1e-6`, comfortably clear of `normalize3`'s
+                    // own `< 1e-12` zero-sentinel threshold.
+                    SsaoKernel::normalize3(raw_tangent)
+                }
+            };
+            let bitangent = cross3(normal, tangent);
 
             let mut occlusion = 0.0_f32;
             let mut valid_samples = 0usize;
 
             for sample in &kernel.samples {
-                // Apply 2-D rotation from the noise texture to the (x, y) components.
-                // The z component (hemisphere depth offset) is used as a weight.
-                let sx = sample[0];
-                let sy = sample[1];
-                let sz = sample[2].abs(); // ensure positive hemisphere
+                let (sx, sy, sz) = (sample[0], sample[1], sample[2]);
 
-                // Rotated 2-D offset in image space.
-                let rx = cos_r * sx - sin_r * sy;
-                let ry = sin_r * sx + cos_r * sy;
+                // Transform the hemisphere sample from tangent space into
+                // the same space `normal_map` uses via the TBN basis.
+                let local_offset = [
+                    tangent[0] * sx + bitangent[0] * sy + normal[0] * sz,
+                    tangent[1] * sx + bitangent[1] * sy + normal[1] * sz,
+                    tangent[2] * sx + bitangent[2] * sy + normal[2] * sz,
+                ];
 
-                // Project to screen-space offset using pinhole projection:
-                // Δscreen = Δview * focal / depth
-                let scale = focal_length / pixel_depth.max(1e-6);
-                let screen_dx = rx * scale * config.radius;
-                let screen_dy = ry * scale * config.radius;
+                // Convert into a view-space offset. Lateral (x, y) axes
+                // align directly, but the depth axis is inverted relative
+                // to the normal's z axis: depth increases *away* from the
+                // camera while `+normal.z` points *toward* it (see the
+                // module docs), so a positive local-z sample component
+                // (further "up" the hemisphere) must *decrease* depth.
+                let view_offset = [local_offset[0], local_offset[1], -local_offset[2]];
 
-                let sample_x_f = px as f32 + screen_dx;
-                let sample_y_f = py as f32 + screen_dy;
+                let sample_view = [
+                    view_pos[0] + view_offset[0] * config.radius,
+                    view_pos[1] + view_offset[1] * config.radius,
+                    view_pos[2] + view_offset[2] * config.radius,
+                ];
+
+                if sample_view[2] <= 0.0 {
+                    continue; // behind the camera
+                }
+
+                // Reproject to screen space using the *sample's own* depth
+                // (pinhole projection), not the originating pixel's depth:
+                // Δscreen = Δview * focal / depth.
+                let sample_x_f = cx + sample_view[0] * focal_length / sample_view[2];
+                let sample_y_f = cy + sample_view[1] * focal_length / sample_view[2];
 
                 // Bounds check — skip out-of-frame samples.
                 if sample_x_f < 0.0
@@ -340,8 +475,9 @@ pub fn compute_ssao(
 
                 valid_samples += 1;
 
-                // Range check: ignore samples too far in depth.
-                let depth_diff = (sampled_depth - pixel_depth).abs();
+                // Range check: ignore samples whose real geometry is too
+                // far in depth from where the sample point itself landed.
+                let depth_diff = (sampled_depth - sample_view[2]).abs();
                 if depth_diff > config.radius {
                     continue;
                 }
@@ -349,23 +485,22 @@ pub fn compute_ssao(
                 // Range weight: smoothly fall off as the sample gets further away.
                 let range_weight = 1.0 - depth_diff / config.radius;
 
-                // Occlusion test: a surface point that is *closer to the camera*
-                // (smaller depth) than the current pixel (plus bias) occludes it.
-                // Using `sampled_depth < pixel_depth - bias` avoids self-occlusion
-                // on flat surfaces (where sampled_depth ≈ pixel_depth).
-                if sampled_depth < pixel_depth - config.bias {
-                    // Weight by sz so that samples pointing more "straight up"
-                    // (large z) contribute more.
-                    occlusion += range_weight * (sz + 0.5);
+                // Occlusion test: real geometry *closer to the camera*
+                // (smaller depth) than where this hemisphere sample landed
+                // (plus bias) occludes it. Comparing against the sample's
+                // own implied depth (rather than the source pixel's depth)
+                // avoids self-occlusion on flat surfaces, where every
+                // sample's implied depth already differs from the source
+                // pixel's by construction.
+                if sampled_depth < sample_view[2] - config.bias {
+                    occlusion += range_weight;
                 }
             }
 
             let ao = if valid_samples == 0 {
                 1.0_f32
             } else {
-                // Normalise occlusion against the maximum possible contribution.
-                let max_occ = valid_samples as f32 * 1.5; // 1.0 * (0.5 + 0.5*sz_avg)
-                let norm_occ = (occlusion / max_occ).min(1.0);
+                let norm_occ = (occlusion / valid_samples as f32).min(1.0);
                 (1.0 - norm_occ).powf(config.power)
             };
 
@@ -580,17 +715,12 @@ mod tests {
 
     #[test]
     fn test_kernel_generate_hemisphere_z_positive() {
-        // Before the random per-component scale, normalised z must be ≥ 0.
-        // We verify the property indirectly: generate a large kernel and confirm
-        // that the direction (after normalisation) stays in the upper hemisphere.
-        // Because we multiply by a random *positive* scale, the sign is preserved.
-        // We test the underlying normalize3 helper and the generator logic:
-        // z = rng_f32 ∈ [0, 1) → after normalize3 z ≥ 0 (since it just scales).
-        // We probe via a deterministic kernel and check z not strongly negative.
+        // Cosine-weighted (Malley's method) sampling computes
+        // z = sqrt(1 - u1) with u1 in [0, 1), which is always >= 0 before
+        // the random per-component `scale` (itself always > 0) is applied,
+        // so the sign is preserved and z must stay non-negative.
         let kernel = SsaoKernel::generate(64, 123_456);
         for s in &kernel.samples {
-            // The z component after multiply by positive scale keeps same sign.
-            // (scale = 0.1 + t^2 * 0.9 > 0 always; normalised z ≥ 0 from rng)
             assert!(
                 s[2] >= 0.0,
                 "Sample z must be non-negative (hemisphere), got {:?}",
@@ -699,6 +829,68 @@ mod tests {
                 (0.0..=1.0).contains(&v),
                 "AO value out of [0, 1] range: {v}"
             );
+        }
+    }
+
+    #[test]
+    fn test_compute_ssao_normal_map_affects_result() {
+        // Regression test for the bug where `compute_ssao` validated
+        // `normal_map`'s length but never read a single element of it.
+        // Two very differently-oriented normal maps over the SAME (flat)
+        // depth map must produce different AO, since the hemisphere kernel
+        // is supposed to be oriented around the per-pixel normal.
+        let w = 16_usize;
+        let h = 16_usize;
+        let depth_map = vec![2.0_f32; w * h];
+        let config = SsaoConfig::default();
+        let kernel = SsaoKernel::generate(32, 7);
+
+        let mut facing_camera = Vec::with_capacity(w * h * 3);
+        let mut facing_sideways = Vec::with_capacity(w * h * 3);
+        for _ in 0..(w * h) {
+            facing_camera.extend_from_slice(&[0.0, 0.0, 1.0]);
+            facing_sideways.extend_from_slice(&[1.0, 0.0, 0.0]);
+        }
+
+        let ao_camera = compute_ssao(&depth_map, &facing_camera, &kernel, &config, 500.0, w, h)
+            .expect("compute_ssao failed");
+        let ao_sideways = compute_ssao(&depth_map, &facing_sideways, &kernel, &config, 500.0, w, h)
+            .expect("compute_ssao failed");
+
+        let differs = ao_camera
+            .iter()
+            .zip(ao_sideways.iter())
+            .any(|(a, b)| (a - b).abs() > 1e-4);
+        assert!(
+            differs,
+            "AO must change when normal_map changes (normal_map was previously ignored entirely)"
+        );
+    }
+
+    #[test]
+    fn test_dot3_cross3_basic() {
+        assert!(approx_eq(dot3([1.0, 0.0, 0.0], [1.0, 0.0, 0.0]), 1.0, 1e-6));
+        assert!(approx_eq(dot3([1.0, 0.0, 0.0], [0.0, 1.0, 0.0]), 0.0, 1e-6));
+        let c = cross3([1.0, 0.0, 0.0], [0.0, 1.0, 0.0]);
+        assert!(approx_eq(c[0], 0.0, 1e-6));
+        assert!(approx_eq(c[1], 0.0, 1e-6));
+        assert!(approx_eq(c[2], 1.0, 1e-6));
+    }
+
+    #[test]
+    fn test_dot3_cross3_share_ambient_occlusion_helpers() {
+        // Regression (duplicate-module consolidation): the two AO modules must
+        // keep computing vector maths with one implementation. Non-orthogonal,
+        // non-unit inputs so a transposed or sign-flipped copy would show up.
+        let a = [0.3_f32, -1.7, 2.4];
+        let b = [-0.9_f32, 0.25, 1.1];
+        assert_eq!(dot3(a, b), crate::ambient_occlusion::ao_dot(a, b));
+        assert_eq!(cross3(a, b), crate::ambient_occlusion::ao_cross(a, b));
+        // Anti-commutativity of the shared cross product.
+        let ba = cross3(b, a);
+        let ab = cross3(a, b);
+        for c in 0..3 {
+            assert!(approx_eq(ab[c], -ba[c], 1e-6));
         }
     }
 

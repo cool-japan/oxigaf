@@ -305,26 +305,13 @@ pub fn bipartite_soft_matching(
 
     // For each A token, compute similarity with all B tokens and pick the best.
     // A tokens are processed in tiles so the B side is streamed once per tile.
-    let mut candidates: Vec<(usize, usize, f32)> = Vec::with_capacity(a_indices.len());
-    for a_chunk in a_indices.chunks(A_TILE) {
-        let mut best_sim = [f32::NEG_INFINITY; A_TILE];
-        let mut best_bi = [b_indices[0]; A_TILE];
-        for &bi in &b_indices {
-            let b_tok = &tokens[bi * d_model..(bi + 1) * d_model];
-            let norm_b = norms[bi];
-            for (slot, &ai) in a_chunk.iter().enumerate() {
-                let a_tok = &tokens[ai * d_model..(ai + 1) * d_model];
-                let sim = token_dot(a_tok, b_tok) / (norms[ai] * norm_b + 1e-8);
-                if sim > best_sim[slot] {
-                    best_sim[slot] = sim;
-                    best_bi[slot] = bi;
-                }
-            }
-        }
-        for (slot, &ai) in a_chunk.iter().enumerate() {
-            candidates.push((ai, best_bi[slot], best_sim[slot]));
-        }
-    }
+    // The tile-local math lives in `tile_best_matches` so the serial and
+    // `parallel`-feature paths below run the *same* arithmetic in the *same*
+    // per-tile order — the only difference is which thread runs each tile.
+    #[cfg(feature = "parallel")]
+    let mut candidates = candidates_parallel(&a_indices, &b_indices, tokens, &norms, d_model);
+    #[cfg(not(feature = "parallel"))]
+    let mut candidates = candidates_serial(&a_indices, &b_indices, tokens, &norms, d_model);
 
     // Sort by descending similarity.
     candidates.sort_by(|x, y| y.2.partial_cmp(&x.2).unwrap_or(std::cmp::Ordering::Equal));
@@ -343,6 +330,107 @@ pub fn bipartite_soft_matching(
     }
 
     Ok(pairs)
+}
+
+/// Best-B-match search for one tile of A-side indices.
+///
+/// For every `ai` in `a_chunk`, streams all of `b_indices` once and keeps the
+/// highest-similarity `(bi, sim)`. Pulled out of [`bipartite_soft_matching`]
+/// so [`candidates_serial`] and [`candidates_parallel`] (the latter only
+/// compiled under the `parallel` feature) run *exactly* this arithmetic per
+/// tile — a shared implementation, not two hand-written copies that could
+/// silently drift apart.
+///
+/// Requires `b_indices` non-empty (checked by the caller before any tiling
+/// starts).
+fn tile_best_matches(
+    a_chunk: &[usize],
+    b_indices: &[usize],
+    tokens: &[f32],
+    norms: &[f32],
+    d_model: usize,
+) -> Vec<(usize, usize, f32)> {
+    debug_assert!(
+        !b_indices.is_empty(),
+        "tile_best_matches requires a non-empty B side"
+    );
+    let mut best_sim = [f32::NEG_INFINITY; A_TILE];
+    let mut best_bi = [b_indices[0]; A_TILE];
+    for &bi in b_indices {
+        let b_tok = &tokens[bi * d_model..(bi + 1) * d_model];
+        let norm_b = norms[bi];
+        for (slot, &ai) in a_chunk.iter().enumerate() {
+            let a_tok = &tokens[ai * d_model..(ai + 1) * d_model];
+            let sim = token_dot(a_tok, b_tok) / (norms[ai] * norm_b + 1e-8);
+            if sim > best_sim[slot] {
+                best_sim[slot] = sim;
+                best_bi[slot] = bi;
+            }
+        }
+    }
+    a_chunk
+        .iter()
+        .enumerate()
+        .map(|(slot, &ai)| (ai, best_bi[slot], best_sim[slot]))
+        .collect()
+}
+
+/// Serial tile walk: the default build, and the baseline the `parallel`
+/// feature's regression test below compares against.
+///
+/// Compiled whenever the `parallel` feature is off (it is then the only
+/// implementation `bipartite_soft_matching` has) or when running tests (so
+/// `test_parallel_matches_serial_candidates` can call it even in a
+/// `--features parallel` build) — otherwise a `--features parallel` build
+/// with no tests would define this and never call it, which is a dead-code
+/// warning under this crate's `-D warnings` policy.
+#[cfg(any(not(feature = "parallel"), test))]
+fn candidates_serial(
+    a_indices: &[usize],
+    b_indices: &[usize],
+    tokens: &[f32],
+    norms: &[f32],
+    d_model: usize,
+) -> Vec<(usize, usize, f32)> {
+    let mut candidates: Vec<(usize, usize, f32)> = Vec::with_capacity(a_indices.len());
+    for a_chunk in a_indices.chunks(A_TILE) {
+        candidates.extend(tile_best_matches(
+            a_chunk, b_indices, tokens, norms, d_model,
+        ));
+    }
+    candidates
+}
+
+/// Data-parallel tile walk (rayon), gated behind the `parallel` feature.
+///
+/// Each tile is computed independently (it only reads `tokens`/`norms` and
+/// writes its own freshly-allocated `Vec`, per [`tile_best_matches`]) and
+/// tiles never touch a shared mutable `Vec` — the classic
+/// lock-and-push-from-every-thread pattern would make the resulting
+/// `candidates` order depend on thread scheduling, and the subsequent
+/// `sort_by` is not stable across ties in similarity, so that would make
+/// `bipartite_soft_matching`'s output nondeterministic run to run. Instead
+/// `par_chunks` (an *indexed* rayon iterator) plus `flat_map_iter` collects
+/// each tile's local candidates back into the vector in the same tile order
+/// the serial path uses, regardless of which worker thread ran which tile —
+/// rayon guarantees a `collect()` reflects the source order, not completion
+/// order. Combined with [`tile_best_matches`] being the single shared
+/// implementation of the per-tile math, this makes `candidates_parallel`
+/// produce output bit-identical to [`candidates_serial`] (see
+/// `test_parallel_matches_serial_candidates` below).
+#[cfg(feature = "parallel")]
+fn candidates_parallel(
+    a_indices: &[usize],
+    b_indices: &[usize],
+    tokens: &[f32],
+    norms: &[f32],
+    d_model: usize,
+) -> Vec<(usize, usize, f32)> {
+    use rayon::prelude::*;
+    a_indices
+        .par_chunks(A_TILE)
+        .flat_map_iter(|a_chunk| tile_best_matches(a_chunk, b_indices, tokens, norms, d_model))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -789,12 +877,12 @@ fn validate_pairs(pairs: &[(usize, usize)], n_tokens: usize) -> Result<(), Token
         if bi >= n_tokens {
             return Err(TokenMergeError::IndexOutOfRange { idx: bi, n_tokens });
         }
-        if ai % 2 != 0 {
+        if !ai.is_multiple_of(2) {
             return Err(TokenMergeError::InvalidPairing {
                 reason: format!("a-side index {ai} must be even"),
             });
         }
-        if bi % 2 == 0 {
+        if bi.is_multiple_of(2) {
             return Err(TokenMergeError::InvalidPairing {
                 reason: format!("b-side index {bi} must be odd"),
             });
@@ -1738,6 +1826,64 @@ mod tests {
                     "({i},{j}): {got} vs {expected}"
                 );
             }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 20. Regression: the `parallel`-feature tile walk (rayon `par_chunks`)
+    //     must produce candidates bit-identical to the serial tile walk.
+    //
+    //     Only compiled with `--features parallel`, since `candidates_parallel`
+    //     doesn't exist otherwise. Run with:
+    //       cargo test -p oxigaf-diffusion --features parallel token_merging
+    // ------------------------------------------------------------------
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn test_parallel_matches_serial_candidates() {
+        // Cover: fewer A tokens than one tile, an exact multiple of A_TILE
+        // (no tail chunk), a tail chunk shorter than A_TILE, and (n = 512,
+        // 256 A tokens => 32 tiles of A_TILE=8) enough tiles that rayon's
+        // pool actually spreads them across worker threads instead of
+        // running the whole `par_chunks` sequentially on the calling
+        // thread -- the small cases alone would pass even with a
+        // thread-unsafe shared-Vec implementation, since 1-2 tiles rarely
+        // cross a thread boundary. This size is what actually exercises the
+        // "collect per-tile, don't push to a shared Vec, so order stays
+        // deterministic across threads" property this test guards.
+        for &n in &[4usize, 32, 26, 512] {
+            let d = 5;
+            let tokens = make_varied_tokens(n, d);
+            let norms = precompute_norms(&tokens, n, d);
+            let a_indices: Vec<usize> = (0..n).step_by(2).collect();
+            let b_indices: Vec<usize> = (1..n).step_by(2).collect();
+
+            let serial = candidates_serial(&a_indices, &b_indices, &tokens, &norms, d);
+            let parallel = candidates_parallel(&a_indices, &b_indices, &tokens, &norms, d);
+            assert_eq!(
+                serial, parallel,
+                "n={n}: serial and parallel tile walks must produce the exact \
+                 same (a_idx, b_idx, sim) candidates in the same order"
+            );
+        }
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn test_parallel_bipartite_matches_naive_reference() {
+        // End-to-end: with the `parallel` feature on, `bipartite_soft_matching`
+        // runs `candidates_parallel` internally. It must still agree with the
+        // plain serial reference implementation used elsewhere in this file.
+        let n = 26;
+        let d = 5;
+        let tokens = make_varied_tokens(n, d);
+        for r in [1usize, 4, 13] {
+            let got = bipartite_soft_matching(&tokens, n, d, r).unwrap();
+            assert_eq!(
+                got,
+                naive_bipartite(&tokens, n, d, r),
+                "parallel-feature build mismatch at r={r}"
+            );
         }
     }
 }

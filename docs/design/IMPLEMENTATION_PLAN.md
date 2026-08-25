@@ -1,61 +1,34 @@
 # OxiGAF — Implementation Plan
 
-> **📋 Design Document Status**
+> **⚠️ Historical document — planning snapshot, not current status.** This
+> implementation plan reflects design planning as it stood on **2026-02-09**,
+> before the v0.1.0 release — see `docs/design/README.md`, which already
+> promises this same caveat for this file. Every item this document used to
+> mark `0%` / `CRITICAL for v1.0` — Latent Upsampler, IP-Adapter,
+> Classifier-Free Guidance, gradient verification, the weight-conversion
+> script, and glTF export — has since shipped (glTF: `oxigaf-cli/src/
+> export_gltf.rs`, wired through the `export` subcommand); see
+> `CHANGELOG.md` at the repository root for what is actually implemented.
+> The percentage/status tracking, "Not Yet Implemented" list, module status
+> summary, "reach v1.0" timeline, and hand-counted test/line totals that
+> used to live in this file have been removed rather than refreshed with
+> new numbers, since a second hand-typed snapshot would only go stale again
+> the same way. For current, maintained status use `CHANGELOG.md` and each
+> crate's own `crates/*/TODO.md`.
 >
-> **Last Updated:** 2026-02-09
-> **Implementation Status:** ~75% complete
-> **Current Status:** See individual `crates/*/TODO.md` files for up-to-date progress
->
-> **✨ Key Achievements Beyond Original Plan:**
-> - **SIMD Acceleration** (oxigaf-flame): 2-4× speedup for Rodrigues rotation and blend shapes
-> - **Flash Attention** (oxigaf-diffusion): 50% memory reduction, 30-50% faster than standard
-> - **Specialized SH Shaders** (oxigaf-render): 10× speedup through compile-time degree optimization
-> - **TensorBoard Integration** (oxigaf-trainer): 1,181 lines of comprehensive logging (not in plan)
-> - **LPIPS in Pure Rust** (oxigaf-trainer): 689 lines, no Python dependency
-> - **Unified Error Handling** (oxigaf meta crate): OxigafError enum wrapping all sub-crates
-> - **Comprehensive CLI** (oxigaf-cli): 161 tests, benchmark/doctor/cache commands, HuggingFace Hub integration
-> - **Buffer Pool** (oxigaf-render): Memory-efficient buffer reuse (90%+ allocation reduction)
->
-> **⚠️ Significant Deviations:**
-> - **No video extraction yet**: ffmpeg-next integration deferred (feature-gated in plan)
-> - **No real-time preview yet**: winit integration deferred
-> - **safetensors instead of .npz**: Using .npy files for FLAME model (easier conversion)
->
-> **❌ Not Yet Implemented (CRITICAL for v1.0):**
-> - **Diffusion Module (35% gap)**:
->   - Latent Upsampler (0%) - CRITICAL for 512×512 output
->   - IP-Adapter conditioning (0%) - CRITICAL for identity preservation
->   - Classifier-Free Guidance (0%) - CRITICAL for quality
->   - Weight conversion script (0%)
-> - **Render Module (20% gap)**:
->   - Gradient verification (0%) - CRITICAL for training
->   - FLAME binding backward shader (partial)
-> - **CLI (15% gap)**:
->   - Video frame extraction (0%)
->   - Real-time preview window (0%)
->   - glTF export implementation (0%)
->
-> **📊 Module Status Summary:**
-> - ✅ oxigaf (meta crate): 100% — Exemplary, exceeds plan
-> - ✅ oxigaf-flame: 85% — Production-ready, missing sequence loading
-> - ⚠️ oxigaf-diffusion: 65% — Core done, missing 3 critical GAF features
-> - ⚠️ oxigaf-render: 80% — Forward pass excellent, backward needs verification
-> - ✅ oxigaf-trainer: 90% — Comprehensive, blocked by diffusion gaps
-> - ✅ oxigaf-cli: 85% — Feature-rich, missing video/preview
->
-> **🎯 To reach v1.0 (estimated 3-4 weeks):**
-> 1. Diffusion: Implement Latent Upsampler + IP-Adapter + CFG (~2 weeks)
-> 2. Render: Gradient verification + FLAME binding backward (~1 week)
-> 3. CLI: Video extraction + Preview window (~1 week)
->
-> **📈 Test Coverage: 573 tests (all passing)**
-> - oxigaf: 7 tests
-> - oxigaf-flame: 43 tests
-> - oxigaf-diffusion: 41 tests
-> - oxigaf-render: 78 tests
-> - oxigaf-trainer: 231 tests
-> - oxigaf-cli: 161 tests
-> - Total: **24,661 lines** of Rust code
+> **Everything below this banner is the original 2026-02-09 plan, left
+> unedited for its architectural rationale.** Read it as design *intent*,
+> not as a specification of the current API: its Cargo.toml snippets,
+> feature-flag tables, and CLI command definitions describe `edition =
+> "2024"`, `candle 0.9`, `wgpu 28`, `ffmpeg-next`, `winit`, a
+> `~/.cache/oxigaf` cache default, and `cuda`/`metal`/`video`/`preview`
+> feature flags — none of which match the shipped workspace (root
+> `README.md`'s "GPU / BLAS Backends" section is explicit that this
+> workspace defines no `cuda`/`metal`/`video`/`preview` features at all,
+> and `Cargo.toml` is `edition = "2021"`). Some of this plan shipped
+> differently than described here rather than not at all — e.g. FLAME
+> model I/O ended up safetensors-first with legacy `.npy` support, not the
+> `.npz`-via-`ndarray-npy` path sketched below.
 
 ---
 
@@ -1249,12 +1222,17 @@ grad_threshold = 0.0002
 min_opacity = 0.005
 
 [training.loss]
-lambda_photometric = 1.0
+lambda_l1 = 0.8
 lambda_ssim = 0.2
-lambda_lpips = 0.1
+lambda_ms_ssim = 0.0
+lambda_lpips = 0.0
 lambda_position_reg = 0.01
 lambda_scale_reg = 0.01
+lambda_opacity_reg = 0.001
 lambda_normal = 0.05
+lambda_gradient_penalty = 0.0
+gradient_penalty_threshold = 100.0
+scale_reg_max_scale = 0.05
 
 [output]
 checkpoint_interval = 1000
@@ -1445,3 +1423,8 @@ impl AssetManager {
 | R8 | Performance gap vs CUDA reference | 🟡 Medium | High | Slower training | Accept 2-3x overhead for wgpu; optimize hot paths |
 | R9 | ffmpeg-next breaking Pure Rust goal | 🟢 Low | Low | Purist concern | Feature-gate; support pre-extracted frames as primary input |
 | R10 | Cross-view attention numerical precision in fp16 | 🟡 Medium | Medium | Image artifacts | Selective fp32 for attention computation |
+
+---
+
+*Original plan written: 2026-02-09*
+*Marked historical, status apparatus removed: 2026-08-25*

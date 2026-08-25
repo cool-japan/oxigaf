@@ -342,53 +342,84 @@ fn bilinear_sample_f32(img: &[u8], width: u32, height: u32, fx: f32, fy: f32) ->
     out
 }
 
-/// Convert a pixel coordinate to the `[-1, 1]` normalised space.
-#[inline]
-fn normalized_coords(px: u32, py: u32, width: u32, height: u32) -> (f32, f32) {
-    let nx = (px as f32 + 0.5) / width as f32 * 2.0 - 1.0;
-    let ny = (py as f32 + 0.5) / height as f32 * 2.0 - 1.0;
-    (nx, ny)
-}
-
-/// Inverse of [`normalized_coords`]: convert from `[-1, 1]` back to pixel space.
-#[inline]
-pub(crate) fn normalized_to_pixel(nx: f32, ny: f32, width: u32, height: u32) -> (f32, f32) {
-    let px = (nx + 1.0) / 2.0 * width as f32 - 0.5;
-    let py = (ny + 1.0) / 2.0 * height as f32 - 0.5;
-    (px, py)
-}
-
-/// Compute a single-channel radial-shift plane from a u8 RGBA image.
+/// Bilinear-sample a *single* channel of a u8 RGBA image at fractional
+/// pixel coordinates, clamping to the image boundary.
 ///
-/// Returns a `width * height` `Vec<f32>` with values in `[0, 255]`.
-fn radial_shift_channel(
+/// Used by [`apply_chromatic_aberration_rgba`], which needs a different
+/// source position per channel — sampling only the needed channel (instead
+/// of all three via [`bilinear_sample_f32`] and discarding two) avoids
+/// doing 3x the bilinear-fetch work.
+#[inline]
+fn bilinear_sample_channel_f32(
     img: &[u8],
     width: u32,
     height: u32,
-    shift_factor: f32,
+    fx: f32,
+    fy: f32,
     channel: usize,
-) -> Vec<f32> {
-    let n = (width * height) as usize;
-    let mut out = vec![0.0f32; n];
-
-    for py in 0..height {
-        for px in 0..width {
-            let (nx, ny) = normalized_coords(px, py, width, height);
-            let r2 = nx * nx + ny * ny;
-            let scale = 1.0 + shift_factor * r2;
-            let src_nx = nx * scale;
-            let src_ny = ny * scale;
-            let (src_px, src_py) = normalized_to_pixel(src_nx, src_ny, width, height);
-
-            let rgb = bilinear_sample_f32(img, width, height, src_px, src_py);
-            let idx = (py * width + px) as usize;
-            if let Some(slot) = out.get_mut(idx) {
-                *slot = rgb.get(channel).copied().unwrap_or(0.0);
-            }
-        }
+) -> f32 {
+    if img.is_empty() || width == 0 || height == 0 {
+        return 0.0;
     }
 
-    out
+    let xc = fx.clamp(0.0, (width - 1) as f32);
+    let yc = fy.clamp(0.0, (height - 1) as f32);
+
+    let x0 = xc.floor() as usize;
+    let y0 = yc.floor() as usize;
+    let x1 = (x0 + 1).min((width - 1) as usize);
+    let y1 = (y0 + 1).min((height - 1) as usize);
+
+    let tx = xc - x0 as f32;
+    let ty = yc - y0 as f32;
+    let w = width as usize;
+
+    let sample = |row: usize, col: usize| -> f32 {
+        let idx = (row * w + col) * 4 + channel;
+        img.get(idx).copied().unwrap_or(0) as f32
+    };
+
+    let v00 = sample(y0, x0);
+    let v10 = sample(y0, x1);
+    let v01 = sample(y1, x0);
+    let v11 = sample(y1, x1);
+    let top = v00 * (1.0 - tx) + v10 * tx;
+    let bot = v01 * (1.0 - tx) + v11 * tx;
+    top * (1.0 - ty) + bot * ty
+}
+
+/// Convert a pixel coordinate to the normalised `[-1, 1]`-ish space (the
+/// image's shorter dimension spans `[-1, 1]`; the longer one extends
+/// beyond that symmetrically).
+///
+/// Both axes are scaled by the *same* factor (the shorter image
+/// dimension) rather than independently by their own dimension, so equal
+/// pixel distances from the centre map to equal radii regardless of
+/// aspect ratio. The previous per-axis scaling made every radial effect
+/// (vignette, chromatic aberration, barrel distortion) anisotropically
+/// stretched on non-square images — e.g. ~1.8x stronger horizontally than
+/// vertically on a 16:9 render. On a square image this is identical to
+/// the old per-axis formula.
+#[inline]
+fn normalized_coords(px: u32, py: u32, width: u32, height: u32) -> (f32, f32) {
+    let scale = 2.0 / (width.min(height).max(1) as f32);
+    let cx = width as f32 * 0.5;
+    let cy = height as f32 * 0.5;
+    let nx = ((px as f32 + 0.5) - cx) * scale;
+    let ny = ((py as f32 + 0.5) - cy) * scale;
+    (nx, ny)
+}
+
+/// Inverse of [`normalized_coords`]: convert from normalised space back to
+/// pixel space. Kept as the exact algebraic inverse of `normalized_coords`.
+#[inline]
+pub(crate) fn normalized_to_pixel(nx: f32, ny: f32, width: u32, height: u32) -> (f32, f32) {
+    let scale = 2.0 / (width.min(height).max(1) as f32);
+    let cx = width as f32 * 0.5;
+    let cy = height as f32 * 0.5;
+    let px = nx / scale + cx - 0.5;
+    let py = ny / scale + cy - 0.5;
+    (px, py)
 }
 
 /// Compute distorted source coordinates from normalised output coordinates.
@@ -409,8 +440,13 @@ pub(crate) fn compute_vignette_factor(nx: f32, ny: f32, config: &LensVignetteCon
     if r <= config.radius {
         return 1.0;
     }
-    let outer = (config.radius - 1.0).abs().max(1e-6);
-    let t = (r - config.radius) / outer;
+    // Normalize by the actual maximum radius reachable in the [-1,1]^2
+    // normalised space — the corners, at r = sqrt(2) — not 1.0. The
+    // corners are farther than the edge midpoints, so normalizing by 1.0
+    // made `t` exceed 1 well before the true image corner, driving the
+    // vignette to full black there regardless of `strength`.
+    let outer = (std::f32::consts::SQRT_2 - config.radius).max(1e-6);
+    let t = ((r - config.radius) / outer).clamp(0.0, 1.0);
     (1.0 - config.strength * t.powf(config.falloff)).clamp(0.0, 1.0)
 }
 
@@ -455,23 +491,34 @@ pub fn apply_chromatic_aberration_rgba(
     let eff_g = config.green_shift * config.strength;
     let eff_b = config.blue_shift * config.strength;
 
-    let r_plane = radial_shift_channel(image_rgba, width, height, eff_r, 0);
-    let g_plane = radial_shift_channel(image_rgba, width, height, eff_g, 1);
-    let b_plane = radial_shift_channel(image_rgba, width, height, eff_b, 2);
-
     let n = (width * height) as usize;
     let mut out = vec![0u8; n * 4];
 
-    for i in 0..n {
-        let r = r_plane.get(i).copied().unwrap_or(0.0).clamp(0.0, 255.0) as u8;
-        let g = g_plane.get(i).copied().unwrap_or(0.0).clamp(0.0, 255.0) as u8;
-        let b = b_plane.get(i).copied().unwrap_or(0.0).clamp(0.0, 255.0) as u8;
-        let a = image_rgba.get(i * 4 + 3).copied().unwrap_or(255);
-        if let Some(dst) = out.get_mut(i * 4..i * 4 + 4) {
-            dst[0] = r;
-            dst[1] = g;
-            dst[2] = b;
-            dst[3] = a;
+    // Single pass over destination pixels: compute (nx, ny) once and
+    // derive each channel's own shifted source position from the shared
+    // r², sampling only that one channel. The previous implementation ran
+    // `radial_shift_channel` three times, each re-deriving (nx, ny) / r²
+    // from scratch and bilinear-sampling *all three* channels while
+    // discarding two of them — 3x the pass count and 3x the bilinear work.
+    for py in 0..height {
+        for px in 0..width {
+            let (nx, ny) = normalized_coords(px, py, width, height);
+            let r2 = nx * nx + ny * ny;
+
+            let idx = (py * width + px) as usize;
+            let base = idx * 4;
+
+            for (channel, shift) in [(0usize, eff_r), (1, eff_g), (2, eff_b)] {
+                let scale = 1.0 + shift * r2;
+                let src_nx = nx * scale;
+                let src_ny = ny * scale;
+                let (src_px, src_py) = normalized_to_pixel(src_nx, src_ny, width, height);
+                let v =
+                    bilinear_sample_channel_f32(image_rgba, width, height, src_px, src_py, channel);
+                out[base + channel] = v.clamp(0.0, 255.0).round() as u8;
+            }
+
+            out[base + 3] = image_rgba.get(base + 3).copied().unwrap_or(255);
         }
     }
 
@@ -519,9 +566,9 @@ pub fn apply_barrel_distortion(
 
             let idx = (py * width + px) as usize;
             if let Some(dst) = out.get_mut(idx * 4..idx * 4 + 4) {
-                dst[0] = rgb[0].clamp(0.0, 255.0) as u8;
-                dst[1] = rgb[1].clamp(0.0, 255.0) as u8;
-                dst[2] = rgb[2].clamp(0.0, 255.0) as u8;
+                dst[0] = rgb[0].clamp(0.0, 255.0).round() as u8;
+                dst[1] = rgb[1].clamp(0.0, 255.0).round() as u8;
+                dst[2] = rgb[2].clamp(0.0, 255.0).round() as u8;
                 dst[3] = a;
             }
         }
@@ -563,7 +610,7 @@ pub fn apply_vignette_effect(
             for ch in 0..3 {
                 let src = image_rgba.get(base + ch).copied().unwrap_or(0) as f32;
                 let color_val = config.color.get(ch).copied().unwrap_or(0.0) * 255.0;
-                let blended = (factor * src + inv * color_val).clamp(0.0, 255.0) as u8;
+                let blended = (factor * src + inv * color_val).clamp(0.0, 255.0).round() as u8;
                 if let Some(dst) = out.get_mut(base + ch) {
                     *dst = blended;
                 }
@@ -821,6 +868,48 @@ mod tests {
         }
     }
 
+    // ── 11b. normalized_coords: isotropic (aspect-ratio independent) radius ──
+
+    #[test]
+    fn test_normalized_coords_isotropic_on_wide_image() {
+        // Regression: previously each axis was normalized independently by
+        // its own dimension, so on a non-square image, a horizontal pixel
+        // offset and an equal *pixel* vertical offset produced very
+        // different radii (anisotropic / elliptical radial effects). Equal
+        // pixel distances from the centre must now give equal radii.
+        let w = 16u32;
+        let h = 4u32;
+        let (nx_h, ny_h) = normalized_coords(w / 2 + 2, h / 2, w, h);
+        let (nx_v, ny_v) = normalized_coords(w / 2, h / 2 + 2, w, h);
+        let r_h = (nx_h * nx_h + ny_h * ny_h).sqrt();
+        let r_v = (nx_v * nx_v + ny_v * ny_v).sqrt();
+        assert!(
+            (r_h - r_v).abs() < 1e-4,
+            "radii should match for equal pixel offsets: r_h={r_h} r_v={r_v}"
+        );
+    }
+
+    #[test]
+    fn test_vignette_factor_equal_at_equal_pixel_radius_wide_image() {
+        // Same isotropy property, exercised through `compute_vignette_factor`
+        // on a 16:4 image.
+        let w = 16u32;
+        let h = 4u32;
+        let cfg = LensVignetteConfig {
+            strength: 0.6,
+            radius: 0.1,
+            ..LensVignetteConfig::default()
+        };
+        let (nx_h, ny_h) = normalized_coords(w / 2 + 2, h / 2, w, h);
+        let (nx_v, ny_v) = normalized_coords(w / 2, h / 2 + 2, w, h);
+        let f_h = compute_vignette_factor(nx_h, ny_h, &cfg);
+        let f_v = compute_vignette_factor(nx_v, ny_v, &cfg);
+        assert!(
+            (f_h - f_v).abs() < 1e-4,
+            "vignette factor should be equal at equal pixel radius: f_h={f_h} f_v={f_v}"
+        );
+    }
+
     // ── 12. apply_distortion_coords: k1=0, k2=0 → identity ───────────────────
 
     #[test]
@@ -863,6 +952,24 @@ mod tests {
         assert!(corner >= 0.0);
     }
 
+    // ── 15b. compute_vignette_factor: corner bounded by 1.0 - strength ───────
+
+    #[test]
+    fn test_compute_vignette_factor_corner_bounded_by_strength() {
+        // Regression: the falloff was previously normalized against r=1.0
+        // instead of the true maximum radius sqrt(2), so the actual image
+        // corner (nx=ny=1.0) always clamped to a factor of exactly 0.0
+        // (fully black) regardless of `strength`. The corner factor must
+        // never drop below `1.0 - strength`.
+        let cfg = LensVignetteConfig::default(); // strength = 0.5
+        let corner = compute_vignette_factor(1.0, 1.0, &cfg);
+        assert!(
+            corner >= 1.0 - cfg.strength - 1e-5,
+            "corner factor {corner} should be >= 1.0 - strength ({})",
+            1.0 - cfg.strength
+        );
+    }
+
     // ── 16. bilinear_sample_f32: in-bounds → correct value ────────────────────
 
     #[test]
@@ -887,17 +994,30 @@ mod tests {
         assert!((rgb[0] - 128.0).abs() < 1.0);
     }
 
-    // ── 18. radial_shift_channel: zero shift → near-identity ─────────────────
+    // ── 18. bilinear_sample_channel_f32: agrees with bilinear_sample_f32 ─────
 
     #[test]
-    fn test_radial_shift_channel_zero_shift() {
-        let img = solid_rgba(8, 8, 100, 150, 200, 255);
-        let plane = radial_shift_channel(&img, 8, 8, 0.0, 0);
-        for &v in &plane {
-            assert!(
-                (v - 100.0).abs() < 1.0,
-                "Zero shift should preserve R values: {v}"
-            );
+    fn test_bilinear_sample_channel_matches_full_sample() {
+        // `apply_chromatic_aberration_rgba` was rewritten to sample one
+        // channel at a time (avoiding 3x redundant bilinear work); the
+        // single-channel sampler must agree with the all-channel sampler
+        // (still used by `apply_barrel_distortion`) on every channel, for
+        // a non-solid-colour image (so genuine interpolation occurs).
+        let img = solid_rgba(6, 5, 37, 91, 214, 255);
+        // Overwrite a few pixels so the image isn't uniform.
+        let mut img = img;
+        img[0] = 250;
+        img[1] = 10;
+        img[2] = 5;
+        for &(fx, fy) in &[(0.0f32, 0.0f32), (2.7, 1.3), (5.0, 4.0), (3.5, 2.5)] {
+            let full = bilinear_sample_f32(&img, 6, 5, fx, fy);
+            for ch in 0..3 {
+                let single = bilinear_sample_channel_f32(&img, 6, 5, fx, fy, ch);
+                assert!(
+                    (single - full[ch]).abs() < 1e-3,
+                    "channel {ch} mismatch at ({fx},{fy}): single={single} full={full:?}"
+                );
+            }
         }
     }
 

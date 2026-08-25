@@ -4,11 +4,15 @@
 // Outputs: grad_positions, grad_rotations, grad_scales, grad_sh_coeffs
 //
 // This shader reverses the forward preprocess operations:
+// 0. cull guard — Gaussians the forward pass rejected on the near/far test are
+//    written as exact zeros instead of dividing by a zero/negative depth
 // 1. grad_position from grad_means2d (through projection Jacobian)
 // 2. grad_cov2d from grad_conics (through matrix inverse)
 // 3. grad_cov3d from grad_cov2d (through J*W projection)
 // 4. grad_rotation, grad_scale from grad_cov3d (through R*S decomposition)
+//    4b. the extra grad_position term through J(p_view)
 // 5. grad_sh_coeffs from grad_colors (through SH evaluation)
+//    5d. the extra grad_position term through dir = normalize(pos - cam_pos)
 
 struct Uniforms {
     view: mat4x4<f32>,
@@ -87,6 +91,40 @@ fn preprocess_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
     let rot = rotations[idx];
     let scale = scales[idx].xyz;
 
+    // SH layout — needed by the cull path below (to zero the coefficients) as
+    // well as by the SH backward block further down.
+    let sh_per_gaussian = (uniforms.sh_degree + 1u) * (uniforms.sh_degree + 1u) * 3u;
+    let sh_offset = idx * sh_per_gaussian;
+
+    // ---- 0. Cull guard ----
+    // preprocess.wgsl culls Gaussians outside [near_plane, far_plane] by writing
+    // radii[idx] = -1 and leaving means2d/cov2d/conics stale.  This kernel runs
+    // for EVERY index, and every projection term below divides by
+    // tz = -p_view.z: at or behind the near plane tz is zero or negative, so
+    // fx/tz becomes ±inf and inf * 0 (a culled Gaussian's zero 2D gradient) is
+    // NaN, which would propagate into grad_positions and poison the optimizer.
+    // `radii` is not bound here, so reproduce the forward cull test instead and
+    // emit exact zeros.
+    //
+    // The forward pass has two further cull paths — det(cov2D) <= 0 and "no
+    // overlapped tile" — but both leave tz > near_plane, so the arithmetic below
+    // stays finite and the gradients come out zero because the incoming 2D
+    // gradients are zero (rasterize_bwd never visited those Gaussians).
+    let p_view = uniforms.view * vec4<f32>(pos, 1.0);
+    let depth = -p_view.z;
+    // The extra `depth < 1e-6` term also covers configurations with a
+    // non-positive near_plane, where the forward test alone would not stop the
+    // division from blowing up.
+    if depth <= uniforms.near_plane || depth >= uniforms.far_plane || depth < 1e-6 {
+        grad_positions[idx] = vec4<f32>(0.0);
+        grad_rotations[idx] = vec4<f32>(0.0);
+        grad_scales[idx] = vec4<f32>(0.0);
+        for (var i = 0u; i < sh_per_gaussian; i++) {
+            grad_sh_coeffs[sh_offset + i] = 0.0;
+        }
+        return;
+    }
+
     // Read 2D gradients
     let dL_dmean2d = vec2<f32>(grad_means2d[idx * 2u], grad_means2d[idx * 2u + 1u]);
     let dL_dconic = vec3<f32>(grad_conics[idx * 3u], grad_conics[idx * 3u + 1u], grad_conics[idx * 3u + 2u]);
@@ -94,10 +132,9 @@ fn preprocess_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // ---- 1. grad_position from grad_means2d ----
     // Forward: p_view = View * [pos, 1]; mean2d = project(p_view)
-    let p_view = uniforms.view * vec4<f32>(pos, 1.0);
     let fx = uniforms.focal.x;
     let fy = uniforms.focal.y;
-    let tz = -p_view.z;  // Use positive depth (RH camera: objects in front have negative z)
+    let tz = depth;  // positive depth (RH camera: objects in front have negative z)
     let tz2 = tz * tz;
 
     // d(mean2d)/d(p_view) = viewport * 0.5 * d(p_ndc)/d(p_view)
@@ -264,9 +301,8 @@ fn preprocess_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
     dL_dpos += transpose(W) * vec3<f32>(dL_dvx_cov, dL_dvy_cov, dL_dvz_cov);
 
     // ---- 5. SH backward: grad_colors → grad_sh_coeffs ----
+    // `sh_per_gaussian` / `sh_offset` are computed above, before the cull guard.
     let dir = normalize(pos - uniforms.cam_pos);
-    let sh_per_gaussian = (uniforms.sh_degree + 1u) * (uniforms.sh_degree + 1u) * 3u;
-    let sh_offset = idx * sh_per_gaussian;
 
     // 5a. Recompute unclamped SH color for clamp derivative
     // Forward applies: color = max(SH_eval + 0.5, 0.0)
@@ -374,8 +410,106 @@ fn preprocess_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 
+    // ---- 5d. SH view-direction gradient → position ----
+    // The forward SH evaluation takes dir = normalize(pos - cam_pos) as its
+    // argument (preprocess.wgsl `eval_sh_degree{1,2,3}_optimized`), so the loss
+    // depends on `pos` through the Gaussian's colour as well as through the
+    // projection.  Reference 3DGS includes this chain
+    // (dL/dcolor → dL/ddir → dL/dpos); omitting it biases every position
+    // gradient whenever sh_degree >= 1.
+    if uniforms.sh_degree >= 1u {
+        let v = pos - uniforms.cam_pos;
+        let v_len2 = dot(v, v);
+        // pos == cam_pos leaves `dir` (and the forward colour) undefined:
+        // contribute nothing rather than a NaN.
+        if v_len2 > 1e-12 {
+            let dx = dir.x; let dy = dir.y; let dz = dir.z;
+
+            let g1_0 = vec3<f32>(sh_coeffs[sh_offset + 3u], sh_coeffs[sh_offset + 4u], sh_coeffs[sh_offset + 5u]);
+            let g1_1 = vec3<f32>(sh_coeffs[sh_offset + 6u], sh_coeffs[sh_offset + 7u], sh_coeffs[sh_offset + 8u]);
+            let g1_2 = vec3<f32>(sh_coeffs[sh_offset + 9u], sh_coeffs[sh_offset + 10u], sh_coeffs[sh_offset + 11u]);
+
+            // Degree-1 basis is (-y, z, -x), so d(colour)/d(dir) is:
+            var dRGB_dx = -SH_C1 * g1_2;
+            var dRGB_dy = -SH_C1 * g1_0;
+            var dRGB_dz = SH_C1 * g1_1;
+
+            if uniforms.sh_degree >= 2u {
+                let xx = dx * dx; let yy = dy * dy; let zz = dz * dz;
+                let q2 = sh_offset + 12u;
+                let g2_0 = vec3<f32>(sh_coeffs[q2], sh_coeffs[q2 + 1u], sh_coeffs[q2 + 2u]);
+                let g2_1 = vec3<f32>(sh_coeffs[q2 + 3u], sh_coeffs[q2 + 4u], sh_coeffs[q2 + 5u]);
+                let g2_2 = vec3<f32>(sh_coeffs[q2 + 6u], sh_coeffs[q2 + 7u], sh_coeffs[q2 + 8u]);
+                let g2_3 = vec3<f32>(sh_coeffs[q2 + 9u], sh_coeffs[q2 + 10u], sh_coeffs[q2 + 11u]);
+                let g2_4 = vec3<f32>(sh_coeffs[q2 + 12u], sh_coeffs[q2 + 13u], sh_coeffs[q2 + 14u]);
+
+                // Basis: C2_0·xy, C2_1·yz, C2_2·(2z²−x²−y²), C2_3·xz, C2_4·(x²−y²)
+                dRGB_dx += SH_C2_0 * dy * g2_0
+                         + SH_C2_2 * (-2.0 * dx) * g2_2
+                         + SH_C2_3 * dz * g2_3
+                         + SH_C2_4 * (2.0 * dx) * g2_4;
+                dRGB_dy += SH_C2_0 * dx * g2_0
+                         + SH_C2_1 * dz * g2_1
+                         + SH_C2_2 * (-2.0 * dy) * g2_2
+                         + SH_C2_4 * (-2.0 * dy) * g2_4;
+                dRGB_dz += SH_C2_1 * dy * g2_1
+                         + SH_C2_2 * (4.0 * dz) * g2_2
+                         + SH_C2_3 * dx * g2_3;
+
+                if uniforms.sh_degree >= 3u {
+                    let xy = dx * dy; let xz = dx * dz; let yz = dy * dz;
+                    let q3 = sh_offset + 27u;
+                    let g3_0 = vec3<f32>(sh_coeffs[q3], sh_coeffs[q3 + 1u], sh_coeffs[q3 + 2u]);
+                    let g3_1 = vec3<f32>(sh_coeffs[q3 + 3u], sh_coeffs[q3 + 4u], sh_coeffs[q3 + 5u]);
+                    let g3_2 = vec3<f32>(sh_coeffs[q3 + 6u], sh_coeffs[q3 + 7u], sh_coeffs[q3 + 8u]);
+                    let g3_3 = vec3<f32>(sh_coeffs[q3 + 9u], sh_coeffs[q3 + 10u], sh_coeffs[q3 + 11u]);
+                    let g3_4 = vec3<f32>(sh_coeffs[q3 + 12u], sh_coeffs[q3 + 13u], sh_coeffs[q3 + 14u]);
+                    let g3_5 = vec3<f32>(sh_coeffs[q3 + 15u], sh_coeffs[q3 + 16u], sh_coeffs[q3 + 17u]);
+                    let g3_6 = vec3<f32>(sh_coeffs[q3 + 18u], sh_coeffs[q3 + 19u], sh_coeffs[q3 + 20u]);
+
+                    dRGB_dx += SH_C3_0 * (6.0 * xy) * g3_0
+                             + SH_C3_1 * yz * g3_1
+                             + SH_C3_2 * (-2.0 * xy) * g3_2
+                             + SH_C3_3 * (-6.0 * xz) * g3_3
+                             + SH_C3_4 * (4.0 * zz - 3.0 * xx - yy) * g3_4
+                             + SH_C3_5 * (2.0 * xz) * g3_5
+                             + SH_C3_6 * (3.0 * (xx - yy)) * g3_6;
+                    dRGB_dy += SH_C3_0 * (3.0 * (xx - yy)) * g3_0
+                             + SH_C3_1 * xz * g3_1
+                             + SH_C3_2 * (4.0 * zz - xx - 3.0 * yy) * g3_2
+                             + SH_C3_3 * (-6.0 * yz) * g3_3
+                             + SH_C3_4 * (-2.0 * xy) * g3_4
+                             + SH_C3_5 * (-2.0 * yz) * g3_5
+                             + SH_C3_6 * (-6.0 * xy) * g3_6;
+                    dRGB_dz += SH_C3_1 * xy * g3_1
+                             + SH_C3_2 * (8.0 * yz) * g3_2
+                             + SH_C3_3 * (3.0 * (2.0 * zz - xx - yy)) * g3_3
+                             + SH_C3_4 * (8.0 * xz) * g3_4
+                             + SH_C3_5 * (xx - yy) * g3_5;
+                }
+            }
+
+            // Contract with the CLAMP-MASKED colour gradient — the forward
+            // clamp max(·, 0) kills the direction path exactly where it kills
+            // the coefficient path.
+            let dL_ddir = vec3<f32>(
+                dot(dRGB_dx, dL_dcolor),
+                dot(dRGB_dy, dL_dcolor),
+                dot(dRGB_dz, dL_dcolor),
+            );
+
+            // Jacobian of normalize(): d(dir)/d(v) = (I − dir·dirᵀ) / |v|.
+            // NOTE: v = pos − cam_pos is already a WORLD-space vector, so this
+            // term is added to dL_dpos directly. It must NOT be multiplied by
+            // transpose(W) the way the view-space projection terms above are.
+            let dL_dv = (dL_ddir - dir * dot(dir, dL_ddir)) / sqrt(v_len2);
+            dL_dpos += dL_dv;
+        }
+    }
+
     // ---- Write outputs ----
-    // Position gradient includes mean2d and cov2d contributions (both additive)
+    // Position gradient includes mean2d, cov2d and SH-direction contributions
+    // (all additive)
     grad_positions[idx] = vec4<f32>(dL_dpos, 0.0);
     grad_rotations[idx] = vec4<f32>(dL_dqx, dL_dqy, dL_dqz, dL_dqw);
     grad_scales[idx] = vec4<f32>(dL_dscale, 0.0);

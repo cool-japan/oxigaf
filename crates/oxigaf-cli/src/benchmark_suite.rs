@@ -298,7 +298,7 @@ const MAX_EXTRA_ITERATIONS_FOR_MIN_TIME: usize = 1_000_000;
 /// Warmup calls are not timed. Normally returns exactly `config.iterations`
 /// entries (nanoseconds each); if `config.min_time_ms > 0.0` and those
 /// iterations finish faster than that floor, additional iterations are
-/// timed (capped by [`MAX_EXTRA_ITERATIONS_FOR_MIN_TIME`]) until the
+/// timed (capped by `MAX_EXTRA_ITERATIONS_FOR_MIN_TIME`) until the
 /// cumulative elapsed time reaches it. The returned vector's length is
 /// always the *actual* number of timed iterations.
 ///
@@ -1060,31 +1060,36 @@ mod tests {
         assert!(time_fn(|| {}, &cfg).is_err());
     }
 
+    /// Regression: `timings.len() > cfg.iterations` alone is timing-dependent
+    /// — under load the base iterations' wall time can pass the floor by
+    /// itself, and `time_fn` then correctly does not extend.
     #[test]
     fn test_time_fn_min_time_ms_extends_iterations() {
         let cfg = BenchmarkConfig {
             iterations: 2,
             warmup: 0,
-            min_time_ms: 5.0, // far more than 2 trivial iterations will take
+            min_time_ms: 50.0, // ~125x the ~400us the base iterations take
             ..Default::default()
         };
         let mut counter = 0usize;
         let timings = time_fn(
             || {
                 counter += 1;
-                // A small sleep so each iteration takes a measurable,
-                // non-zero amount of time without relying on the safety cap.
                 std::thread::sleep(std::time::Duration::from_micros(200));
             },
             &cfg,
         )
         .expect("time_fn failed");
-        assert!(
-            timings.len() > 2,
-            "expected more than 2 iterations to reach the min_time_ms floor, got {}",
-            timings.len()
-        );
         assert_eq!(counter, timings.len());
+
+        let min_ns = cfg.min_time_ms * 1_000_000.0;
+        let base_ns: f64 = timings[..cfg.iterations].iter().sum();
+        assert!(
+            timings.len() > cfg.iterations || base_ns >= min_ns,
+            "base {} iterations took {base_ns:.0}ns of a {min_ns:.0}ns floor \
+             but time_fn did not extend past them",
+            cfg.iterations
+        );
     }
 
     #[test]

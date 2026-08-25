@@ -58,6 +58,34 @@ impl Default for ScalarStats {
     }
 }
 
+/// Compute the linearly-interpolated percentile `p` (0..=100) of `slice`
+/// using `select_nth_unstable_by` for the two bracketing order statistics
+/// instead of a full sort — O(len) rather than O(len log len).
+///
+/// `slice` is partially reordered by this call (its element *set* is
+/// unchanged). Panics only if `slice` is empty (callers must guard that).
+fn percentile_via_select(slice: &mut [f32], p: f64) -> f32 {
+    let n = slice.len();
+    if n == 1 {
+        return slice[0];
+    }
+    let idx = p / 100.0 * (n - 1) as f64;
+    let lo = (idx.floor() as usize).min(n - 1);
+    let frac = (idx - lo as f64) as f32;
+
+    // `select_nth_unstable_by(lo)` partitions `slice` so that `slice[lo]`
+    // holds the value that would be at sorted position `lo`, everything
+    // before it is <=, and everything in `right` is >=. The *minimum* of
+    // `right` is therefore exactly the value at sorted position `lo + 1`
+    // (or equal to `v_lo` when `lo` is already the last index).
+    let (_, &mut v_lo, right) = slice.select_nth_unstable_by(lo, f32::total_cmp);
+    if frac <= 0.0 || right.is_empty() {
+        return v_lo;
+    }
+    let v_hi = right.iter().copied().fold(f32::INFINITY, f32::min);
+    v_lo + frac * (v_hi - v_lo)
+}
+
 /// Compute summary statistics for a slice of f32 values.
 ///
 /// Empty input or all-NaN/Inf input returns `ScalarStats::default()` with
@@ -118,23 +146,17 @@ pub fn compute_scalar_stats(values: &[f32]) -> ScalarStats {
     let variance = (var_sum / n as f64) as f32;
     let std_dev = variance.sqrt();
 
-    // Sort copy for percentiles
-    finite.sort_by(f32::total_cmp);
-
-    let percentile = |p: f64| -> f32 {
-        if n == 1 {
-            return finite[0];
-        }
-        let idx = p / 100.0 * (n - 1) as f64;
-        let lo = idx.floor() as usize;
-        let hi = (lo + 1).min(n - 1);
-        let frac = (idx - lo as f64) as f32;
-        finite[lo] + frac * (finite[hi] - finite[lo])
-    };
-
-    let median = percentile(50.0);
-    let p5 = percentile(5.0);
-    let p95 = percentile(95.0);
+    // Order statistics via `select_nth_unstable_by` (average O(len) per
+    // call) instead of a full O(n log n) sort — `GaussianStats::compute`
+    // calls this for nine fields, so for a multi-million-Gaussian model
+    // avoiding the sort (and its dedicated allocation-free quickselect
+    // partitioning) meaningfully cuts wall time. `select_nth_unstable_by`
+    // is safe to call repeatedly on the same slice: each call produces a
+    // correct result regardless of any partial ordering left by a
+    // previous call.
+    let median = percentile_via_select(&mut finite, 50.0);
+    let p5 = percentile_via_select(&mut finite, 5.0);
+    let p95 = percentile_via_select(&mut finite, 95.0);
 
     ScalarStats {
         count,
@@ -351,56 +373,115 @@ pub struct GaussianStats {
     pub rigid_count: usize,
     /// Number of flexible Gaussians.
     pub flexible_count: usize,
+    /// Exact count of Gaussians whose actual (sigmoid) opacity is > 0.99.
+    /// Backs the "High opacity" check in [`detect_anomalies`] with a real
+    /// count instead of a p95-based guess.
+    pub opacity_above_099_count: usize,
+    /// Exact count of Gaussians with actual scale < 0.001 on *at least one*
+    /// axis (not just the mean of the three axes, which can hide a
+    /// single-axis degenerate Gaussian). Backs the "Degenerate scale"
+    /// check in [`detect_anomalies`].
+    pub degenerate_scale_count: usize,
+}
+
+/// Per-Gaussian scalar fields extracted from a `GaussianModel` in a single
+/// pass, shared by [`GaussianStats::compute`] and
+/// [`GaussianHistograms::compute`] (and [`compute_stats_and_histograms`])
+/// so a caller who needs both never re-derives the same fields twice.
+struct ExtractedFields {
+    pos_x: Vec<f32>,
+    pos_y: Vec<f32>,
+    pos_z: Vec<f32>,
+    scale_x: Vec<f32>,
+    scale_y: Vec<f32>,
+    scale_z: Vec<f32>,
+    scale_mean: Vec<f32>,
+    opacity: Vec<f32>,
+    sh_energy: Vec<f32>,
+    opacity_above_099_count: usize,
+    degenerate_scale_count: usize,
+}
+
+/// Extract [`ExtractedFields`] from `model` in one pass over
+/// `model.gaussians` (plus the SH DC lookup, which shares the same index).
+fn extract_fields(model: &GaussianModel) -> ExtractedFields {
+    let n = model.gaussians.len();
+
+    let mut pos_x = Vec::with_capacity(n);
+    let mut pos_y = Vec::with_capacity(n);
+    let mut pos_z = Vec::with_capacity(n);
+    let mut scale_x = Vec::with_capacity(n);
+    let mut scale_y = Vec::with_capacity(n);
+    let mut scale_z = Vec::with_capacity(n);
+    let mut scale_mean = Vec::with_capacity(n);
+    let mut opacity = Vec::with_capacity(n);
+    let mut sh_energy = Vec::with_capacity(n);
+    let mut opacity_above_099_count = 0usize;
+    let mut degenerate_scale_count = 0usize;
+
+    let sh_total = ((model.sh_degree + 1) * (model.sh_degree + 1) * 3) as usize;
+    let sh_valid = sh_total >= 3 && model.sh_coeffs.len() == n * sh_total;
+
+    for (i, g) in model.gaussians.iter().enumerate() {
+        pos_x.push(g.position[0]);
+        pos_y.push(g.position[1]);
+        pos_z.push(g.position[2]);
+
+        // exp(stored) → actual scale
+        let esx = g.scale[0].exp();
+        let esy = g.scale[1].exp();
+        let esz = g.scale[2].exp();
+        scale_x.push(esx);
+        scale_y.push(esy);
+        scale_z.push(esz);
+        scale_mean.push((esx + esy + esz) / 3.0);
+        if esx.min(esy).min(esz) < 0.001 {
+            degenerate_scale_count += 1;
+        }
+
+        // sigmoid(stored) → actual opacity
+        let op = sigmoid(g.opacity);
+        opacity.push(op);
+        if op > 0.99 {
+            opacity_above_099_count += 1;
+        }
+
+        // SH DC energy: sqrt(dc_r² + dc_g² + dc_b²)
+        if sh_valid {
+            let base = i * sh_total;
+            let r = model.sh_coeffs[base];
+            let gc = model.sh_coeffs[base + 1];
+            let b = model.sh_coeffs[base + 2];
+            sh_energy.push((r * r + gc * gc + b * b).sqrt());
+        } else {
+            sh_energy.push(0.0_f32);
+        }
+    }
+
+    ExtractedFields {
+        pos_x,
+        pos_y,
+        pos_z,
+        scale_x,
+        scale_y,
+        scale_z,
+        scale_mean,
+        opacity,
+        sh_energy,
+        opacity_above_099_count,
+        degenerate_scale_count,
+    }
 }
 
 impl GaussianStats {
     /// Compute statistics from a `GaussianModel`.
     pub fn compute(model: &GaussianModel) -> Self {
+        let fields = extract_fields(model);
+        Self::from_fields(model, &fields)
+    }
+
+    fn from_fields(model: &GaussianModel, fields: &ExtractedFields) -> Self {
         let n = model.gaussians.len();
-
-        let mut pos_x = Vec::with_capacity(n);
-        let mut pos_y = Vec::with_capacity(n);
-        let mut pos_z = Vec::with_capacity(n);
-        let mut sx = Vec::with_capacity(n);
-        let mut sy = Vec::with_capacity(n);
-        let mut sz = Vec::with_capacity(n);
-        let mut scale_avg = Vec::with_capacity(n);
-        let mut opacities = Vec::with_capacity(n);
-
-        for g in &model.gaussians {
-            pos_x.push(g.position[0]);
-            pos_y.push(g.position[1]);
-            pos_z.push(g.position[2]);
-
-            // exp(stored) → actual scale
-            let esx = g.scale[0].exp();
-            let esy = g.scale[1].exp();
-            let esz = g.scale[2].exp();
-            sx.push(esx);
-            sy.push(esy);
-            sz.push(esz);
-            scale_avg.push((esx + esy + esz) / 3.0);
-
-            // sigmoid(stored) → actual opacity
-            let op = sigmoid(g.opacity);
-            opacities.push(op);
-        }
-
-        // SH DC energy: sqrt(dc_r² + dc_g² + dc_b²) per Gaussian
-        let sh_total = ((model.sh_degree + 1) * (model.sh_degree + 1) * 3) as usize;
-        let mut sh_energy = Vec::with_capacity(n);
-        if sh_total >= 3 && model.sh_coeffs.len() == n * sh_total {
-            for i in 0..n {
-                let base = i * sh_total;
-                let r = model.sh_coeffs[base];
-                let g = model.sh_coeffs[base + 1];
-                let b = model.sh_coeffs[base + 2];
-                sh_energy.push((r * r + g * g + b * b).sqrt());
-            }
-        } else {
-            sh_energy.extend(std::iter::repeat_n(0.0_f32, n));
-        }
-
         let rigid_count = model.is_rigid.iter().filter(|&&r| r).count();
         let flexible_count = n - rigid_count;
 
@@ -414,18 +495,20 @@ impl GaussianStats {
 
         GaussianStats {
             num_gaussians: n,
-            position_x: compute_scalar_stats(&pos_x),
-            position_y: compute_scalar_stats(&pos_y),
-            position_z: compute_scalar_stats(&pos_z),
-            scale_mean: compute_scalar_stats(&scale_avg),
-            scale_x: compute_scalar_stats(&sx),
-            scale_y: compute_scalar_stats(&sy),
-            scale_z: compute_scalar_stats(&sz),
-            opacity: compute_scalar_stats(&opacities),
-            sh_energy: compute_scalar_stats(&sh_energy),
+            position_x: compute_scalar_stats(&fields.pos_x),
+            position_y: compute_scalar_stats(&fields.pos_y),
+            position_z: compute_scalar_stats(&fields.pos_z),
+            scale_mean: compute_scalar_stats(&fields.scale_mean),
+            scale_x: compute_scalar_stats(&fields.scale_x),
+            scale_y: compute_scalar_stats(&fields.scale_y),
+            scale_z: compute_scalar_stats(&fields.scale_z),
+            opacity: compute_scalar_stats(&fields.opacity),
+            sh_energy: compute_scalar_stats(&fields.sh_energy),
             memory_bytes,
             rigid_count,
             flexible_count,
+            opacity_above_099_count: fields.opacity_above_099_count,
+            degenerate_scale_count: fields.degenerate_scale_count,
         }
     }
 }
@@ -460,47 +543,20 @@ impl GaussianHistograms {
     ///
     /// `num_bins` controls the number of bins; use 50 as a default.
     pub fn compute(model: &GaussianModel, num_bins: usize) -> Self {
-        let n = model.gaussians.len();
+        let fields = extract_fields(model);
+        Self::from_fields(&fields, num_bins)
+    }
+
+    fn from_fields(fields: &ExtractedFields, num_bins: usize) -> Self {
         let num_bins = if num_bins == 0 { 50 } else { num_bins };
 
-        let mut pos_x = Vec::with_capacity(n);
-        let mut pos_y = Vec::with_capacity(n);
-        let mut pos_z = Vec::with_capacity(n);
-        let mut scale_avg = Vec::with_capacity(n);
-        let mut opacities = Vec::with_capacity(n);
-
-        for g in &model.gaussians {
-            pos_x.push(g.position[0]);
-            pos_y.push(g.position[1]);
-            pos_z.push(g.position[2]);
-            let esx = g.scale[0].exp();
-            let esy = g.scale[1].exp();
-            let esz = g.scale[2].exp();
-            scale_avg.push((esx + esy + esz) / 3.0);
-            opacities.push(sigmoid(g.opacity));
-        }
-
-        let sh_total = ((model.sh_degree + 1) * (model.sh_degree + 1) * 3) as usize;
-        let mut sh_energy = Vec::with_capacity(n);
-        if sh_total >= 3 && model.sh_coeffs.len() == n * sh_total {
-            for i in 0..n {
-                let base = i * sh_total;
-                let r = model.sh_coeffs[base];
-                let g_c = model.sh_coeffs[base + 1];
-                let b = model.sh_coeffs[base + 2];
-                sh_energy.push((r * r + g_c * g_c + b * b).sqrt());
-            }
-        } else {
-            sh_energy.extend(std::iter::repeat_n(0.0_f32, n));
-        }
-
         GaussianHistograms {
-            position_x: Histogram::compute(&pos_x, num_bins),
-            position_y: Histogram::compute(&pos_y, num_bins),
-            position_z: Histogram::compute(&pos_z, num_bins),
-            scale_mean: Histogram::compute(&scale_avg, num_bins),
-            opacity: Histogram::compute(&opacities, num_bins),
-            sh_energy: Histogram::compute(&sh_energy, num_bins),
+            position_x: Histogram::compute(&fields.pos_x, num_bins),
+            position_y: Histogram::compute(&fields.pos_y, num_bins),
+            position_z: Histogram::compute(&fields.pos_z, num_bins),
+            scale_mean: Histogram::compute(&fields.scale_mean, num_bins),
+            opacity: Histogram::compute(&fields.opacity, num_bins),
+            sh_energy: Histogram::compute(&fields.sh_energy, num_bins),
         }
     }
 
@@ -526,6 +582,23 @@ impl GaussianHistograms {
         }
         out
     }
+}
+
+/// Compute both [`GaussianStats`] and [`GaussianHistograms`] from a single
+/// extraction pass over `model`.
+///
+/// Calling [`GaussianStats::compute`] and [`GaussianHistograms::compute`]
+/// separately each re-derive the same per-Gaussian scalar fields from
+/// scratch; when both are needed for the same model (e.g. a full report),
+/// this halves that field-derivation work.
+pub fn compute_stats_and_histograms(
+    model: &GaussianModel,
+    num_bins: usize,
+) -> (GaussianStats, GaussianHistograms) {
+    let fields = extract_fields(model);
+    let stats = GaussianStats::from_fields(model, &fields);
+    let histograms = GaussianHistograms::from_fields(&fields, num_bins);
+    (stats, histograms)
 }
 
 // ─── Report formatting ───────────────────────────────────────────────────────
@@ -587,10 +660,11 @@ pub fn format_gaussian_report(stats: &GaussianStats) -> String {
 ///
 /// An empty return value indicates no anomalies were found.
 ///
-/// Checks:
+/// Checks (all exact counts from `stats`, not heuristics):
 /// - High opacity: >10% of Gaussians have actual opacity > 0.99
 /// - Exploding scale: max actual scale > 5.0
-/// - Degenerate scale: >0% of Gaussians have actual scale < 0.001
+/// - Degenerate scale: >0% of Gaussians have actual scale < 0.001 on at
+///   least one axis
 /// - NaN in positions
 pub fn detect_anomalies(stats: &GaussianStats) -> Vec<String> {
     let mut warnings = Vec::new();
@@ -617,32 +691,26 @@ pub fn detect_anomalies(stats: &GaussianStats) -> Vec<String> {
         warnings.push(format!("Exploding scale: max scale {max_scale:.4} > 5.0"));
     }
 
-    // High opacity: >10% of Gaussians have opacity > 0.99
-    // We check using p95; a more precise check would need raw data.
-    // Since we have opacity stats computed from actual (sigmoid) values,
-    // we can check if p95 > 0.99 (rough proxy) — but the spec says
-    // "X% of Gaussians have opacity > 0.99", which requires counting.
-    // We approximate: if max > 0.99 and (1-p95) proportion > 10%.
-    // Actually, we use p95 as proxy: if p95 > 0.99 → >5% above 0.99 → >10% possible.
-    // For a correct check we'd need raw values. The anomaly detector is a heuristic,
-    // so we use the p95 as a conservative trigger.
-    if stats.opacity.p95 > 0.99 {
-        // estimate percentage: if p95 > 0.99, then at least 5% of values are above 0.99.
-        // We report conservatively.
-        let pct = ((1.0 - 0.95) * 100.0) as usize;
+    // High opacity: >10% of Gaussians have opacity > 0.99. `stats` now
+    // carries the exact count (computed alongside the rest of the fields
+    // in `GaussianStats::compute`), so this is a real measurement rather
+    // than a p95-based guess.
+    let opacity_pct = stats.opacity_above_099_count as f64 / n as f64 * 100.0;
+    if opacity_pct > 10.0 {
         warnings.push(format!(
-            "High opacity: at least {pct}% of Gaussians have opacity > 0.99 (p95={:.4})",
-            stats.opacity.p95
+            "High opacity: {opacity_pct:.1}% of Gaussians have opacity > 0.99 ({} of {n})",
+            stats.opacity_above_099_count
         ));
     }
 
-    // Degenerate scale: any Gaussian has actual scale < 0.001
-    // We check the min of the average scale
-    if stats.scale_mean.min < 0.001 {
-        // We can't know exact percentage without raw data, report the minimum
+    // Degenerate scale: >0% of Gaussians have actual scale < 0.001 on at
+    // least one axis. Checked per-axis (not on the mean of the three
+    // axes), so a Gaussian degenerate along only one axis is still caught.
+    if stats.degenerate_scale_count > 0 {
+        let degenerate_pct = stats.degenerate_scale_count as f64 / n as f64 * 100.0;
         warnings.push(format!(
-            "Degenerate: min mean scale {:.6} < 0.001",
-            stats.scale_mean.min
+            "Degenerate scale: {degenerate_pct:.1}% of Gaussians have scale < 0.001 on at least one axis ({} of {n})",
+            stats.degenerate_scale_count
         ));
     }
 
@@ -1019,6 +1087,192 @@ mod tests {
         assert!(
             anomalies.iter().any(|w| w.contains("scale")),
             "Expected exploding scale warning, got: {anomalies:?}"
+        );
+    }
+
+    // ── detect_anomalies: exact-count regression tests ───────────────────────
+
+    #[test]
+    fn test_detect_anomalies_high_opacity_exact_count_above_threshold() {
+        // Exactly 3 of 20 (15%) Gaussians have opacity > 0.99 → must trigger
+        // (>10%). The old p95-based heuristic could not distinguish this
+        // from many other fractions; `opacity_above_099_count` now gives
+        // the exact figure.
+        let n = 20;
+        let sh_degree = 0u32;
+        let sh_total = ((sh_degree + 1) * (sh_degree + 1) * 3) as usize;
+        let gaussians: Vec<GaussianAttributes> = (0..n)
+            .map(|i| GaussianAttributes {
+                position: [0.0, 0.0, 0.0],
+                _pad0: 0.0,
+                rotation: [0.0, 0.0, 0.0, 1.0],
+                scale: [-1.0, -1.0, -1.0],
+                opacity: if i < 3 { 10.0 } else { -2.0 },
+            })
+            .collect();
+        let model = GaussianModel {
+            gaussians,
+            sh_coeffs: vec![0.0_f32; n * sh_total],
+            sh_degree,
+            face_indices: vec![0u32; n],
+            barycentric: vec![[1.0 / 3.0; 3]; n],
+            local_offsets: vec![[0.0; 3]; n],
+            is_rigid: vec![false; n],
+        };
+        let stats = GaussianStats::compute(&model);
+        assert_eq!(stats.opacity_above_099_count, 3);
+        let anomalies = detect_anomalies(&stats);
+        assert!(
+            anomalies
+                .iter()
+                .any(|w| w.contains("opacity") && w.contains("15.0%")),
+            "Expected a 15% high-opacity warning, got: {anomalies:?}"
+        );
+    }
+
+    #[test]
+    fn test_detect_anomalies_high_opacity_at_threshold_no_warning() {
+        // Exactly 2 of 20 (10%) Gaussians have opacity > 0.99 → must NOT
+        // trigger, since the documented check is a strict ">10%".
+        let n = 20;
+        let sh_degree = 0u32;
+        let sh_total = ((sh_degree + 1) * (sh_degree + 1) * 3) as usize;
+        let gaussians: Vec<GaussianAttributes> = (0..n)
+            .map(|i| GaussianAttributes {
+                position: [0.0, 0.0, 0.0],
+                _pad0: 0.0,
+                rotation: [0.0, 0.0, 0.0, 1.0],
+                scale: [-1.0, -1.0, -1.0],
+                opacity: if i < 2 { 10.0 } else { -2.0 },
+            })
+            .collect();
+        let model = GaussianModel {
+            gaussians,
+            sh_coeffs: vec![0.0_f32; n * sh_total],
+            sh_degree,
+            face_indices: vec![0u32; n],
+            barycentric: vec![[1.0 / 3.0; 3]; n],
+            local_offsets: vec![[0.0; 3]; n],
+            is_rigid: vec![false; n],
+        };
+        let stats = GaussianStats::compute(&model);
+        assert_eq!(stats.opacity_above_099_count, 2);
+        let anomalies = detect_anomalies(&stats);
+        assert!(
+            !anomalies.iter().any(|w| w.contains("opacity")),
+            "Expected no high-opacity warning at exactly 10%, got: {anomalies:?}"
+        );
+    }
+
+    #[test]
+    fn test_detect_anomalies_degenerate_scale_single_axis_caught() {
+        // Only the Z axis is degenerate (< 0.001); the *mean* of the three
+        // axes is not, so the old mean-based check would have missed this
+        // entirely.
+        let n = 4;
+        let sh_degree = 0u32;
+        let sh_total = ((sh_degree + 1) * (sh_degree + 1) * 3) as usize;
+        let gaussians: Vec<GaussianAttributes> = (0..n)
+            .map(|_| GaussianAttributes {
+                position: [0.0, 0.0, 0.0],
+                _pad0: 0.0,
+                rotation: [0.0, 0.0, 0.0, 1.0],
+                // exp(-1) ≈ 0.368, exp(-1) ≈ 0.368, exp(-10) ≈ 0.0000454 (< 0.001)
+                scale: [-1.0, -1.0, -10.0],
+                opacity: 0.0,
+            })
+            .collect();
+        let model = GaussianModel {
+            gaussians,
+            sh_coeffs: vec![0.0_f32; n * sh_total],
+            sh_degree,
+            face_indices: vec![0u32; n],
+            barycentric: vec![[1.0 / 3.0; 3]; n],
+            local_offsets: vec![[0.0; 3]; n],
+            is_rigid: vec![false; n],
+        };
+        let stats = GaussianStats::compute(&model);
+        // The mean-based check would NOT have flagged this: mean ≈ 0.245.
+        assert!(stats.scale_mean.min > 0.001);
+        // The per-axis check correctly flags all 4 Gaussians.
+        assert_eq!(stats.degenerate_scale_count, 4);
+        let anomalies = detect_anomalies(&stats);
+        assert!(
+            anomalies.iter().any(|w| w.contains("Degenerate")),
+            "Expected a degenerate-scale warning, got: {anomalies:?}"
+        );
+    }
+
+    // ── percentile_via_select: parity with the old full-sort computation ─────
+
+    #[test]
+    fn test_percentile_via_select_matches_full_sort() {
+        // 137 pseudo-random-ish values (not evenly spaced, with
+        // duplicates) — enough to exercise `select_nth_unstable_by` across
+        // several distinct ranks and confirm it agrees with a plain sort.
+        // `wrapping_mul` avoids an overflow panic in debug builds (the
+        // product legitimately exceeds u32::MAX for i > ~1.6).
+        let values: Vec<f32> = (0..137u32)
+            .map(|i| ((i.wrapping_mul(2654435761)) % 10007) as f32 * 0.01)
+            .collect();
+
+        let mut sorted = values.clone();
+        sorted.sort_by(f32::total_cmp);
+        let expected_percentile = |p: f64| -> f32 {
+            let n = sorted.len();
+            let idx = p / 100.0 * (n - 1) as f64;
+            let lo = idx.floor() as usize;
+            let hi = (lo + 1).min(n - 1);
+            let frac = (idx - lo as f64) as f32;
+            sorted[lo] + frac * (sorted[hi] - sorted[lo])
+        };
+
+        let stats = compute_scalar_stats(&values);
+        for (name, p, expected) in [
+            ("median", 50.0, expected_percentile(50.0)),
+            ("p5", 5.0, expected_percentile(5.0)),
+            ("p95", 95.0, expected_percentile(95.0)),
+        ] {
+            let actual = match name {
+                "median" => stats.median,
+                "p5" => stats.p5,
+                _ => stats.p95,
+            };
+            assert!(
+                (actual - expected).abs() < 1e-3,
+                "{name} (p={p}) mismatch: select-based={actual}, full-sort={expected}"
+            );
+        }
+    }
+
+    // ── compute_stats_and_histograms: single-pass combined computation ───────
+
+    #[test]
+    fn test_compute_stats_and_histograms_matches_separate_calls() {
+        let model = make_model(30, 1);
+        let (stats, histograms) = compute_stats_and_histograms(&model, 10);
+
+        let stats_alone = GaussianStats::compute(&model);
+        let histograms_alone = GaussianHistograms::compute(&model, 10);
+
+        assert_eq!(stats.num_gaussians, stats_alone.num_gaussians);
+        assert_eq!(
+            stats.opacity_above_099_count,
+            stats_alone.opacity_above_099_count
+        );
+        assert_eq!(
+            stats.degenerate_scale_count,
+            stats_alone.degenerate_scale_count
+        );
+        assert!((stats.position_x.mean - stats_alone.position_x.mean).abs() < 1e-6);
+
+        assert_eq!(
+            histograms.position_x.num_bins,
+            histograms_alone.position_x.num_bins
+        );
+        assert_eq!(
+            histograms.opacity.counts, histograms_alone.opacity.counts,
+            "histogram bin counts should match the separately-computed version"
         );
     }
 }

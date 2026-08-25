@@ -63,16 +63,34 @@ pub struct ViewEvalResult {
     /// Identifier for this view (e.g. file name or camera index).
     pub view_id: String,
     /// PSNR in dB; `f32::INFINITY` when images are identical.
+    ///
+    /// Always computed, even when [`EvalConfig::metrics`] omits
+    /// [`EvalMetricKind::Psnr`] — it is the ranking key for every aggregate.
     pub psnr: f32,
     /// SSIM in [−1, 1] (ideally ≈1.0 for good quality).
+    ///
+    /// `f32::NAN` when [`EvalConfig::metrics`] did not select
+    /// [`EvalMetricKind::Ssim`].
     pub ssim: f32,
     /// LPIPS approximation; lower means perceptually closer.
+    ///
+    /// `f32::NAN` when [`EvalConfig::metrics`] did not select
+    /// [`EvalMetricKind::LpipsApprox`].
     pub lpips_approx: f32,
     /// Mean absolute error.
+    ///
+    /// `f32::NAN` when [`EvalConfig::metrics`] did not select
+    /// [`EvalMetricKind::Mae`].
     pub mae: f32,
     /// Root mean square error.
+    ///
+    /// `f32::NAN` when [`EvalConfig::metrics`] did not select
+    /// [`EvalMetricKind::Rmse`].
     pub rmse: f32,
     /// Multi-scale SSIM.
+    ///
+    /// `f32::NAN` when [`EvalConfig::metrics`] did not select
+    /// [`EvalMetricKind::SsimMs`].
     pub ssim_ms: f32,
     /// Image width in pixels.
     pub width: usize,
@@ -87,8 +105,29 @@ pub struct ViewEvalResult {
 #[derive(Debug, Clone)]
 pub struct EvalConfig {
     /// Which metrics to compute (all by default).
+    ///
+    /// Honoured by `eval_suite`: an unselected metric is not computed at all
+    /// (skipping SSIM *and* MS-SSIM avoids the Gaussian-window convolutions,
+    /// the dominant cost of a full evaluation) and is reported as `f32::NAN`
+    /// on every [`ViewEvalResult`], which propagates to the corresponding
+    /// aggregate mean.
+    ///
+    /// [`EvalMetricKind::Psnr`] is computed unconditionally — it is a single
+    /// cheap pass and the ranking key behind `worst_views`, `best_views`,
+    /// `std_psnr`, `min_psnr`/`max_psnr`, and the histogram/percentile
+    /// helpers — so listing it is implied.
+    ///
+    /// Must name at least one kind; an empty list is rejected with
+    /// [`EvalError::InvalidConfig`].
     pub metrics: Vec<EvalMetricKind>,
     /// Whether to store per-view results in the returned suite result.
+    ///
+    /// Not currently consulted: `eval_suite` always populates
+    /// [`EvalSuiteResult::per_view`], because `eval_compare` needs the
+    /// per-view list to count improved/degraded views and the `analyze eval`
+    /// command reads it for `--per-view`. Honouring this flag therefore has
+    /// to change its default to `true` in the same commit, or those callers
+    /// silently lose their data.
     pub save_per_view_results: bool,
     /// Number of worst-performing views to report (by PSNR).
     pub n_worst_views: usize,
@@ -107,11 +146,15 @@ pub struct EvalSuiteResult {
     pub mean_lpips: f32,
     /// Mean MAE across all views.
     pub mean_mae: f32,
-    /// Standard deviation of PSNR across views.
+    /// Standard deviation of PSNR across views, over the finite (imperfect)
+    /// views only — a spread is undefined once an infinity enters it. `0.0`
+    /// when fewer than two views are finite.
     pub std_psnr: f32,
-    /// Minimum PSNR across views.
+    /// Minimum PSNR across views; `f32::INFINITY` only when *every* view is a
+    /// pixel-perfect match.
     pub min_psnr: f32,
-    /// Maximum PSNR across views.
+    /// Maximum PSNR across views, infinities included: `f32::INFINITY` when
+    /// at least one view is a pixel-perfect match.
     pub max_psnr: f32,
     /// Total number of evaluated views.
     pub n_views: usize,

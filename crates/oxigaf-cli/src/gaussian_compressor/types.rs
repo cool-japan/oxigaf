@@ -120,6 +120,64 @@ impl QuantizedAttribute {
         }
     }
 }
+/// K-means position clustering persisted alongside residual-encoded positions.
+///
+/// When [`CompressedScene::position_clustering`] is `Some`, the scene's
+/// `positions` attribute holds per-Gaussian **residuals** (offset from the
+/// assigned cluster centre) rather than absolute world positions. Residuals
+/// have a far smaller dynamic range than absolute coordinates, so the same
+/// bit width resolves them much more finely — that is the whole point of the
+/// clustering pass. Reconstruction is
+/// `position[i] = centers[assignments[i]] + residual[i]`, performed by
+/// [`CompressedScene::reconstruct_positions`].
+#[derive(Debug, Clone)]
+pub struct PositionClustering {
+    /// Cluster centres, flat K×3, stored at full f32 precision.
+    ///
+    /// K is the codebook size and is tiny next to N, so quantizing the
+    /// centres would trade a negligible size win for error injected into
+    /// *every* Gaussian assigned to that centre.
+    pub centers: Vec<f32>,
+    /// Per-Gaussian cluster index, length N (= [`CompressedScene::n_gaussians`]).
+    ///
+    /// Every entry is `< n_clusters()`; [`CompressedScene::reconstruct_positions`]
+    /// rejects an out-of-range index with
+    /// [`CompressorError::DimensionMismatch`] rather than indexing past the
+    /// codebook.
+    pub assignments: Vec<u32>,
+}
+impl PositionClustering {
+    /// Number of cluster centres in the codebook (K).
+    pub fn n_clusters(&self) -> usize {
+        self.centers.len() / 3
+    }
+    /// Bytes needed per stored cluster index.
+    ///
+    /// Assignments are held in memory as `u32` for convenience, but a
+    /// serialized codebook index only needs as many bytes as K demands —
+    /// one byte for the common case of a 256-entry codebook. Reporting the
+    /// narrow width keeps [`CompressedScene::compressed_bytes`] consistent
+    /// with how [`QuantizedAttribute::byte_size`] reports i8/i16/f32 widths
+    /// rather than in-memory `Vec` overhead.
+    pub fn index_byte_width(&self) -> usize {
+        let k = self.n_clusters();
+        if k <= u8::MAX as usize + 1 {
+            1
+        } else if k <= u16::MAX as usize + 1 {
+            2
+        } else {
+            4
+        }
+    }
+    /// Size in bytes of the clustering payload: codebook plus indices.
+    ///
+    /// This *is* part of the compressed representation — a decompressor
+    /// cannot rebuild absolute positions without it — so it counts toward
+    /// [`CompressedScene::compressed_bytes`].
+    pub fn byte_size(&self) -> usize {
+        self.centers.len() * 4 + self.assignments.len() * self.index_byte_width()
+    }
+}
 /// Configuration for k-means position clustering.
 #[derive(Debug, Clone)]
 pub struct KMeansConfig {
@@ -222,6 +280,11 @@ pub struct ScenePruningConfig {
 /// A fully compressed Gaussian scene with all attributes quantized.
 pub struct CompressedScene {
     /// Positions N×3, quantized.
+    ///
+    /// When [`Self::position_clustering`] is `Some`, these are **residuals**
+    /// relative to the assigned cluster centre, not absolute world
+    /// positions — use [`Self::reconstruct_positions`] (or `gc_decompress`)
+    /// instead of dequantizing this field directly.
     pub positions: QuantizedAttribute,
     /// Rotations N×4 (quaternions), quantized.
     pub rotations: QuantizedAttribute,
@@ -237,18 +300,94 @@ pub struct CompressedScene {
     pub n_gaussians: usize,
     /// Number of SH rest coefficients per Gaussian.
     pub n_sh_rest: usize,
+    /// K-means position codebook, present only when the compression config
+    /// requested position clustering.
+    ///
+    /// `Some` means [`Self::positions`] holds residuals; `None` means it
+    /// holds absolute positions.
+    pub position_clustering: Option<PositionClustering>,
+    /// Index into the **original, pre-pruning** arrays for each survivor,
+    /// ascending. Length is [`Self::n_gaussians`].
+    ///
+    /// `gc_compress` prunes before quantizing, so compressed row `j`
+    /// corresponds to original Gaussian `kept_indices[j]`, not original row
+    /// `j`. Recording the mapping is what lets `gc_compute_stats` compare
+    /// each survivor against the *right* original instead of reporting an
+    /// index-misaligned RMSE (or giving up and reporting `NaN`).
+    ///
+    /// This is compression-time provenance, not payload: a decompressor
+    /// never needs it to rebuild the scene, so it deliberately does **not**
+    /// count toward [`Self::compressed_bytes`].
+    pub kept_indices: Vec<u32>,
     /// The compression configuration used.
     pub compression_config: CompressionConfig,
 }
 impl CompressedScene {
-    /// Total compressed size in bytes (all quantized attributes).
+    /// Total compressed size in bytes (all quantized attributes, plus the
+    /// position codebook and cluster indices when clustering is used).
+    ///
+    /// [`Self::kept_indices`] is excluded: it records which originals
+    /// survived pruning and is not needed to reconstruct the scene.
     pub fn compressed_bytes(&self) -> usize {
+        let clustering_bytes = self
+            .position_clustering
+            .as_ref()
+            .map_or(0, PositionClustering::byte_size);
         self.positions.byte_size()
             + self.rotations.byte_size()
             + self.scales.byte_size()
             + self.opacities.byte_size()
             + self.sh_dc.byte_size()
             + self.sh_rest.byte_size()
+            + clustering_bytes
+    }
+    /// Rebuild absolute world positions, flat N×3.
+    ///
+    /// Without clustering this is just the dequantized `positions`
+    /// attribute. With clustering it adds each Gaussian's assigned cluster
+    /// centre back onto its stored residual. Malformed clustering data
+    /// (wrong assignment count, empty or ragged codebook, out-of-range
+    /// index) is reported as an error rather than panicking on an
+    /// out-of-bounds index.
+    pub fn reconstruct_positions(&self) -> Result<Vec<f32>, CompressorError> {
+        let mut positions = self.positions.dequantize();
+        let Some(clustering) = self.position_clustering.as_ref() else {
+            return Ok(positions);
+        };
+        let n = self.n_gaussians;
+        if positions.len() != n * 3 {
+            return Err(CompressorError::DimensionMismatch {
+                expected: n * 3,
+                got: positions.len(),
+            });
+        }
+        if clustering.assignments.len() != n {
+            return Err(CompressorError::DimensionMismatch {
+                expected: n,
+                got: clustering.assignments.len(),
+            });
+        }
+        if clustering.centers.is_empty() || !clustering.centers.len().is_multiple_of(3) {
+            return Err(CompressorError::InvalidConfig(format!(
+                "cluster centers must be a non-empty flat array of 3D points (length a multiple \
+                 of 3), got length {}",
+                clustering.centers.len()
+            )));
+        }
+        let k = clustering.n_clusters();
+        for (i, &assignment) in clustering.assignments.iter().enumerate() {
+            let ci = assignment as usize;
+            if ci >= k {
+                return Err(CompressorError::DimensionMismatch {
+                    expected: k,
+                    got: ci,
+                });
+            }
+            positions[i * 3] += clustering.centers[ci * 3];
+            positions[i * 3 + 1] += clustering.centers[ci * 3 + 1];
+            positions[i * 3 + 2] += clustering.centers[ci * 3 + 2];
+        }
+        Ok(positions)
     }
     /// Equivalent uncompressed size in bytes (all as f32).
     pub fn uncompressed_bytes(&self) -> usize {

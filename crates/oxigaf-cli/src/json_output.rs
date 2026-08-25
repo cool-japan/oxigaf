@@ -125,18 +125,26 @@ impl JsonOutput {
     }
 
     /// Add a warning message.
-    #[allow(dead_code)]
+    ///
+    /// This is the machine-readable half of
+    /// [`crate::commands::flag_warnings`]: a handler that emits warnings on
+    /// stderr should attach the same strings here so a `--json` consumer sees
+    /// them without having to scrape stderr.
+    ///
+    /// A warning never downgrades an already-failed document: once
+    /// [`Self::add_error`] has set [`Status::Error`], the status stays
+    /// `Error` and the warning is recorded alongside it.
     pub fn add_warning(&mut self, warning: String) {
         self.warnings.push(warning);
-        if !self.errors.is_empty() {
-            // Keep error status if we already have errors
-        } else {
+        if self.errors.is_empty() {
             self.status = Status::Warning;
         }
     }
 
     /// Add an error message.
-    #[allow(dead_code)]
+    ///
+    /// Sets the document status to [`Status::Error`] unconditionally — an
+    /// error outranks any warning already recorded.
     pub fn add_error(&mut self, error: String) {
         self.errors.push(error);
         self.status = Status::Error;
@@ -214,6 +222,35 @@ mod tests {
         output.add_error("Fatal error".to_string());
         assert!(matches!(output.status, Status::Error));
         assert_eq!(output.errors.len(), 1);
+    }
+
+    /// Regression: `add_warning` guarded its status update with an empty
+    /// `if !errors.is_empty() { /* keep error status */ } else { .. }`. The
+    /// intent — a warning must never downgrade a failed document back to
+    /// `Warning` — was only expressed by that comment and was untested.
+    #[test]
+    fn test_warning_does_not_downgrade_error_status() {
+        let mut output = JsonOutput::new("test");
+        output.add_error("Fatal error".to_string());
+        output.add_warning("Low memory".to_string());
+
+        assert!(
+            matches!(output.status, Status::Error),
+            "a warning must not downgrade an already-failed document"
+        );
+        assert_eq!(output.errors.len(), 1);
+        assert_eq!(output.warnings.len(), 1, "the warning is still recorded");
+    }
+
+    /// The reverse order: an error raised after a warning wins.
+    #[test]
+    fn test_error_overrides_warning_status() {
+        let mut output = JsonOutput::new("test");
+        output.add_warning("Low memory".to_string());
+        assert!(matches!(output.status, Status::Warning));
+
+        output.add_error("Fatal error".to_string());
+        assert!(matches!(output.status, Status::Error));
     }
 
     #[test]

@@ -3,23 +3,23 @@
 ## ✅ Completed (from plan)
 
 ### Core Training Loop
-- ✅ Main `Trainer` struct with orchestration (923 lines)
+- ✅ Main `Trainer` struct with orchestration (1,985 lines)
 - ✅ Iterative denoising distillation loop
 - ✅ Gaussian initialization on FLAME mesh (`init.rs`, 130 lines)
-- ✅ Per-parameter Adam optimizer with group-wise learning rates (501 lines)
+- ✅ Per-parameter Adam optimizer with group-wise learning rates (1,209 lines)
 - ✅ Learning rate scheduling (exponential decay)
-- ✅ Checkpoint save/load (JSON + flat f32 arrays, 490 lines)
+- ✅ Checkpoint save/load (JSON + flat f32 arrays, 1,029 lines)
 
-### Loss Functions (1,277 lines)
+### Loss Functions (1,604 lines)
 - ✅ Photometric loss (L1 + SSIM blend)
 - ✅ SSIM computation (structural similarity)
-- ✅ **LPIPS** perceptual loss (689 lines, Pure Rust VGG network)
+- ✅ **LPIPS** perceptual loss (806 lines, Pure Rust VGG network)
 - ✅ Position regularization (binding to FLAME mesh)
 - ✅ Scale regularization (prevent oversized Gaussians)
 - ✅ Opacity regularization (sparsity)
 - ✅ Normal consistency loss
 
-### Adaptive Density Control (349 lines)
+### Adaptive Density Control (624 lines)
 - ✅ Clone Gaussians (high gradient, small scale)
 - ✅ Split Gaussians (high gradient, large scale)
 - ✅ Prune Gaussians (low opacity, large screen size)
@@ -27,23 +27,23 @@
 - ✅ Opacity reset schedule
 
 ### Metrics & Logging
-- ✅ PSNR computation (196 lines)
+- ✅ PSNR + SSIM tracking (`metrics.rs`, 252 lines)
 - ✅ SSIM metric tracking
-- ✅ **TensorBoard integration** (1,181 lines - EXCEEDS PLAN!)
+- ✅ **TensorBoard integration** (1,290 lines - EXCEEDS PLAN!)
   - Scalar logging (loss, metrics)
   - Image logging (renders, pseudo-GT)
   - Histogram logging (parameters, gradients)
   - Graph logging
 - ✅ Metric history tracking
 
-### Diffusion Target Generation (973 lines)
+### Diffusion Target Generation (1,907 lines)
 - ✅ Pseudo-GT generation from current renders
 - ✅ Normal map conditioning
 - ✅ Camera pose integration
 - ✅ Multi-view consistency
 
 ### Testing
-- ✅ **2787 tests** (all passing, 11 ignored GPU/slow) - EXCEEDS PLAN
+- ✅ **3,174 tests** (12 ignored GPU/slow) - EXCEEDS PLAN
 - ✅ Unit tests across all modules
 - ✅ Integration tests
 - ✅ Property-based tests (proptest)
@@ -51,8 +51,12 @@
 
 ### Code Quality
 - ✅ No unwrap policy
-- ✅ All files under 1,300 lines
-- ✅ Total: 7,332 lines
+- ⚠️ Not all files are under the 2,000-line policy cap any more:
+  `anomaly_detection.rs` (2,168 lines) and `domain_adaptation.rs` (2,271
+  lines) exceed it and need a splitrs-class module split
+- ✅ Total: ~92,200 lines across 70 source files — grew well beyond the
+  original ~10-module core listed above via the v0.1.1 training-regime,
+  gradient-tool, and optimisation-utility modules below
 - ✅ Comprehensive error handling
 
 ## ✅ Completed (v0.1.1)
@@ -169,7 +173,7 @@ Currently none - implementation is remarkably complete!
 - ✅ EMA parameter tracking: 100% (bias-corrected, density-control aware)
 - ⬜ End-to-end integration: pending (requires real model weights for full test)
 
-### Tests: 2787 tests (all passing, 11 ignored GPU/slow) - **EXCELLENT**
+### Tests: 3,174 tests (12 ignored GPU/slow) - **EXCELLENT**
 
 ### Documentation: Good
 
@@ -185,9 +189,9 @@ Currently none - implementation is remarkably complete!
 ## 🏆 Implementation Highlights
 
 **EXCEEDS PLAN:**
-1. **TensorBoard integration** (1,181 lines) - Not in original plan!
-2. **LPIPS in Pure Rust** (689 lines) - No Python dependency
-3. **2787 tests** - Exceptional coverage (11 ignored GPU/slow)
+1. **TensorBoard integration** (1,290 lines) - Not in original plan!
+2. **LPIPS in Pure Rust** (806 lines) - No Python dependency
+3. **3,174 tests** - Exceptional coverage (12 ignored GPU/slow)
 7. **Video input support** — `VideoFrameIterator`, `VideoConfig`, `FrameBatch`, `TrainerError::SequenceError`, 15 tests
 4. **Comprehensive checkpoint format**
 5. **Guidance scale annealing** - `annealed_guidance_scale(step)`, linear decay (7 tests)

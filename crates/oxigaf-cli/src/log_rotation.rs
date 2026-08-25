@@ -43,7 +43,7 @@ pub enum LogRotation {
     /// Rotate by size (bytes).
     ///
     /// Note: `tracing-appender` has no native size-based strategy, so this
-    /// is implemented locally by [`SizeRotatingWriter`]: once the active
+    /// is implemented locally by `SizeRotatingWriter`: once the active
     /// file reaches the given byte count, it is renamed to `<file>.1`
     /// (shifting any existing `.1..N-1` backups up by one slot and
     /// dropping the oldest) and a fresh file is opened in its place.
@@ -162,6 +162,28 @@ pub fn init_logging_with_file(log_config: LogConfig, verbosity: Verbosity) -> Re
     Ok(())
 }
 
+/// Directory a log file lives in, with a bare filename resolved to `.`.
+///
+/// `Path::new("app.log").parent()` is `Some("")`, and an empty path is not a
+/// directory that any filesystem call will accept — it has to be read as
+/// "the current directory" before the existence check in
+/// [`create_appender`] can be applied to it.
+///
+/// # Errors
+///
+/// Returns an error only for a path with no parent component at all (a bare
+/// root such as `/`), which cannot name a log *file*.
+fn log_parent_dir(log_path: &Path) -> Result<&Path> {
+    let parent = log_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("Invalid log path: no parent directory"))?;
+    if parent.as_os_str().is_empty() {
+        Ok(Path::new("."))
+    } else {
+        Ok(parent)
+    }
+}
+
 /// Create a rolling file appender based on rotation strategy.
 ///
 /// Time-based strategies (`Never`/`Hourly`/`Daily`) are handled by
@@ -169,6 +191,11 @@ pub fn init_logging_with_file(log_config: LogConfig, verbosity: Verbosity) -> Re
 /// handled by the local [`SizeRotatingWriter`] since `tracing-appender` has
 /// no size-based strategy of its own. Both are erased behind a single
 /// [`BoxMakeWriter`] so callers don't need to care which one is active.
+///
+/// Creating the log directory is the caller's job ([`init_logging_with_file`]
+/// does it before calling here), so a directory that does not exist is
+/// reported as an error rather than conjured up: a mistyped `--log-file`
+/// should say so, not quietly scatter directories across the filesystem.
 ///
 /// # Arguments
 ///
@@ -179,21 +206,31 @@ pub fn init_logging_with_file(log_config: LogConfig, verbosity: Verbosity) -> Re
 ///
 /// # Errors
 ///
-/// Returns error if the log path is invalid or the appender cannot be created
-/// (e.g. the log directory is not writable).
+/// Returns error if the log path is invalid, the parent directory does not
+/// exist, or the appender cannot be created (e.g. the log directory is not
+/// writable).
 fn create_appender(
     log_path: &Path,
     rotation: LogRotation,
     max_files: usize,
 ) -> Result<BoxMakeWriter> {
-    let dir = log_path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("Invalid log path: no parent directory"))?;
+    let dir = log_parent_dir(log_path)?;
 
     let filename = log_path
         .file_name()
         .and_then(|n| n.to_str())
         .ok_or_else(|| anyhow::anyhow!("Invalid log filename"))?;
+
+    // `tracing-appender` silently `create_dir_all`s a missing parent, while
+    // the `SizeRotatingWriter` path below fails with `NotFound`. Check up
+    // front so both rotation strategies behave identically and neither
+    // creates directories behind the caller's back.
+    if !dir.is_dir() {
+        anyhow::bail!(
+            "Log directory does not exist: {} (create it before enabling file logging)",
+            dir.display()
+        );
+    }
 
     let build_rolling = |tracing_rotation: Rotation| -> Result<BoxMakeWriter> {
         let appender = RollingFileAppender::builder()
@@ -436,6 +473,27 @@ mod tests {
         assert!(
             result.is_err(),
             "expected an Err when the log directory does not exist"
+        );
+    }
+
+    #[test]
+    fn test_log_parent_dir_resolves_a_bare_filename_to_the_current_dir() {
+        // `create_appender` now refuses a directory that does not exist. A
+        // bare filename's parent is the *empty* path, which is not a
+        // directory anywhere, so it must be resolved to "." first or plain
+        // `--log-file app.log` would be rejected out of hand.
+        let bare = log_parent_dir(Path::new("app.log")).expect("bare filename has a parent");
+        assert_eq!(bare, Path::new("."));
+        assert!(bare.is_dir(), "the current directory must exist");
+
+        let nested = log_parent_dir(Path::new("logs/app.log")).expect("nested path has a parent");
+        assert_eq!(nested, Path::new("logs"));
+
+        let tmpdir = tempfile::tempdir().expect("create temp dir");
+        let absolute = tmpdir.path().join("app.log");
+        assert_eq!(
+            log_parent_dir(&absolute).expect("absolute path has a parent"),
+            tmpdir.path()
         );
     }
 

@@ -187,14 +187,26 @@ impl GaussianRecord {
 /// | 2      | 24          |
 /// | 3      | 45          |
 /// | other  | 0           |
+///
+/// Only degrees 0–3 exist in the 3DGS convention (and in this format's
+/// header, whose `sh_degree` field is validated by [`from_binary`]), so any
+/// other degree maps to 0 rather than extrapolating the formula. Evaluating
+/// `((degree+1)² − 1) × 3` unguarded overflowed `usize` for a large
+/// attacker- or corruption-supplied header value (`degree = u32::MAX`
+/// squares to exactly 2⁶⁴), which panics in debug builds; the upper-bound
+/// guard below keeps this function total for every `usize`.
 #[must_use]
 pub fn sh_rest_size(degree: usize) -> usize {
-    if degree == 0 {
+    if degree == 0 || degree > MAX_SH_DEGREE {
         0
     } else {
         ((degree + 1) * (degree + 1) - 1) * 3
     }
 }
+
+/// Highest SH degree the 3DGS convention (and hence this module's binary
+/// header and [`degree_for_rest_len`]) represents.
+const MAX_SH_DEGREE: usize = 3;
 
 /// Recognised SH degree (0–3) for an exact `sh_rest` length, or `None` if the
 /// length does not correspond to any degree in the 3DGS convention.
@@ -769,13 +781,26 @@ pub fn from_binary(data: &[u8]) -> Result<Vec<GaussianRecord>, ConvertError> {
 
     let num_gaussians = read_u32_le(data, 12)? as usize;
     let sh_degree = read_u32_le(data, 16)? as usize;
+    // Reject an out-of-range degree explicitly. `sh_rest_size` maps any
+    // unrecognised degree to 0, so without this check a header claiming
+    // e.g. degree 7 would be parsed as "no sh_rest coefficients at all" —
+    // every record silently stripped of its SH data and the record stride
+    // computed wrong, with no error.
+    if sh_degree > MAX_SH_DEGREE {
+        return Err(ConvertError::InvalidFormat(format!(
+            "unsupported SH degree in header: {sh_degree} (supported: 0..={MAX_SH_DEGREE})"
+        )));
+    }
     // flags at bytes 20–23 are reserved; read but ignore.
     let _flags = read_u32_le(data, 20)?;
 
     let sh_extra = sh_rest_size(sh_degree);
     // Fixed f32 fields per record: 3+3+4+1+3 = 14 → 56 bytes + sh_rest.
     let bytes_per_record = 56 + sh_extra * 4;
-    let expected_total = HEADER_SIZE + num_gaussians * bytes_per_record;
+    // Saturating: `num_gaussians` comes straight off disk, so on a 32-bit
+    // target a corrupt count could otherwise wrap this product to a small
+    // number and wave a truncated file through the length check below.
+    let expected_total = HEADER_SIZE.saturating_add(num_gaussians.saturating_mul(bytes_per_record));
 
     if data.len() < expected_total {
         return Err(ConvertError::ParseError(format!(
@@ -1203,6 +1228,38 @@ mod tests {
     }
 
     #[test]
+    fn sh_rest_size_is_total_over_every_usize() {
+        // Regression: the formula `((degree+1)² − 1) × 3` used to be applied
+        // to *any* non-zero degree. A header-supplied `degree` near
+        // `u32::MAX` squares past `usize::MAX`, which panics on overflow in
+        // debug builds instead of returning a value at all.
+        assert_eq!(sh_rest_size(u32::MAX as usize), 0);
+        assert_eq!(sh_rest_size(usize::MAX), 0);
+        assert_eq!(sh_rest_size(usize::MAX / 2), 0);
+    }
+
+    #[test]
+    fn from_binary_rejects_an_out_of_range_sh_degree_header() {
+        // Regression: `sh_rest_size` maps an unrecognised degree to 0, so a
+        // header claiming degree 4+ used to parse as "zero sh_rest
+        // coefficients" — silently dropping SH data and mis-striding every
+        // record — rather than reporting the unsupported degree.
+        let bytes = to_binary(&[make_record(1.0, 2.0, 3.0)]).expect("degree-0 record is valid");
+        for bad_degree in [4u32, 7, 99, u32::MAX] {
+            let mut corrupt = bytes.clone();
+            corrupt[16..20].copy_from_slice(&bad_degree.to_le_bytes());
+            let err = from_binary(&corrupt)
+                .expect_err("an out-of-range SH degree in the header must be rejected");
+            assert!(
+                matches!(err, ConvertError::InvalidFormat(ref m) if m.contains("SH degree")),
+                "unexpected error for degree {bad_degree}: {err:?}"
+            );
+        }
+        // The untouched header still round-trips.
+        assert_eq!(from_binary(&bytes).expect("valid blob").len(), 1);
+    }
+
+    #[test]
     fn degree_for_rest_len_round_trips_sh_rest_size() {
         for degree in 0..=3usize {
             let len = sh_rest_size(degree);
@@ -1373,7 +1430,7 @@ mod tests {
         // expected length) and silently write zero sh_rest floats. Now the
         // full 45 coefficients must round-trip exactly.
         let r = make_record(0.0, 0.0, 0.0).with_sh_rest((0..45).map(|i| i as f32 * 0.01).collect());
-        let bytes = to_binary(&[r.clone()]).expect("degree-3 record is valid");
+        let bytes = to_binary(std::slice::from_ref(&r)).expect("degree-3 record is valid");
         let parsed = from_binary(&bytes).expect("roundtrip should succeed");
         assert_eq!(parsed[0].sh_rest.len(), 45);
         for (a, b) in parsed[0].sh_rest.iter().zip(r.sh_rest.iter()) {

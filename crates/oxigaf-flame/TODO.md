@@ -151,7 +151,16 @@ Currently none.
   - Load `texture_data_*.npy` files
   - UV coordinate interpolation
   - Texture map rendering
-- ✅ **estimate_pitch_from_vertical** — real geometric algorithm (vertical centroid spread → asin) in `pose_estimation.rs`
+- ✅ **estimate_pitch_from_vertical** — reference-based geometric foreshortening
+  solve in `pose_estimation.rs` (`PitchReference` supplies the model-space
+  upper/lower landmark-group centroids plus a weak-perspective scale; the
+  function solves `θ = ±acos(Δy_cam / amplitude) − φ` from the observed
+  vertical separation). It returns **both** candidate angles rather than
+  picking one: a single foreshortening measurement genuinely cannot
+  distinguish them (they collapse to `±θ` when the two groups share a model
+  depth). Use `select_pitch_candidate` with a prior (e.g. the previous
+  frame's pitch) or `estimate_pose_weak_perspective` on the full landmark
+  set to resolve the ambiguity.
 - ✅ **Dynamic landmarks (pose-dependent contours)** — `dynamic_landmarks.rs` (295 lines). `ContourSide` (Left/Right/Both). `DynamicLandmarkConfig` (num_contour_landmarks=17, side_threshold_rad=0.1). `ContourVertexChains::default_flame()` (left chain: vertices 1-17, right chain: vertices 4984-5000). `DynamicLandmarkExtractor`: `extract_yaw(params)` reads pose[1] (Y axis-angle), `select_contour_side()` threshold-based, `extract(mesh, params)` → 17 Landmarks (with graceful out-of-bounds handling), `extract_all()` → 68 landmarks (jaw-line 0-16 overwritten by dynamic contour). `Mesh::extract_dynamic_landmarks()`. 25 new tests.
 - ✅ **Vertex masks** (face region segmentation) (`vertex_mask.rs`)
   - `FaceRegion` enum (8 variants: Face, LeftEye, RightEye, Mouth, Neck, LeftEar, RightEar, Scalp)
@@ -203,7 +212,10 @@ Currently none.
 ### Usability
 - ⬜ **FLAME model auto-download utility**
   - Download from MPI server (requires agreement)
-  - Cache in `~/.cache/oxigaf/flame/`
+  - Cache in `~/Library/Caches/oxigaf/flame/` (macOS; `~/.cache/oxigaf/flame/` on
+    Linux, `%LOCALAPPDATA%\oxigaf\flame\` on Windows — see `oxigaf-cli`'s
+    `default_cache_dir()`, which already implements this layout for other
+    asset downloads via `dirs::cache_dir()`)
   - Checksum verification
 - ✅ **Parameter interpolation utilities** (`params.rs`)
   - `FlameParams::lerp(other, t)` — linear interpolation for shape/expression/translation, quaternion slerp for pose axis-angle
@@ -250,7 +262,18 @@ Currently none reported.
 - ✅ GPU buffer export: 100% (`gpu_buffers.rs`, padded f32/u32 buffers, bytemuck, 18 tests)
 - ⬜ Advanced FLAME features: 60% (static landmarks + dynamic landmarks + GPU buffers done, UV/GPU rasterizer pending)
 
-### Tests: 280 tests (all passing)
+### Tests: 2,582 `#[test]`-attributed tests in source
+
+The count that actually compiles depends on features/toolchain
+(`tests/simd_tests.rs` is `nightly`-gated and contributes 0 on a stable
+compiler); rustdoc doctests are separate and not counted here.
+
+The category breakdown below is the original v0.1.0 core count (280) and
+predates the much larger v0.1.1 feature set (mesh processing, geometry/
+statistical tools, UV/texture pipeline, motion/fitting utilities, avatar
+rigging — see "Completed (v0.1.1)" above), which accounts for most of the
+growth to 2,582 and is not broken out per-category here:
+
 - ✅ Unit tests: 43 (in `src/`)
 - ✅ Doc tests: 16
 - ✅ Lib tests: 58

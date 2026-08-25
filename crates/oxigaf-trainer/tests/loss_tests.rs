@@ -9,7 +9,7 @@ use oxigaf_trainer::loss::{
     clip_gradients_by_norm, clip_gradients_by_value, gaussian_kernel_1d, gradient_penalty,
     gradient_statistics, l1_loss, ms_ssim_loss, normal_consistency,
     normal_consistency_view_weighted, opacity_reg, position_reg, sanitize_gradients, scale_reg,
-    ssim_loss,
+    scale_reg_with_max, ssim_loss, MAX_REASONABLE_WORLD_SCALE,
 };
 
 /// Create a minimal test model.
@@ -455,24 +455,52 @@ fn position_reg_nonzero_offsets() {
 
 #[test]
 fn scale_reg_uniform_scales() {
+    // `scale_reg` is `mean(relu(e^log_s − max_scale)²)`, NOT the old symmetric
+    // `mean(log_s²)`: it charges only for Gaussians whose *world-space* scale
+    // exceeds the threshold.  All scales here are log -5.0, i.e. e^-5 ≈ 0.0067
+    // world units — well inside the 0.05 default — so the penalty is zero.
     let model = make_model(3);
     let loss = scale_reg(&model);
-    // All scales are -5.0, so (-5)^2 * 3 / 3 = 25
-    let expected = 25.0;
-    assert!(
-        (loss - expected).abs() < 1e-5,
-        "Expected {expected}, got {loss}"
-    );
+    assert_eq!(loss, 0.0, "undersized Gaussians must not be penalised");
 }
 
 #[test]
 fn scale_reg_zero_scales() {
+    // A *log*-scale of 0.0 is a world-space scale of e^0 = 1.0 — enormous for
+    // a FLAME head spanning ~0.2 units — so this is the penalised case, not
+    // the free one.  Each axis contributes (1.0 − 0.05)² = 0.9025.
     let mut model = make_model(3);
     for g in &mut model.gaussians {
         g.scale = [0.0, 0.0, 0.0];
     }
     let loss = scale_reg(&model);
-    assert_eq!(loss, 0.0, "Zero scales should give zero loss");
+    let expected = (1.0_f32 - MAX_REASONABLE_WORLD_SCALE).powi(2);
+    assert!(
+        (loss - expected).abs() < 1e-5,
+        "zero LOG-scales are oversized: expected {expected}, got {loss}"
+    );
+
+    // The genuinely free case is a scale at or below the threshold.
+    for g in &mut model.gaussians {
+        g.scale = [MAX_REASONABLE_WORLD_SCALE.ln(); 3];
+    }
+    assert!(scale_reg(&model) < 1e-6);
+}
+
+#[test]
+fn scale_reg_threshold_is_configurable() {
+    // Regression (F289): the threshold was a hardcoded constant; it is now
+    // `LossConfig::w_scale_reg_max_scale`, reachable via `scale_reg_with_max`.
+    let mut model = make_model(2);
+    for g in &mut model.gaussians {
+        g.scale = [-3.0; 3]; // e^-3 ≈ 0.0498, just inside the default
+    }
+    assert_eq!(
+        scale_reg_with_max(&model, MAX_REASONABLE_WORLD_SCALE),
+        scale_reg(&model)
+    );
+    assert_eq!(scale_reg(&model), 0.0);
+    assert!(scale_reg_with_max(&model, 0.01) > 0.0);
 }
 
 #[test]

@@ -67,31 +67,54 @@
 //!
 //! # Layer Name Conventions
 //!
-//! - **PyTorch**: `unet.down_blocks.0.resnets.0.conv1.weight`
-//! - **OxiGAF (PyTorch bridge)**: `down__blocks_0_resnets_0_conv1_weight` --
-//!   existing underscores are doubled before dots become single underscores,
-//!   so `down_blocks` (one underscore) is distinguishable from a converted
-//!   dot. See [`layer_mapping::LayerMapping`].
-//! - **OxiGAF (ToRSh/GAF bridge)**: `down_blocks.0.resnets.0.conv1.weight` --
-//!   a direct `/` → `.` substitution, matching the dot-separated path
-//!   convention `candle_nn::VarBuilder::pp` expects. See
-//!   [`gaf_layer_mapper::GafLayerMapper`].
-//! - **ToRSh**: `down_blocks/0/resnets/0/conv1/weight`
+//! There is exactly **one** OxiGAF name convention, and both bridges emit
+//! it: the model-rooted, dot-separated path `candle_nn::VarBuilder::pp`
+//! walks.
 //!
-//! Note that these two "OxiGAF" forms are **not** interchangeable: the
-//! flat, double-underscore-escaped form the PyTorch bridge produces is not
-//! `candle_nn::VarBuilder`-loadable (`VarBuilder::pp` needs the dot-nested
-//! form), while the ToRSh bridge's form is. A checkpoint produced by
-//! `WeightConverter::pytorch_to_oxigaf` is therefore not, today, loadable by
-//! `oxigaf-diffusion`'s `VarBuilder`-based model code the way one produced
-//! by `WeightConverter::torsh_to_oxigaf` (behind the `torsh` feature) is --
-//! this reflects the two conversion paths having been implemented
-//! independently, not a deliberate two-format design.
+//! | Convention | Example |
+//! |---|---|
+//! | PyTorch | `unet.down_blocks.0.resnets.0.conv1.weight` |
+//! | OxiGAF | `down_blocks.0.resnets.0.conv1.weight` |
+//! | ToRSh | `down_blocks/0/resnets/0/conv1/weight` |
+//!
+//! - The PyTorch bridge ([`layer_mapping::LayerMapping`]) strips a
+//!   recognized top-level prefix (`unet.`, `model.`, `module.`) and
+//!   preserves the dot-separated remainder verbatim, recording the stripped
+//!   prefix per tensor in the output's `__metadata__` so the reverse
+//!   direction restores the exact original name.
+//! - The ToRSh bridge ([`gaf_layer_mapper::GafLayerMapper`]) performs the
+//!   direct `/` ↔ `.` substitution.
+//!
+//! A checkpoint produced by `WeightConverter::pytorch_to_oxigaf` is
+//! therefore loadable by `oxigaf-diffusion`'s `VarBuilder`-based model code
+//! (`vs.pp("down_blocks").pp("0")…`, see `oxigaf-diffusion/src/unet.rs`) on
+//! exactly the same footing as one produced by
+//! `WeightConverter::torsh_to_oxigaf`.
+//!
+//! ## Compatibility note (0.1.2)
+//!
+//! Before 0.1.2 the PyTorch bridge emitted a *different*, flat OxiGAF form
+//! (`down__blocks_0_resnets_0_conv1_weight`) that `VarBuilder::pp` could not
+//! walk and whose underscore escaping was not injective (`a._b` and `a_.b`
+//! both encoded to `a___b`). OxiGAF files written by an older version of
+//! this crate must be re-converted from their PyTorch source; the two forms
+//! are not interconvertible in general.
+
+// The no-unwrap policy applies to every production path in this crate.
+// Test code is exempt: `cfg(test)` is set for the whole crate when
+// compiling the test harness, so these only bind in ordinary builds. The
+// `panic` lint is gated the same way rather than left unconditional,
+// because inline `#[cfg(test)]` modules legitimately `panic!` inside
+// `unwrap_or_else` assertion helpers.
+#![cfg_attr(not(test), deny(clippy::unwrap_used))]
+#![cfg_attr(not(test), deny(clippy::expect_used))]
+#![cfg_attr(not(test), warn(clippy::panic))]
 
 pub mod error;
 pub mod gaf_layer_mapper;
 pub mod layer_mapping;
 pub mod oxigaf_to_pytorch;
+pub mod pickle;
 pub mod precision;
 pub mod pytorch_to_oxigaf;
 
@@ -106,12 +129,22 @@ pub mod validation;
 pub use error::{BridgeError, Result};
 pub use gaf_layer_mapper::GafLayerMapper;
 pub use layer_mapping::{LayerMapping, NamingConvention};
+pub use pickle::{
+    convert_flame_model, convert_pytorch_checkpoint, Component, ConversionReport, PickleError,
+};
 pub use precision::{Precision, PrecisionConfig};
 
 #[cfg(feature = "torsh")]
-pub use validation::{
-    create_synthetic_gaf_checkpoint, validate_converted_checkpoint, ValidationReport,
-};
+pub use validation::{validate_converted_checkpoint, ValidationReport};
+
+/// Test-fixture generator, available only with the `test-fixtures` feature.
+///
+/// This is deliberately **not** part of the crate's stable surface: it
+/// exists so this crate's own integration tests (and downstream tests that
+/// opt in) can build a synthetic GAF checkpoint without shipping a binary
+/// asset. Enabling `test-fixtures` also enables `torsh`.
+#[cfg(feature = "test-fixtures")]
+pub use validation::create_synthetic_gaf_checkpoint;
 
 use std::path::Path;
 

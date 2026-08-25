@@ -1038,11 +1038,20 @@ mod tests {
     fn test_attention_map_to_image_respects_normalize_per_map_false() {
         let weights = vec![0.1_f32, 0.2, 0.05, 0.4, 0.1, 0.2, 0.05, 0.4];
         let map = AttentionMap::new(weights, 1, 2, 2, 2, 1, None).expect("valid map");
-        let mut config = AttentionVizConfig::default();
-        config.normalize_per_map = false;
-        let img_off = attention_map_to_image(&map, &config);
-        config.normalize_per_map = true;
-        let img_on = attention_map_to_image(&map, &config);
+        let img_off = attention_map_to_image(
+            &map,
+            &AttentionVizConfig {
+                normalize_per_map: false,
+                ..AttentionVizConfig::default()
+            },
+        );
+        let img_on = attention_map_to_image(
+            &map,
+            &AttentionVizConfig {
+                normalize_per_map: true,
+                ..AttentionVizConfig::default()
+            },
+        );
         assert_ne!(
             img_off, img_on,
             "normalize_per_map should change the rendered heatmap"
@@ -1057,8 +1066,10 @@ mod tests {
     fn test_overlay_attention_on_image_with_config_uses_configured_alpha() {
         let base = vec![0u8, 0, 0, 255];
         let attention = vec![255u8, 255, 255, 255];
-        let mut config = AttentionVizConfig::default();
-        config.overlay_alpha = 0.25;
+        let config = AttentionVizConfig {
+            overlay_alpha: 0.25,
+            ..AttentionVizConfig::default()
+        };
         let via_config = overlay_attention_on_image_with_config(&base, &attention, &config);
         let via_explicit = overlay_attention_on_image(&base, &attention, 0.25);
         assert_eq!(via_config, via_explicit);

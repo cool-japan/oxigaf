@@ -135,6 +135,15 @@ pub fn retar_unstandardize(
 /// Uses Cholesky decomposition of the symmetric positive-definite matrix
 /// (A^T A + λI).  Fails with [`RetargetError::Singular`] if any pivot is
 /// non-positive.
+///
+/// Production code solves ridge systems via `retar_solve_ridge_multi_rhs`
+/// (in `types.rs`), which factorizes `AᵀA + λI` once and reuses it across
+/// every right-hand-side column instead of re-factorizing per column as a
+/// naive loop over this function would. This single-column solver is kept,
+/// gated to test builds, as the independent reference implementation that
+/// `types.rs`'s `test_retar_solve_ridge_multi_rhs_matches_single_column_solve`
+/// checks the batched solver against.
+#[cfg(test)]
 pub(super) fn retar_solve_ridge(
     matrix_a: &[f32],
     rhs_b: &[f32],

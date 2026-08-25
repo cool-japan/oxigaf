@@ -9,8 +9,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::arcball::{
-    look_at as arcball_look_at, vec3_add, vec3_dot, vec3_length, vec3_normalize, vec3_scale,
-    vec3_sub,
+    look_at as arcball_look_at, vec3_add, vec3_length, vec3_normalize, vec3_scale, vec3_sub,
 };
 
 // ---------------------------------------------------------------------------
@@ -316,7 +315,7 @@ impl CameraPath {
         if frames.is_empty() {
             return Err(CameraPathError::EmptyPath);
         }
-        if !(fps > 0.0) {
+        if fps.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
             return Err(CameraPathError::InvalidConfig(format!(
                 "fps must be a positive finite number, got {fps}"
             )));
@@ -517,7 +516,7 @@ pub fn keyframe_path(
         }
     }
     for pair in keyframes.windows(2) {
-        if !(pair[0].time < pair[1].time) {
+        if pair[0].time.partial_cmp(&pair[1].time) != Some(std::cmp::Ordering::Less) {
             return Err(CameraPathError::InvalidConfig(format!(
                 "keyframe times must be strictly increasing, got {} then {}",
                 pair[0].time, pair[1].time
@@ -975,21 +974,14 @@ pub fn zoom_in_path(
     CameraPath::new(frames, config.fps)
 }
 
-// ---------------------------------------------------------------------------
-// Internal utilities
-// ---------------------------------------------------------------------------
-
-/// Clamp a value between lo and hi.
-#[allow(dead_code)]
-fn clamp(v: f32, lo: f32, hi: f32) -> f32 {
-    v.max(lo).min(hi)
-}
-
-/// Dot product alias for clarity.
-#[allow(dead_code)]
-fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
-    vec3_dot(a, b)
-}
+// Removed: a private `clamp(v, lo, hi)` and a `dot3` alias for
+// `crate::arcball::vec3_dot`, both unreachable and both held alive by
+// `#[allow(dead_code)]`. `clamp` duplicated `f32::clamp`, which this module
+// already calls directly (see the easing and `smooth_path` code above);
+// `dot3` renamed `vec3_dot` without changing it, and was its only caller —
+// hence `vec3_dot` is no longer imported above. Neither was ever called, so
+// both were deleted rather than re-suppressed: new code here should use
+// `f32::clamp` and re-import `crate::arcball::vec3_dot` directly.
 
 // ---------------------------------------------------------------------------
 // Tests

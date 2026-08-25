@@ -56,17 +56,28 @@ impl Mesh {
     }
 
     /// Recompute per-vertex normals from the current vertex positions.
+    ///
+    /// A face referencing a vertex index `>= self.vertices.len()` (a
+    /// malformed/corrupted mesh) is skipped rather than indexed, matching
+    /// the same guard `model::compute_normals_into` and
+    /// `gpu_buffers::recompute_normals_from_faces` already use.
     pub fn recompute_normals(&mut self) {
         // Zero out
         for n in &mut self.normals {
             *n = na::Vector3::zeros();
         }
 
+        let n_verts = self.vertices.len();
+
         // Accumulate area-weighted face normals
         for face in &self.faces {
             let i0 = face[0] as usize;
             let i1 = face[1] as usize;
             let i2 = face[2] as usize;
+
+            if i0 >= n_verts || i1 >= n_verts || i2 >= n_verts {
+                continue;
+            }
 
             let v0 = &self.vertices[i0];
             let v1 = &self.vertices[i1];
@@ -106,14 +117,58 @@ impl Mesh {
     }
 
     /// Compute the area of a triangle face.
+    ///
+    /// Returns `0.0` if any of `face`'s vertex indices is out of range for
+    /// this mesh, rather than panicking -- a malformed/corrupted face
+    /// carries no reliable area, so it is treated the same as any other
+    /// degenerate (zero-area) triangle.
     #[must_use]
     pub fn face_area(&self, face: &[u32; 3]) -> f32 {
-        let v0 = &self.vertices[face[0] as usize];
-        let v1 = &self.vertices[face[1] as usize];
-        let v2 = &self.vertices[face[2] as usize];
+        let n_verts = self.vertices.len();
+        let i0 = face[0] as usize;
+        let i1 = face[1] as usize;
+        let i2 = face[2] as usize;
+        if i0 >= n_verts || i1 >= n_verts || i2 >= n_verts {
+            return 0.0;
+        }
+        let v0 = &self.vertices[i0];
+        let v1 = &self.vertices[i1];
+        let v2 = &self.vertices[i2];
         let edge1 = v1 - v0;
         let edge2 = v2 - v0;
         edge1.cross(&edge2).norm() * 0.5
+    }
+
+    /// Build a mesh, validating that every face index is in range for
+    /// `vertices`, before computing per-vertex normals.
+    ///
+    /// Unlike [`Mesh::new`] (which silently skips a malformed face when
+    /// accumulating normals, leaving affected vertices with a zero/degenerate
+    /// normal), this rejects the mesh outright -- useful when loading mesh
+    /// data from an untrusted or external source, where corruption should be
+    /// surfaced rather than silently absorbed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FlameError::IndexOutOfBounds`] if any face references a
+    /// vertex index `>= vertices.len()`.
+    pub fn try_new(
+        vertices: Vec<na::Point3<f32>>,
+        faces: Vec<[u32; 3]>,
+    ) -> Result<Self, FlameError> {
+        let n_verts = vertices.len();
+        for (face_idx, face) in faces.iter().enumerate() {
+            for (c, &idx) in face.iter().enumerate() {
+                if idx as usize >= n_verts {
+                    return Err(FlameError::index_out_of_bounds(
+                        format!("faces[{face_idx}][{c}]"),
+                        idx as usize,
+                        n_verts,
+                    ));
+                }
+            }
+        }
+        Ok(Self::new(vertices, faces))
     }
 
     /// Export this mesh to Wavefront OBJ format using default config.
@@ -332,6 +387,14 @@ impl Mesh {
     /// Classifies each vertex into a semantic [`crate::FaceRegion`] based on its
     /// position in the FLAME canonical coordinate system.
     ///
+    /// The geometric thresholds are only meaningful for a mesh in the FLAME
+    /// canonical pose. This method delegates to
+    /// [`VertexMask::from_vertices`](crate::vertex_mask::VertexMask::from_vertices),
+    /// which emits a `tracing::warn!` **on every call** for a mesh that fails
+    /// the canonical-pose check. That is fine for a one-shot call, but a
+    /// per-frame caller would flood the log; such callers should use
+    /// [`Mesh::vertex_mask_checked`] and handle the error once instead.
+    ///
     /// # Example
     ///
     /// ```
@@ -348,6 +411,54 @@ impl Mesh {
     #[must_use]
     pub fn vertex_mask(&self) -> crate::vertex_mask::VertexMask {
         crate::vertex_mask::VertexMask::from_vertices(&self.vertices)
+    }
+
+    /// Compute geometric vertex masks, rejecting a non-canonical mesh.
+    ///
+    /// Identical classification to [`Mesh::vertex_mask`], but the
+    /// canonical-pose precondition is reported as an error instead of a
+    /// `tracing::warn!`. Prefer this in a loop (per-frame region lookups, batch
+    /// processing): the caller decides once whether to canonicalize the mesh,
+    /// fall back to real FLAME region indices via
+    /// [`VertexMask::from_region_map`](crate::vertex_mask::VertexMask::from_region_map),
+    /// or surface the failure — instead of emitting one warning per call.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VertexMaskError::NonCanonicalPose`](crate::VertexMaskError::NonCanonicalPose)
+    /// when the vertex centroid is too far from the origin or the bounding box
+    /// does not have canonical FLAME head extents.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use nalgebra as na;
+    /// # use oxigaf_flame::{Mesh, VertexMaskError};
+    /// // A head with canonical extents, centred on the origin, passes.
+    /// let canonical = vec![
+    ///     na::Point3::new(-0.08f32, -0.15, -0.08),
+    ///     na::Point3::new(0.08f32, 0.15, 0.08),
+    ///     na::Point3::new(0.0f32, 0.0, 0.05),
+    /// ];
+    /// let mesh = Mesh::new(canonical.clone(), vec![[0, 1, 2]]);
+    /// assert!(mesh.vertex_mask_checked().is_ok());
+    ///
+    /// // The same head translated up by 0.2 m is reported, instead of being
+    /// // classified against thresholds evaluated in the wrong frame.
+    /// let translated: Vec<_> = canonical
+    ///     .iter()
+    ///     .map(|p| na::Point3::new(p.x, p.y + 0.2, p.z))
+    ///     .collect();
+    /// let posed = Mesh::new(translated, vec![[0, 1, 2]]);
+    /// assert!(matches!(
+    ///     posed.vertex_mask_checked(),
+    ///     Err(VertexMaskError::NonCanonicalPose { .. })
+    /// ));
+    /// ```
+    pub fn vertex_mask_checked(
+        &self,
+    ) -> Result<crate::vertex_mask::VertexMask, crate::vertex_mask::VertexMaskError> {
+        crate::vertex_mask::VertexMask::from_vertices_checked(&self.vertices)
     }
 
     // -----------------------------------------------------------------------
@@ -627,5 +738,151 @@ mod tests {
             (dist_sq - 0.0225_f32).abs() < 1e-4,
             "dist_sq ≈ 0.0225, got {dist_sq}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Bounds safety: malformed faces must not panic
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_new_skips_out_of_range_faces_instead_of_panicking() {
+        let vertices = vec![
+            na::Point3::new(0.0f32, 0.0, 0.0),
+            na::Point3::new(1.0f32, 0.0, 0.0),
+            na::Point3::new(0.0f32, 1.0, 0.0),
+        ];
+        // Face references vertex index 99, which does not exist.
+        let faces = vec![[0, 1, 99]];
+        let mesh = Mesh::new(vertices, faces);
+        // Must not panic; normals stay at zero since the only face
+        // touching these vertices was skipped as malformed.
+        assert_eq!(mesh.normals.len(), 3);
+        for n in &mesh.normals {
+            assert!(n.x.is_finite() && n.y.is_finite() && n.z.is_finite());
+        }
+    }
+
+    #[test]
+    fn test_recompute_normals_mixed_valid_and_invalid_faces() {
+        // A valid face and an out-of-range face in the same mesh: the
+        // valid face's contribution must still be computed correctly.
+        let vertices = vec![
+            na::Point3::new(0.0f32, 0.0, 0.0),
+            na::Point3::new(1.0f32, 0.0, 0.0),
+            na::Point3::new(0.0f32, 1.0, 0.0),
+        ];
+        let faces = vec![[0, 1, 2], [0, 1, 999]];
+        let mesh = Mesh::new(vertices, faces);
+        // Vertex 2's normal comes only from the valid face [0,1,2], which
+        // lies in the XY plane, so its normal must point along +/-Z.
+        let n2 = mesh.normals[2];
+        assert!(n2.x.abs() < 1e-5 && n2.y.abs() < 1e-5);
+        assert!((n2.z.abs() - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_face_area_out_of_range_returns_zero_instead_of_panicking() {
+        let mesh = unit_square_mesh();
+        let area = mesh.face_area(&[0, 1, 99]);
+        assert_eq!(
+            area, 0.0,
+            "out-of-range face should report zero area, not panic"
+        );
+    }
+
+    #[test]
+    fn test_face_area_valid_face_unchanged() {
+        let mesh = unit_square_mesh();
+        // Triangle (0,1,2) = (0,0,0),(1,0,0),(0,1,0): area = 0.5
+        let area = mesh.face_area(&[0, 1, 2]);
+        assert!((area - 0.5).abs() < 1e-6, "expected area 0.5, got {area}");
+    }
+
+    #[test]
+    fn test_try_new_rejects_out_of_range_face() {
+        let vertices = vec![
+            na::Point3::new(0.0f32, 0.0, 0.0),
+            na::Point3::new(1.0f32, 0.0, 0.0),
+        ];
+        let faces = vec![[0, 1, 5]];
+        let result = Mesh::try_new(vertices, faces);
+        assert!(
+            result.is_err(),
+            "face referencing vertex 5 with only 2 vertices should be rejected"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // vertex_mask_checked: error instead of a per-call tracing::warn
+    // -----------------------------------------------------------------------
+
+    /// A three-vertex stand-in with canonical FLAME head extents, centred on
+    /// the origin (mirrors `vertex_mask.rs`'s private `canonical_head`).
+    fn canonical_head_mesh() -> Mesh {
+        let vertices = vec![
+            na::Point3::new(-0.08f32, -0.15, -0.08),
+            na::Point3::new(0.08f32, 0.15, 0.08),
+            na::Point3::new(0.0f32, 0.0, 0.05),
+        ];
+        Mesh::new(vertices, vec![[0, 1, 2]])
+    }
+
+    #[test]
+    fn test_vertex_mask_checked_accepts_canonical_mesh() {
+        let mesh = canonical_head_mesh();
+        let mask = mesh
+            .vertex_mask_checked()
+            .expect("canonical-extent mesh should pass the precondition");
+        assert_eq!(mask.num_vertices, mesh.num_vertices());
+    }
+
+    #[test]
+    fn test_vertex_mask_checked_rejects_non_canonical_mesh() {
+        // A head translated up by 0.2 m: `vertex_mask()` only warns (once per
+        // call — log spam for a per-frame caller), the checked variant reports.
+        let canonical = canonical_head_mesh();
+        let translated: Vec<na::Point3<f32>> = canonical
+            .vertices
+            .iter()
+            .map(|p| na::Point3::new(p.x, p.y + 0.2, p.z))
+            .collect();
+        let posed = Mesh::new(translated, canonical.faces.clone());
+
+        assert!(
+            matches!(
+                posed.vertex_mask_checked(),
+                Err(crate::VertexMaskError::NonCanonicalPose { .. })
+            ),
+            "translated mesh must be rejected by the checked variant"
+        );
+        // The infallible variant still returns a mask, so existing callers keep
+        // working.
+        assert_eq!(posed.vertex_mask().num_vertices, posed.num_vertices());
+    }
+
+    #[test]
+    fn test_vertex_mask_checked_matches_vertex_mask_on_canonical_mesh() {
+        let mesh = canonical_head_mesh();
+        let checked = mesh
+            .vertex_mask_checked()
+            .expect("canonical-extent mesh should pass the precondition");
+        let unchecked = mesh.vertex_mask();
+        assert_eq!(
+            checked.regions, unchecked.regions,
+            "checked variant must classify identically, only the failure mode differs"
+        );
+    }
+
+    #[test]
+    fn test_try_new_accepts_valid_mesh() {
+        let vertices = vec![
+            na::Point3::new(0.0f32, 0.0, 0.0),
+            na::Point3::new(1.0f32, 0.0, 0.0),
+            na::Point3::new(0.0f32, 1.0, 0.0),
+        ];
+        let faces = vec![[0, 1, 2]];
+        let mesh = Mesh::try_new(vertices, faces).expect("valid faces should be accepted");
+        assert_eq!(mesh.num_vertices(), 3);
+        assert_eq!(mesh.num_faces(), 1);
     }
 }

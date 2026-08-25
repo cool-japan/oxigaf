@@ -227,6 +227,17 @@ fn softmax(values: &[f32], temperature: f32) -> Vec<f32> {
 /// clamped to [0, 1] by dividing by 3.0 (typical maximum absolute value for
 /// FLAME PCA coefficients).
 ///
+/// # Not monotonic in `n_params`
+///
+/// Because this is a root-mean-*square*, widening the window can *lower* the
+/// result: the extra coefficients enlarge the divisor `n` whether or not they
+/// contribute to the numerator. With `params = [3, 0, 0, …]`, `n_params = 1`
+/// reports `1.0` while `n_params = 8` reports `sqrt(9/8)/3 ≈ 0.354`. That is
+/// the intended reading of an RMS — "how strong is the average leading
+/// coefficient", not "how much total energy is there" — so do not assume
+/// `intensity(n) <= intensity(n + k)`. Use a fixed `n_params` when comparing
+/// intensities across frames or subjects.
+///
 /// # Errors
 ///
 /// Returns [`EmotionError::EmptyParams`] when `params` is empty.
@@ -752,9 +763,59 @@ mod tests {
             ..EmotionConfig::default()
         };
         let intensity_full = compute_expression_intensity(&params, &permissive).unwrap();
-        // With the large tail included the RMS (and hence intensity) can only
-        // be >= the single-parameter case.
-        assert!(intensity_full >= intensity - 1e-6);
+        // Widening the window changes the answer, which is the whole point of
+        // the regression: `n_params` is genuinely consulted. The exact value
+        // is the closed form of the documented metric — 11 entries of 3.0
+        // (index 0 plus indices 10..20) averaged over the full 20-wide
+        // window: sqrt(11 * 9 / 20) / 3 = sqrt(0.55).
+        let expected_full = 0.55_f32.sqrt();
+        assert_abs_diff_eq!(intensity_full, expected_full, epsilon = 1e-6);
+        assert!(
+            (intensity_full - intensity).abs() > 1e-3,
+            "n_params must change the result: {intensity_full} vs {intensity}"
+        );
+    }
+
+    #[test]
+    fn intensity_is_not_monotonic_in_n_params() {
+        // `compute_expression_intensity` is a *root-mean-square* over the
+        // first `n` coefficients, so it is deliberately NOT monotonic in
+        // `n_params`: extending the window over near-zero coefficients
+        // divides by a larger `n` without adding to the numerator, which
+        // *lowers* the reported intensity.
+        //
+        // This is the documented behaviour of an RMS ("how strong is the
+        // average leading coefficient"), not a bug — but it is unintuitive
+        // enough that an earlier version of `intensity_respects_config_n_params`
+        // asserted the opposite (`intensity_full >= intensity`) and failed.
+        // Pin the real property down so that mistake cannot recur.
+        let mut params = vec![0.0_f32; 8];
+        params[0] = 3.0; // one strong coefficient, the rest silent
+
+        let narrow = compute_expression_intensity(
+            &params,
+            &EmotionConfig {
+                n_params: 1,
+                ..EmotionConfig::default()
+            },
+        )
+        .unwrap();
+        let wide = compute_expression_intensity(
+            &params,
+            &EmotionConfig {
+                n_params: 8,
+                ..EmotionConfig::default()
+            },
+        )
+        .unwrap();
+
+        assert_abs_diff_eq!(narrow, 1.0, epsilon = 1e-6);
+        // sqrt(9 / 8) / 3 = sqrt(1/8)
+        assert_abs_diff_eq!(wide, 0.125_f32.sqrt(), epsilon = 1e-6);
+        assert!(
+            wide < narrow,
+            "padding the window with zeros must dilute the RMS: {wide} vs {narrow}"
+        );
     }
 
     #[test]

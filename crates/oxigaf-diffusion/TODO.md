@@ -15,12 +15,17 @@
 ### Attention Mechanisms
 - ✅ Multi-view spatial transformer blocks
 - ✅ Cross-view attention (Q from one view, K/V from all N views)
-- ✅ **Flash Attention** (feature: `flash_attention`, enabled by default)
+- ✅ **Flash Attention** (feature: `flash_attention`, **opt-in since v0.1.2** —
+  no longer part of `default`; `use_flash_attention` in `DiffusionConfig`
+  still defaults to `true` when the feature *is* compiled in)
   - Memory-efficient O(N) attention instead of O(N²)
   - Block-based tiled computation
-  - 2-4× memory reduction for large sequences
+  - 2-4× memory reduction for large sequences whose un-tiled score matrix
+    would exceed the 64 MiB budget (`DEFAULT_SCORE_MATRIX_BUDGET`) — below
+    that budget `FlashAttention::forward` runs the same full-materialization
+    kernel as standard attention, so smaller sequences see no reduction
   - Configurable block size
-- ✅ Standard attention fallback (when flash_attention disabled)
+- ✅ Standard attention fallback (now the default path; used whenever flash_attention is disabled)
 - ✅ Self-attention (per-view spatial)
 - ✅ Cross-attention to encoder hidden states
 
@@ -107,12 +112,20 @@
 - ✅ Clean module structure
 
 ### Feature Flags
-- ✅ `default` = `["accelerate", "flash_attention"]`
-- ✅ `accelerate` - CPU BLAS/LAPACK acceleration
-- ✅ `cuda` - NVIDIA GPU support
-- ✅ `metal` - Apple Silicon GPU support
-- ✅ `flash_attention` - Memory-efficient attention
-- ✅ `mixed_precision` - FP16/BF16 inference
+
+*Superseded by v0.1.2 — `accelerate`/`cuda`/`metal` were dropped from this
+crate's own `[features]` and `flash_attention` left `default`. Current flag
+set:*
+
+- ✅ `default` = `[]` (was `["accelerate", "flash_attention"]` before v0.1.2)
+- ✅ `flash_attention` - Memory-efficient attention (opt-in since v0.1.2, not in `default`)
+- ✅ `mixed_precision` - FP32↔BF16/FP16 conversion utilities (`mixed_precision.rs`); real and tested, but not yet called from `unet.rs`/`vae.rs`/`pipeline.rs`, so it doesn't change `generate()`'s output
+- ✅ `gpu_debug` - NaN/Inf debug hooks (`debug_hooks::assert_finite`, `DebugConfig`)
+- ❌ ~~`accelerate` - CPU BLAS/LAPACK acceleration~~ — removed in v0.1.2;
+  enable it on the resolved `candle-core`/`candle-nn` package instead
+  (`oxicandle-core`/`oxicandle-nn` fork — see README "GPU / BLAS Backends")
+- ❌ ~~`cuda` - NVIDIA GPU support~~ — removed in v0.1.2; same redirection as `accelerate`
+- ❌ ~~`metal` - Apple Silicon GPU support~~ — removed in v0.1.2; same redirection as `accelerate`
 
 ### Mixed Precision Support (v0.1.1)
 - ✅ **Mixed precision support** (feature: `mixed_precision`, `mixed_precision.rs`, ~560 lines code + ~260 lines tests)
@@ -243,7 +256,7 @@ Currently none.
   - U-Net block structure
   - Attention block composition
   - Data flow through pipeline
-- ✅ **Usage examples** — `basic_inference.rs`, `multi_view_consistency.rs`, `cfg_comparison.rs`, `flash_vs_standard.rs`, `batch_generation.rs`, `streaming_demo.rs`
+- ✅ **Usage examples** — `basic_inference.rs`, `multi_view_consistency.rs`, `cfg_comparison.rs`, `flash_vs_standard.rs`, `batch_generation.rs`, `streaming_demo.rs` (`streaming_demo.rs` compiles and runs, but its output is misleading post-streaming.rs rewrite — see the "Known bug" note under Streaming inference above)
 
 ### Model Variants
 - ✅ **Model variants** (`model_variants.rs`)
@@ -286,7 +299,28 @@ Currently none.
   - Bottleneck identification
 
 ### Integration
-- ✅ **Streaming inference** — `streaming.rs` (260 lines). `StreamingConfig` (256×256, guidance=3.0, num_steps=20). `StreamingStep` (view_index, step_index, total_steps, partial_image, is_final, progress_fraction()). `StreamingInference::step_iter(num_views)` returning `StreamingIterator` implementing `Iterator<Item=StreamingStep>`. Greyscale gradient placeholder across steps. 20 new tests. Total: 329 tests passing (0 failed, 1 ignored).
+- ✅ **Streaming inference** — `streaming.rs` (grew from 260 to 880 lines
+  post-v0.1.1; no longer a placeholder). `StreamingConfig` (256×256,
+  guidance=3.0, num_steps=20). `StreamingStep` (view_index, step_index,
+  total_steps, partial_image, is_final, progress_fraction()). Two engine
+  modes: `StreamingInference::new` builds a **schedule-only** engine — real
+  step bookkeeping, but `partial_image` stays honestly empty (no weights, no
+  fabricated pixels — the old grey-ramp placeholder was removed as a
+  regression fix); `StreamingInference::load`/`with_pipeline` attach a real
+  `MultiViewDiffusionPipeline` + `GenerationSession` and yield genuine
+  VAE-decoded RGB frames per denoising step. `StreamingInference::step_iter(num_views)`
+  returns a `StreamingIterator: Iterator<Item = StreamingStep>` yielding
+  **step-major** (all views of step 0, then all views of step 1, …) — code
+  that assumes view-major ordering (grouping all steps of one view together)
+  will misbehave; `examples/streaming_demo.rs` has this bug as of this
+  writing (see TODO below). 23 tests in `streaming.rs` itself.
+  - ⬜ **Known bug**: `examples/streaming_demo.rs` still calls
+    `StreamingInference::new` (schedule-only), so it prints `first_pixel=0`
+    and a `0 bytes` buffer on every step instead of real pixels, and its
+    `last_view`-tracked "--- View N ---" header (written for view-major
+    output) now re-prints before almost every line under step-major
+    ordering. Needs `StreamingInference::load` with real weights (or an
+    explicit "no model attached" framing) and step-major-aware headers.
 - ✅ **Batch generation** — `batch_gen.rs` (323 lines). `GenerationRequest` (id, reference_image bytes, num_views, guidance_scale, num_steps, seed). `GeneratedView` (view_index, image_data, width, height, generation_time_ms). `GenerationResult` (id, views, total_time_ms, num_cached_kv, throughput_views_per_sec()). `BatchGenConfig` (max_batch_size=4, max_views_per_request=4, guidance_scale=3.0, num_steps=20, use_kv_cache=true, synchronous=true). `BatchStats` (total_requests/views/time, cache_hits/misses, hit_rate). `BatchGenerator` with queue()/process_batch()/process_one()/clear_queue()/stats()/reset_stats(). 31 new tests.
 - ⬜ **Web API server**
   - REST API for inference
@@ -299,7 +333,7 @@ Currently none.
   - Flash attention may have slightly different outputs vs standard (tiling artifacts)
   - Need more testing with fp16
   - Mitigation: Make it optional, default to standard for now
-- ✅ ~~**Mixed precision**~~ — Fully implemented (`mixed_precision.rs`, 44 tests); BF16/FP16 conversion, `PrecisionStats`, feature-gated default.
+- ✅ ~~**Mixed precision**~~ — The conversion toolkit itself is fully implemented (`mixed_precision.rs`, 44 tests): BF16/FP16 conversion, `PrecisionStats`, feature-gated default. Not yet wired into `unet.rs`/`vae.rs`/`pipeline.rs`, though, so turning the feature on doesn't change `generate()`'s numerics — see "Feature Flags" above.
 
 ## 📊 Current Status
 
@@ -314,7 +348,7 @@ Currently none.
 - ✅ CFG: 100%
 - ✅ Pipeline orchestration: 100%
 - ✅ Selective FP32 / Numerical stability: 100% (`numerics.rs`, 28 tests)
-- ✅ Mixed precision (FP16/BF16): 100% (`mixed_precision.rs`, 44 tests)
+- ✅ Mixed precision (FP16/BF16) conversion toolkit: 100% (`mixed_precision.rs`, 44 tests) — not yet wired into the inference path (see "Feature Flags" above)
 - ✅ Variable resolution support: 100% (`resolution.rs`, 771 lines)
 - ✅ Noise schedule analysis (Karras EDM): 100% (`noise_schedule_analysis.rs`, 1213 lines)
 - ⬜ Weight loading: 50% (structure exists, conversion script pending)
@@ -353,12 +387,12 @@ Currently none.
 | DDIM scheduler | ✅ | ✅ | V-prediction + Epsilon modes |
 | Latent upsampler | ✅ | ✅ | **Done v0.1.0** (`upsampler.rs`) |
 | CFG | ✅ | ✅ | **Done v0.1.0** |
-| Flash attention | ⬜ Optional | ✅ | **EXCEEDS PLAN** - default feature |
+| Flash attention | ⬜ Optional | ✅ | **EXCEEDS PLAN** - opt-in feature (`flash_attention`; not in `default` since v0.1.2) |
 | Attention slicing | ⬜ | ✅ | **Done** (`sliced_attention.rs`, chunked softmax, 23 tests) |
 | Pipeline integration tests | ⬜ | ✅ | **Done** (`tests/comprehensive_tests.rs`, 47 new tests, 160 total) |
 | Weight loading | ✅ | ⬜ | Structure exists, conversion script needed |
 | Mixed precision | ⬜ Optional | ✅ | **Done v0.1.1** (`mixed_precision.rs`, 44 tests, BF16/FP16 conversion, `PrecisionStats`) |
-| Streaming inference | ⬜ | ✅ | **Done v0.1.1** (`streaming.rs`, 260 lines, `StreamingIterator`, 20 tests) |
+| Streaming inference | ⬜ | ✅ | **Done v0.1.1**, since expanded (`streaming.rs`, 880 lines, `StreamingIterator`, 23 tests) |
 | Batch generation | ⬜ | ✅ | **Done v0.1.1** (`batch_gen.rs`, 323 lines, `BatchGenerator`, `BatchStats`, 31 tests) |
 | Variable resolution | ⬜ | ✅ | **Done** (`resolution.rs`, 771 lines, adaptive latents, multi-scale) |
 | Noise schedule analysis | ⬜ | ✅ | **Done** (`noise_schedule_analysis.rs`, 1213 lines, Karras EDM sigmas, SNR) |
@@ -393,7 +427,8 @@ Currently none.
 1. **Flash Attention** (not in original plan as default)
    - Memory-efficient O(N) attention
    - 30-50% faster than standard for large sequences
-   - Enabled by default, with standard attention fallback
+   - Opt-in via the `flash_attention` feature since v0.1.2 (previously
+     default); standard attention is the default path
    - Comprehensive benchmarking suite
 
 2. **Comprehensive Error Handling** (better than planned)
@@ -408,9 +443,11 @@ Currently none.
    - Extensive benchmarking suite
 
 4. **Feature Flag Design** (cleaner than planned)
-   - Mutually exclusive GPU backends
-   - Default features for CPU-only
-   - Flash attention optional but default
+   - GPU/BLAS backends (`accelerate`/`cuda`/`metal`) removed from this crate
+     in v0.1.2; enable them on the resolved `candle-core`/`candle-nn`
+     package instead
+   - `default = []` since v0.1.2 — CPU-only, no optional features
+   - Flash attention opt-in (not part of `default`)
 
 5. **Code Quality** (stricter than planned)
    - All files well under 2000 lines (largest: 665 lines)

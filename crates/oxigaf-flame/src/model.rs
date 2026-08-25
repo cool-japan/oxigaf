@@ -227,8 +227,10 @@ impl BatchBufferPool {
 /// different [`FlameParams`] to produce posed meshes.
 ///
 /// Joint positions depend only on shape parameters (not expression or pose),
-/// so they are memoized per unique shape parameter vector. See
-/// [`joint_positions_cached`](Self::joint_positions_cached).
+/// so they are memoized per unique shape parameter vector. `forward` itself
+/// regresses joints from the shape-only rest pose for the same reason, so
+/// the memoized joints always match the ones `forward` actually skins with.
+/// See [`joint_positions_cached`](Self::joint_positions_cached).
 pub struct FlameModel {
     /// Template (rest-pose) vertex positions `[N, 3]`.
     pub v_template: Array2<f32>,
@@ -332,11 +334,19 @@ impl FlameModel {
     /// Compute the posed mesh from FLAME parameters.
     #[must_use]
     pub fn forward(&self, params: &FlameParams) -> Mesh {
-        // 1. Shape + expression blend shapes → v_shaped
-        let v_shaped = self.apply_shape_expression(params);
+        // 1a. Shape-only blend shapes → the shape-only rest-pose mesh.
+        let mut v_shaped = self.apply_shape_only(&params.shape);
 
-        // 2. Joint positions from shaped vertices
+        // 2. Joint positions are regressed from the SHAPE-ONLY mesh (not
+        //    shape+expression); see `compute_joint_positions` for the
+        //    rationale. This keeps `forward` consistent with
+        //    `joint_positions_cached`.
         let joints = self.j_regressor.dot(&v_shaped); // [n_joints, 3]
+
+        // 1b. Now add expression on top, for the posing/skinning pipeline
+        //     below (expression still affects the final mesh — just not
+        //     the joint pivots used to build the skinning transforms).
+        self.add_expression(&mut v_shaped, &params.expression);
 
         // 3. Per-joint rotation matrices (Rodrigues)
         let rot_mats = self.compute_rotation_matrices(params);
@@ -363,11 +373,14 @@ impl FlameModel {
     pub fn forward_simd(&self, params: &FlameParams) -> Mesh {
         use crate::simd::apply_lbs_simd;
 
-        // 1. Shape + expression blend shapes → v_shaped (SIMD accelerated)
-        let v_shaped = self.apply_shape_expression_simd(params);
+        // 1a. Shape-only blend shapes (SIMD) → shape-only rest-pose mesh.
+        let mut v_shaped = self.apply_shape_only_simd(&params.shape);
 
-        // 2. Joint positions from shaped vertices
+        // 2. Joint positions from the SHAPE-ONLY mesh, matching `forward`.
         let joints = self.j_regressor.dot(&v_shaped); // [n_joints, 3]
+
+        // 1b. Add expression (SIMD) on top for posing/skinning.
+        self.add_expression_simd(&mut v_shaped, &params.expression);
 
         // 3. Per-joint rotation matrices (Rodrigues SIMD)
         let rot_mats = self.compute_rotation_matrices_simd(params);
@@ -524,6 +537,35 @@ impl FlameModel {
         output
     }
 
+    /// Validate that `buffer_pool`'s per-mesh dimensions match this model.
+    ///
+    /// A `BatchBufferPool` can be constructed directly via
+    /// [`BatchBufferPool::new`] with caller-supplied dimensions that have no
+    /// structural link to any particular model, so a mismatched pool is a
+    /// plausible caller mistake rather than a programming-logic-only bug.
+    /// Without this check, passing a mismatched pool to
+    /// `forward_into_with_buffers` panics deep inside `ndarray`/slice
+    /// indexing instead of failing cleanly.
+    fn check_pool_compatible(&self, buffer_pool: &BatchBufferPool) -> Result<(), FlameError> {
+        let compatible = buffer_pool.num_vertices == self.num_vertices()
+            && buffer_pool.n_joints == self.n_joints;
+        if compatible {
+            return Ok(());
+        }
+        Err(FlameError::ShapeMismatch {
+            name: "BatchBufferPool".to_string(),
+            expected: format!(
+                "num_vertices={}, n_joints={}",
+                self.num_vertices(),
+                self.n_joints
+            ),
+            got: format!(
+                "num_vertices={}, n_joints={}",
+                buffer_pool.num_vertices, buffer_pool.n_joints
+            ),
+        })
+    }
+
     /// Process multiple parameter sets with buffer pool for intermediate values.
     ///
     /// This method reuses intermediate buffers across the batch to minimize
@@ -538,17 +580,26 @@ impl FlameModel {
     ///
     /// `BatchedFlameOutput` containing all vertices and normals.
     ///
+    /// # Errors
+    ///
+    /// Returns [`FlameError::ShapeMismatch`] if `buffer_pool`'s per-mesh
+    /// vertex/joint dimensions do not match this model (e.g. a pool built
+    /// with [`BatchBufferPool::new`] using the wrong `num_vertices`/`n_joints`
+    /// rather than via [`create_buffer_pool`](Self::create_buffer_pool)).
+    /// Without this check, a mismatched pool would panic deep inside the
+    /// forward pass instead of failing cleanly.
+    ///
     /// # Example
     ///
     /// ```rust,no_run
-    /// # use oxigaf_flame::{FlameModel, FlameParams, BatchBufferPool};
+    /// # use oxigaf_flame::{FlameModel, FlameParams};
     /// let model = FlameModel::load("path/to/flame")?;
-    /// let mut pool = BatchBufferPool::new(16, model.num_vertices(), 5);
+    /// let mut pool = model.create_buffer_pool(16);
     ///
     /// // Reuse pool across multiple batch calls
     /// for _ in 0..100 {
     ///     let params_batch: Vec<FlameParams> = vec![/* ... */];
-    ///     let output = model.forward_batch_with_pool(&params_batch, &mut pool);
+    ///     let output = model.forward_batch_with_pool(&params_batch, &mut pool)?;
     /// }
     /// # Ok::<(), oxigaf_flame::FlameError>(())
     /// ```
@@ -556,7 +607,9 @@ impl FlameModel {
         &self,
         params_batch: &[FlameParams],
         buffer_pool: &mut BatchBufferPool,
-    ) -> BatchedFlameOutput {
+    ) -> Result<BatchedFlameOutput, FlameError> {
+        self.check_pool_compatible(buffer_pool)?;
+
         let batch_size = params_batch.len();
         let num_vertices = self.num_vertices();
 
@@ -578,13 +631,17 @@ impl FlameModel {
             );
         }
 
-        output
+        Ok(output)
     }
 
     /// Process multiple parameter sets in parallel with buffer pool.
     ///
-    /// This method combines parallel processing with buffer reuse for
-    /// optimal performance on multi-core systems.
+    /// This method combines parallel processing with buffer reuse: each
+    /// rayon worker is handed its own disjoint per-mesh slot of
+    /// `buffer_pool` (`v_shaped`, `v_posed`, `rot_mats`, `skinning`), so the
+    /// pool's memory is genuinely reused across calls via
+    /// `forward_into_with_buffers`
+    /// instead of each element allocating fresh scratch buffers.
     ///
     /// # Arguments
     ///
@@ -594,12 +651,21 @@ impl FlameModel {
     /// # Returns
     ///
     /// `BatchedFlameOutput` containing all vertices and normals.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FlameError::ShapeMismatch`] if `buffer_pool`'s per-mesh
+    /// vertex/joint dimensions do not match this model. See
+    /// [`forward_batch_with_pool`](Self::forward_batch_with_pool) for
+    /// details.
     #[cfg(feature = "parallel")]
     pub fn forward_batch_par_with_pool(
         &self,
         params_batch: &[FlameParams],
         buffer_pool: &mut BatchBufferPool,
-    ) -> BatchedFlameOutput {
+    ) -> Result<BatchedFlameOutput, FlameError> {
+        self.check_pool_compatible(buffer_pool)?;
+
         let batch_size = params_batch.len();
         let num_vertices = self.num_vertices();
 
@@ -609,23 +675,37 @@ impl FlameModel {
         let mut output =
             BatchedFlameOutput::with_capacity(batch_size, num_vertices, self.faces.clone());
 
-        // Process in parallel
+        // Split the pool into its four fields up front so the borrow
+        // checker can see that the per-index slices handed to each rayon
+        // worker below are disjoint (different fields, and — within each
+        // field — different array elements).
+        let BatchBufferPool {
+            v_shaped,
+            v_posed,
+            rot_mats,
+            skinning,
+            ..
+        } = &mut *buffer_pool;
+
+        // Process in parallel: each worker gets its own slot `idx` of every
+        // pooled buffer plus its own output vertex/normal buffer.
         params_batch
             .par_iter()
-            .enumerate()
+            .zip(v_shaped[..batch_size].par_iter_mut())
+            .zip(v_posed[..batch_size].par_iter_mut())
+            .zip(rot_mats[..batch_size].par_iter_mut())
+            .zip(skinning[..batch_size].par_iter_mut())
             .zip(output.vertices.par_iter_mut())
             .zip(output.normals.par_iter_mut())
-            .for_each(|(((idx, params), vertices), normals)| {
-                // Note: This requires that buffer_pool buffers are not modified
-                // during parallel access. For full parallelism with buffer reuse,
-                // thread-local buffers would be needed.
-                // Here we use a simpler approach: each thread gets its own view.
-                // For the parallel case without pool, we just do direct forward.
-                self.forward_into(params, vertices, normals);
-                let _ = idx; // Suppress unused warning
-            });
+            .for_each(
+                |((((((params, v_shaped), v_posed), rot_mats), skinning), vertices), normals)| {
+                    self.forward_into_with_buffers(
+                        params, v_shaped, v_posed, rot_mats, skinning, vertices, normals,
+                    );
+                },
+            );
 
-        output
+        Ok(output)
     }
 
     /// Create a buffer pool sized for this model.
@@ -658,11 +738,14 @@ impl FlameModel {
         vertices_out: &mut [na::Point3<f32>],
         normals_out: &mut [na::Vector3<f32>],
     ) {
-        // 1. Shape + expression blend shapes → v_shaped
-        let v_shaped = self.apply_shape_expression(params);
+        // 1a. Shape-only blend shapes → shape-only rest-pose mesh.
+        let mut v_shaped = self.apply_shape_only(&params.shape);
 
-        // 2. Joint positions from shaped vertices
+        // 2. Joint positions from the SHAPE-ONLY mesh, matching `forward`.
         let joints = self.j_regressor.dot(&v_shaped);
+
+        // 1b. Add expression on top for posing/skinning.
+        self.add_expression(&mut v_shaped, &params.expression);
 
         // 3. Per-joint rotation matrices (Rodrigues)
         let rot_mats = self.compute_rotation_matrices(params);
@@ -692,11 +775,14 @@ impl FlameModel {
         vertices_out: &mut [na::Point3<f32>],
         normals_out: &mut [na::Vector3<f32>],
     ) {
-        // 1. Shape + expression blend shapes → v_shaped
-        self.apply_shape_expression_into(params, v_shaped);
+        // 1a. Shape-only blend shapes into the pooled buffer.
+        self.apply_shape_only_into(&params.shape, v_shaped);
 
-        // 2. Joint positions from shaped vertices
+        // 2. Joint positions from the SHAPE-ONLY mesh, matching `forward`.
         let joints = self.j_regressor.dot(v_shaped);
+
+        // 1b. Add expression on top of the pooled buffer for posing/skinning.
+        self.add_expression(v_shaped, &params.expression);
 
         // 3. Per-joint rotation matrices (Rodrigues)
         self.compute_rotation_matrices_into(params, rot_mats);
@@ -718,12 +804,24 @@ impl FlameModel {
     // Internal helpers
     // -----------------------------------------------------------------------
 
+    /// Build the shape-only rest-pose mesh: `v_template + shapedirs · shape`.
+    ///
+    /// This is deliberately expression- and pose-independent: it is the
+    /// mesh joint positions are regressed from (see
+    /// [`compute_joint_positions`](Self::compute_joint_positions)). Callers
+    /// that also need expression should follow up with
+    /// [`add_expression`](Self::add_expression).
     #[inline]
-    fn apply_shape_expression(&self, params: &FlameParams) -> Array2<f32> {
+    fn apply_shape_only(&self, shape: &[f32]) -> Array2<f32> {
         let mut v = self.v_template.clone();
-        apply_blend_shapes(&mut v, &self.shapedirs, &params.shape);
-        apply_blend_shapes(&mut v, &self.expressiondirs, &params.expression);
+        apply_blend_shapes(&mut v, &self.shapedirs, shape);
         v
+    }
+
+    /// Add expression blend shapes on top of an already shape-blended mesh.
+    #[inline]
+    fn add_expression(&self, v: &mut Array2<f32>, expression: &[f32]) {
+        apply_blend_shapes(v, &self.expressiondirs, expression);
     }
 
     #[inline]
@@ -846,14 +944,15 @@ impl FlameModel {
     // In-place internal helpers (for buffer reuse)
     // -----------------------------------------------------------------------
 
-    /// Apply shape and expression blend shapes into a pre-allocated buffer.
+    /// Apply only shape blend shapes into a pre-allocated buffer
+    /// (shape-only rest-pose mesh; see [`apply_shape_only`](Self::apply_shape_only)).
+    /// Follow up with [`add_expression`](Self::add_expression) for posing.
     #[inline]
-    fn apply_shape_expression_into(&self, params: &FlameParams, out: &mut Array2<f32>) {
+    fn apply_shape_only_into(&self, shape: &[f32], out: &mut Array2<f32>) {
         // Copy template to output
         out.assign(&self.v_template);
-        // Apply blend shapes in-place
-        apply_blend_shapes(out, &self.shapedirs, &params.shape);
-        apply_blend_shapes(out, &self.expressiondirs, &params.expression);
+        // Apply shape blend shapes in-place
+        apply_blend_shapes(out, &self.shapedirs, shape);
     }
 
     /// Compute rotation matrices into a pre-allocated buffer.
@@ -979,16 +1078,25 @@ impl FlameModel {
     // SIMD-accelerated internal helpers
     // -----------------------------------------------------------------------
 
-    /// Apply shape and expression blend shapes using SIMD.
+    /// Apply only shape blend shapes using SIMD (shape-only rest-pose mesh;
+    /// see [`apply_shape_only`](Self::apply_shape_only)).
     #[cfg(all(feature = "simd", nightly))]
     #[inline]
-    fn apply_shape_expression_simd(&self, params: &FlameParams) -> Array2<f32> {
+    fn apply_shape_only_simd(&self, shape: &[f32]) -> Array2<f32> {
         use crate::simd::apply_blend_shapes_simd;
 
         let mut v = self.v_template.clone();
-        apply_blend_shapes_simd(&mut v, &self.shapedirs, &params.shape);
-        apply_blend_shapes_simd(&mut v, &self.expressiondirs, &params.expression);
+        apply_blend_shapes_simd(&mut v, &self.shapedirs, shape);
         v
+    }
+
+    /// Add expression blend shapes (SIMD) on top of an already
+    /// shape-blended mesh; see [`add_expression`](Self::add_expression).
+    #[cfg(all(feature = "simd", nightly))]
+    #[inline]
+    fn add_expression_simd(&self, v: &mut Array2<f32>, expression: &[f32]) {
+        use crate::simd::apply_blend_shapes_simd;
+        apply_blend_shapes_simd(v, &self.expressiondirs, expression);
     }
 
     /// Compute rotation matrices using SIMD-accelerated Rodrigues.
@@ -1041,8 +1149,22 @@ impl FlameModel {
     ///
     /// In FLAME, joint locations are regressed from the shaped rest-pose mesh,
     /// which depends only on shape blend shapes (identity parameters), not
-    /// expression or pose. This makes them stable across an animation sequence
-    /// where the same person performs many expressions.
+    /// expression or pose: `J(β) = J_regressor · (v_template + B_S(β))` (Li
+    /// et al. 2017, eq. 3). This makes them stable across an animation
+    /// sequence where the same person performs many expressions, and is what
+    /// [`forward`](Self::forward) itself now uses to build the skinning
+    /// transforms, so these joints match the ones `forward` actually poses
+    /// with.
+    ///
+    /// Note this deliberately departs from the popular `FLAME_PyTorch` / DECA
+    /// re-implementation, which concatenates expression coefficients into
+    /// the same `betas`/`shapedirs` tensors used by SMPL's generic `lbs()`
+    /// routine and therefore folds expression into the joint regression
+    /// step too. This crate follows the original paper instead, primarily
+    /// because it keeps [`joint_positions_cached`](Self::joint_positions_cached)'s
+    /// per-shape (per-identity) cache meaningful — expression varies every
+    /// frame in a typical sequence, so a cache keyed on shape+expression
+    /// would rarely hit.
     ///
     /// `joint_positions_cached` should be preferred over calling this directly;
     /// it returns a cached result when the same shape vector has been seen before.
@@ -1051,9 +1173,7 @@ impl FlameModel {
     ///
     /// `Vec<[f32; 3]>` with `n_joints` entries, each being `[x, y, z]`.
     fn compute_joint_positions(&self, shape: &[f32]) -> Vec<[f32; 3]> {
-        // Apply only shape blend shapes (not expression) to v_template
-        let mut v_shape_only = self.v_template.clone();
-        apply_blend_shapes(&mut v_shape_only, &self.shapedirs, shape);
+        let v_shape_only = self.apply_shape_only(shape);
 
         // Regress joint positions: [n_joints, 3] = j_regressor [n_joints, N] · v [N, 3]
         let joints = self.j_regressor.dot(&v_shape_only);
@@ -1368,5 +1488,251 @@ mod tests {
         let product = r1 * r2;
         let id = na::Matrix3::<f32>::identity();
         assert!((product - id).norm() < 1e-5);
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression: forward() must regress joints from the SHAPE-ONLY mesh,
+    // matching joint_positions_cached / compute_joint_positions. Before the
+    // fix, forward() used the shape+expression mesh for joint regression, so
+    // a vertex 100% LBS-weighted to a joint whose regressor pulls from a
+    // DIFFERENT vertex with a nonzero expression direction would shift when
+    // expression changed -- even though that vertex has no expression
+    // contribution of its own.
+    // -----------------------------------------------------------------------
+
+    /// Build a minimal 2-vertex, 2-joint model where:
+    /// - vertex 0 ("A") is the sole input to joint 0's regressor and has a
+    ///   nonzero expression direction,
+    /// - vertex 1 ("B") is 100% LBS-weighted to joint 0 and has NO
+    ///   expression direction of its own,
+    /// - shape and pose-corrective blend shapes are all zero (isolates the
+    ///   joint-pivot effect from other confounds).
+    fn build_joint_expression_test_model() -> FlameModel {
+        let n_verts = 2;
+        let n_joints = 2;
+        let n_shape = 1;
+        let n_expr = 1;
+        let n_pose_dirs = (n_joints - 1) * 9;
+
+        // A = origin, B = (5, 0, 0).
+        let v_template = Array2::from_shape_vec((n_verts, 3), vec![0.0, 0.0, 0.0, 5.0, 0.0, 0.0])
+            .expect("test: fixed shape matches data length");
+
+        let faces = vec![[0u32, 1, 0]];
+
+        // No shape effect at all.
+        let shapedirs = Array3::zeros((n_verts, 3, n_shape));
+
+        // Only vertex A (index 0) moves with expression; B is unaffected.
+        let mut expressiondirs = Array3::zeros((n_verts, 3, n_expr));
+        expressiondirs[[0, 0, 0]] = 1.0;
+
+        // No pose-corrective blend shapes.
+        let posedirs = Array3::zeros((n_verts, 3, n_pose_dirs));
+
+        // Joint 0 regressed purely from vertex A; joint 1 purely from B.
+        let j_regressor = Array2::from_shape_vec((n_joints, n_verts), vec![1.0, 0.0, 0.0, 1.0])
+            .expect("test: fixed shape matches data length");
+
+        let parents = vec![-1i32, 0];
+
+        // Vertex B is 100% weighted to joint 0 (the joint whose pivot the
+        // bug perturbs); vertex A's weights are irrelevant to this test.
+        let lbs_weights = Array2::from_shape_vec((n_verts, n_joints), vec![1.0, 0.0, 1.0, 0.0])
+            .expect("test: fixed shape matches data length");
+
+        FlameModel::from_arrays(
+            v_template,
+            faces,
+            shapedirs,
+            expressiondirs,
+            posedirs,
+            j_regressor,
+            parents,
+            lbs_weights,
+            n_joints,
+        )
+    }
+
+    #[test]
+    fn test_forward_joints_are_expression_invariant() {
+        let model = build_joint_expression_test_model();
+
+        // 90 degree rotation of the root joint (joint 0) about Z; joint 1
+        // stays at identity (only the first 3 pose values are non-zero).
+        let base_pose = vec![0.0, 0.0, std::f32::consts::FRAC_PI_2, 0.0, 0.0, 0.0];
+
+        let params_a = FlameParams {
+            shape: vec![0.0],
+            expression: vec![0.3],
+            pose: base_pose.clone(),
+            translation: [0.0, 0.0, 0.0],
+        };
+        let params_b = FlameParams {
+            shape: vec![0.0],
+            expression: vec![-0.5],
+            pose: base_pose,
+            translation: [0.0, 0.0, 0.0],
+        };
+
+        let mesh_a = model.forward(&params_a);
+        let mesh_b = model.forward(&params_b);
+
+        // Vertex B (index 1) has no expression contribution of its own and
+        // is 100% weighted to joint 0. Its posed position must be
+        // IDENTICAL regardless of the expression coefficient: joints must
+        // be regressed from the shape-only mesh, not shape+expression.
+        let b_a = &mesh_a.vertices[1];
+        let b_b = &mesh_b.vertices[1];
+        assert!(
+            (b_a - b_b).norm() < 1e-4,
+            "vertex B's posed position must not depend on expression: {b_a:?} vs {b_b:?}"
+        );
+
+        // It should match the analytically expected pivot-about-origin
+        // rotation of (5,0,0) by 90 degrees around Z: (0, 5, 0).
+        assert!(
+            (b_a.x).abs() < 1e-4 && (b_a.y - 5.0).abs() < 1e-4 && (b_a.z).abs() < 1e-4,
+            "expected vertex B at (0, 5, 0), got {b_a:?}"
+        );
+    }
+
+    #[test]
+    fn test_joint_positions_cached_matches_forward_joint_regression() {
+        let model = build_joint_expression_test_model();
+        let shape = vec![0.0f32];
+
+        // joint_positions_cached (shape-only) must match what `forward`
+        // itself uses: joint 0 sits at vertex A's shape-only position (the
+        // origin here) regardless of expression.
+        let cached = model.joint_positions_cached(&shape);
+        assert!(
+            cached[0][0].abs() < 1e-6 && cached[0][1].abs() < 1e-6 && cached[0][2].abs() < 1e-6,
+            "joint 0 should sit at the shape-only origin, got {:?}",
+            cached[0]
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression: forward_batch_(par_)with_pool must validate the pool's
+    // dimensions instead of panicking, and forward_batch_par_with_pool must
+    // actually write into the pool's buffers (not silently bypass them).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_forward_batch_with_pool_rejects_mismatched_pool() {
+        let model = build_joint_expression_test_model(); // num_vertices=2, n_joints=2
+                                                         // Pool built for the WRONG dimensions -- a plausible caller mistake
+                                                         // when constructing directly via `BatchBufferPool::new` instead of
+                                                         // `model.create_buffer_pool`.
+        let mut mismatched_pool = BatchBufferPool::new(4, 999, 7);
+        let params_batch = vec![FlameParams::neutral(), FlameParams::neutral()];
+
+        let result = model.forward_batch_with_pool(&params_batch, &mut mismatched_pool);
+        assert!(
+            result.is_err(),
+            "a pool with mismatched dimensions must be rejected with an error, not panic"
+        );
+    }
+
+    #[test]
+    fn test_forward_batch_with_pool_matches_sequential_forward() {
+        let model = build_joint_expression_test_model();
+        let mut pool = model.create_buffer_pool(2);
+        let params_batch = vec![
+            FlameParams {
+                shape: vec![0.0],
+                expression: vec![0.2],
+                pose: vec![0.0; 6],
+                translation: [0.0; 3],
+            },
+            FlameParams {
+                shape: vec![0.0],
+                expression: vec![-0.1],
+                pose: vec![0.0; 6],
+                translation: [0.0; 3],
+            },
+        ];
+
+        let output = model
+            .forward_batch_with_pool(&params_batch, &mut pool)
+            .expect("a pool matching the model's dimensions must succeed");
+
+        for (idx, params) in params_batch.iter().enumerate() {
+            let expected = model.forward(params);
+            for (v_pool, v_seq) in output.vertices[idx].iter().zip(expected.vertices.iter()) {
+                assert!(
+                    (v_pool - v_seq).norm() < 1e-5,
+                    "pooled forward must match plain sequential forward"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn test_forward_batch_par_with_pool_rejects_mismatched_pool() {
+        let model = build_joint_expression_test_model();
+        let mut mismatched_pool = BatchBufferPool::new(4, 999, 7);
+        let params_batch = vec![FlameParams::neutral(), FlameParams::neutral()];
+
+        let result = model.forward_batch_par_with_pool(&params_batch, &mut mismatched_pool);
+        assert!(
+            result.is_err(),
+            "a pool with mismatched dimensions must be rejected with an error, not panic"
+        );
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn test_forward_batch_par_with_pool_actually_writes_pool_buffers() {
+        let model = build_joint_expression_test_model();
+        let mut pool = model.create_buffer_pool(2);
+        let params_batch = vec![
+            FlameParams {
+                shape: vec![0.0],
+                expression: vec![0.4],
+                pose: vec![0.0; 6],
+                translation: [0.0; 3],
+            },
+            FlameParams {
+                shape: vec![0.0],
+                expression: vec![-0.2],
+                pose: vec![0.0; 6],
+                translation: [0.0; 3],
+            },
+        ];
+
+        // Before the call, pooled v_shaped buffers are freshly allocated
+        // zeros (see `BatchBufferPool::new`).
+        for buf in pool.v_shaped.iter().take(params_batch.len()) {
+            assert!(buf.iter().all(|&x| x == 0.0));
+        }
+
+        let output = model
+            .forward_batch_par_with_pool(&params_batch, &mut pool)
+            .expect("a pool matching the model's dimensions must succeed");
+
+        // After the call, each element's pooled v_shaped buffer must
+        // actually hold that mesh's shape-blended vertices, proving
+        // `forward_into_with_buffers` (not the pool-ignoring `forward_into`)
+        // was used.
+        for (idx, buf) in pool.v_shaped.iter().take(params_batch.len()).enumerate() {
+            assert!(
+                buf.iter().any(|&x| x != 0.0),
+                "pool v_shaped[{idx}] was never written -- buffer pool is being bypassed"
+            );
+        }
+
+        // And the parallel-with-pool output must match plain sequential forward.
+        for (idx, params) in params_batch.iter().enumerate() {
+            let expected = model.forward(params);
+            for (v_pool, v_seq) in output.vertices[idx].iter().zip(expected.vertices.iter()) {
+                assert!(
+                    (v_pool - v_seq).norm() < 1e-5,
+                    "pooled parallel forward must match plain sequential forward"
+                );
+            }
+        }
     }
 }

@@ -4,6 +4,7 @@
 //! scales → u8, opacities → u8) and LBG vector quantization for
 //! spherical-harmonics coefficients.
 
+use rayon::prelude::*;
 use thiserror::Error;
 
 // ────────────────────────────────────────────────────────────────
@@ -18,8 +19,15 @@ pub enum CompressionError {
     EmptyInput,
 
     /// Two arrays have different lengths when they must match.
-    #[error("length mismatch: expected {expected}, got {got}")]
-    LengthMismatch { expected: usize, got: usize },
+    #[error("length mismatch for {field}: expected {expected}, got {got}")]
+    LengthMismatch {
+        /// Name of the field/array that was mismatched.
+        field: &'static str,
+        /// Expected length.
+        expected: usize,
+        /// Actual length found.
+        got: usize,
+    },
 
     /// Codebook size is invalid.
     #[error("invalid codebook size {size}: {reason}")]
@@ -94,7 +102,9 @@ fn quantize_i16(v: f32, lo: f32, hi: f32) -> i16 {
     let t = ((v - lo) / (hi - lo)).clamp(0.0, 1.0);
     // Map [0,1] → [i16::MIN, i16::MAX]
     let scaled = t * 65535.0 - 32768.0;
-    scaled.clamp(i16::MIN as f32, i16::MAX as f32) as i16
+    // Round to nearest (not truncate) to halve the worst-case quantization
+    // error and avoid a systematic bias toward `lo`.
+    scaled.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16
 }
 
 /// Dequantize `i16` back to `f32` in `[lo, hi]`.
@@ -109,7 +119,9 @@ fn dequantize_i16(q: i16, lo: f32, hi: f32) -> f32 {
 fn quantize_i8(v: f32) -> i8 {
     let t = (v.clamp(-1.0, 1.0) + 1.0) / 2.0; // [0, 1]
     let scaled = t * 255.0 - 128.0;
-    scaled.clamp(i8::MIN as f32, i8::MAX as f32) as i8
+    // Round to nearest (not truncate) to halve the worst-case quantization
+    // error and avoid a systematic bias toward zero.
+    scaled.round().clamp(i8::MIN as f32, i8::MAX as f32) as i8
 }
 
 /// Dequantize `i8` back to `f32` in `[-1, 1]`.
@@ -126,7 +138,9 @@ fn quantize_u8(v: f32, lo: f32, hi: f32) -> u8 {
         return 128;
     }
     let t = ((v - lo) / (hi - lo)).clamp(0.0, 1.0);
-    (t * 255.0).clamp(0.0, 255.0) as u8
+    // Round to nearest (not truncate) to halve the worst-case quantization
+    // error and avoid a systematic downward bias.
+    (t * 255.0).round().clamp(0.0, 255.0) as u8
 }
 
 /// Dequantize `u8` back to `f32` in `[lo, hi]`.
@@ -243,16 +257,26 @@ impl CompressedRotations {
     }
 
     /// Decompress back to f32 quaternions.
+    ///
+    /// Each component is independently dequantized to ~1/128 resolution, so
+    /// the raw result is not unit length; it is renormalized here so that
+    /// consumers building a rotation matrix from it (which do not
+    /// renormalize themselves, matching the GPU `quat_to_mat` shader) get a
+    /// proper rotation rather than a scaled-and-sheared matrix.
     pub fn decompress(&self) -> Vec<[f32; 4]> {
         self.data
             .iter()
             .map(|q| {
-                [
-                    dequantize_i8(q[0]),
-                    dequantize_i8(q[1]),
-                    dequantize_i8(q[2]),
-                    dequantize_i8(q[3]),
-                ]
+                let x = dequantize_i8(q[0]);
+                let y = dequantize_i8(q[1]);
+                let z = dequantize_i8(q[2]);
+                let w = dequantize_i8(q[3]);
+                let n = (x * x + y * y + z * z + w * w).sqrt();
+                if n < 1e-6 {
+                    [0.0, 0.0, 0.0, 1.0]
+                } else {
+                    [x / n, y / n, z / n, w / n]
+                }
             })
             .collect()
     }
@@ -444,19 +468,39 @@ pub struct ShCodebook {
 impl ShCodebook {
     /// Build a codebook using simplified LBG (binary split + k-means).
     ///
-    /// `k` must be a power of two between 64 and 256 (inclusive).
-    /// Returns `None` if `sh_coeffs` is empty.
-    pub fn build(sh_coeffs: &[Vec<f32>], k: usize) -> Option<Self> {
+    /// `k` must be a power of two between 2 and 256 (inclusive).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompressionError::EmptyInput`] if `sh_coeffs` is empty,
+    /// [`CompressionError::InvalidCodebookSize`] if `k` is not a power of
+    /// two in `[2, 256]`, or [`CompressionError::LengthMismatch`] if the SH
+    /// vectors do not all share the same length.
+    pub fn build(sh_coeffs: &[Vec<f32>], k: usize) -> Result<Self, CompressionError> {
         if sh_coeffs.is_empty() {
-            return None;
+            return Err(CompressionError::EmptyInput);
         }
 
         // Validate k is power of 2 and in [2, 256].
         if !(2..=256).contains(&k) || (k & (k - 1)) != 0 {
-            return None;
+            return Err(CompressionError::InvalidCodebookSize {
+                size: k,
+                reason: "must be a power of two between 2 and 256",
+            });
         }
 
+        // All SH vectors must share the same length; otherwise `compute_mean`
+        // and `sq_dist` would silently zip to the shorter length, biasing
+        // centroids, and `decode` would silently change the SH coefficient
+        // count of the ragged Gaussians.
         let sh_len = sh_coeffs[0].len();
+        if let Some(bad) = sh_coeffs.iter().position(|v| v.len() != sh_len) {
+            return Err(CompressionError::LengthMismatch {
+                field: "sh_coeffs (ragged: per-Gaussian SH vector lengths differ)",
+                expected: sh_len,
+                got: sh_coeffs[bad].len(),
+            });
+        }
         let n = sh_coeffs.len();
 
         // Cap effective k to number of inputs to avoid degenerate codebooks.
@@ -482,7 +526,7 @@ impl ShCodebook {
             codebook = kmeans_refine(sh_coeffs, codebook, sh_len, 20);
         }
 
-        Some(Self {
+        Ok(Self {
             entries: codebook,
             sh_len,
         })
@@ -490,8 +534,10 @@ impl ShCodebook {
 
     /// Encode each SH vector as an index into the codebook.
     pub fn encode(&self, sh_coeffs: &[Vec<f32>]) -> Vec<u8> {
+        // O(N*K*L) nearest-centroid search; data points are independent so
+        // this parallelizes trivially across all available threads.
         sh_coeffs
-            .iter()
+            .par_iter()
             .map(|v| {
                 let mut best_idx = 0usize;
                 let mut best_dist = f32::INFINITY;
@@ -559,18 +605,29 @@ fn sq_dist(a: &[f32], b: &[f32]) -> f32 {
 /// Returns `(assignments, per-centroid total distortion)`.
 fn assign_to_centroids(data: &[Vec<f32>], codebook: &[Vec<f32>]) -> (Vec<usize>, Vec<f32>) {
     let k = codebook.len();
+    // The O(N*K*L) nearest-centroid search dominates k-means cost; each data
+    // point is independent, so run it across all available threads. The
+    // per-centroid distortion accumulation stays a cheap sequential O(N)
+    // fold over the (index, distance) pairs so the result is deterministic.
+    let per_point: Vec<(usize, f32)> = data
+        .par_iter()
+        .map(|v| {
+            let mut best_idx = 0usize;
+            let mut best_dist = f32::INFINITY;
+            for (i, entry) in codebook.iter().enumerate() {
+                let d = sq_dist(v, entry);
+                if d < best_dist {
+                    best_dist = d;
+                    best_idx = i;
+                }
+            }
+            (best_idx, best_dist)
+        })
+        .collect();
+
     let mut assignments = vec![0usize; data.len()];
     let mut distortions = vec![0.0f32; k];
-    for (idx, v) in data.iter().enumerate() {
-        let mut best_idx = 0usize;
-        let mut best_dist = f32::INFINITY;
-        for (i, entry) in codebook.iter().enumerate() {
-            let d = sq_dist(v, entry);
-            if d < best_dist {
-                best_dist = d;
-                best_idx = i;
-            }
-        }
+    for (idx, &(best_idx, best_dist)) in per_point.iter().enumerate() {
         assignments[idx] = best_idx;
         distortions[best_idx] += best_dist;
     }
@@ -594,8 +651,21 @@ fn kmeans_refine(
         return codebook;
     }
 
+    // Relative tolerance on total squared-error distortion: once an
+    // iteration improves the k-means objective by less than this fraction,
+    // the codebook is close enough to its fixed point that further
+    // O(N*K*L) passes are not worth their cost. This is in addition to (not
+    // a replacement for) the exact-stagnation `changed` check below, and is
+    // only consulted *after* dead-centroid reinitialization and the live
+    // centroid update below have both run for the current iteration, so an
+    // iteration that is "converged" in aggregate distortion still gets its
+    // dead centroids fixed before we decide whether to stop.
+    const CONVERGENCE_TOL: f32 = 1e-5;
+    let mut prev_total_distortion: Option<f32> = None;
+
     for _iter in 0..max_iter {
         let (assignments, distortions) = assign_to_centroids(data, &codebook);
+        let total_distortion: f32 = distortions.iter().sum();
 
         // Recompute centroids from assignments.
         let mut sums: Vec<Vec<f32>> = vec![vec![0.0f32; sh_len]; k];
@@ -656,6 +726,17 @@ fn kmeans_refine(
         if !changed {
             break;
         }
+
+        // Convergence-tolerance early exit (see comment above): checked
+        // last so it never skips a dead-centroid reinit or live-centroid
+        // update for the current iteration.
+        if let Some(prev) = prev_total_distortion {
+            let denom = prev.max(1e-12);
+            if ((prev - total_distortion).abs() / denom) < CONVERGENCE_TOL {
+                break;
+            }
+        }
+        prev_total_distortion = Some(total_distortion);
     }
 
     codebook
@@ -722,6 +803,7 @@ impl CompressedGaussianModel {
 // ────────────────────────────────────────────────────────────────
 
 /// All Gaussian arrays after decompression.
+#[derive(Debug)]
 pub struct DecompressedArrays {
     /// Positions.
     pub positions: Vec<[f32; 3]>,
@@ -830,14 +912,32 @@ pub fn compress_gaussians(
         ("opacities", opacities.len()),
     ] {
         if got != n {
-            return Err(CompressionError::LengthMismatch { expected: n, got });
+            return Err(CompressionError::LengthMismatch {
+                field: name,
+                expected: n,
+                got,
+            });
         }
-        let _ = name;
     }
     if !sh_coeffs.is_empty() && sh_coeffs.len() != n {
         return Err(CompressionError::LengthMismatch {
+            field: "sh_coeffs",
             expected: n,
             got: sh_coeffs.len(),
+        });
+    }
+    // SH vectors must all share the same length; a ragged input would
+    // otherwise silently bias `sh_len_per`'s byte accounting below and any
+    // codebook built from it (see `ShCodebook::build`).
+    if let Some(bad) = sh_coeffs
+        .first()
+        .map(|first| first.len())
+        .and_then(|sh_len| sh_coeffs.iter().position(|v| v.len() != sh_len))
+    {
+        return Err(CompressionError::LengthMismatch {
+            field: "sh_coeffs (ragged: per-Gaussian SH vector lengths differ)",
+            expected: sh_coeffs[0].len(),
+            got: sh_coeffs[bad].len(),
         });
     }
 
@@ -880,11 +980,14 @@ pub fn compress_gaussians(
         ShCompressed::Raw(Vec::new())
     } else if config.use_sh_codebook {
         match ShCodebook::build(sh_coeffs, config.sh_codebook_size) {
-            Some(codebook) => {
+            Ok(codebook) => {
                 let indices = codebook.encode(sh_coeffs);
                 ShCompressed::Codebook { codebook, indices }
             }
-            None => ShCompressed::Raw(sh_coeffs.to_vec()),
+            // sh_coeffs/k were already validated above, so this should not
+            // happen in practice; fall back to lossless raw storage rather
+            // than failing the whole compression.
+            Err(_) => ShCompressed::Raw(sh_coeffs.to_vec()),
         }
     } else {
         ShCompressed::Raw(sh_coeffs.to_vec())
@@ -966,12 +1069,34 @@ pub fn decompress_gaussians(
         ShCompressed::Codebook { codebook, indices } => codebook.decode(indices),
     };
 
-    // Validate consistency.
+    // Validate consistency. A `CompressedGaussianModel` can be constructed
+    // directly (all fields are public) or deserialized from a truncated
+    // file, so every array must be checked against `num_gaussians` here —
+    // not just positions — or a mismatched array panics or silently drops
+    // Gaussians at the first consumer that zips them together.
     let n = model.num_gaussians;
-    if positions.len() != n {
+    for (field, len) in [
+        ("positions", positions.len()),
+        ("rotations", rotations.len()),
+        ("scales", scales.len()),
+        ("opacities", opacities.len()),
+    ] {
+        if len != n {
+            return Err(CompressionError::LengthMismatch {
+                field,
+                expected: n,
+                got: len,
+            });
+        }
+    }
+    // `sh_coeffs` is documented to be empty when the model carries no SH
+    // data at all (see `ShCompressed::Raw(Vec::new())` in
+    // `compress_gaussians`), so only enforce the length when non-empty.
+    if !sh_coeffs.is_empty() && sh_coeffs.len() != n {
         return Err(CompressionError::LengthMismatch {
+            field: "sh_coeffs",
             expected: n,
-            got: positions.len(),
+            got: sh_coeffs.len(),
         });
     }
 
@@ -1001,7 +1126,9 @@ mod tests {
         for &v in &[-5.0f32, -2.5, 0.0, 2.5, 5.0] {
             let q = quantize_i16(v, lo, hi);
             let r = dequantize_i16(q, lo, hi);
-            let max_err = (hi - lo) / 65535.0;
+            // Round-to-nearest halves the worst-case error vs. truncation
+            // (0.5 LSB instead of 1 LSB).
+            let max_err = (hi - lo) / 65535.0 / 2.0;
             assert!(
                 (v - r).abs() <= max_err + 1e-6,
                 "i16 roundtrip: orig={v}, recon={r}, max_err={max_err}"
@@ -1014,8 +1141,9 @@ mod tests {
         for &v in &[-1.0f32, -0.5, 0.0, 0.5, 1.0] {
             let q = quantize_i8(v);
             let r = dequantize_i8(q);
-            // i8 has 256 levels over range [-1, 1], so step ≈ 2/255 ≈ 0.00784
-            assert!((v - r).abs() < 0.009, "i8 roundtrip: orig={v}, recon={r}");
+            // i8 has 256 levels over range [-1, 1], so step ≈ 2/255 ≈ 0.00784;
+            // round-to-nearest halves the worst case to ≈ 0.00392.
+            assert!((v - r).abs() < 0.0045, "i8 roundtrip: orig={v}, recon={r}");
         }
     }
 
@@ -1026,7 +1154,8 @@ mod tests {
         for &v in &[0.0f32, 0.25, 0.5, 0.75, 1.0] {
             let q = quantize_u8(v, lo, hi);
             let r = dequantize_u8(q, lo, hi);
-            let max_err = (hi - lo) / 255.0;
+            // Round-to-nearest halves the worst-case error vs. truncation.
+            let max_err = (hi - lo) / 255.0 / 2.0;
             assert!(
                 (v - r).abs() <= max_err + 1e-6,
                 "u8 roundtrip: orig={v}, recon={r}"
@@ -1105,6 +1234,52 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_compress_rotations_decompress_is_normalized() {
+        // Independent per-component i8 quantization does not preserve unit
+        // length; `decompress` must renormalize so a consumer that builds a
+        // rotation matrix straight from the result (as the GPU shader does,
+        // without renormalizing itself) gets a proper rotation.
+        let rotations = vec![
+            [0.0f32, 0.0, 0.0, 1.0],
+            [0.5, 0.5, 0.5, 0.5],
+            [-0.5, 0.5, -0.5, 0.5],
+            [1.0f32 / 2.0f32.sqrt(), 0.0, 0.0, 1.0f32 / 2.0f32.sqrt()],
+            [0.1, 0.2, 0.3, 0.9],
+        ];
+        let comp = CompressedRotations::compress(&rotations);
+        let recon = comp.decompress();
+        for q in &recon {
+            let norm = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
+            assert!(
+                (norm - 1.0).abs() < 1e-5,
+                "decompressed quaternion should be unit length, got |q|={norm} for {q:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_compress_rotations_decompress_extreme_values_stay_finite_and_normalized() {
+        // Directly-constructed (not via `compress`) extreme i8 quadruples
+        // must still dequantize+renormalize to a finite unit quaternion,
+        // never NaN — exercising the same divide-by-norm path that a
+        // near-zero-norm input would hit via the `n < 1e-6` fallback.
+        let comp = CompressedRotations {
+            data: vec![[i8::MIN, i8::MIN, i8::MIN, i8::MIN], [0, 0, 0, i8::MIN]],
+        };
+        let recon = comp.decompress();
+        for q in &recon {
+            let norm = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
+            for &v in q {
+                assert!(v.is_finite(), "expected finite component, got {v}");
+            }
+            assert!(
+                (norm - 1.0).abs() < 1e-5,
+                "expected unit-length fallback/renormalization, got |q|={norm}"
+            );
+        }
+    }
+
     // ── CompressedScales ────────────────────────────────────────
 
     #[test]
@@ -1150,10 +1325,39 @@ mod tests {
         // Two very different vectors, codebook of size 2.
         let sh_coeffs = vec![vec![1.0f32, 0.0, 0.0], vec![0.0f32, 0.0, 1.0]];
         let codebook = ShCodebook::build(&sh_coeffs, 2);
-        assert!(codebook.is_some());
+        assert!(codebook.is_ok());
         let cb = codebook.unwrap();
         assert_eq!(cb.entries.len(), 2);
         assert_eq!(cb.sh_len, 3);
+    }
+
+    #[test]
+    fn test_sh_codebook_build_rejects_ragged_vectors() {
+        // Second vector has a different length than the first.
+        let sh_coeffs = vec![vec![1.0f32, 0.0, 0.0], vec![0.0f32, 1.0]];
+        let result = ShCodebook::build(&sh_coeffs, 2);
+        assert!(matches!(
+            result,
+            Err(CompressionError::LengthMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn test_sh_codebook_build_doc_range_matches_code() {
+        // The doc says k must be a power of two in [2, 256]; k=2 (the
+        // documented lower bound) must actually be accepted.
+        let sh_coeffs = vec![vec![1.0f32, 0.0], vec![0.0f32, 1.0]];
+        assert!(ShCodebook::build(&sh_coeffs, 2).is_ok());
+        // Non-power-of-two and out-of-range sizes are rejected with a
+        // reason, not silently swallowed.
+        assert!(matches!(
+            ShCodebook::build(&sh_coeffs, 3),
+            Err(CompressionError::InvalidCodebookSize { .. })
+        ));
+        assert!(matches!(
+            ShCodebook::build(&sh_coeffs, 512),
+            Err(CompressionError::InvalidCodebookSize { .. })
+        ));
     }
 
     #[test]
@@ -1313,6 +1517,85 @@ mod tests {
             result,
             Err(CompressionError::LengthMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn test_length_mismatch_error_names_field() {
+        let positions = vec![[0.0f32; 3]; 3];
+        let rotations = vec![[0.0f32, 0.0, 0.0, 1.0]; 2]; // wrong length
+        let scales = vec![[-1.0f32; 3]; 3];
+        let opacities = vec![0.0f32; 3];
+        let result = compress_gaussians(
+            &positions,
+            &rotations,
+            &scales,
+            &opacities,
+            &[],
+            0,
+            &Default::default(),
+        );
+        match result {
+            Err(CompressionError::LengthMismatch { field, .. }) => {
+                assert_eq!(field, "rotations", "error should name the short array")
+            }
+            other => panic!("expected LengthMismatch naming 'rotations', got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_compress_gaussians_rejects_ragged_sh_vectors() {
+        let n = 3usize;
+        let positions: Vec<[f32; 3]> = vec![[0.0; 3]; n];
+        let rotations: Vec<[f32; 4]> = vec![[0.0, 0.0, 0.0, 1.0]; n];
+        let scales: Vec<[f32; 3]> = vec![[-1.0; 3]; n];
+        let opacities: Vec<f32> = vec![0.0; n];
+        // Second Gaussian's SH vector has a different length than the rest.
+        let sh_coeffs: Vec<Vec<f32>> = vec![vec![0.0f32; 9], vec![0.0f32; 6], vec![0.0f32; 9]];
+        let result = compress_gaussians(
+            &positions,
+            &rotations,
+            &scales,
+            &opacities,
+            &sh_coeffs,
+            1,
+            &Default::default(),
+        );
+        assert!(matches!(
+            result,
+            Err(CompressionError::LengthMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn test_decompress_gaussians_rejects_truncated_rotations() {
+        // Directly construct a model whose rotations array is shorter than
+        // `num_gaussians` (as if deserialized from a truncated file).
+        let positions = CompressedPositions::compress(
+            &[[0.0f32; 3], [1.0, 1.0, 1.0]],
+            &SceneBounds {
+                min: [0.0; 3],
+                max: [1.0; 3],
+            },
+        );
+        let rotations = CompressedRotations::compress(&[[0.0, 0.0, 0.0, 1.0]]); // only 1, need 2
+        let scales = CompressedScales::compress(&[[-1.0f32; 3], [-1.0; 3]]);
+        let opacities = CompressedOpacities::compress(&[0.0f32, 0.0]);
+        let model = CompressedGaussianModel {
+            positions,
+            rotations,
+            scales,
+            opacities,
+            sh_compressed: ShCompressed::Raw(Vec::new()),
+            sh_degree: 0,
+            num_gaussians: 2,
+        };
+        let result = decompress_gaussians(&model);
+        match result {
+            Err(CompressionError::LengthMismatch { field, .. }) => {
+                assert_eq!(field, "rotations")
+            }
+            other => panic!("expected LengthMismatch naming 'rotations', got {other:?}"),
+        }
     }
 
     // ── Decompress roundtrip RMS ────────────────────────────────

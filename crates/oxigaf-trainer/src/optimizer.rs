@@ -7,6 +7,7 @@
 use oxigaf_render::gaussian::GaussianModel;
 
 use crate::config::OptimizerConfig;
+use crate::TrainerError;
 
 // ---------------------------------------------------------------------------
 // Parameter groups
@@ -91,6 +92,75 @@ impl Gradients {
     /// `position` length).
     pub fn num_gaussians(&self) -> usize {
         self.position.len() / 3
+    }
+
+    /// The six parameter groups as separate flat vectors, in
+    /// [`ParameterGroup`] order (position, rotation, scale, opacity, SH,
+    /// offset).
+    ///
+    /// This is the shape every group-wise utility in the crate speaks —
+    /// [`crate::gradient_clipping::GradientClipper::step`],
+    /// [`crate::gradient_accumulation::GradientAccumulator::accumulate`] and
+    /// [`crate::data_parallel::GradientAggregator::submit_gradients`] all take
+    /// `&[Vec<f32>]` — so it is the single conversion point rather than six
+    /// ad-hoc `vec![...]` literals scattered across call sites.
+    pub fn to_group_vecs(&self) -> Vec<Vec<f32>> {
+        vec![
+            self.position.clone(),
+            self.rotation.clone(),
+            self.scale.clone(),
+            self.opacity.clone(),
+            self.sh.clone(),
+            self.offset.clone(),
+        ]
+    }
+
+    /// Element counts of the six groups, in [`to_group_vecs`](Self::to_group_vecs)
+    /// order — what [`crate::gradient_accumulation::GradientAccumulator::initialize`]
+    /// wants.
+    pub fn group_sizes(&self) -> [usize; 6] {
+        [
+            self.position.len(),
+            self.rotation.len(),
+            self.scale.len(),
+            self.opacity.len(),
+            self.sh.len(),
+            self.offset.len(),
+        ]
+    }
+
+    /// Overwrite the six groups from vectors laid out as
+    /// [`to_group_vecs`](Self::to_group_vecs) produced them.
+    ///
+    /// # Errors
+    ///
+    /// [`TrainerError::GradientSizeMismatch`] if the slice does not hold
+    /// exactly six groups, or if any group's length differs from this buffer's.
+    /// Silently truncating instead would drop the tail of a parameter group's
+    /// gradient — a corrupted step that no later check could catch.
+    pub fn set_from_group_vecs(&mut self, groups: &[Vec<f32>]) -> Result<(), TrainerError> {
+        if groups.len() != 6 {
+            return Err(TrainerError::GradientSizeMismatch {
+                expected: 6,
+                actual: groups.len(),
+            });
+        }
+        let expected = self.group_sizes();
+        for (idx, group) in groups.iter().enumerate() {
+            if group.len() != expected[idx] {
+                return Err(TrainerError::GradientSizeMismatch {
+                    expected: expected[idx],
+                    actual: group.len(),
+                });
+            }
+        }
+        self.position.copy_from_slice(&groups[0]);
+        self.rotation.copy_from_slice(&groups[1]);
+        self.scale.copy_from_slice(&groups[2]);
+        self.opacity.copy_from_slice(&groups[3]);
+        self.sh.copy_from_slice(&groups[4]);
+        self.offset.copy_from_slice(&groups[5]);
+        Ok(())
     }
 
     /// Accumulate (`+=`) each element from `other` element-wise.
@@ -184,6 +254,12 @@ pub struct GaussianOptimizer {
     accumulated_gradients: Option<Gradients>,
     /// Number of micro-batches accumulated so far since the last optimizer step.
     accumulation_step: u32,
+    /// Multiplier applied to **every** group's learning rate.
+    ///
+    /// This is where an external schedule ([`crate::lr_scheduler`]) enters the
+    /// update; `1.0` reproduces the configured rates exactly.  Kept private so
+    /// it can only be set through the validating [`GaussianOptimizer::set_lr_scale`].
+    lr_scale: f32,
 }
 
 impl GaussianOptimizer {
@@ -202,29 +278,112 @@ impl GaussianOptimizer {
             sh_channels,
             accumulated_gradients: None,
             accumulation_step: 0,
+            lr_scale: 1.0,
         }
     }
 
     // ----- learning-rate schedule -------------------------------------------
 
-    /// Exponentially-decayed learning rate for position parameters.
+    /// Exponentially-decayed learning rate for position parameters, including
+    /// the current [`lr_scale`](Self::lr_scale).
     pub fn position_lr(&self, iteration: u32) -> f32 {
         let t = (iteration as f32) / (self.config.position_lr_decay_steps as f32).max(1.0);
         let t = t.min(1.0);
         let log_start = self.config.lr_position.ln();
         let log_end = self.config.lr_position_final.ln();
-        ((1.0 - t) * log_start + t * log_end).exp()
+        ((1.0 - t) * log_start + t * log_end).exp() * self.lr_scale
+    }
+
+    /// The multiplier currently applied to every group's learning rate.
+    pub fn lr_scale(&self) -> f32 {
+        self.lr_scale
+    }
+
+    /// Set the multiplier applied to every group's learning rate.
+    ///
+    /// This is how an [`crate::lr_scheduler::LrScheduler`] reaches the update:
+    /// build the schedule with `base_lr = 1.0` and feed its value here once per
+    /// iteration.  It composes with — rather than replaces — the optimizer's own
+    /// exponential position decay.
+    ///
+    /// # Errors
+    ///
+    /// [`TrainerError::ParameterOutOfRange`] for a non-finite or negative
+    /// scale: either would silently turn the whole update into `NaN` or into
+    /// gradient *ascent*, which is far worse than refusing it here.
+    pub fn set_lr_scale(&mut self, scale: f32) -> Result<(), TrainerError> {
+        if !scale.is_finite() || scale < 0.0 {
+            return Err(TrainerError::ParameterOutOfRange {
+                param: "lr_scale".into(),
+                value: format!("{scale}"),
+                expected: ">= 0 and finite".into(),
+            });
+        }
+        self.lr_scale = scale;
+        Ok(())
     }
 
     // ----- optimiser step ---------------------------------------------------
 
+    /// Validate that `gradients` and every Adam-state buffer match the
+    /// current model size (`n` Gaussians, `sh_len` total SH coefficients).
+    ///
+    /// # Errors
+    /// [`TrainerError::GradientSizeMismatch`] naming the first mismatched
+    /// buffer's actual/expected element counts.
+    fn validate_step_shapes(
+        &self,
+        gradients: &Gradients,
+        n: usize,
+        sh_len: usize,
+    ) -> Result<(), TrainerError> {
+        // Each Adam state's `m`/`v` buffers are always allocated together
+        // (see `AdamState::new`) and kept in sync by `handle_densify`, so
+        // checking `m` alone is sufficient to catch a desync.
+        let buffers: [(usize, usize); 12] = [
+            (gradients.position.len(), n * 3), // position gradient
+            (self.position.m.len(), n * 3),    // position Adam state
+            (gradients.rotation.len(), n * 4), // rotation gradient
+            (self.rotation.m.len(), n * 4),    // rotation Adam state
+            (gradients.scale.len(), n * 3),    // scale gradient
+            (self.scale.m.len(), n * 3),       // scale Adam state
+            (gradients.opacity.len(), n),      // opacity gradient
+            (self.opacity.m.len(), n),         // opacity Adam state
+            (gradients.sh.len(), sh_len),      // SH gradient
+            (self.sh.m.len(), sh_len),         // SH Adam state
+            (gradients.offset.len(), n * 3),   // offset gradient
+            (self.offset.m.len(), n * 3),      // offset Adam state
+        ];
+        for (actual, expected) in buffers {
+            if actual != expected {
+                return Err(TrainerError::GradientSizeMismatch { expected, actual });
+            }
+        }
+        Ok(())
+    }
+
     /// Perform one Adam update for **all** parameter groups.
-    pub fn step(&mut self, model: &mut GaussianModel, gradients: &Gradients, iteration: u32) {
+    ///
+    /// # Errors
+    /// [`TrainerError::GradientSizeMismatch`] if `gradients` (or this
+    /// optimiser's own Adam-state buffers) do not match `model`'s current
+    /// size — e.g. a `Gradients` built for a different Gaussian count, or a
+    /// `model.sh_degree` that changed since this optimiser was constructed
+    /// without a corresponding resize of its SH state.
+    pub fn step(
+        &mut self,
+        model: &mut GaussianModel,
+        gradients: &Gradients,
+        iteration: u32,
+    ) -> Result<(), TrainerError> {
         let n = model.len();
+        self.validate_step_shapes(gradients, n, model.sh_coeffs.len())?;
+        let lr_scale = self.lr_scale;
         let cfg = &self.config;
 
         // Position (with exponential LR decay)
         {
+            // `position_lr` already folds in `lr_scale`.
             let lr = self.position_lr(iteration);
             let s = &mut self.position;
             s.t += 1;
@@ -251,7 +410,7 @@ impl GaussianOptimizer {
 
         // Rotation
         {
-            let lr = cfg.lr_rotation;
+            let lr = cfg.lr_rotation * lr_scale;
             let s = &mut self.rotation;
             s.t += 1;
             let bc1 = 1.0 - cfg.beta1.powi(s.t as i32);
@@ -277,7 +436,7 @@ impl GaussianOptimizer {
 
         // Scale
         {
-            let lr = cfg.lr_scale;
+            let lr = cfg.lr_scale * lr_scale;
             let s = &mut self.scale;
             s.t += 1;
             let bc1 = 1.0 - cfg.beta1.powi(s.t as i32);
@@ -303,7 +462,7 @@ impl GaussianOptimizer {
 
         // Opacity
         {
-            let lr = cfg.lr_opacity;
+            let lr = cfg.lr_opacity * lr_scale;
             let s = &mut self.opacity;
             s.t += 1;
             let bc1 = 1.0 - cfg.beta1.powi(s.t as i32);
@@ -326,7 +485,7 @@ impl GaussianOptimizer {
 
         // Spherical-Harmonics coefficients
         {
-            let lr = cfg.lr_sh;
+            let lr = cfg.lr_sh * lr_scale;
             let s = &mut self.sh;
             s.t += 1;
             let bc1 = 1.0 - cfg.beta1.powi(s.t as i32);
@@ -349,7 +508,7 @@ impl GaussianOptimizer {
 
         // Local offsets
         {
-            let lr = cfg.lr_offset;
+            let lr = cfg.lr_offset * lr_scale;
             let s = &mut self.offset;
             s.t += 1;
             let bc1 = 1.0 - cfg.beta1.powi(s.t as i32);
@@ -372,6 +531,8 @@ impl GaussianOptimizer {
                 }
             }
         }
+
+        Ok(())
     }
 
     // ----- gradient clipping ------------------------------------------------
@@ -383,19 +544,57 @@ impl GaussianOptimizer {
     /// are scaled uniformly by `max_norm / norm`.
     ///
     /// Returns the norm **before** any clipping was applied.
-    pub fn clip_grad_norm(&self, gradients: &mut Gradients, max_norm: f32) -> f32 {
-        // Accumulate squared sum over every gradient slice.
-        let sum_sq = [
-            &gradients.position,
-            &gradients.rotation,
-            &gradients.scale,
-            &gradients.opacity,
-            &gradients.sh,
-            &gradients.offset,
-        ]
-        .iter()
-        .flat_map(|g| g.iter())
-        .fold(0.0_f32, |acc, &x| acc + x * x);
+    ///
+    /// # Errors
+    /// [`TrainerError::NanDetected`] / [`TrainerError::InfDetected`] if any
+    /// gradient element is non-finite, naming the offending parameter group
+    /// and index. Previously a NaN silently defeated the `norm > max_norm`
+    /// check (NaN compares `false` to everything) and passed straight
+    /// through unclipped, while an Inf silently zeroed every gradient
+    /// (`max_norm / Inf == 0`) without reporting anything. On `Err`,
+    /// `gradients` is left **unmodified** — unlike the old Inf behaviour,
+    /// callers must not assume any clipping happened.
+    pub fn clip_grad_norm(
+        &self,
+        gradients: &mut Gradients,
+        max_norm: f32,
+    ) -> Result<f32, TrainerError> {
+        let groups: [(&str, &Vec<f32>); 6] = [
+            ("position", &gradients.position),
+            ("rotation", &gradients.rotation),
+            ("scale", &gradients.scale),
+            ("opacity", &gradients.opacity),
+            ("sh", &gradients.sh),
+            ("offset", &gradients.offset),
+        ];
+
+        // Single pass: accumulate the squared sum while also recording the
+        // first non-finite element found (if any), so this costs no more
+        // than the original unguarded fold.
+        let mut sum_sq = 0.0_f32;
+        let mut non_finite: Option<(&str, usize, f32)> = None;
+        for (name, buf) in groups {
+            for (idx, &x) in buf.iter().enumerate() {
+                if non_finite.is_none() && !x.is_finite() {
+                    non_finite = Some((name, idx, x));
+                }
+                sum_sq += x * x;
+            }
+        }
+
+        if let Some((parameter, index, value)) = non_finite {
+            return if value.is_nan() {
+                Err(TrainerError::NanDetected {
+                    parameter: parameter.to_string(),
+                    index,
+                })
+            } else {
+                Err(TrainerError::InfDetected {
+                    parameter: parameter.to_string(),
+                    index,
+                })
+            };
+        }
 
         let norm = sum_sq.sqrt();
 
@@ -415,7 +614,7 @@ impl GaussianOptimizer {
             }
         }
 
-        norm
+        Ok(norm)
     }
 
     /// Clip each gradient value per-parameter group to `[-max_value, max_value]`.
@@ -475,37 +674,45 @@ impl GaussianOptimizer {
     /// * `iteration` — global training iteration (used for LR scheduling).
     ///
     /// # Returns
-    /// * `Some(n)` — the update was applied; `n` is the number of
+    /// * `Ok(Some(n))` — the update was applied; `n` is the number of
     ///   micro-batches that were averaged together.
-    /// * `None` — not enough micro-batches have been accumulated yet; the
-    ///   caller should continue calling `accumulate_gradients`.
+    /// * `Ok(None)` — not enough micro-batches have been accumulated yet;
+    ///   the caller should continue calling `accumulate_gradients`.
+    ///
+    /// # Errors
+    /// Propagates [`TrainerError::GradientSizeMismatch`] from
+    /// [`Self::step`] if the accumulated buffer no longer matches `model`'s
+    /// size.
     pub fn step_accumulated(
         &mut self,
         model: &mut GaussianModel,
         accumulation_steps: u32,
         iteration: u32,
-    ) -> Option<u32> {
+    ) -> Result<Option<u32>, TrainerError> {
         if self.accumulation_step < accumulation_steps {
-            return None;
+            return Ok(None);
         }
 
         let n_steps = self.accumulation_step;
 
         // Take ownership of the accumulated buffer to release the borrow on
         // `self.accumulated_gradients` before calling `self.step()`.
-        let mut averaged = self.accumulated_gradients.take()?;
+        let mut averaged = match self.accumulated_gradients.take() {
+            Some(g) => g,
+            None => return Ok(None),
+        };
 
         // Average in-place.
         if n_steps > 1 {
             averaged.scale(1.0 / n_steps as f32);
         }
 
-        // Reset counter before calling step (step may panic; we still reset).
+        // Reset counter before calling step (step may error; we still reset).
         self.accumulation_step = 0;
 
-        self.step(model, &averaged, iteration);
+        self.step(model, &averaged, iteration)?;
 
-        Some(n_steps)
+        Ok(Some(n_steps))
     }
 
     // ----- density-control bookkeeping --------------------------------------
@@ -727,7 +934,9 @@ mod tests {
         // Global L2 norm = sqrt(6 * 1²) = sqrt(6) ≈ 2.449
         let expected_norm = (6.0_f32).sqrt();
         let max_norm = 1.0_f32;
-        let returned_norm = opt.clip_grad_norm(&mut grads, max_norm);
+        let returned_norm = opt
+            .clip_grad_norm(&mut grads, max_norm)
+            .expect("all-finite gradients must not error");
 
         // Returned norm must equal norm *before* clipping.
         assert!(
@@ -760,12 +969,71 @@ mod tests {
             offset: vec![0.0_f32; 3],
         };
         // norm = sqrt(3 * 0.01) = sqrt(0.03) ≈ 0.173, well within max_norm=1.0
-        let norm = opt.clip_grad_norm(&mut grads, 1.0);
+        let norm = opt
+            .clip_grad_norm(&mut grads, 1.0)
+            .expect("all-finite gradients must not error");
         assert!(norm < 1.0, "norm should be under max_norm");
         // Values must be unchanged.
         for &v in &grads.position {
             assert!((v - 0.1).abs() < 1e-7, "should be unchanged, got {v}");
         }
+    }
+
+    #[test]
+    fn clip_grad_norm_nan_returns_err_and_leaves_gradients_unmodified() {
+        // Regression: a NaN used to poison `norm` (NaN compares false to
+        // everything), so `norm > max_norm` was false and no clipping
+        // happened — the poisoned gradients passed straight through
+        // silently instead of being reported.
+        let config = crate::config::OptimizerConfig::default();
+        let dummy_model = make_tiny_model(1, 0);
+        let opt = GaussianOptimizer::new(&config, &dummy_model);
+
+        let mut grads = Gradients {
+            position: vec![1.0_f32, f32::NAN, 1.0],
+            rotation: vec![0.0_f32; 4],
+            scale: vec![0.0_f32; 3],
+            opacity: vec![0.0_f32; 1],
+            sh: vec![],
+            offset: vec![0.0_f32; 3],
+        };
+        let before = grads.position.clone();
+        let result = opt.clip_grad_norm(&mut grads, 1.0);
+        assert!(
+            matches!(result, Err(TrainerError::NanDetected { .. })),
+            "expected NanDetected, got {result:?}"
+        );
+        // Gradients must be left untouched on error.
+        assert_eq!(before[0], grads.position[0]);
+        assert!(grads.position[1].is_nan());
+        assert_eq!(before[2], grads.position[2]);
+    }
+
+    #[test]
+    fn clip_grad_norm_inf_returns_err_and_leaves_gradients_unmodified() {
+        // Regression: `Inf > max_norm` is true, so the old code computed
+        // `scale = max_norm / Inf = 0.0` and silently zeroed every
+        // gradient instead of reporting the overflow.
+        let config = crate::config::OptimizerConfig::default();
+        let dummy_model = make_tiny_model(1, 0);
+        let opt = GaussianOptimizer::new(&config, &dummy_model);
+
+        let mut grads = Gradients {
+            position: vec![1.0_f32, f32::INFINITY, 1.0],
+            rotation: vec![0.0_f32; 4],
+            scale: vec![0.0_f32; 3],
+            opacity: vec![0.0_f32; 1],
+            sh: vec![],
+            offset: vec![0.0_f32; 3],
+        };
+        let result = opt.clip_grad_norm(&mut grads, 1.0);
+        assert!(
+            matches!(result, Err(TrainerError::InfDetected { .. })),
+            "expected InfDetected, got {result:?}"
+        );
+        // Gradients must not have been silently zeroed.
+        assert_eq!(grads.position[0], 1.0);
+        assert!(grads.position[1].is_infinite());
     }
 
     #[test]
@@ -859,6 +1127,25 @@ mod tests {
     }
 
     #[test]
+    fn step_rejects_mismatched_gradient_size_instead_of_panicking() {
+        // Regression: `step` used to index `gradients.position[idx]` etc.
+        // with no size validation, panicking with an index-out-of-bounds
+        // for any caller whose `Gradients` was built for a different
+        // Gaussian count than `model`.
+        let config = crate::config::OptimizerConfig::default();
+        let mut model = make_tiny_model(2, 0); // n=2 Gaussians
+        let mut opt = GaussianOptimizer::new(&config, &model);
+
+        // Gradients sized for only 1 Gaussian instead of 2.
+        let mismatched = make_tiny_gradients(1, 0.1);
+        let result = opt.step(&mut model, &mismatched, 0);
+        assert!(
+            matches!(result, Err(TrainerError::GradientSizeMismatch { .. })),
+            "expected GradientSizeMismatch, got {result:?}"
+        );
+    }
+
+    #[test]
     fn accumulate_once_and_step_applies_update() {
         let config = crate::config::OptimizerConfig::default();
         let mut model = make_tiny_model(2, 0);
@@ -871,7 +1158,9 @@ mod tests {
         opt.accumulate_gradients(&grads);
 
         // With accumulation_steps = 1, step_accumulated should fire immediately.
-        let result = opt.step_accumulated(&mut model, 1, 0);
+        let result = opt
+            .step_accumulated(&mut model, 1, 0)
+            .expect("valid gradients");
         assert_eq!(result, Some(1), "expected step to fire");
 
         // Position should have changed (Adam update with non-zero gradient).
@@ -895,7 +1184,9 @@ mod tests {
         opt.accumulate_gradients(&grads);
 
         // Require 4 micro-batches; only 1 accumulated — should return None.
-        let result = opt.step_accumulated(&mut model, 4, 0);
+        let result = opt
+            .step_accumulated(&mut model, 4, 0)
+            .expect("valid gradients");
         assert_eq!(
             result, None,
             "should not fire with only 1 of 4 micro-batches"
@@ -911,7 +1202,8 @@ mod tests {
 
         let grads = make_tiny_gradients(2, 0.5);
         opt.accumulate_gradients(&grads);
-        opt.step_accumulated(&mut model, 1, 0);
+        opt.step_accumulated(&mut model, 1, 0)
+            .expect("valid gradients");
 
         // After step, accumulation_step must be reset.
         assert_eq!(
@@ -935,7 +1227,9 @@ mod tests {
         let mut model_direct = make_tiny_model(1, 0);
         let mut opt_direct = GaussianOptimizer::new(&config, &model_direct);
         let single_grad = make_tiny_gradients(1, 1.0);
-        opt_direct.step(&mut model_direct, &single_grad, 0);
+        opt_direct
+            .step(&mut model_direct, &single_grad, 0)
+            .expect("valid gradients");
 
         let mut model_accum = make_tiny_model(1, 0);
         let mut opt_accum = GaussianOptimizer::new(&config, &model_accum);
@@ -943,7 +1237,9 @@ mod tests {
         for _ in 0..4 {
             opt_accum.accumulate_gradients(&micro);
         }
-        opt_accum.step_accumulated(&mut model_accum, 4, 0);
+        opt_accum
+            .step_accumulated(&mut model_accum, 4, 0)
+            .expect("valid gradients");
 
         // Both should result in the same parameter values.
         for i in 0..model_direct.gaussians.len() {
@@ -970,7 +1266,8 @@ mod tests {
             opt.accumulate_gradients(&grads);
         }
         assert_eq!(
-            opt.step_accumulated(&mut model, 4, 0),
+            opt.step_accumulated(&mut model, 4, 0)
+                .expect("valid gradients"),
             None,
             "should not fire after 3 of 4"
         );
@@ -978,7 +1275,9 @@ mod tests {
 
         // Fourth micro-batch — should now fire.
         opt.accumulate_gradients(&grads);
-        let result = opt.step_accumulated(&mut model, 4, 0);
+        let result = opt
+            .step_accumulated(&mut model, 4, 0)
+            .expect("valid gradients");
         assert_eq!(result, Some(4), "should fire after 4 micro-batches");
     }
 
@@ -1022,5 +1321,82 @@ mod tests {
                 "expected 1.0 after scale by 0.25, got {v}"
             );
         }
+    }
+
+    // ---- LR scale + group-vector conversion --------------------------------
+
+    #[test]
+    fn lr_scale_multiplies_every_group_and_is_validated() {
+        let model = make_tiny_model(2, 0);
+        let config = OptimizerConfig::default();
+        let mut optimizer = GaussianOptimizer::new(&config, &model);
+        assert_eq!(optimizer.lr_scale(), 1.0);
+
+        let base_position_lr = optimizer.position_lr(0);
+        optimizer
+            .set_lr_scale(0.5)
+            .expect("0.5 is a valid multiplier");
+        assert_eq!(optimizer.lr_scale(), 0.5);
+        assert!((optimizer.position_lr(0) - base_position_lr * 0.5).abs() < 1e-12);
+
+        // A halved schedule must move the parameters half as far.
+        let mut grads = Gradients::zeros(model.len(), 3);
+        grads.opacity.iter_mut().for_each(|g| *g = 1.0);
+
+        let mut full = model.clone();
+        let mut full_opt = GaussianOptimizer::new(&config, &model);
+        full_opt
+            .step(&mut full, &grads, 1)
+            .expect("shapes match the model");
+
+        let mut halved = model.clone();
+        let mut half_opt = GaussianOptimizer::new(&config, &model);
+        half_opt.set_lr_scale(0.5).expect("valid multiplier");
+        half_opt
+            .step(&mut halved, &grads, 1)
+            .expect("shapes match the model");
+
+        let full_delta = model.gaussians[0].opacity - full.gaussians[0].opacity;
+        let half_delta = model.gaussians[0].opacity - halved.gaussians[0].opacity;
+        assert!(full_delta.abs() > 0.0, "the full step must move opacity");
+        assert!(
+            (half_delta - full_delta * 0.5).abs() < 1e-6,
+            "half scale should halve the step: {half_delta} vs {full_delta}"
+        );
+
+        // Non-finite / negative multipliers are refused, not silently applied.
+        assert!(optimizer.set_lr_scale(f32::NAN).is_err());
+        assert!(optimizer.set_lr_scale(-0.1).is_err());
+        assert_eq!(optimizer.lr_scale(), 0.5, "a rejected scale must not stick");
+    }
+
+    #[test]
+    fn gradients_round_trip_through_group_vectors() {
+        let mut grads = Gradients::zeros(3, 4);
+        for (i, g) in grads.position.iter_mut().enumerate() {
+            *g = i as f32;
+        }
+        grads.opacity[1] = -2.5;
+
+        let groups = grads.to_group_vecs();
+        assert_eq!(groups.len(), 6);
+        assert_eq!(
+            groups.iter().map(Vec::len).collect::<Vec<_>>(),
+            grads.group_sizes().to_vec()
+        );
+
+        let mut restored = Gradients::zeros(3, 4);
+        restored
+            .set_from_group_vecs(&groups)
+            .expect("matching shapes round-trip");
+        assert_eq!(restored.position, grads.position);
+        assert_eq!(restored.opacity, grads.opacity);
+
+        // A wrong group count or a wrong length is an error, never a silent
+        // truncation that would drop the tail of a parameter group.
+        assert!(restored.set_from_group_vecs(&groups[..5]).is_err());
+        let mut short = groups.clone();
+        short[0].pop();
+        assert!(restored.set_from_group_vecs(&short).is_err());
     }
 }

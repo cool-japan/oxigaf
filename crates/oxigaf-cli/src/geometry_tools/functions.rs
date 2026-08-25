@@ -708,11 +708,21 @@ mod tests {
 
     #[test]
     fn transform_scales_identity_is_noop() {
-        let original = vec![-1.0f32, 0.3, 2.7, -0.5];
+        // Six values = two Gaussians' worth of log-scales. An earlier
+        // version of this test passed four values — a *quaternion*-shaped
+        // length — which `transform_scales` rejects outright with
+        // `InvalidScaleLength { len: 4 }` (see
+        // `transform_scales_rejects_length_not_multiple_of_3` below), so it
+        // never reached the identity behaviour it meant to check.
+        let original = vec![-1.0f32, 0.3, 2.7, -0.5, 1.25, 0.0];
         let mut scales = original.clone();
         transform_scales(&mut scales, &RigidTransform::identity()).expect("identity succeeds");
+        assert_eq!(scales.len(), original.len());
         for (a, b) in scales.iter().zip(original.iter()) {
-            assert!((a - b).abs() < 1e-6);
+            assert!(
+                (a - b).abs() < 1e-6,
+                "identity must leave log-scales untouched: {a} vs {b}"
+            );
         }
     }
 

@@ -22,9 +22,19 @@
 //! what is logged.
 //!
 //! Two configured terms contribute no gradient *by construction*: normal
-//! consistency needs a FLAME mesh the trainer does not track (its value is a
-//! constant `0.0` here), and the gradient penalty is evaluated on an external
+//! consistency is reported once a mesh is installed with [`Trainer::set_mesh`]
+//! (and stays a constant `0.0` without one) but is not differentiated into the
+//! parameter gradients, and the gradient penalty is evaluated on an external
 //! gradient buffer the trainer does not pass.
+//!
+//! ## Optional loop components
+//!
+//! [`TrainingConfig`] switches on four components that are otherwise inert:
+//! a learning-rate multiplier schedule (`lr_schedule`), gradient clipping
+//! (`gradient_clip`), micro-batch gradient accumulation
+//! (`gradient_accumulation_steps`) and EMA shadow weights (`ema_decay`).  Each
+//! defaults to off, so an unchanged config drives exactly the loop it did
+//! before.
 //!
 //! ## Diffusion Integration
 //!
@@ -49,7 +59,7 @@ use nalgebra as na;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 
-use oxigaf_flame::Camera;
+use oxigaf_flame::{Camera, Mesh, NormalMapRenderer};
 use oxigaf_render::gaussian::GaussianModel;
 use oxigaf_render::{RasterConfig, Rasterizer, RenderCamera};
 
@@ -57,9 +67,14 @@ use crate::checkpoint;
 use crate::config::{LossConfig, TrainingConfig};
 use crate::density::DensityController;
 use crate::diffusion_target::{DiffusionTargetConfig, DiffusionTargetGenerator, SdsLoss};
-use crate::loss::{gaussian_kernel_1d, LossComputer, LossOutput};
+use crate::ema::GaussianEma;
+use crate::gradient_accumulation::{AccumulationConfig, GradNormalization, GradientAccumulator};
+use crate::gradient_clipping::{ClipStats, GradientClipper};
+use crate::image_gradient::{photometric_pixel_gradient, PhotometricSpec};
+use crate::loss::{scale_reg_axis_gradient, LossComputer, LossOutput};
+use crate::lr_scheduler::{LrSchedule, LrScheduler};
 use crate::metrics::{self, MetricTracker};
-use crate::mixed_precision::{LossScaler, MixedPrecisionTrainer};
+use crate::mixed_precision::MixedPrecisionTrainer;
 use crate::optimizer::{GaussianOptimizer, Gradients};
 use crate::profiler_integration::{TrainingPhase, TrainingProfiler};
 use crate::tensorboard::{LearningRates, TrainingMetricsLogger};
@@ -81,6 +96,93 @@ pub struct StepOutput {
     pub used_diffusion: bool,
     /// Current diffusion timestep.
     pub diffusion_timestep: u32,
+    /// Multi-view consistency penalty on the diffusion targets, already scaled
+    /// by `DiffusionTargetConfig::view_consistency_weight` (`0.0` when no
+    /// diffusion targets were produced this step).
+    pub view_consistency: f32,
+    /// Whether the optimizer actually stepped this iteration.
+    ///
+    /// `false` while a gradient-accumulation window is still filling, and on a
+    /// mixed-precision gradient overflow.
+    pub optimizer_stepped: bool,
+    /// Learning-rate multiplier the configured schedule produced this step.
+    pub lr_scale: f32,
+    /// Clipping statistics, when gradient clipping is configured.
+    pub clip_stats: Option<ClipStats>,
+}
+
+// ---------------------------------------------------------------------------
+// LoopComponents
+// ---------------------------------------------------------------------------
+
+/// The optional per-iteration components [`TrainingConfig`] switches on.
+///
+/// Each is `None` for the historical default, so a config that sets none of
+/// the new fields drives exactly the loop it did before.
+struct LoopComponents {
+    lr_scheduler: Option<LrScheduler>,
+    gradient_clipper: Option<GradientClipper>,
+    gradient_accumulator: Option<GradientAccumulator>,
+    ema: Option<GaussianEma>,
+}
+
+impl LoopComponents {
+    /// Build every configured component, or fail with the reason.
+    ///
+    /// # Errors
+    ///
+    /// [`TrainerError::InvalidConfig`] / [`TrainerError::ParameterOutOfRange`]
+    /// for an out-of-range schedule, clip threshold, accumulation window or EMA
+    /// decay — the same checks [`TrainingConfig::validate`] runs, applied here
+    /// so a trainer can never be constructed with a component silently dropped.
+    fn from_config(config: &TrainingConfig, model: &GaussianModel) -> Result<Self, TrainerError> {
+        let lr_scheduler = config.lr_schedule.build(config.total_iterations)?;
+
+        let gradient_clipper = match config.gradient_clip.clip_mode() {
+            None => None,
+            Some(mode) => Some(
+                GradientClipper::new(mode)
+                    .map_err(|e| TrainerError::InvalidConfig(format!("gradient_clip: {e}")))?,
+            ),
+        };
+
+        let gradient_accumulator =
+            if config.gradient_accumulation_steps <= 1 {
+                None
+            } else {
+                let accumulation_config = AccumulationConfig {
+                    accumulation_steps: config.gradient_accumulation_steps as usize,
+                    // The trainer already averages over views inside one step, so
+                    // the window average is the right micro-batch normalisation.
+                    normalization: GradNormalization::MeanOverSteps,
+                    auto_clear: true,
+                };
+                Some(GradientAccumulator::new(accumulation_config).map_err(|e| {
+                    TrainerError::InvalidConfig(format!("gradient_accumulation: {e}"))
+                })?)
+            };
+
+        let ema = match config.ema_decay {
+            None => None,
+            Some(decay) => {
+                if !decay.is_finite() || decay <= 0.0 || decay >= 1.0 {
+                    return Err(TrainerError::ParameterOutOfRange {
+                        param: "ema_decay".into(),
+                        value: format!("{decay}"),
+                        expected: "in (0, 1)".into(),
+                    });
+                }
+                Some(GaussianEma::new(model, decay))
+            }
+        };
+
+        Ok(Self {
+            lr_scheduler,
+            gradient_clipper,
+            gradient_accumulator,
+            ema,
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -126,6 +228,33 @@ pub struct Trainer {
     pub mp_trainer: MixedPrecisionTrainer,
     /// Per-phase training profiler.
     pub profiler: TrainingProfiler,
+
+    // ---- Configured loop components ----
+    /// Learning-rate multiplier schedule, `None` for
+    /// [`crate::config::LrScheduleConfig::Fixed`].
+    pub lr_scheduler: Option<LrScheduler>,
+    /// Gradient clipper run immediately before the optimizer step, `None` for
+    /// [`crate::config::GradientClipConfig::Disabled`].
+    pub gradient_clipper: Option<GradientClipper>,
+    /// Micro-batch gradient accumulator, `None` when
+    /// `TrainingConfig::gradient_accumulation_steps <= 1`.
+    pub gradient_accumulator: Option<GradientAccumulator>,
+    /// EMA shadow copy of the model, `None` when `TrainingConfig::ema_decay`
+    /// is unset.  [`Trainer::save_checkpoint`] writes these weights when
+    /// present — see [`Trainer::ema_model`].
+    pub ema: Option<GaussianEma>,
+
+    /// FLAME mesh the Gaussians are bound to, when the caller supplies one.
+    ///
+    /// `None` by default — [`Trainer::new`] takes a [`GaussianModel`] alone.
+    /// Installing one with [`Trainer::set_mesh`] switches on the two terms that
+    /// need the surface and are otherwise inert:
+    ///
+    /// * `LossConfig::w_normal` — normal consistency, a hardcoded `0.0` without
+    ///   a mesh;
+    /// * per-view normal-map conditioning of the diffusion targets
+    ///   ([`DiffusionTargetGenerator::generate_targets_with_normals`]).
+    pub mesh: Option<Mesh>,
 }
 
 impl Trainer {
@@ -193,15 +322,20 @@ impl Trainer {
         // Initialize mixed-precision trainer and profiler
         let mp_trainer = MixedPrecisionTrainer::new(config.precision);
         let profiler = TrainingProfiler::new(config.enable_profiling);
+        let components = LoopComponents::from_config(&config, &model)?;
 
         tracing::info!(
-            "Trainer created: {} Gaussians, {} total iterations, warmup={} iters, tensorboard={}, precision={}, profiling={}",
+            "Trainer created: {} Gaussians, {} total iterations, warmup={} iters, tensorboard={}, precision={}, profiling={}, lr_schedule={:?}, clip={:?}, accum={}, ema={:?}",
             model.len(),
             config.total_iterations,
             diffusion_config.warmup_iterations,
             tensorboard_logger.is_enabled(),
             mp_trainer.precision.label(),
             profiler.is_enabled(),
+            config.lr_schedule,
+            config.gradient_clip,
+            config.gradient_accumulation_steps,
+            config.ema_decay,
         );
 
         Ok(Self {
@@ -221,6 +355,11 @@ impl Trainer {
             tensorboard_logger,
             mp_trainer,
             profiler,
+            lr_scheduler: components.lr_scheduler,
+            gradient_clipper: components.gradient_clipper,
+            gradient_accumulator: components.gradient_accumulator,
+            ema: components.ema,
+            mesh: None,
         })
     }
 
@@ -242,6 +381,30 @@ impl Trainer {
     /// Check if the diffusion pipeline is loaded.
     pub fn is_diffusion_loaded(&self) -> bool {
         self.diffusion_generator.is_loaded()
+    }
+
+    /// Install the FLAME mesh the Gaussians are bound to.
+    ///
+    /// Without one, two configured terms are inert by construction:
+    /// `LossConfig::w_normal` reports a constant `0.0`, and the diffusion
+    /// targets are generated with no geometric conditioning.  Both switch on
+    /// the moment a mesh is present — see [`Trainer::mesh`].
+    ///
+    /// The mesh is a *fixed* surface for the run: it is not re-posed per
+    /// iteration, so pass the mesh in the pose the Gaussians were bound in.
+    pub fn set_mesh(&mut self, mesh: Mesh) {
+        tracing::info!(
+            vertices = mesh.vertices.len(),
+            faces = mesh.faces.len(),
+            "FLAME mesh installed — normal consistency and normal-map \
+             conditioning are now active"
+        );
+        self.mesh = Some(mesh);
+    }
+
+    /// Drop the installed mesh, returning to the mesh-free path.
+    pub fn clear_mesh(&mut self) -> Option<Mesh> {
+        self.mesh.take()
     }
 
     /// Check if we're currently in the warmup period.
@@ -315,6 +478,7 @@ impl Trainer {
         // Initialize mixed-precision trainer and profiler
         let mp_trainer = MixedPrecisionTrainer::new(config.precision);
         let profiler = TrainingProfiler::new(config.enable_profiling);
+        let components = LoopComponents::from_config(&config, &model)?;
 
         tracing::info!(
             "Trainer restored from checkpoint at iteration {iteration}, {} Gaussians, warmup={}, tensorboard={}, precision={}, profiling={}",
@@ -342,6 +506,11 @@ impl Trainer {
             tensorboard_logger,
             mp_trainer,
             profiler,
+            lr_scheduler: components.lr_scheduler,
+            gradient_clipper: components.gradient_clipper,
+            gradient_accumulator: components.gradient_accumulator,
+            ema: components.ema,
+            mesh: None,
         })
     }
 
@@ -372,8 +541,14 @@ impl Trainer {
                     .iteration
                     .is_multiple_of(self.config.checkpoint_interval)
                 {
+                    let t_ckpt = std::time::Instant::now();
                     let path = dir.join(format!("ckpt_{:06}.json", self.iteration));
-                    self.save_checkpoint(&path)?;
+                    let saved = self.save_checkpoint(&path);
+                    self.profiler.record(
+                        TrainingPhase::Checkpoint,
+                        t_ckpt.elapsed().as_micros() as u64,
+                    );
+                    saved?;
                 }
             }
 
@@ -410,6 +585,21 @@ impl Trainer {
     /// [`TrainerError::Render`] instead of optimising against a fabricated image
     /// or a silently down-weighted gradient.
     pub fn train_step(&mut self) -> Result<StepOutput, TrainerError> {
+        // `TrainingPhase::Total` must wrap the *whole* iteration, gaps between
+        // sub-phases included — `TrainingProfiler::iterations_per_second`
+        // divides by it and reports `0.0` while it is never recorded.  Summing
+        // the sub-phase EMAs instead would double-count nested scopes and miss
+        // every gap, so the wrapper records the real wall clock, on the error
+        // path too (a step that failed still consumed the time).
+        let t_total = std::time::Instant::now();
+        let result = self.train_step_inner();
+        self.profiler
+            .record(TrainingPhase::Total, t_total.elapsed().as_micros() as u64);
+        result
+    }
+
+    /// The body of [`Trainer::train_step`], wrapped by the `Total` phase timer.
+    fn train_step_inner(&mut self) -> Result<StepOutput, TrainerError> {
         self.iteration += 1;
         let iter = self.iteration;
 
@@ -444,8 +634,25 @@ impl Trainer {
             self.raster_config.image_width as usize,
             self.raster_config.image_height as usize,
             &self.model,
-            None, // Mesh not tracked by trainer; normal consistency loss will be 0.0
+            self.mesh.as_ref(),
         );
+
+        // 5b. Multi-view consistency of the *diffusion targets*.  Without this
+        // the configured `view_consistency_weight` reached nothing at all: the
+        // generator exposes the loss but the loop never called it.  It is a
+        // penalty on the pseudo-GT, so it is meaningless on the self-supervised
+        // fallback (where the targets ARE the renders).
+        let view_consistency = if used_diffusion {
+            self.diffusion_generator.view_consistency_loss().compute(
+                &targets,
+                &cameras,
+                None,
+                self.raster_config.image_width as usize,
+                self.raster_config.image_height as usize,
+            )
+        } else {
+            0.0
+        };
         self.profiler.record(
             TrainingPhase::LossComputation,
             t_loss.elapsed().as_micros() as u64,
@@ -474,48 +681,44 @@ impl Trainer {
             .record(TrainingPhase::Backward, t_bwd.elapsed().as_micros() as u64);
         let mut gradients = gradients?;
 
-        // 8. Mixed-precision loss scaling before the overflow check: simulates
-        // scaling the loss ahead of the backward pass, enabling dynamic overflow
-        // detection.  BF16 needs it as much as FP16 — see
-        // `TrainingPrecision::requires_scaling`.
-        if self.config.precision.requires_scaling() {
-            gradients.scale(self.mp_trainer.scaler.scale());
+        // 8+9. Mixed-precision gradient handling: scale (so an FP16/BF16-range
+        // overflow becomes observable), unscale, and make ONE overflow
+        // decision across all six groups, updating the dynamic loss scale.
+        // `MixedPrecisionTrainer::process` is a no-op for `Float32`.
+        let should_optimizer_step = self.mp_trainer.process(&mut gradients);
+        if !should_optimizer_step {
+            tracing::warn!(
+                iteration = iter,
+                precision = self.config.precision.label(),
+                scale = self.mp_trainer.scaler.scale(),
+                "Gradient overflow detected — skipping optimizer step"
+            );
         }
 
-        // 9. Unscale gradients and check for overflow (scaled precisions only).
-        // Skips optimizer step on overflow and updates the loss scale adaptively.
-        let should_optimizer_step = if self.config.precision.requires_scaling() {
-            let inv_scale = 1.0 / self.mp_trainer.scaler.scale();
-            gradients.scale(inv_scale);
-            let overflow = LossScaler::has_overflow(&gradients.position)
-                || LossScaler::has_overflow(&gradients.rotation)
-                || LossScaler::has_overflow(&gradients.scale)
-                || LossScaler::has_overflow(&gradients.opacity)
-                || LossScaler::has_overflow(&gradients.sh)
-                || LossScaler::has_overflow(&gradients.offset);
-            self.mp_trainer.scaler.update(overflow);
-            if overflow {
-                tracing::warn!(
-                    iteration = iter,
-                    precision = self.config.precision.label(),
-                    scale = self.mp_trainer.scaler.scale(),
-                    "Gradient overflow detected — skipping optimizer step"
-                );
-            }
-            !overflow
-        } else {
-            true
-        };
-
-        // 10. Optimiser step (skipped on gradient overflow)  [Optimize].
+        // 10. Optimiser step (skipped on gradient overflow, and while a
+        // gradient-accumulation window is still filling)  [Optimize].
+        let mut clip_stats = None;
+        let mut optimizer_stepped = false;
+        let lr_scale = self.scheduled_lr_scale(iter);
         if should_optimizer_step {
             let t_opt = std::time::Instant::now();
-            self.optimizer.step(&mut self.model, &gradients, iter);
+            // Accumulation returns the window mean once the window is full;
+            // `None` means "keep accumulating, do not step yet".
+            if let Some(mut effective) = self.stage_gradients(&gradients)? {
+                clip_stats = self.clip_gradients(&mut effective)?;
+                self.optimizer.set_lr_scale(lr_scale)?;
+                self.optimizer.step(&mut self.model, &effective, iter)?;
+                optimizer_stepped = true;
+                if let Some(ema) = self.ema.as_mut() {
+                    ema.update(&self.model);
+                }
+            }
             self.profiler
                 .record(TrainingPhase::Optimize, t_opt.elapsed().as_micros() as u64);
         }
 
-        // 11. Density control.
+        // 11. Density control  [DensityControl].
+        let t_density = std::time::Instant::now();
         self.density_controller.accumulate_gradients(&gradients);
 
         if self.should_densify(iter) {
@@ -524,6 +727,16 @@ impl Trainer {
                 .densify_and_prune(&mut self.model, &mut self.rng);
             self.optimizer
                 .handle_densify(&result.keep_mask, result.num_added);
+            // Every per-Gaussian buffer is now stale: the accumulator would
+            // reject the next `accumulate` on a length mismatch, and the EMA
+            // shadow would average unrelated Gaussians.  Note this must key on
+            // whether the *membership* changed, not on the count: pruning K
+            // and adding K leaves the length identical while replacing which
+            // Gaussian sits at every index after the first prune.
+            let pruned = result.keep_mask.iter().any(|kept| !kept);
+            if pruned || result.num_added > 0 {
+                self.reset_size_dependent_state();
+            }
         }
 
         // 12. Opacity reset.
@@ -533,8 +746,13 @@ impl Trainer {
         {
             DensityController::reset_opacity(&mut self.model, self.config.init.initial_opacity);
         }
+        self.profiler.record(
+            TrainingPhase::DensityControl,
+            t_density.elapsed().as_micros() as u64,
+        );
 
-        // 13. Record metrics.
+        // 13. Record metrics  [Metrics].
+        let t_metrics = std::time::Instant::now();
         let psnr_val = if !rendered.is_empty() && !targets.is_empty() {
             metrics::psnr(&rendered[0], &targets[0])
         } else {
@@ -550,8 +768,12 @@ impl Trainer {
         } else {
             0.0
         };
-        self.metric_tracker
-            .record(iter, psnr_val, ssim_val, loss_output.total + sds_loss_value);
+        self.metric_tracker.record(
+            iter,
+            psnr_val,
+            ssim_val,
+            loss_output.total + sds_loss_value + view_consistency,
+        );
 
         // 14. TensorBoard logging.
         self.log_to_tensorboard(
@@ -563,6 +785,10 @@ impl Trainer {
             &rendered,
             &gradients,
         )?;
+        self.profiler.record(
+            TrainingPhase::Metrics,
+            t_metrics.elapsed().as_micros() as u64,
+        );
 
         Ok(StepOutput {
             iteration: iter,
@@ -571,7 +797,168 @@ impl Trainer {
             sds_loss: sds_loss_value,
             used_diffusion,
             diffusion_timestep: current_timestep,
+            view_consistency,
+            optimizer_stepped,
+            lr_scale,
+            clip_stats,
         })
+    }
+
+    // -----------------------------------------------------------------------
+    // Configured loop components
+    // -----------------------------------------------------------------------
+
+    /// The learning-rate multiplier the configured schedule produces at
+    /// `iteration`, or `1.0` when no schedule is configured.
+    ///
+    /// Schedules are built with `base_lr = 1.0` (see
+    /// [`crate::config::LrScheduleConfig`]) so their value *is* the multiplier;
+    /// a non-finite or negative one would poison every parameter group, so it
+    /// degrades to `1.0` with a warning rather than reaching the optimizer.
+    fn scheduled_lr_scale(&self, iteration: u32) -> f32 {
+        let Some(scheduler) = self.lr_scheduler.as_ref() else {
+            return 1.0;
+        };
+        let raw = scheduler.lr_at(iteration as usize) as f32;
+        if raw.is_finite() && raw >= 0.0 {
+            raw
+        } else {
+            tracing::warn!(
+                iteration,
+                value = raw,
+                "lr schedule produced a non-finite/negative multiplier — using 1.0"
+            );
+            1.0
+        }
+    }
+
+    /// Feed this step's gradients through the accumulation window.
+    ///
+    /// Returns the gradients the optimizer should consume: `gradients`
+    /// unchanged when accumulation is disabled, the window mean when the
+    /// window just filled, and `None` while it is still filling.
+    ///
+    /// # Errors
+    ///
+    /// [`TrainerError::Training`] wrapping an
+    /// [`crate::gradient_accumulation::AccumulationError`], and
+    /// [`TrainerError::GradientSizeMismatch`] if the window's buffers do not
+    /// match the current model — both mean the accumulated update would be
+    /// wrong, which must not be silently applied.
+    fn stage_gradients(
+        &mut self,
+        gradients: &Gradients,
+    ) -> Result<Option<Gradients>, TrainerError> {
+        let Some(accumulator) = self.gradient_accumulator.as_mut() else {
+            return Ok(Some(gradients.clone()));
+        };
+
+        // A window always starts from buffers sized to the *current* model.
+        // Density control clears the window when it changes the Gaussian set,
+        // so `steps_accumulated == 0` is the point at which the new sizes are
+        // adopted; mid-window the sizes cannot have changed, and
+        // `accumulate` would report a `LengthMismatch` if they somehow had.
+        if accumulator.steps_accumulated == 0 {
+            accumulator
+                .initialize(&gradients.group_sizes())
+                .map_err(|e| TrainerError::Training(format!("gradient_accumulation: {e}")))?;
+        }
+        accumulator
+            .accumulate(&gradients.to_group_vecs(), 1)
+            .map_err(|e| TrainerError::Training(format!("gradient_accumulation: {e}")))?;
+
+        if !accumulator.should_update() {
+            return Ok(None);
+        }
+        let groups = accumulator
+            .apply()
+            .map_err(|e| TrainerError::Training(format!("gradient_accumulation: {e}")))?;
+        let mut effective = gradients.clone();
+        effective.set_from_group_vecs(&groups)?;
+        Ok(Some(effective))
+    }
+
+    /// Clip `gradients` in place with the configured clipper, if any.
+    ///
+    /// # Errors
+    ///
+    /// [`TrainerError::GradientExplosion`] when the clipper reports a
+    /// non-finite gradient norm: no threshold can rescue a `NaN`/`Inf` update,
+    /// and stepping on one destroys the model silently.
+    fn clip_gradients(
+        &mut self,
+        gradients: &mut Gradients,
+    ) -> Result<Option<ClipStats>, TrainerError> {
+        let configured_threshold = self.config.gradient_clip.threshold();
+        let Some(clipper) = self.gradient_clipper.as_mut() else {
+            return Ok(None);
+        };
+        // Read the EMA *before* the step: a non-finite norm poisons it, so the
+        // post-step value would be the NaN we are trying to report about
+        // rather than the threshold that was actually in force.
+        let pre_step_ema = clipper.ema_norm();
+        let mut groups = gradients.to_group_vecs();
+        let stats = clipper
+            .step(&mut groups)
+            .map_err(|e| TrainerError::Training(format!("gradient_clip: {e}")))?;
+        if !stats.original_norm.is_finite() {
+            return Err(TrainerError::GradientExplosion {
+                norm: stats.original_norm,
+                // `Adaptive` has no fixed threshold; report the EMA it clips at.
+                threshold: configured_threshold.unwrap_or(pre_step_ema),
+            });
+        }
+        gradients.set_from_group_vecs(&groups)?;
+        Ok(Some(stats))
+    }
+
+    /// Drop state whose buffers are indexed by Gaussian.
+    ///
+    /// Called after adaptive density control actually changed the model's
+    /// membership (pruned or appended).  Both the accumulation window and the
+    /// EMA shadow address Gaussians positionally, so after a prune every index
+    /// refers to a different Gaussian even when the total count is unchanged;
+    /// carrying either forward would blend unrelated parameters.  The caller
+    /// skips this when nothing changed, so a decay near `1.0` is not restarted
+    /// on every `density_control_interval` for no reason.
+    fn reset_size_dependent_state(&mut self) {
+        if let Some(accumulator) = self.gradient_accumulator.as_mut() {
+            if accumulator.steps_accumulated > 0 {
+                tracing::debug!(
+                    steps = accumulator.steps_accumulated,
+                    "densification resized the model — discarding the partial \
+                     gradient-accumulation window"
+                );
+            }
+            // `clear()` zeroes the buffers and resets `steps_accumulated`;
+            // `stage_gradients` re-`initialize`s at the start of every window,
+            // so the new sizes are picked up there.
+            accumulator.clear();
+        }
+        if let Some(decay) = self.config.ema_decay {
+            tracing::debug!(
+                num_gaussians = self.model.len(),
+                "density control changed the Gaussian set — restarting the EMA average"
+            );
+            self.ema = Some(GaussianEma::new(&self.model, decay));
+        }
+    }
+
+    /// A copy of the model carrying the EMA shadow weights, when EMA is on.
+    ///
+    /// This is normally the better model to evaluate and to ship: it averages
+    /// out the per-step noise the raw weights carry.
+    ///
+    /// **Caveat**: adaptive density control changes the Gaussian count, and the
+    /// shadow is indexed by Gaussian, so it is restarted from the live weights
+    /// whenever that happens.  Immediately after a densify/prune the "average"
+    /// is therefore just the current model, and it needs on the order of
+    /// `1/(1 − ema_decay)` further steps to become meaningful again.
+    pub fn ema_model(&self) -> Option<GaussianModel> {
+        let ema = self.ema.as_ref()?;
+        let mut averaged = self.model.clone();
+        ema.apply_to(&mut averaged);
+        Some(averaged)
     }
 
     // -----------------------------------------------------------------------
@@ -579,9 +966,41 @@ impl Trainer {
     // -----------------------------------------------------------------------
 
     /// Save the current state to a JSON checkpoint file.
+    ///
+    /// This always writes the **live** weights, EMA configuration or not, so
+    /// resuming continues the real trajectory.  For the averaged weights use
+    /// [`Trainer::save_ema_checkpoint`] explicitly — silently substituting them
+    /// here would be wrong whenever adaptive density control has recently
+    /// restarted the average (see [`Trainer::ema_model`]).
     pub fn save_checkpoint(&self, path: &Path) -> Result<(), TrainerError> {
         let data = checkpoint::build_checkpoint(
             &self.model,
+            &self.optimizer,
+            self.iteration,
+            &self.metric_tracker,
+        );
+        checkpoint::save_checkpoint(path, &data)
+    }
+
+    /// Save the **EMA shadow** weights to a JSON checkpoint file.
+    ///
+    /// The optimizer state written alongside is the live one, so the file is
+    /// still resumable — but the weights are the average, which is usually the
+    /// better model to evaluate or ship.
+    ///
+    /// # Errors
+    ///
+    /// [`TrainerError::InvalidConfig`] when no EMA is configured: writing the
+    /// raw weights under this name would be a silent lie about what the file
+    /// contains.  Also propagates any I/O or serialisation failure.
+    pub fn save_ema_checkpoint(&self, path: &Path) -> Result<(), TrainerError> {
+        let averaged = self.ema_model().ok_or_else(|| {
+            TrainerError::InvalidConfig(
+                "save_ema_checkpoint requires TrainingConfig::ema_decay to be set".into(),
+            )
+        })?;
+        let data = checkpoint::build_checkpoint(
+            &averaged,
             &self.optimizer,
             self.iteration,
             &self.metric_tracker,
@@ -857,19 +1276,79 @@ impl Trainer {
             "Generating diffusion targets with annealed classifier-free guidance"
         );
 
-        match self
-            .diffusion_generator
-            .generate_targets(rendered, cameras, iteration, width, height)
-        {
-            Ok(targets) => Ok((targets, true)),
+        // Per-view FLAME normal maps are the geometric conditioning the
+        // multi-view U-Net expects.  Without an installed mesh there is
+        // nothing to render, and the generator falls back to zero latents.
+        let normal_maps = self.render_normal_maps(cameras);
+
+        let targets = match self.diffusion_generator.generate_targets_with_normals(
+            rendered,
+            cameras,
+            normal_maps.as_deref(),
+            iteration,
+            width,
+            height,
+        ) {
+            Ok(targets) => targets,
             Err(e) => {
                 tracing::warn!(
                     "Diffusion target generation failed: {}, falling back to rendered",
                     e
                 );
-                Ok((rendered.to_vec(), false))
+                return Ok((rendered.to_vec(), false));
+            }
+        };
+
+        // The pipeline decodes at `DiffusionConfig::image_size`, which is NOT
+        // necessarily the rasterizer's resolution.  Every downstream consumer
+        // (the loss, the image-space gradient, the SDS residual) indexes both
+        // buffers by the *rasterizer's* pixel count, so a mismatch would be
+        // absorbed per pixel and quietly corrupt the gradient.  A resolution
+        // disagreement is a configuration error that recurs every step, so it
+        // is reported rather than degraded into a silent self-supervised run.
+        let expected = (width as usize) * (height as usize) * 3;
+        for (idx, target) in targets.iter().enumerate() {
+            if target.len() != expected {
+                tracing::error!(
+                    view = idx,
+                    expected,
+                    actual = target.len(),
+                    raster_width = width,
+                    raster_height = height,
+                    "Diffusion target resolution does not match the rasterizer — \
+                     set DiffusionConfig::image_size to the raster image size"
+                );
+                return Err(TrainerError::ImageDimensionMismatch {
+                    expected,
+                    actual: target.len(),
+                });
             }
         }
+
+        Ok((targets, true))
+    }
+
+    /// Render one FLAME normal map per camera, when a mesh is installed.
+    ///
+    /// Returns HWC RGB buffers in `[0, 1]` at the rasterizer's resolution —
+    /// the encoding [`DiffusionTargetGenerator::generate_targets_with_normals`]
+    /// documents.  `None` when no mesh is set, which is the honest signal that
+    /// there is no geometric conditioning to hand over (as opposed to handing
+    /// over a black image that would read as a valid, flat surface).
+    fn render_normal_maps(&self, cameras: &[Camera]) -> Option<Vec<Vec<f32>>> {
+        let mesh = self.mesh.as_ref()?;
+        let maps = cameras
+            .iter()
+            .map(|camera| {
+                let image = NormalMapRenderer::render(mesh, camera);
+                image
+                    .as_raw()
+                    .iter()
+                    .map(|&b| f32::from(b) / 255.0)
+                    .collect::<Vec<f32>>()
+            })
+            .collect::<Vec<_>>();
+        Some(maps)
     }
 
     /// Compute parameter gradients via the GPU backward rasterization pass.
@@ -896,12 +1375,22 @@ impl Trainer {
         let n = self.model.len();
         let sh_channels = ((self.model.sh_degree + 1) * (self.model.sh_degree + 1) * 3) as usize;
 
+        // Differentiate the objective the *installed* `LossComputer` reports —
+        // `loss_computer` is a public field, so its config, SSIM window and
+        // MS-SSIM scale weights may differ from `self.config.loss` and the
+        // library defaults.  Snapshotting them here also releases the borrow
+        // before the rasterizer needs `&mut self`.
+        let loss_config = self.loss_computer.config().clone();
+        let ssim_kernel = self.loss_computer.ssim_kernel().to_vec();
+        let ms_ssim_weights = *self.loss_computer.ms_ssim_weights();
+        let sds_max_timestep = self.sds_loss.max_timestep;
+
         // Accumulate gradients across all views.
         let mut acc = Gradients::zeros(n, sh_channels);
 
         if rendered.is_empty() || targets.is_empty() {
             // No image term, but the regularisers still depend on the parameters.
-            add_regularization_gradients(&self.config.loss, &self.model, &mut acc);
+            add_regularization_gradients(&loss_config, &self.model, &mut acc);
             return Ok(acc);
         }
 
@@ -909,28 +1398,30 @@ impl Trainer {
         let h = self.raster_config.image_height as usize;
         let npx = w * h;
         let num_views = rendered.len().min(targets.len());
+        let spec = PhotometricSpec {
+            config: &loss_config,
+            ssim_kernel: &ssim_kernel,
+            ms_ssim_weights: &ms_ssim_weights,
+            num_views,
+        };
 
         for v in 0..num_views {
             // ∂L/∂pixel of the configured photometric objective, averaged over
             // views exactly like `LossComputer::compute` averages the loss.
-            let mut grad_rgb = photometric_pixel_gradient(
-                &self.config.loss,
-                &rendered[v],
-                &targets[v],
-                w,
-                h,
-                num_views,
-                &LossComputer::DEFAULT_MS_SSIM_WEIGHTS,
-            );
+            let mut grad_rgb = photometric_pixel_gradient(&spec, &rendered[v], &targets[v], w, h);
 
             // Pixel-space distillation gradient w(t)·sds_weight·(render − target),
             // renormalised to the "mean over pixels, mean over views" scale the
             // reported SDS loss uses, so the two cannot drift apart.
             if use_sds {
-                let sds_grad = self.diffusion_generator.compute_sds_gradient(
+                // Same DDPM horizon the reported `SdsLoss` weights with, so
+                // `w(t)` is identical in the logged value and the descent
+                // direction.
+                let sds_grad = self.diffusion_generator.compute_sds_gradient_with_horizon(
                     &rendered[v],
                     &targets[v],
                     iteration,
+                    sds_max_timestep,
                 );
                 let elems = rendered[v].len().max(1);
                 let norm = 2.0 / (num_views as f32 * elems as f32);
@@ -956,7 +1447,7 @@ impl Trainer {
             add_vec(&mut acc.sh, &gpu_grads.grad_sh_coeffs);
         }
 
-        add_regularization_gradients(&self.config.loss, &self.model, &mut acc);
+        add_regularization_gradients(&loss_config, &self.model, &mut acc);
 
         Ok(acc)
     }
@@ -980,24 +1471,6 @@ impl Trainer {
 /// zero there.
 const OPACITY_ENTROPY_CLAMP: f32 = 1e-6;
 
-/// SSIM stabiliser `(K₁·L)²` with `K₁ = 0.01`, `L = 1` — as in [`crate::loss`].
-const SSIM_C1: f32 = 0.01 * 0.01;
-/// SSIM stabiliser `(K₂·L)²` with `K₂ = 0.03`, `L = 1` — as in [`crate::loss`].
-const SSIM_C2: f32 = 0.03 * 0.03;
-
-/// Taps of the SSIM Gaussian window used by [`crate::loss::ssim_loss`].
-const SSIM_KERNEL_TAPS: usize = 11;
-/// Sigma of the SSIM Gaussian window used by [`crate::loss::ssim_loss`].
-const SSIM_KERNEL_SIGMA: f32 = 1.5;
-/// Taps of the smaller window [`crate::loss::ms_ssim_loss`] uses per scale.
-const MS_SSIM_KERNEL_TAPS: usize = 7;
-/// Sigma of the smaller window [`crate::loss::ms_ssim_loss`] uses per scale.
-const MS_SSIM_KERNEL_SIGMA: f32 = 1.0;
-/// Smallest dimension [`crate::loss::ms_ssim_loss`] still builds a scale for.
-const MS_SSIM_MIN_DIM: usize = 7;
-/// Maximum number of MS-SSIM scales (one per weight).
-const MS_SSIM_MAX_SCALES: usize = 5;
-
 /// Flatten a slice of fixed-size per-Gaussian gradient tuples.
 fn flatten<const N: usize>(values: &[[f32; N]]) -> Vec<f32> {
     values.iter().flat_map(|v| v.iter().copied()).collect()
@@ -1015,18 +1488,6 @@ fn add_vec(dst: &mut [f32], src: &[f32]) {
 #[inline]
 fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
-}
-
-/// Sub-gradient of `|x|`, taking `0` at the kink.
-#[inline]
-fn sign_or_zero(x: f32) -> f32 {
-    if x > 0.0 {
-        1.0
-    } else if x < 0.0 {
-        -1.0
-    } else {
-        0.0
-    }
 }
 
 /// Mirror the top-level guidance-annealing schedule into the diffusion config.
@@ -1067,8 +1528,18 @@ fn apply_guidance_schedule(config: &TrainingConfig, diffusion_config: &mut Diffu
 /// | term | value ([`crate::loss`]) | gradient |
 /// |---|---|---|
 /// | `w_position_reg` | `(1/N)·Σ‖offset‖²` | `2·w·offset/N` → [`Gradients::offset`] |
-/// | `w_scale_reg` | `(1/3N)·Σ log_s²` | `2·w·log_s/(3N)` → [`Gradients::scale`] |
+/// | `w_scale_reg` | `(1/3N)·Σ relu(e^log_s − m)²` | `2·w·relu(e^log_s − m)·e^log_s/(3N)` → [`Gradients::scale`] |
 /// | `w_opacity_reg` | `(1/N)·Σ H(σ(x))` | `−w·x·σ(1−σ)/N` → [`Gradients::opacity`] |
+///
+/// The scale term is the **asymmetric** one [`crate::loss::scale_reg_with_max`]
+/// reports (its per-axis derivative lives in
+/// [`crate::loss::scale_reg_axis_gradient`]), evaluated at
+/// [`LossConfig::w_scale_reg_max_scale`].  It is
+/// deliberately *not* the derivative of a symmetric `mean(log_s²)`: that older
+/// form pulled every log-scale towards `0.0` (a 1.0 world-unit Gaussian), so
+/// using its derivative here would have applied a constant outward pressure
+/// the reported loss no longer charges for — descending an objective nobody
+/// asked for, in the opposite direction for ordinary undersized Gaussians.
 ///
 /// The opacity entropy is evaluated on a clamped sigmoid; inside the clamped
 /// tails the term is constant, so its gradient is zero there.  `w_normal` and
@@ -1103,11 +1574,12 @@ fn add_regularization_gradients(cfg: &LossConfig, model: &GaussianModel, acc: &m
     }
 
     if cfg.w_scale_reg > 0.0 {
-        let k = 2.0 * cfg.w_scale_reg * inv_n / 3.0;
+        let k = cfg.w_scale_reg * inv_n / 3.0;
+        let max_scale = cfg.w_scale_reg_max_scale;
         for (g, grad) in model.gaussians.iter().zip(acc.scale.chunks_exact_mut(3)) {
-            grad[0] += k * g.scale[0];
-            grad[1] += k * g.scale[1];
-            grad[2] += k * g.scale[2];
+            for (axis, slot) in grad.iter_mut().enumerate() {
+                *slot += k * scale_reg_axis_gradient(g.scale[axis], max_scale);
+            }
         }
     }
 
@@ -1124,501 +1596,13 @@ fn add_regularization_gradients(cfg: &LossConfig, model: &GaussianModel, acc: &m
     }
 }
 
-// ---------------------------------------------------------------------------
-// Image-space loss gradients
-// ---------------------------------------------------------------------------
-
-/// Image-space gradient `∂L/∂rendered` of the configured photometric loss for
-/// one view, as a flat HWC RGB buffer of length `width·height·3`.
+/// Convert an [`oxigaf_flame::Camera`] to the GPU-facing [`RenderCamera`].
 ///
-/// Every term is differentiated at exactly the normalisation
-/// [`LossComputer::compute`] uses — mean over pixels, mean over views
-/// (`num_views`), configured weight — and a zero-weight term is skipped.
-/// LPIPS is absent on purpose: [`LossComputer::compute`] reports a hard `0.0`
-/// for it, so it is not part of the objective the trainer optimises.
-fn photometric_pixel_gradient(
-    cfg: &LossConfig,
-    rendered: &[f32],
-    target: &[f32],
-    width: usize,
-    height: usize,
-    num_views: usize,
-    ms_ssim_weights: &[f32; 5],
-) -> Vec<f32> {
-    let npx = width * height;
-    let mut grad = vec![0.0_f32; npx * 3];
-    if npx == 0 || rendered.is_empty() || target.is_empty() || num_views == 0 {
-        return grad;
-    }
-    let view_norm = 1.0 / num_views as f32;
-
-    // ---- L1: mean absolute error over every element of the view ------------
-    if cfg.w_l1 > 0.0 {
-        // `crate::loss::l1_loss` divides by `pred.len()`.
-        let k = cfg.w_l1 * view_norm / rendered.len() as f32;
-        for ((g, r), t) in grad.iter_mut().zip(rendered.iter()).zip(target.iter()) {
-            *g += k * sign_or_zero(r - t);
-        }
-    }
-
-    // ---- SSIM dissimilarity (1 − SSIM) -------------------------------------
-    if cfg.w_ssim > 0.0 {
-        let kernel = gaussian_kernel_1d(SSIM_KERNEL_TAPS, SSIM_KERNEL_SIGMA);
-        let g = ssim_pixel_gradient(rendered, target, width, height, &kernel);
-        let k = cfg.w_ssim * view_norm;
-        for (dst, src) in grad.iter_mut().zip(g.iter()) {
-            *dst += k * src;
-        }
-    }
-
-    // ---- MS-SSIM dissimilarity (1 − MS-SSIM) -------------------------------
-    if cfg.w_ms_ssim > 0.0 {
-        let g = ms_ssim_pixel_gradient(rendered, target, width, height, ms_ssim_weights);
-        let k = cfg.w_ms_ssim * view_norm;
-        for (dst, src) in grad.iter_mut().zip(g.iter()) {
-            *dst += k * src;
-        }
-    }
-
-    grad
-}
-
-/// Windowed first- and second-order statistics of an image-pair channel.
-///
-/// All five maps use the same separable Gaussian window as the forward SSIM, so
-/// the gradient is the exact adjoint away from the border (replicate padding is
-/// only its own approximate transpose).
-struct LocalStats {
-    mu_x: Vec<f32>,
-    mu_y: Vec<f32>,
-    sigma_x2: Vec<f32>,
-    sigma_y2: Vec<f32>,
-    sigma_xy: Vec<f32>,
-}
-
-impl LocalStats {
-    /// Compute the windowed statistics of one channel pair (`len = width·height`).
-    fn compute(x: &[f32], y: &[f32], width: usize, height: usize, kernel: &[f32]) -> Self {
-        let n = width * height;
-        let xx: Vec<f32> = x.iter().take(n).map(|v| v * v).collect();
-        let yy: Vec<f32> = y.iter().take(n).map(|v| v * v).collect();
-        let xy: Vec<f32> = x.iter().zip(y.iter()).take(n).map(|(a, b)| a * b).collect();
-
-        let mu_x = convolve_separable(x, width, height, kernel);
-        let mu_y = convolve_separable(y, width, height, kernel);
-        let mut sigma_x2 = convolve_separable(&xx, width, height, kernel);
-        let mut sigma_y2 = convolve_separable(&yy, width, height, kernel);
-        let mut sigma_xy = convolve_separable(&xy, width, height, kernel);
-        for i in 0..n {
-            sigma_x2[i] -= mu_x[i] * mu_x[i];
-            sigma_y2[i] -= mu_y[i] * mu_y[i];
-            sigma_xy[i] -= mu_x[i] * mu_y[i];
-        }
-
-        Self {
-            mu_x,
-            mu_y,
-            sigma_x2,
-            sigma_y2,
-            sigma_xy,
-        }
-    }
-
-    /// SSIM luminance term `l = (2μxμy + C₁)/(μx² + μy² + C₁)` at pixel `q`.
-    #[inline]
-    fn luminance(&self, q: usize) -> f32 {
-        let (mu_x, mu_y) = (self.mu_x[q], self.mu_y[q]);
-        (2.0 * mu_x * mu_y + SSIM_C1) / (mu_x * mu_x + mu_y * mu_y + SSIM_C1)
-    }
-
-    /// SSIM contrast-structure term `cs = (2σxy + C₂)/(σx² + σy² + C₂)` at `q`.
-    #[inline]
-    fn contrast_structure(&self, q: usize) -> f32 {
-        (2.0 * self.sigma_xy[q] + SSIM_C2) / (self.sigma_x2[q] + self.sigma_y2[q] + SSIM_C2)
-    }
-
-    /// Accumulate `∂/∂x Σ_q [ wl(q)·l(q) + wcs(q)·cs(q) ]` into `out`.
-    ///
-    /// Every SSIM-family term in [`crate::loss`] is a weighted sum of the
-    /// luminance and contrast-structure maps, so one adjoint pass serves all of
-    /// them.  With `∂μx(q)/∂x(p) = G(p−q)`,
-    /// `∂σx²(q)/∂x(p) = 2·G(p−q)·(x(p) − μx(q))` and
-    /// `∂σxy(q)/∂x(p) = G(p−q)·(y(p) − μy(q))`, the sum over windows collapses
-    /// into five convolutions with the same (symmetric) window.
-    #[allow(clippy::too_many_arguments)]
-    fn accumulate_gradient(
-        &self,
-        x: &[f32],
-        y: &[f32],
-        width: usize,
-        height: usize,
-        kernel: &[f32],
-        wl: &[f32],
-        wcs: &[f32],
-        out: &mut [f32],
-    ) {
-        let n = width * height;
-        let mut au = vec![0.0_f32; n];
-        let mut av = vec![0.0_f32; n];
-        let mut avmu = vec![0.0_f32; n];
-        let mut az = vec![0.0_f32; n];
-        let mut azmu = vec![0.0_f32; n];
-
-        for q in 0..n {
-            let mu_x = self.mu_x[q];
-            let mu_y = self.mu_y[q];
-            let a1 = 2.0 * mu_x * mu_y + SSIM_C1;
-            let b1 = mu_x * mu_x + mu_y * mu_y + SSIM_C1;
-            let a2 = 2.0 * self.sigma_xy[q] + SSIM_C2;
-            let b2 = self.sigma_x2[q] + self.sigma_y2[q] + SSIM_C2;
-
-            // ∂l/∂μx = 2(μy·B₁ − μx·A₁)/B₁²
-            au[q] = wl[q] * 2.0 * (mu_y * b1 - mu_x * a1) / (b1 * b1);
-            // ∂cs/∂σxy = 2/B₂ and ∂cs/∂σx² = −2·A₂/B₂²
-            let v = wcs[q] * 2.0 / b2;
-            let z = wcs[q] * -2.0 * a2 / (b2 * b2);
-            av[q] = v;
-            avmu[q] = v * mu_y;
-            az[q] = z;
-            azmu[q] = z * mu_x;
-        }
-
-        let gu = convolve_separable(&au, width, height, kernel);
-        let gv = convolve_separable(&av, width, height, kernel);
-        let gvmu = convolve_separable(&avmu, width, height, kernel);
-        let gz = convolve_separable(&az, width, height, kernel);
-        let gzmu = convolve_separable(&azmu, width, height, kernel);
-
-        for p in 0..n {
-            out[p] += gu[p] + y[p] * gv[p] - gvmu[p] + x[p] * gz[p] - gzmu[p];
-        }
-    }
-}
-
-/// Separable 2-D convolution with replicate-boundary padding.
-///
-/// Mirrors the private helper behind [`crate::loss::ssim_loss`] so forward loss
-/// and backward gradient see the same window.
-fn convolve_separable(src: &[f32], width: usize, height: usize, kernel: &[f32]) -> Vec<f32> {
-    let n = width * height;
-    let mut out = vec![0.0_f32; n];
-    if n == 0 || src.len() < n || kernel.is_empty() {
-        return out;
-    }
-    let half = (kernel.len() / 2) as isize;
-
-    // Horizontal pass.
-    let mut tmp = vec![0.0_f32; n];
-    for y in 0..height {
-        let row = y * width;
-        for x in 0..width {
-            let mut sum = 0.0_f32;
-            for (i, &kv) in kernel.iter().enumerate() {
-                let ix = clamp_index(x as isize + i as isize - half, width);
-                sum += src[row + ix] * kv;
-            }
-            tmp[row + x] = sum;
-        }
-    }
-
-    // Vertical pass.
-    for y in 0..height {
-        for x in 0..width {
-            let mut sum = 0.0_f32;
-            for (i, &kv) in kernel.iter().enumerate() {
-                let iy = clamp_index(y as isize + i as isize - half, height);
-                sum += tmp[iy * width + x] * kv;
-            }
-            out[y * width + x] = sum;
-        }
-    }
-
-    out
-}
-
-/// Clamp a (possibly negative) index into `0..len`.  `len` must be non-zero.
-#[inline]
-fn clamp_index(idx: isize, len: usize) -> usize {
-    idx.clamp(0, len as isize - 1) as usize
-}
-
-/// Extract one interleaved HWC channel as a dense plane, zero-filling any pixel
-/// the source is too short for (the same tolerance the forward loss applies).
-fn extract_channel(img: &[f32], n_pixels: usize, channel: usize) -> Vec<f32> {
-    (0..n_pixels)
-        .map(|p| img.get(p * 3 + channel).copied().unwrap_or(0.0))
-        .collect()
-}
-
-/// `∂(1 − SSIM)/∂pred` for one HWC RGB image pair.
-///
-/// The forward term is `1 − (1/3)·Σ_c mean_q S_c(q)` with `S = l·cs`, so
-/// `∂(mean S)/∂l = cs/N` and `∂(mean S)/∂cs = l/N`.
-fn ssim_pixel_gradient(
-    pred: &[f32],
-    target: &[f32],
-    width: usize,
-    height: usize,
-    kernel: &[f32],
-) -> Vec<f32> {
-    let n = width * height;
-    let mut grad = vec![0.0_f32; n * 3];
-    // `crate::loss::ssim_loss` returns a constant 0.0 for undersized buffers.
-    if n == 0 || pred.len() < n * 3 || target.len() < n * 3 {
-        return grad;
-    }
-
-    let outer = -1.0 / (3.0 * n as f32);
-    let mut wl = vec![0.0_f32; n];
-    let mut wcs = vec![0.0_f32; n];
-    let mut chan = vec![0.0_f32; n];
-
-    for c in 0..3 {
-        let x = extract_channel(pred, n, c);
-        let y = extract_channel(target, n, c);
-        let stats = LocalStats::compute(&x, &y, width, height, kernel);
-
-        for q in 0..n {
-            wl[q] = outer * stats.contrast_structure(q);
-            wcs[q] = outer * stats.luminance(q);
-        }
-
-        chan.fill(0.0);
-        stats.accumulate_gradient(&x, &y, width, height, kernel, &wl, &wcs, &mut chan);
-        for (p, &g) in chan.iter().enumerate() {
-            grad[p * 3 + c] = g;
-        }
-    }
-
-    grad
-}
-
-/// `∂(1 − MS-SSIM)/∂pred` for one HWC RGB image pair.
-///
-/// [`crate::loss::ms_ssim_loss`] combines *scalar* per-scale means,
-/// `P = Πⱼ cs̄ⱼ^wⱼ · l̄_M^w_M`, so `∂(1−P)/∂cs̄ⱼ = −P·wⱼ/cs̄ⱼ` (likewise for the
-/// coarsest luminance), followed by the adjoint of the box-downsampling chain.
-/// Outside the `[0, 1]` clamp the forward term is constant → zero gradient.
-fn ms_ssim_pixel_gradient(
-    pred: &[f32],
-    target: &[f32],
-    width: usize,
-    height: usize,
-    weights: &[f32; 5],
-) -> Vec<f32> {
-    let mut grad = vec![0.0_f32; width * height * 3];
-    // Mirror the guards of the forward term: inside them it is a constant.
-    if width < 16 || height < 16 {
-        return grad;
-    }
-    if pred.len() < width * height * 3 || target.len() < width * height * 3 {
-        return grad;
-    }
-
-    let kernel = gaussian_kernel_1d(MS_SSIM_KERNEL_TAPS, MS_SSIM_KERNEL_SIGMA);
-
-    // Pyramid dimensions, exactly as the forward term derives them.
-    let mut dims: Vec<(usize, usize)> = Vec::with_capacity(MS_SSIM_MAX_SCALES);
-    let mut w = width;
-    let mut h = height;
-    for _ in 0..MS_SSIM_MAX_SCALES {
-        if w < MS_SSIM_MIN_DIM || h < MS_SSIM_MIN_DIM {
-            break;
-        }
-        dims.push((w, h));
-        w /= 2;
-        h /= 2;
-    }
-    let num_scales = dims.len();
-    if num_scales == 0 {
-        return grad;
-    }
-    let last = num_scales - 1;
-
-    // Build the pyramid.
-    let mut preds: Vec<Vec<f32>> = Vec::with_capacity(num_scales);
-    let mut tgts: Vec<Vec<f32>> = Vec::with_capacity(num_scales);
-    preds.push(pred[..width * height * 3].to_vec());
-    tgts.push(target[..width * height * 3].to_vec());
-    for idx in 1..num_scales {
-        let (pw, ph) = dims[idx - 1];
-        let down_pred = downsample_2x(&preds[idx - 1], pw, ph);
-        let down_tgt = downsample_2x(&tgts[idx - 1], pw, ph);
-        preds.push(down_pred);
-        tgts.push(down_tgt);
-    }
-
-    // Per-scale scalar means, then the product the forward term reports.
-    let mut l_means = Vec::with_capacity(num_scales);
-    let mut cs_means = Vec::with_capacity(num_scales);
-    for idx in 0..num_scales {
-        let (sw, sh) = dims[idx];
-        let (l, cs) = ssim_component_means(&preds[idx], &tgts[idx], sw, sh, &kernel);
-        l_means.push(l);
-        cs_means.push(cs);
-    }
-
-    let mut product = 1.0_f32;
-    for idx in 0..num_scales {
-        product *= cs_means[idx].max(0.0).powf(weights[idx]);
-    }
-    product *= l_means[last].max(0.0).powf(weights[last]);
-
-    // `1 − clamp(P, 0, 1)`: on or outside the clamp the term is constant.
-    if !product.is_finite() || product <= 0.0 || product >= 1.0 {
-        return grad;
-    }
-
-    // Walk from the coarsest scale back up, folding in each scale's
-    // contribution and applying the downsampling adjoint between scales.
-    let (mut acc_w, mut acc_h) = dims[last];
-    let mut acc = vec![0.0_f32; acc_w * acc_h * 3];
-    for idx in (0..num_scales).rev() {
-        let (sw, sh) = dims[idx];
-        let n = sw * sh;
-
-        let d_cs = if weights[idx] > 0.0 && cs_means[idx] > 0.0 {
-            -product * weights[idx] / cs_means[idx]
-        } else {
-            0.0
-        };
-        let d_l = if idx == last && weights[last] > 0.0 && l_means[last] > 0.0 {
-            -product * weights[last] / l_means[last]
-        } else {
-            0.0
-        };
-
-        if d_cs != 0.0 || d_l != 0.0 {
-            // `ssim_components` averages over pixels *and* the three channels.
-            let inv_count = 1.0 / (3 * n) as f32;
-            let wl = vec![d_l * inv_count; n];
-            let wcs = vec![d_cs * inv_count; n];
-            let mut chan = vec![0.0_f32; n];
-            for c in 0..3 {
-                let x = extract_channel(&preds[idx], n, c);
-                let y = extract_channel(&tgts[idx], n, c);
-                let stats = LocalStats::compute(&x, &y, sw, sh, &kernel);
-                chan.fill(0.0);
-                stats.accumulate_gradient(&x, &y, sw, sh, &kernel, &wl, &wcs, &mut chan);
-                for (p, &g) in chan.iter().enumerate() {
-                    acc[p * 3 + c] += g;
-                }
-            }
-        }
-
-        if idx > 0 {
-            let (fw, fh) = dims[idx - 1];
-            acc = upsample_adjoint_2x(&acc, acc_w, acc_h, fw, fh);
-            acc_w = fw;
-            acc_h = fh;
-        }
-    }
-
-    for (dst, src) in grad.iter_mut().zip(acc.iter()) {
-        *dst += src;
-    }
-
-    grad
-}
-
-/// Mean SSIM luminance and contrast-structure over all pixels *and* channels —
-/// the two scalars [`crate::loss::ms_ssim_loss`] combines per scale.
-fn ssim_component_means(
-    pred: &[f32],
-    target: &[f32],
-    width: usize,
-    height: usize,
-    kernel: &[f32],
-) -> (f32, f32) {
-    let n = width * height;
-    if n == 0 {
-        return (0.0, 0.0);
-    }
-
-    let mut l_sum = 0.0_f32;
-    let mut cs_sum = 0.0_f32;
-    for c in 0..3 {
-        let x = extract_channel(pred, n, c);
-        let y = extract_channel(target, n, c);
-        let stats = LocalStats::compute(&x, &y, width, height, kernel);
-        for q in 0..n {
-            l_sum += stats.luminance(q);
-            cs_sum += stats.contrast_structure(q);
-        }
-    }
-
-    let count = (3 * n) as f32;
-    (l_sum / count, cs_sum / count)
-}
-
-/// 2× box downsample of an HWC RGB image — identical to the forward term's.
-fn downsample_2x(image: &[f32], width: usize, height: usize) -> Vec<f32> {
-    let new_w = width / 2;
-    let new_h = height / 2;
-    if new_w == 0 || new_h == 0 {
-        return Vec::new();
-    }
-
-    let mut out = vec![0.0_f32; new_w * new_h * 3];
-    for y in 0..new_h {
-        for x in 0..new_w {
-            for c in 0..3 {
-                let mut sum = 0.0_f32;
-                for dy in 0..2 {
-                    for dx in 0..2 {
-                        let idx = ((y * 2 + dy) * width + (x * 2 + dx)) * 3 + c;
-                        if idx < image.len() {
-                            sum += image[idx];
-                        }
-                    }
-                }
-                out[(y * new_w + x) * 3 + c] = sum / 4.0;
-            }
-        }
-    }
-
-    out
-}
-
-/// Adjoint of [`downsample_2x`]: spread each coarse gradient over the 2×2 block
-/// it averaged, carrying the same `1/4` factor.
-fn upsample_adjoint_2x(
-    grad_coarse: &[f32],
-    coarse_w: usize,
-    coarse_h: usize,
-    fine_w: usize,
-    fine_h: usize,
-) -> Vec<f32> {
-    let mut out = vec![0.0_f32; fine_w * fine_h * 3];
-    for y in 0..coarse_h {
-        for x in 0..coarse_w {
-            for c in 0..3 {
-                let g = grad_coarse
-                    .get((y * coarse_w + x) * 3 + c)
-                    .copied()
-                    .unwrap_or(0.0)
-                    * 0.25;
-                if g == 0.0 {
-                    continue;
-                }
-                for dy in 0..2 {
-                    for dx in 0..2 {
-                        let fy = y * 2 + dy;
-                        let fx = x * 2 + dx;
-                        if fy < fine_h && fx < fine_w {
-                            out[(fy * fine_w + fx) * 3 + c] += g;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    out
-}
-
-/// Convert an `oxigaf_flame::Camera` to the GPU-facing [`RenderCamera`].
-fn camera_to_render_camera(cam: &Camera, _w: u32, _h: u32) -> RenderCamera {
+/// `_w` / `_h` are unused: the intrinsics already carry the resolution through
+/// `Camera::width` / `Camera::height`.  Exposed so any other loop rendering
+/// through the same rasterizer (e.g. [`crate::meta_learning_avatar`]) builds the
+/// identical view/projection matrices rather than a second, divergent version.
+pub fn camera_to_render_camera(cam: &Camera, _w: u32, _h: u32) -> RenderCamera {
     // Build a 4×4 view matrix (column-major f32 array) from the Camera's
     // rotation (3×3) and translation (3).
     let mut view = [0.0f32; 16];
@@ -1680,68 +1664,25 @@ fn camera_to_render_camera(cam: &Camera, _w: u32, _h: u32) -> RenderCamera {
 mod tests {
     use super::*;
     use crate::config::OptimizerConfig;
-    use crate::loss::{l1_loss, ms_ssim_loss, opacity_reg, position_reg, scale_reg, ssim_loss};
+    use crate::loss::{opacity_reg, position_reg, scale_reg};
     use oxigaf_render::gaussian::GaussianAttributes;
 
-    /// Deterministic, non-trivial image pair in `[0.1, 0.9]`.
-    fn make_pair(width: usize, height: usize) -> (Vec<f32>, Vec<f32>) {
-        let n = width * height * 3;
-        let mut pred = Vec::with_capacity(n);
-        let mut target = Vec::with_capacity(n);
-        for i in 0..n {
-            let f = i as f32;
-            pred.push(0.5 + 0.4 * (f * 0.137).sin());
-            target.push(0.5 + 0.4 * (f * 0.091).cos());
-        }
-        (pred, target)
-    }
-
-    fn loss_cfg(w_l1: f32, w_ssim: f32, w_ms_ssim: f32) -> LossConfig {
-        LossConfig {
-            w_l1,
-            w_ssim,
-            w_ms_ssim,
-            w_lpips: 0.0,
-            w_position_reg: 0.0,
-            w_scale_reg: 0.0,
-            w_opacity_reg: 0.0,
-            w_normal: 0.0,
-            w_gradient_penalty: 0.0,
-            gradient_penalty_threshold: 100.0,
-        }
-    }
-
+    /// A [`LossConfig`] carrying only the three regularisation weights; the
+    /// image terms are differentiated (and tested) in [`crate::image_gradient`].
     fn reg_cfg(w_position_reg: f32, w_scale_reg: f32, w_opacity_reg: f32) -> LossConfig {
         LossConfig {
+            w_l1: 0.0,
+            w_ssim: 0.0,
+            w_ms_ssim: 0.0,
+            w_lpips: 0.0,
             w_position_reg,
             w_scale_reg,
             w_opacity_reg,
-            ..loss_cfg(0.0, 0.0, 0.0)
+            w_normal: 0.0,
+            w_gradient_penalty: 0.0,
+            gradient_penalty_threshold: 100.0,
+            w_scale_reg_max_scale: crate::loss::MAX_REASONABLE_WORLD_SCALE,
         }
-    }
-
-    /// `photometric_pixel_gradient` with the stock MS-SSIM scale weights.
-    fn pixel_grad(c: &LossConfig, p: &[f32], t: &[f32], w: usize, h: usize, v: usize) -> Vec<f32> {
-        photometric_pixel_gradient(c, p, t, w, h, v, &LossComputer::DEFAULT_MS_SSIM_WEIGHTS)
-    }
-
-    /// The scalar photometric objective `LossComputer::compute` reports for one
-    /// view (its regularisation terms are constant w.r.t. the pixels).
-    fn scalar_loss(cfg: &LossConfig, pred: &[f32], tgt: &[f32], w: usize, h: usize) -> f32 {
-        let kernel = gaussian_kernel_1d(SSIM_KERNEL_TAPS, SSIM_KERNEL_SIGMA);
-        cfg.w_l1 * l1_loss(pred, tgt)
-            + cfg.w_ssim * ssim_loss(pred, tgt, w, h, &kernel)
-            + cfg.w_ms_ssim * ms_ssim_loss(pred, tgt, w, h, &LossComputer::DEFAULT_MS_SSIM_WEIGHTS)
-    }
-
-    /// Central-difference derivative of [`scalar_loss`] w.r.t. `p[i]`.
-    fn numeric_grad(c: &LossConfig, p: &[f32], t: &[f32], w: usize, h: usize, i: usize) -> f32 {
-        let eps = 0.02_f32;
-        let mut plus = p.to_vec();
-        let mut minus = p.to_vec();
-        plus[i] += eps;
-        minus[i] -= eps;
-        (scalar_loss(c, &plus, t, w, h) - scalar_loss(c, &minus, t, w, h)) / (2.0 * eps)
     }
 
     fn relative_error(analytic: f32, numeric: f32) -> f32 {
@@ -1768,99 +1709,6 @@ mod tests {
         }
     }
 
-    // ---- photometric image-space gradient ---------------------------------
-
-    #[test]
-    fn l1_gradient_is_view_normalised_sign() {
-        let (w, h) = (4, 4);
-        let (pred, target) = make_pair(w, h);
-        let cfg = loss_cfg(0.8, 0.0, 0.0);
-        let grad = pixel_grad(&cfg, &pred, &target, w, h, 2);
-
-        let k = 0.8 / 2.0 / pred.len() as f32;
-        for i in 0..pred.len() {
-            let expected = k * sign_or_zero(pred[i] - target[i]);
-            assert!((grad[i] - expected).abs() < 1e-9, "L1 gradient at {i}");
-        }
-    }
-
-    #[test]
-    fn ssim_gradient_matches_finite_differences() {
-        let (w, h) = (16, 16);
-        let (pred, target) = make_pair(w, h);
-        let cfg = loss_cfg(0.0, 1.0, 0.0);
-        let grad = pixel_grad(&cfg, &pred, &target, w, h, 1);
-
-        // Well-interior pixels only: replicate padding makes the window adjoint
-        // approximate within `kernel_taps / 2` of the border.
-        for &i in &[409_usize, 354, 317, 453, 255, 510] {
-            let numeric = numeric_grad(&cfg, &pred, &target, w, h, i);
-            assert!(
-                relative_error(grad[i], numeric) < 0.1,
-                "SSIM gradient at {i}: analytic {} vs numeric {numeric}",
-                grad[i]
-            );
-        }
-    }
-
-    #[test]
-    fn ms_ssim_gradient_matches_finite_differences() {
-        let (w, h) = (64, 64);
-        let (pred, target) = make_pair(w, h);
-        let cfg = loss_cfg(0.0, 0.0, 1.0);
-        let grad = pixel_grad(&cfg, &pred, &target, w, h, 1);
-
-        for &i in &[6240_usize, 6241, 5484] {
-            let numeric = numeric_grad(&cfg, &pred, &target, w, h, i);
-            assert!(
-                relative_error(grad[i], numeric) < 0.25,
-                "MS-SSIM gradient at {i}: analytic {} vs numeric {numeric}",
-                grad[i]
-            );
-        }
-
-        // At the optimum (identical images) the clamped product pins the term.
-        let flat = pixel_grad(&cfg, &pred, &pred, w, h, 1);
-        assert!(flat.iter().all(|g| *g == 0.0));
-    }
-
-    #[test]
-    fn configured_weights_reach_the_gradient() {
-        // Regression: the image-space gradient used to be a hardcoded MSE that
-        // ignored every configured loss weight.
-        let (w, h) = (16, 16);
-        let (pred, target) = make_pair(w, h);
-        let g_l1 = pixel_grad(&loss_cfg(1.0, 0.0, 0.0), &pred, &target, w, h, 1);
-        let g_ssim = pixel_grad(&loss_cfg(0.0, 1.0, 0.0), &pred, &target, w, h, 1);
-        let g_double = pixel_grad(&loss_cfg(2.0, 0.0, 0.0), &pred, &target, w, h, 1);
-
-        assert!(g_l1.iter().any(|g| g.abs() > 0.0));
-        assert!(g_ssim.iter().any(|g| g.abs() > 0.0));
-        // Two different objectives must not yield the same descent direction,
-        // and doubling a weight must double that term's contribution.
-        let zipped = g_l1.iter().zip(g_ssim.iter());
-        assert!(zipped.map(|(a, b)| (a - b).abs()).fold(0.0_f32, f32::max) > 1e-9);
-        for (a, b) in g_double.iter().zip(g_l1.iter()) {
-            assert!((a - 2.0 * b).abs() < 1e-9);
-        }
-    }
-
-    #[test]
-    fn downsample_and_adjoint_are_transposes() {
-        // <D·x, y> == <x, Dᵀ·y> for the 2× box filter.
-        let (w, h) = (4, 4);
-        let x: Vec<f32> = (0..w * h * 3).map(|i| i as f32 * 0.01).collect();
-        let y: Vec<f32> = (0..(w / 2) * (h / 2) * 3)
-            .map(|i| 1.0 - i as f32 * 0.02)
-            .collect();
-
-        let dx = downsample_2x(&x, w, h);
-        let dty = upsample_adjoint_2x(&y, w / 2, h / 2, w, h);
-        let lhs: f32 = dx.iter().zip(y.iter()).map(|(a, b)| a * b).sum();
-        let rhs: f32 = x.iter().zip(dty.iter()).map(|(a, b)| a * b).sum();
-        assert!((lhs - rhs).abs() < 1e-5, "lhs {lhs} rhs {rhs}");
-    }
-
     // ---- regularisation gradients -----------------------------------------
 
     #[test]
@@ -1871,11 +1719,14 @@ mod tests {
         add_regularization_gradients(&cfg, &model, &mut grads);
 
         let eps = 1e-2_f32;
-        let reg_loss = |m: &GaussianModel| {
-            cfg.w_position_reg * position_reg(m)
-                + cfg.w_scale_reg * scale_reg(m)
-                + cfg.w_opacity_reg * opacity_reg(m)
-        };
+        // Each term is differenced against **only its own** contribution.
+        // Summing all three first would make the central difference measure a
+        // ~1e-7 delta on top of a ~3e-2 constant, where f32 round-off alone is
+        // 2% of the delta — the parameters a term does not depend on cancel
+        // exactly anyway, so nothing is lost by isolating them.
+        let position_loss = |m: &GaussianModel| cfg.w_position_reg * position_reg(m);
+        let scale_loss = |m: &GaussianModel| cfg.w_scale_reg * scale_reg(m);
+        let opacity_loss = |m: &GaussianModel| cfg.w_opacity_reg * opacity_reg(m);
 
         for j in 0..3 {
             // Offsets — the whole point of the `Offset` parameter group.
@@ -1883,7 +1734,7 @@ mod tests {
             let mut minus = model.clone();
             plus.local_offsets[1][j] += eps;
             minus.local_offsets[1][j] -= eps;
-            let numeric = (reg_loss(&plus) - reg_loss(&minus)) / (2.0 * eps);
+            let numeric = (position_loss(&plus) - position_loss(&minus)) / (2.0 * eps);
             assert!(
                 relative_error(grads.offset[3 + j], numeric) < 0.01,
                 "offset[{j}]: analytic {} vs numeric {numeric}",
@@ -1895,9 +1746,9 @@ mod tests {
             let mut minus = model.clone();
             plus.gaussians[2].scale[j] += eps;
             minus.gaussians[2].scale[j] -= eps;
-            let numeric = (reg_loss(&plus) - reg_loss(&minus)) / (2.0 * eps);
+            let numeric = (scale_loss(&plus) - scale_loss(&minus)) / (2.0 * eps);
             assert!(
-                relative_error(grads.scale[6 + j], numeric) < 0.01,
+                relative_error(grads.scale[6 + j], numeric) < 0.02,
                 "scale[{j}]: analytic {} vs numeric {numeric}",
                 grads.scale[6 + j]
             );
@@ -1908,7 +1759,7 @@ mod tests {
         let mut minus = model.clone();
         plus.gaussians[0].opacity += eps;
         minus.gaussians[0].opacity -= eps;
-        let numeric = (reg_loss(&plus) - reg_loss(&minus)) / (2.0 * eps);
+        let numeric = (opacity_loss(&plus) - opacity_loss(&minus)) / (2.0 * eps);
         assert!(
             relative_error(grads.opacity[0], numeric) < 0.01,
             "opacity: analytic {} vs numeric {numeric}",
@@ -1981,5 +1832,90 @@ mod tests {
             let lr = optimizer.position_lr(iteration);
             assert!(lr.is_finite() && lr > 0.0, "lr at {iteration} is {lr}");
         }
+    }
+
+    #[test]
+    fn scale_regularisation_gradient_follows_the_asymmetric_penalty() {
+        // Regression: `scale_reg` became `mean(relu(e^log_s − m)²)` but this
+        // gradient stayed the derivative of the old symmetric `mean(log_s²)`,
+        // so for every ordinary (undersized) Gaussian it pushed the log-scale
+        // in the OPPOSITE direction to the reported loss.
+        let cfg = reg_cfg(0.0, 1.0, 0.0);
+        let model = tiny_model(1);
+        let mut grads = Gradients::zeros(model.len(), 3);
+        add_regularization_gradients(&cfg, &model, &mut grads);
+
+        // Oversized axes (e^-1.5 ≈ 0.223 > 0.05) push the scale DOWN, i.e. a
+        // positive gradient; the old symmetric form gave a negative one.
+        for (axis, g) in grads.scale.iter().enumerate() {
+            assert!(*g > 0.0, "scale[{axis}] gradient {g} must be positive");
+        }
+
+        // Inside the clamp the penalty is exactly constant → zero gradient.
+        let mut small = tiny_model(1);
+        small.gaussians[0].scale = [-5.0, -5.0, -5.0]; // e^-5 ≈ 0.0067 < 0.05
+        let mut small_grads = Gradients::zeros(small.len(), 3);
+        add_regularization_gradients(&cfg, &small, &mut small_grads);
+        assert!(small_grads.scale.iter().all(|g| *g == 0.0));
+    }
+
+    #[test]
+    fn configured_max_scale_reaches_the_regularisation_gradient() {
+        // Regression (F289): the threshold was a hardcoded constant, so
+        // `LossConfig::w_scale_reg_max_scale` changed the reported loss but not
+        // the descent direction.
+        let mut model = tiny_model(1);
+        model.gaussians[0].scale = [-3.0, -3.0, -3.0]; // e^-3 ≈ 0.0498
+
+        // Default threshold (0.05) leaves it inside the clamp: no gradient.
+        let mut default_grads = Gradients::zeros(model.len(), 3);
+        add_regularization_gradients(&reg_cfg(0.0, 1.0, 0.0), &model, &mut default_grads);
+        assert!(default_grads.scale.iter().all(|g| *g == 0.0));
+
+        // A tighter threshold makes the same Gaussian oversized.
+        let tight = LossConfig {
+            w_scale_reg_max_scale: 0.01,
+            ..reg_cfg(0.0, 1.0, 0.0)
+        };
+        let mut tight_grads = Gradients::zeros(model.len(), 3);
+        add_regularization_gradients(&tight, &model, &mut tight_grads);
+        assert!(tight_grads.scale.iter().all(|g| *g > 0.0));
+    }
+
+    // ---- configured loop components ----------------------------------------
+
+    #[test]
+    fn loop_components_are_off_by_default_and_on_when_configured() {
+        let model = tiny_model(2);
+        let off = LoopComponents::from_config(&TrainingConfig::default(), &model)
+            .expect("default config must build");
+        assert!(off.lr_scheduler.is_none());
+        assert!(off.gradient_clipper.is_none());
+        assert!(off.gradient_accumulator.is_none());
+        assert!(off.ema.is_none());
+
+        let config = TrainingConfig {
+            lr_schedule: crate::config::LrScheduleConfig::WarmupCosine {
+                warmup_steps: 10,
+                total_steps: 100,
+                min_factor: 0.1,
+            },
+            gradient_clip: crate::config::GradientClipConfig::GlobalNorm { max_norm: 1.0 },
+            gradient_accumulation_steps: 4,
+            ema_decay: Some(0.99),
+            ..Default::default()
+        };
+        let on = LoopComponents::from_config(&config, &model).expect("valid config must build");
+        assert!(on.lr_scheduler.is_some());
+        assert!(on.gradient_clipper.is_some());
+        assert!(on.gradient_accumulator.is_some());
+        assert!(on.ema.is_some());
+
+        // An out-of-range component is reported, never silently dropped.
+        let bad = TrainingConfig {
+            gradient_clip: crate::config::GradientClipConfig::GlobalNorm { max_norm: -1.0 },
+            ..Default::default()
+        };
+        assert!(LoopComponents::from_config(&bad, &model).is_err());
     }
 }

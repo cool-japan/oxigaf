@@ -58,6 +58,84 @@ impl GaussianModel {
         self.gaussians.is_empty()
     }
 
+    /// Check that every parallel array agrees with `gaussians.len()`.
+    ///
+    /// `GaussianModel`'s side arrays are independent `Vec`s that only some
+    /// consumers read: `DeformPipeline`, `lod.rs` and `density.rs` index
+    /// `face_indices` / `barycentric` / `local_offsets` / `is_rigid`, and the
+    /// binding and rasterization paths index `sh_coeffs`. A model whose
+    /// arrays have drifted out of step therefore renders perfectly and
+    /// misbehaves much later, in whichever consumer happens to read the short
+    /// array first. This is the cheap up-front check that turns that into one
+    /// clear error.
+    ///
+    /// # What "consistent" means here
+    ///
+    /// * The four FLAME arrays are each either **empty** or exactly
+    ///   `len()` long. Empty is legal and common: PLY and SafeTensors carry no
+    ///   binding data, so a model loaded from either has no FLAME arrays at
+    ///   all, and `binding::apply_binding` rejects that case on its own terms.
+    ///   A *partially* filled array is never legal.
+    /// * `sh_coeffs` is either empty (the GPU buffer is then zero-filled at
+    ///   degree 0) or exactly `len() * (sh_degree + 1)² * 3` floats.
+    /// * `sh_degree` is at most 3 — the largest degree with a defined SH
+    ///   basis in the shaders and in [`crate::spherical_harmonics`].
+    ///
+    /// # Errors
+    ///
+    /// [`RenderError::MismatchedBufferSizes`] naming the expected and actual
+    /// length, or [`RenderError::ValidationError`] for an out-of-range
+    /// `sh_degree`.
+    pub fn validate(&self) -> Result<(), RenderError> {
+        let n = self.gaussians.len();
+
+        if self.sh_degree > 3 {
+            return Err(RenderError::ValidationError(format!(
+                "GaussianModel: sh_degree must be in [0, 3], got {}",
+                self.sh_degree
+            )));
+        }
+
+        // Each side array is a strict all-or-nothing companion of `gaussians`.
+        let side_arrays: [(&str, usize); 4] = [
+            ("face_indices", self.face_indices.len()),
+            ("barycentric", self.barycentric.len()),
+            ("local_offsets", self.local_offsets.len()),
+            ("is_rigid", self.is_rigid.len()),
+        ];
+        for (name, len) in side_arrays {
+            if len != 0 && len != n {
+                tracing::error!(
+                    array = name,
+                    expected = n,
+                    actual = len,
+                    "GaussianModel side array length does not match the Gaussian count"
+                );
+                return Err(RenderError::MismatchedBufferSizes {
+                    expected: n,
+                    actual: len,
+                });
+            }
+        }
+
+        let sh_stride = ((self.sh_degree + 1) * (self.sh_degree + 1) * 3) as usize;
+        let expected_sh = n.saturating_mul(sh_stride);
+        if !self.sh_coeffs.is_empty() && self.sh_coeffs.len() != expected_sh {
+            tracing::error!(
+                expected = expected_sh,
+                actual = self.sh_coeffs.len(),
+                sh_degree = self.sh_degree,
+                "GaussianModel sh_coeffs length does not match the Gaussian count and degree"
+            );
+            return Err(RenderError::MismatchedBufferSizes {
+                expected: expected_sh,
+                actual: self.sh_coeffs.len(),
+            });
+        }
+
+        Ok(())
+    }
+
     /// Save this model to a binary little-endian PLY file in the standard 3DGS format.
     ///
     /// The file is compatible with the SIBR viewer and other 3DGS tools.
@@ -67,7 +145,13 @@ impl GaussianModel {
     /// # Property order (per vertex)
     /// `x y z nx ny nz f_dc_0 f_dc_1 f_dc_2 [f_rest_*] opacity scale_0 scale_1 scale_2 rot_0 rot_1 rot_2 rot_3`
     ///
-    /// Where `rot_0..rot_3` = w,x,y,z (PLY convention).
+    /// Where `rot_0..rot_3` = w,x,y,z (PLY convention), and `f_rest_*` is
+    /// **channel-major**: all higher-order R coefficients, then all G, then
+    /// all B (`features_rest.transpose(1, 2).flatten()` in the reference
+    /// 3DGS Python implementation) - this crate's own in-memory
+    /// `sh_coeffs` layout is coefficient-major RGB-interleaved (see
+    /// [`GaussianModel::sh_coeffs`]), so the two orders are permuted on
+    /// write and un-permuted on [`Self::load_ply`].
     pub fn save_ply(&self, path: &Path) -> Result<(), RenderError> {
         let n = self.gaussians.len();
         // C = (sh_degree+1)^2 * 3
@@ -118,9 +202,18 @@ impl GaussianModel {
                 write_f32_le(&mut w, 0.0_f32)?;
             }
 
-            // f_rest: remaining SH values
-            for k in 0..num_rest {
-                write_f32_le(&mut w, self.sh_coeffs[sh_start + 3 + k])?;
+            // f_rest: remaining SH values, permuted from this crate's
+            // internal coefficient-major RGB-interleaved layout
+            // (`sh_coeffs[coefficient*3 + channel]`) to the PLY format's
+            // channel-major layout (all R, then all G, then all B) - see
+            // this function's doc comment. `num_rest` is always a multiple
+            // of 3 (it is `((sh_degree+1)^2 - 1) * 3`).
+            let num_rest_coeffs = num_rest / 3;
+            for c in 0..3 {
+                for j in 1..=num_rest_coeffs {
+                    let internal_idx = sh_start + j * 3 + c;
+                    write_f32_le(&mut w, self.sh_coeffs[internal_idx])?;
+                }
             }
 
             // opacity (logit, raw)
@@ -147,12 +240,27 @@ impl GaussianModel {
 
     /// Load a `GaussianModel` from a binary little-endian PLY file in the standard 3DGS format.
     ///
+    /// The vertex element's properties are read by name/offset rather than
+    /// assumed to be in [`Self::save_ply`]'s exact order, so files written
+    /// by other 3DGS tools (which may reorder properties or add/omit
+    /// extras) load correctly as long as every property this loader
+    /// requires (`x y z f_dc_0..2 [f_rest_*] opacity scale_0..2 rot_0..3`)
+    /// is present with a supported scalar type. `f_rest_*` is un-permuted
+    /// from the PLY channel-major order back to this crate's internal
+    /// coefficient-major order - see [`Self::save_ply`]'s doc.
+    ///
     /// FLAME binding fields are initialised to defaults:
     /// - `face_indices`: all 0
     /// - `barycentric`: all [1/3, 1/3, 1/3]
     /// - `local_offsets`: all [0, 0, 0]
     /// - `is_rigid`: all false
     pub fn load_ply(path: &Path) -> Result<Self, RenderError> {
+        // Needed up front to sanity-check the header's declared vertex
+        // count before pre-allocating anything sized by it (see below).
+        let file_len = std::fs::metadata(path)
+            .map_err(|e| RenderError::PlyIo(format!("Cannot stat file: {e}")))?
+            .len();
+
         let file = std::fs::File::open(path)
             .map_err(|e| RenderError::PlyIo(format!("Cannot open file: {e}")))?;
         let mut reader = BufReader::new(file);
@@ -181,48 +289,90 @@ impl GaussianModel {
         // sh_degree is (sqrt - 1)
         let sh_degree = sh_degree - 1;
 
+        // Build the actual per-vertex byte layout from the header's own
+        // property list, in file order. Real-world 3DGS exports frequently
+        // reorder properties or add/omit extras (confidence, normals,
+        // `uchar` colour); reading the body by looking up each required
+        // property's offset - rather than assuming this crate's own
+        // `write_ply_header` order and a fixed `float`-only property count
+        // - means such files are read correctly instead of as silently
+        // misaligned garbage.
+        let (layout, bytes_per_vertex) = ply_vertex_layout(&header.properties);
+        if bytes_per_vertex == 0 {
+            return Err(RenderError::PlyIo(
+                "PLY vertex element declares no properties".to_string(),
+            ));
+        }
+
+        // Sanity-check the declared vertex count against the file's actual
+        // size before pre-allocating: a tiny malformed/adversarial file
+        // declaring e.g. `element vertex 4000000000` would otherwise cause
+        // a multi-gigabyte allocation before a single body byte is read.
+        let declared_body_bytes = n.checked_mul(bytes_per_vertex).ok_or_else(|| {
+            RenderError::PlyIo(format!(
+                "declared vertex count {n} overflows when computing required body size"
+            ))
+        })?;
+        if declared_body_bytes as u64 > file_len {
+            return Err(RenderError::PlyIo(format!(
+                "PLY header declares {n} vertices ({declared_body_bytes} body bytes needed), \
+                 but the file is only {file_len} bytes"
+            )));
+        }
+        let sh_coeffs_capacity = n.checked_mul(sh_total).ok_or_else(|| {
+            RenderError::PlyIo(format!(
+                "sh_coeffs capacity overflow: n={n} * sh_total={sh_total}"
+            ))
+        })?;
+
         let mut gaussians = Vec::with_capacity(n);
-        let mut sh_coeffs = Vec::with_capacity(n * sh_total);
+        let mut sh_coeffs = Vec::with_capacity(sh_coeffs_capacity);
+        let num_rest_coeffs = num_rest / 3;
+        let mut rest_raw = vec![0.0_f32; num_rest];
 
         // --- Binary body ---
+        let mut record = vec![0u8; bytes_per_vertex];
         for idx in 0..n {
-            // position
-            let px = read_f32_le(&mut reader, idx, "x")?;
-            let py = read_f32_le(&mut reader, idx, "y")?;
-            let pz = read_f32_le(&mut reader, idx, "z")?;
+            reader
+                .read_exact(&mut record)
+                .map_err(|e| RenderError::PlyIo(format!("Read error at vertex {idx}: {e}")))?;
 
-            // normals (read and discard)
-            let _nx = read_f32_le(&mut reader, idx, "nx")?;
-            let _ny = read_f32_le(&mut reader, idx, "ny")?;
-            let _nz = read_f32_le(&mut reader, idx, "nz")?;
+            let px = ply_require_field(&layout, &record, "x")?;
+            let py = ply_require_field(&layout, &record, "y")?;
+            let pz = ply_require_field(&layout, &record, "z")?;
 
-            // f_dc
-            let dc0 = read_f32_le(&mut reader, idx, "f_dc_0")?;
-            let dc1 = read_f32_le(&mut reader, idx, "f_dc_1")?;
-            let dc2 = read_f32_le(&mut reader, idx, "f_dc_2")?;
-            sh_coeffs.push(dc0);
-            sh_coeffs.push(dc1);
-            sh_coeffs.push(dc2);
+            // f_dc (coefficient 0, all 3 channels - not permuted).
+            sh_coeffs.push(ply_require_field(&layout, &record, "f_dc_0")?);
+            sh_coeffs.push(ply_require_field(&layout, &record, "f_dc_1")?);
+            sh_coeffs.push(ply_require_field(&layout, &record, "f_dc_2")?);
 
-            // f_rest
-            for k in 0..num_rest {
-                let v = read_f32_le(&mut reader, idx, &format!("f_rest_{k}"))?;
-                sh_coeffs.push(v);
+            // f_rest: the file stores these channel-major (all R, then all
+            // G, then all B - see `save_ply`'s doc), but this crate's
+            // internal layout is coefficient-major RGB-interleaved
+            // (`sh_coeffs[coefficient*3 + channel]`) - collect the raw
+            // values in file order, then de-interleave into internal order.
+            for (k, slot) in rest_raw.iter_mut().enumerate() {
+                let name = format!("f_rest_{k}");
+                *slot = ply_require_field(&layout, &record, &name)?;
+            }
+            for j in 1..=num_rest_coeffs {
+                for c in 0..3 {
+                    let ply_idx = c * num_rest_coeffs + (j - 1);
+                    sh_coeffs.push(rest_raw[ply_idx]);
+                }
             }
 
-            // opacity
-            let opacity = read_f32_le(&mut reader, idx, "opacity")?;
+            let opacity = ply_require_field(&layout, &record, "opacity")?;
 
-            // scale
-            let sx = read_f32_le(&mut reader, idx, "scale_0")?;
-            let sy = read_f32_le(&mut reader, idx, "scale_1")?;
-            let sz = read_f32_le(&mut reader, idx, "scale_2")?;
+            let sx = ply_require_field(&layout, &record, "scale_0")?;
+            let sy = ply_require_field(&layout, &record, "scale_1")?;
+            let sz = ply_require_field(&layout, &record, "scale_2")?;
 
             // rotation: PLY w,x,y,z → struct x,y,z,w
-            let rot_w = read_f32_le(&mut reader, idx, "rot_0")?;
-            let rot_x = read_f32_le(&mut reader, idx, "rot_1")?;
-            let rot_y = read_f32_le(&mut reader, idx, "rot_2")?;
-            let rot_z = read_f32_le(&mut reader, idx, "rot_3")?;
+            let rot_w = ply_require_field(&layout, &record, "rot_0")?;
+            let rot_x = ply_require_field(&layout, &record, "rot_1")?;
+            let rot_y = ply_require_field(&layout, &record, "rot_2")?;
+            let rot_z = ply_require_field(&layout, &record, "rot_3")?;
 
             gaussians.push(GaussianAttributes {
                 position: [px, py, pz],
@@ -534,16 +684,108 @@ fn write_f32_le(w: &mut impl Write, v: f32) -> Result<(), RenderError> {
         .map_err(|e| RenderError::PlyIo(format!("Write error: {e}")))
 }
 
-/// Read a single f32 from 4 bytes little-endian.
-#[inline]
-fn read_f32_le(r: &mut impl Read, idx: usize, prop: &str) -> Result<f32, RenderError> {
-    let mut buf = [0u8; 4];
-    r.read_exact(&mut buf).map_err(|e| {
+/// A PLY scalar property type, together with its on-disk byte width.
+///
+/// Needed to correctly skip properties the loader does not care about
+/// (e.g. normals, `uchar` colour) without misaligning the rest of the
+/// per-vertex record - see [`ply_vertex_layout`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlyScalarType {
+    Float32,
+    Float64,
+    Int8,
+    UInt8,
+    Int16,
+    UInt16,
+    Int32,
+    UInt32,
+}
+
+impl PlyScalarType {
+    /// Parse a PLY type token (`float`, `float32`, `double`, `uchar`, …).
+    fn parse(token: &str) -> Option<Self> {
+        match token {
+            "float" | "float32" => Some(Self::Float32),
+            "double" | "float64" => Some(Self::Float64),
+            "char" | "int8" => Some(Self::Int8),
+            "uchar" | "uint8" => Some(Self::UInt8),
+            "short" | "int16" => Some(Self::Int16),
+            "ushort" | "uint16" => Some(Self::UInt16),
+            "int" | "int32" => Some(Self::Int32),
+            "uint" | "uint32" => Some(Self::UInt32),
+            _ => None,
+        }
+    }
+
+    /// On-disk width in bytes.
+    fn byte_size(self) -> usize {
+        match self {
+            Self::Float32 | Self::Int32 | Self::UInt32 => 4,
+            Self::Float64 => 8,
+            Self::Int8 | Self::UInt8 => 1,
+            Self::Int16 | Self::UInt16 => 2,
+        }
+    }
+
+    /// Decode a little-endian value of this type from the start of `buf`
+    /// (which must be at least `byte_size()` bytes) as an `f32`.
+    fn read_le_as_f32(self, buf: &[u8]) -> f32 {
+        match self {
+            Self::Float32 => f32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]),
+            Self::Float64 => f64::from_le_bytes([
+                buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+            ]) as f32,
+            Self::Int8 => buf[0] as i8 as f32,
+            Self::UInt8 => buf[0] as f32,
+            Self::Int16 => i16::from_le_bytes([buf[0], buf[1]]) as f32,
+            Self::UInt16 => u16::from_le_bytes([buf[0], buf[1]]) as f32,
+            Self::Int32 => i32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as f32,
+            Self::UInt32 => u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as f32,
+        }
+    }
+}
+
+/// Compute each vertex property's byte offset (and type) within one vertex
+/// record, plus the total per-vertex record size, from an ordered property
+/// list (in file order, as recorded by [`parse_ply_header`]).
+fn ply_vertex_layout(
+    properties: &[(String, PlyScalarType)],
+) -> (HashMap<&str, (usize, PlyScalarType)>, usize) {
+    let mut offsets: HashMap<&str, (usize, PlyScalarType)> =
+        HashMap::with_capacity(properties.len());
+    let mut offset = 0usize;
+    for (name, ty) in properties {
+        offsets.insert(name.as_str(), (offset, *ty));
+        offset += ty.byte_size();
+    }
+    (offsets, offset)
+}
+
+/// Read one named property's value out of a single vertex record, as an
+/// `f32` regardless of its on-disk scalar type.
+///
+/// # Errors
+///
+/// Returns [`RenderError::PlyIo`] if `name` is not a property of this PLY
+/// file's vertex element.
+fn ply_require_field(
+    layout: &HashMap<&str, (usize, PlyScalarType)>,
+    record: &[u8],
+    name: &str,
+) -> Result<f32, RenderError> {
+    let (offset, ty) = layout.get(name).ok_or_else(|| {
         RenderError::PlyIo(format!(
-            "Read error at vertex {idx}, property '{prop}': {e}"
+            "PLY vertex element is missing required property '{name}'"
         ))
     })?;
-    Ok(f32::from_le_bytes(buf))
+    let end = offset + ty.byte_size();
+    let slice = record.get(*offset..end).ok_or_else(|| {
+        RenderError::PlyIo(format!(
+            "Internal error: property '{name}' offset {offset}..{end} exceeds record size {}",
+            record.len()
+        ))
+    })?;
+    Ok(ty.read_le_as_f32(slice))
 }
 
 /// Write the PLY ASCII header to `w`.
@@ -594,11 +836,16 @@ struct PlyHeader {
     vertex_count: usize,
     /// Number of `f_rest_*` properties.
     num_rest: usize,
+    /// Every `vertex` element property in file order: `(name, type)`. Used
+    /// by [`ply_vertex_layout`] to read the body by property name/offset
+    /// instead of assuming a fixed order and property count.
+    properties: Vec<(String, PlyScalarType)>,
 }
 
 /// Parse a PLY ASCII header from `r`, consuming exactly the header lines.
 ///
-/// Returns counts needed to read the binary body.
+/// Returns the vertex count and full per-vertex property list needed to
+/// read the binary body.
 fn parse_ply_header(r: &mut impl BufRead) -> Result<PlyHeader, RenderError> {
     let mut line = String::new();
 
@@ -616,6 +863,12 @@ fn parse_ply_header(r: &mut impl BufRead) -> Result<PlyHeader, RenderError> {
     let mut vertex_count: Option<usize> = None;
     let mut num_rest: usize = 0;
     let mut found_binary_le = false;
+    let mut properties: Vec<(String, PlyScalarType)> = Vec::new();
+    // Only the `vertex` element's properties belong in the per-vertex
+    // record layout - a PLY file may declare other elements (e.g. `face`)
+    // afterward, whose (possibly list-typed) properties must not be mixed
+    // into it.
+    let mut in_vertex_element = false;
 
     loop {
         line.clear();
@@ -633,17 +886,47 @@ fn parse_ply_header(r: &mut impl BufRead) -> Result<PlyHeader, RenderError> {
             break;
         } else if trimmed.starts_with("format binary_little_endian") {
             found_binary_le = true;
-        } else if trimmed.starts_with("element vertex ") {
-            let count_str = trimmed
-                .strip_prefix("element vertex ")
-                .ok_or_else(|| RenderError::PlyIo("Malformed element vertex line".to_string()))?;
-            vertex_count = Some(count_str.trim().parse::<usize>().map_err(|e| {
-                RenderError::PlyIo(format!("Invalid vertex count '{count_str}': {e}"))
-            })?);
-        } else if trimmed.starts_with("property float f_rest_") {
-            num_rest += 1;
+        } else if let Some(rest) = trimmed.strip_prefix("element ") {
+            let mut parts = rest.split_whitespace();
+            let elem_name = parts.next().unwrap_or("");
+            in_vertex_element = elem_name == "vertex";
+            if in_vertex_element {
+                let count_str = parts.next().ok_or_else(|| {
+                    RenderError::PlyIo("Malformed 'element vertex' line".to_string())
+                })?;
+                vertex_count = Some(count_str.trim().parse::<usize>().map_err(|e| {
+                    RenderError::PlyIo(format!("Invalid vertex count '{count_str}': {e}"))
+                })?);
+            }
+        } else if in_vertex_element {
+            if let Some(rest) = trimmed.strip_prefix("property ") {
+                if rest.trim_start().starts_with("list ") {
+                    return Err(RenderError::PlyIo(
+                        "List-valued vertex properties are not supported".to_string(),
+                    ));
+                }
+                let mut parts = rest.split_whitespace();
+                let type_str = parts.next().ok_or_else(|| {
+                    RenderError::PlyIo(format!("Malformed property line: {trimmed:?}"))
+                })?;
+                let name = parts.next().ok_or_else(|| {
+                    RenderError::PlyIo(format!("Malformed property line: {trimmed:?}"))
+                })?;
+                let ty = PlyScalarType::parse(type_str).ok_or_else(|| {
+                    RenderError::PlyIo(format!(
+                        "Unsupported PLY property type '{type_str}' for property '{name}'"
+                    ))
+                })?;
+                if name.starts_with("f_rest_") {
+                    num_rest += 1;
+                }
+                properties.push((name.to_string(), ty));
+            }
+            // Comment / obj_info lines inside the vertex element are
+            // silently skipped, as before.
         }
-        // All other property/comment/obj_info lines are silently skipped.
+        // Lines outside the `vertex` element (including another element's
+        // own property lines) are intentionally ignored.
     }
 
     if !found_binary_le {
@@ -659,6 +942,7 @@ fn parse_ply_header(r: &mut impl BufRead) -> Result<PlyHeader, RenderError> {
     Ok(PlyHeader {
         vertex_count,
         num_rest,
+        properties,
     })
 }
 
@@ -950,6 +1234,184 @@ mod tests {
                 assert!(approx_eq(orig.position[c], load.position[c], tol));
             }
         }
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn test_ply_save_writes_f_rest_channel_major() {
+        // Regression test for the interleaving bug: `f_rest_*` must be
+        // written channel-major (all R higher-order coefficients, then all
+        // G, then all B) to match the official 3DGS PLY convention
+        // (`features_rest.transpose(1, 2).flatten()`), not interleaved
+        // per-coefficient like this crate's internal `sh_coeffs` layout -
+        // otherwise any degree>=1 model saved here renders with scrambled
+        // view-dependent colour in SIBR/gsplat/supersplat.
+        let sh_degree = 1u32; // 4 basis functions: 1 DC + 3 "rest"
+        let sh_total = 12usize; // 4 * 3
+        let mut sh_coeffs = vec![0.0_f32; sh_total];
+        // DC (coefficient 0): arbitrary, unrelated to this check.
+        sh_coeffs[0] = 9.0;
+        sh_coeffs[1] = 9.1;
+        sh_coeffs[2] = 9.2;
+        // Coefficient 1 (R=1, G=2, B=3), coefficient-major internal layout:
+        sh_coeffs[3] = 1.0;
+        sh_coeffs[4] = 2.0;
+        sh_coeffs[5] = 3.0;
+        // Coefficient 2 (R=4, G=5, B=6):
+        sh_coeffs[6] = 4.0;
+        sh_coeffs[7] = 5.0;
+        sh_coeffs[8] = 6.0;
+        // Coefficient 3 (R=7, G=8, B=9):
+        sh_coeffs[9] = 7.0;
+        sh_coeffs[10] = 8.0;
+        sh_coeffs[11] = 9.0;
+
+        let third = 1.0_f32 / 3.0_f32;
+        let model = GaussianModel {
+            gaussians: vec![GaussianAttributes {
+                position: [0.0, 0.0, 0.0],
+                _pad0: 0.0,
+                rotation: [0.0, 0.0, 0.0, 1.0],
+                scale: [0.0, 0.0, 0.0],
+                opacity: 0.0,
+            }],
+            sh_coeffs,
+            sh_degree,
+            face_indices: vec![0],
+            barycentric: vec![[third, third, third]],
+            local_offsets: vec![[0.0, 0.0, 0.0]],
+            is_rigid: vec![false],
+        };
+
+        let tmp = std::env::temp_dir().join("test_ply_f_rest_channel_major.ply");
+        model.save_ply(&tmp).expect("save_ply failed");
+
+        let raw = std::fs::read(&tmp).expect("read raw ply bytes");
+        let needle = b"end_header\n";
+        let header_end = raw
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .expect("end_header not found")
+            + needle.len();
+        let body = &raw[header_end..];
+
+        // x,y,z (12 bytes) + nx,ny,nz (12) + f_dc_0..2 (12) = 36 bytes
+        // before f_rest_0.
+        let f_rest_start = 36;
+        let read_f32 = |offset: usize| -> f32 {
+            let b = &body[offset..offset + 4];
+            f32::from_le_bytes([b[0], b[1], b[2], b[3]])
+        };
+
+        // Channel-major: f_rest_0..2 = R of coefficients 1..3,
+        // f_rest_3..5 = G, f_rest_6..8 = B.
+        let expected = [1.0, 4.0, 7.0, 2.0, 5.0, 8.0, 3.0, 6.0, 9.0];
+        for (k, &exp) in expected.iter().enumerate() {
+            let got = read_f32(f_rest_start + k * 4);
+            assert!(
+                (got - exp).abs() < 1e-6,
+                "f_rest_{k}: expected {exp}, got {got}"
+            );
+        }
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn test_ply_load_tolerates_reordered_and_extra_properties() {
+        // Regression test: a real-world PLY may reorder vertex properties,
+        // add extras this crate does not need (e.g. a `uchar` confidence
+        // value), or omit normals entirely - the loader must read such a
+        // file correctly by property name/offset rather than assuming
+        // this crate's own `write_ply_header` order and property set.
+        let tmp = std::env::temp_dir().join("test_ply_reordered_properties.ply");
+
+        let header = "ply\n\
+            format binary_little_endian 1.0\n\
+            element vertex 1\n\
+            property uchar confidence\n\
+            property float opacity\n\
+            property float scale_0\n\
+            property float scale_1\n\
+            property float scale_2\n\
+            property float rot_0\n\
+            property float rot_1\n\
+            property float rot_2\n\
+            property float rot_3\n\
+            property float x\n\
+            property float y\n\
+            property float z\n\
+            property float f_dc_0\n\
+            property float f_dc_1\n\
+            property float f_dc_2\n\
+            end_header\n";
+
+        let mut body: Vec<u8> = Vec::new();
+        body.push(200u8); // confidence (uchar, ignored by this loader)
+        body.extend_from_slice(&0.75_f32.to_le_bytes()); // opacity
+        body.extend_from_slice(&(-1.0_f32).to_le_bytes()); // scale_0
+        body.extend_from_slice(&(-2.0_f32).to_le_bytes()); // scale_1
+        body.extend_from_slice(&(-3.0_f32).to_le_bytes()); // scale_2
+        body.extend_from_slice(&1.0_f32.to_le_bytes()); // rot_0 (w)
+        body.extend_from_slice(&0.0_f32.to_le_bytes()); // rot_1 (x)
+        body.extend_from_slice(&0.0_f32.to_le_bytes()); // rot_2 (y)
+        body.extend_from_slice(&0.0_f32.to_le_bytes()); // rot_3 (z)
+        body.extend_from_slice(&10.0_f32.to_le_bytes()); // x
+        body.extend_from_slice(&20.0_f32.to_le_bytes()); // y
+        body.extend_from_slice(&30.0_f32.to_le_bytes()); // z
+        body.extend_from_slice(&0.5_f32.to_le_bytes()); // f_dc_0
+        body.extend_from_slice(&0.6_f32.to_le_bytes()); // f_dc_1
+        body.extend_from_slice(&0.7_f32.to_le_bytes()); // f_dc_2
+
+        let mut file_bytes = header.as_bytes().to_vec();
+        file_bytes.extend_from_slice(&body);
+        std::fs::write(&tmp, &file_bytes).expect("write test ply");
+
+        let loaded = GaussianModel::load_ply(&tmp).expect("load_ply should tolerate reordering");
+
+        assert_eq!(loaded.gaussians.len(), 1);
+        let g = loaded.gaussians[0];
+        assert_eq!(g.position, [10.0, 20.0, 30.0]);
+        assert!((g.opacity - 0.75).abs() < 1e-6);
+        assert_eq!(g.scale, [-1.0, -2.0, -3.0]);
+        assert_eq!(g.rotation, [0.0, 0.0, 0.0, 1.0]); // struct is x,y,z,w
+        assert_eq!(loaded.sh_coeffs, vec![0.5, 0.6, 0.7]);
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn test_ply_load_rejects_vertex_count_exceeding_file_size() {
+        // Regression test: a tiny file declaring an enormous vertex count
+        // must be rejected with a clear error instead of attempting a
+        // multi-gigabyte pre-allocation before a single body byte is read.
+        let tmp = std::env::temp_dir().join("test_ply_huge_vertex_count.ply");
+        let header = "ply\n\
+            format binary_little_endian 1.0\n\
+            element vertex 4000000000\n\
+            property float x\n\
+            property float y\n\
+            property float z\n\
+            property float f_dc_0\n\
+            property float f_dc_1\n\
+            property float f_dc_2\n\
+            property float opacity\n\
+            property float scale_0\n\
+            property float scale_1\n\
+            property float scale_2\n\
+            property float rot_0\n\
+            property float rot_1\n\
+            property float rot_2\n\
+            property float rot_3\n\
+            end_header\n";
+        std::fs::write(&tmp, header).expect("write test ply");
+
+        let result = GaussianModel::load_ply(&tmp);
+        assert!(
+            matches!(result, Err(RenderError::PlyIo(_))),
+            "expected a PlyIo error for an over-declared vertex count, got {result:?}"
+        );
 
         let _ = std::fs::remove_file(&tmp);
     }
@@ -1287,5 +1749,97 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    // --- GaussianModel::validate (F270) ---
+
+    #[test]
+    fn test_validate_accepts_a_well_formed_model() {
+        for degree in 0..=3 {
+            make_model(5, degree)
+                .validate()
+                .unwrap_or_else(|e| panic!("degree {degree} model must validate: {e}"));
+        }
+        // An empty model is trivially consistent.
+        make_model(0, 0).validate().expect("empty model");
+    }
+
+    /// A PLY/SafeTensors model carries no FLAME binding data at all. Empty is
+    /// legal; a *partially* filled array is the drift this check exists for.
+    #[test]
+    fn test_validate_allows_absent_flame_arrays_but_not_short_ones() {
+        let mut model = make_model(6, 0);
+        model.face_indices.clear();
+        model.barycentric.clear();
+        model.local_offsets.clear();
+        model.is_rigid.clear();
+        model.validate().expect("absent binding data is legal");
+
+        for shorten in 0..4usize {
+            let mut model = make_model(6, 0);
+            match shorten {
+                0 => model.face_indices.truncate(3),
+                1 => model.barycentric.truncate(3),
+                2 => model.local_offsets.truncate(3),
+                _ => model.is_rigid.truncate(3),
+            }
+            let err = model
+                .validate()
+                .expect_err("a half-filled side array must be rejected");
+            assert!(matches!(
+                err,
+                RenderError::MismatchedBufferSizes {
+                    expected: 6,
+                    actual: 3
+                }
+            ));
+        }
+    }
+
+    /// A side array *longer* than the model is just as wrong as a short one:
+    /// the extra entries silently belong to no Gaussian.
+    #[test]
+    fn test_validate_rejects_overlong_side_array() {
+        let mut model = make_model(4, 0);
+        model.is_rigid.push(true);
+        assert!(matches!(
+            model.validate(),
+            Err(RenderError::MismatchedBufferSizes {
+                expected: 4,
+                actual: 5
+            })
+        ));
+    }
+
+    #[test]
+    fn test_validate_rejects_sh_coeffs_of_the_wrong_stride() {
+        // Degree-2 model (27 floats each) mislabelled as degree 3 (48 each).
+        let mut model = make_model(4, 2);
+        model.sh_degree = 3;
+        let err = model
+            .validate()
+            .expect_err("an SH stride that does not match the degree must be rejected");
+        assert!(matches!(
+            err,
+            RenderError::MismatchedBufferSizes {
+                expected: 192,
+                actual: 108
+            }
+        ));
+
+        // Absent SH data is legal: the GPU buffer is zero-filled at degree 0.
+        let mut model = make_model(4, 2);
+        model.sh_coeffs.clear();
+        model.validate().expect("absent SH data is legal");
+    }
+
+    #[test]
+    fn test_validate_rejects_sh_degree_above_three() {
+        let mut model = make_model(2, 0);
+        model.sh_degree = 4;
+        assert!(matches!(
+            model.validate(),
+            Err(RenderError::ValidationError(_))
+        ));
     }
 }

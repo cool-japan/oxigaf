@@ -291,6 +291,13 @@ pub struct CullingResult {
     pub distance_culled: usize,
     /// Number of Gaussians removed by screen-size culling.
     pub size_culled: usize,
+    /// Number of Gaussians removed because they sit behind (or exactly at)
+    /// the camera — a non-positive view-space depth along the camera's
+    /// look direction. This check always runs, independent of
+    /// `config.frustum_cull` / `config.distance_cull`, because such a
+    /// Gaussian cannot be projected to a valid, non-mirrored screen
+    /// position.
+    pub behind_camera_culled: usize,
     /// Total Gaussians in the input.
     pub total: usize,
     /// Number of visible Gaussians.
@@ -311,13 +318,14 @@ impl CullingResult {
     /// Human-readable one-line summary.
     pub fn format_summary(&self) -> String {
         format!(
-            "visible={}/{} ({:.1}%) | frustum_culled={} distance_culled={} size_culled={}",
+            "visible={}/{} ({:.1}%) | frustum_culled={} distance_culled={} size_culled={} behind_camera_culled={}",
             self.num_visible,
             self.total,
             self.visibility_ratio() * 100.0,
             self.frustum_culled,
             self.distance_culled,
             self.size_culled,
+            self.behind_camera_culled,
         )
     }
 }
@@ -380,6 +388,16 @@ pub fn cull_gaussians(
     focal_y: f32,
     config: &CullingConfig,
 ) -> Result<CullingResult, CullingError> {
+    // Validate config/argument consistency up front, regardless of input
+    // size: requesting frustum culling with no frustum supplied is a
+    // caller error, not a silent no-op pass (it used to disable frustum
+    // culling entirely while still reporting `frustum_culled: 0`).
+    if config.frustum_cull && frustum.is_none() {
+        return Err(CullingError::InvalidFrustum(
+            "frustum_cull enabled but no ViewFrustum supplied".to_string(),
+        ));
+    }
+
     let total = gaussians.len();
 
     // Fast path for empty input — return an empty result rather than an error.
@@ -390,6 +408,7 @@ pub fn cull_gaussians(
             frustum_culled: 0,
             distance_culled: 0,
             size_culled: 0,
+            behind_camera_culled: 0,
             total: 0,
             num_visible: 0,
         });
@@ -399,16 +418,30 @@ pub fn cull_gaussians(
     let mut frustum_culled = 0usize;
     let mut distance_culled = 0usize;
     let mut size_culled = 0usize;
+    let mut behind_camera_culled = 0usize;
 
     for (idx, g) in gaussians.iter().enumerate() {
         // Transform centre to view (camera) space.
         let view_center = transform_point(view_matrix, g.center);
 
-        // Camera-space depth is |Z|.
-        let depth = view_center[2].abs();
+        // Camera-space depth: the camera looks down -Z in view space, so
+        // the signed depth *in front of* the camera is -Z (matching
+        // `compute_screen_bounds` below). A Gaussian with signed_depth <= 0
+        // sits behind (or exactly at) the camera and can never project to
+        // a valid, non-mirrored screen position, so it is always culled —
+        // independent of `distance_cull` / `frustum_cull`. Using `.abs()`
+        // here (the previous behaviour) treated a Gaussian behind the
+        // camera as if it were the same distance in *front* of it, so it
+        // was never culled when frustum culling was disabled.
+        let signed_depth = -view_center[2];
+        if signed_depth <= 0.0 {
+            visible[idx] = false;
+            behind_camera_culled += 1;
+            continue;
+        }
 
         // --- Distance culling ---
-        if config.distance_cull && depth > config.max_distance {
+        if config.distance_cull && signed_depth > config.max_distance {
             visible[idx] = false;
             distance_culled += 1;
             continue;
@@ -416,6 +449,7 @@ pub fn cull_gaussians(
 
         // --- Frustum culling ---
         if config.frustum_cull {
+            // `frustum` is guaranteed Some here (validated above).
             if let Some(frust) = frustum {
                 let scaled_radius = g.radius * config.radius_scale;
                 if !frust.intersects_sphere(view_center, scaled_radius) {
@@ -428,8 +462,12 @@ pub fn cull_gaussians(
 
         // --- Screen-size culling ---
         if config.min_screen_size > 0.0 {
-            let screen_r =
-                project_radius_ndc(g.radius * config.radius_scale, depth, focal_x, focal_y);
+            let screen_r = project_radius_ndc(
+                g.radius * config.radius_scale,
+                signed_depth,
+                focal_x,
+                focal_y,
+            );
             if screen_r < config.min_screen_size {
                 visible[idx] = false;
                 size_culled += 1;
@@ -447,6 +485,7 @@ pub fn cull_gaussians(
         frustum_culled,
         distance_culled,
         size_culled,
+        behind_camera_culled,
         total,
         num_visible,
     })
@@ -719,7 +758,14 @@ mod tests {
 
     #[test]
     fn test_cull_empty_input() {
-        let result = cull_gaussians(&[], &identity(), None, 1.0, 1.0, &CullingConfig::default());
+        // frustum_cull disabled: an empty-input call with no frustum must
+        // still succeed even though `CullingConfig::default()` otherwise
+        // requires one (see `test_cull_gaussians_requires_frustum_when_enabled`).
+        let config = CullingConfig {
+            frustum_cull: false,
+            ..CullingConfig::default()
+        };
+        let result = cull_gaussians(&[], &identity(), None, 1.0, 1.0, &config);
         let r = result.expect("empty input should return Ok, not Err");
         assert_eq!(r.total, 0);
         assert_eq!(r.num_visible, 0);
@@ -920,13 +966,18 @@ mod tests {
 
     #[test]
     fn test_cull_stats_basic() {
+        // Centres use negative Z: with the identity view matrix, view-space
+        // Z equals world Z, and the camera looks down -Z, so negative Z is
+        // *in front of* the camera (see the `behind_camera_culled` fix) —
+        // otherwise both Gaussians would now be behind-camera-culled and
+        // visibility_ratio would be 0.0 instead of the 1.0 asserted below.
         let gaussians = vec![
             GaussianCullData {
-                center: [0.0, 0.0, 3.0],
+                center: [0.0, 0.0, -3.0],
                 radius: 0.5,
             },
             GaussianCullData {
-                center: [0.0, 0.0, 7.0],
+                center: [0.0, 0.0, -7.0],
                 radius: 1.5,
             },
         ];
@@ -961,5 +1012,62 @@ mod tests {
             stats.mean_radius
         );
         assert!((stats.visibility_ratio - 1.0).abs() < 1e-6);
+    }
+
+    // ── 23. cull_gaussians: frustum_cull=true with frustum=None → Err ────────
+
+    #[test]
+    fn test_cull_gaussians_requires_frustum_when_enabled() {
+        let gaussians = vec![GaussianCullData {
+            center: [0.0, 0.0, -5.0],
+            radius: 0.1,
+        }];
+        let config = CullingConfig {
+            frustum_cull: true,
+            ..Default::default()
+        };
+        let result = cull_gaussians(&gaussians, &identity(), None, 1.0, 1.0, &config);
+        assert!(
+            matches!(result, Err(CullingError::InvalidFrustum(_))),
+            "Expected InvalidFrustum when frustum_cull=true and frustum=None, got {result:?}"
+        );
+    }
+
+    // ── 24. cull_gaussians: a Gaussian behind the camera is always culled ────
+
+    #[test]
+    fn test_cull_gaussians_culls_behind_camera() {
+        // View-space z = +5 (identity view matrix) is *behind* the camera
+        // (camera looks down -Z). With frustum_cull and distance_cull both
+        // disabled, the old `|view_z|` implementation treated this exactly
+        // like a Gaussian 5 units in front and never culled it.
+        let gaussians = vec![
+            GaussianCullData {
+                center: [0.0, 0.0, 5.0],
+                radius: 0.1,
+            },
+            GaussianCullData {
+                center: [0.0, 0.0, -5.0],
+                radius: 0.1,
+            },
+        ];
+        let config = CullingConfig {
+            frustum_cull: false,
+            distance_cull: false,
+            min_screen_size: 0.0,
+            ..Default::default()
+        };
+        let result = cull_gaussians(&gaussians, &identity(), None, 1.0, 1.0, &config)
+            .expect("should succeed");
+        assert!(
+            !result.visible[0],
+            "Gaussian behind the camera must be culled"
+        );
+        assert!(
+            result.visible[1],
+            "Gaussian in front of the camera must stay visible"
+        );
+        assert_eq!(result.behind_camera_culled, 1);
+        assert_eq!(result.num_visible, 1);
     }
 }

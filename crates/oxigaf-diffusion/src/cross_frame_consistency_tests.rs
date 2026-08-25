@@ -412,8 +412,7 @@ fn test_frame_pair_consistency_beats_raw_pairing_baseline() -> Result<(), Consis
 }
 
 #[test]
-fn test_consistency_loss_warp_term_beats_raw_pairing_baseline() -> Result<(), ConsistencyError>
-{
+fn test_consistency_loss_warp_term_beats_raw_pairing_baseline() -> Result<(), ConsistencyError> {
     let a = x_ramp_frame(24, 24);
     let b = shift_right_frame(&a, 1);
     let flow_cfg = FlowConfig {
@@ -806,14 +805,17 @@ fn test_consistency_loss_warp_weight_applied() -> Result<(), ConsistencyError> {
         use_optical_flow: true,
         ..Default::default()
     };
-    let frames_no: Vec<Frame> = [fa.pixels().to_vec(), fb.pixels().to_vec(), fc.pixels().to_vec()]
-        .into_iter()
-        .zip([(8usize, 8usize), (8, 8), (8, 8)])
-        .map(|(p, (w, h))| Frame::from_pixels(p, w, h).expect("valid pixel buffer"))
-        .collect();
+    let frames_no: Vec<Frame> = [
+        fa.pixels().to_vec(),
+        fb.pixels().to_vec(),
+        fc.pixels().to_vec(),
+    ]
+    .into_iter()
+    .zip([(8usize, 8usize), (8, 8), (8, 8)])
+    .map(|(p, (w, h))| Frame::from_pixels(p, w, h).expect("valid pixel buffer"))
+    .collect();
     let loss_no = cfc_consistency_loss(&frames_no, &cfg_no_warp, &FlowConfig::default())?;
-    let loss_with =
-        cfc_consistency_loss(&[fa, fb, fc], &cfg_with_warp, &FlowConfig::default())?;
+    let loss_with = cfc_consistency_loss(&[fa, fb, fc], &cfg_with_warp, &FlowConfig::default())?;
     // Both should be positive; with-warp should differ from no-warp
     assert!(loss_no.total > 0.0);
     assert!(loss_with.total > 0.0);
@@ -878,9 +880,11 @@ fn test_consistency_loss_psnr_weight_applied() -> Result<(), ConsistencyError> {
         uniform_frame(8, 8, 0.2, 0.2, 0.2),
     ];
     let loss_zero = cfc_consistency_loss(&frames_zero, &cfg_zero, &FlowConfig::default())?;
-    let loss_nonzero =
-        cfc_consistency_loss(&frames_nonzero, &cfg_nonzero, &FlowConfig::default())?;
-    assert_eq!(loss_zero.total, 0.0, "all weights zero should give zero loss");
+    let loss_nonzero = cfc_consistency_loss(&frames_nonzero, &cfg_nonzero, &FlowConfig::default())?;
+    assert_eq!(
+        loss_zero.total, 0.0,
+        "all weights zero should give zero loss"
+    );
     assert!(
         loss_nonzero.psnr_term > 0.0,
         "psnr_term should be nonzero for differing frames"

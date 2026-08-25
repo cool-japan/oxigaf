@@ -12,10 +12,22 @@ fn test_snapshot_single_gaussian_values() {
     let opacities = vec![0.0f32]; // sigmoid(0) = 0.5
     let snap = so_compute_snapshot(&positions, &scales, &opacities, 1, 3, OpacitySpace::Logit);
     assert_eq!(snap.n_gaussians, 1);
-    assert!((snap.mean_opacity - 0.5).abs() < 1e-5, "mean_opacity should be ~0.5");
-    assert!((snap.max_opacity - 0.5).abs() < 1e-5, "max_opacity should be ~0.5");
-    assert!((snap.mean_scale - 0.2).abs() < 1e-5, "mean_scale should be ~0.2");
-    assert!((snap.max_scale - 0.3).abs() < 1e-5, "max_scale should be 0.3");
+    assert!(
+        (snap.mean_opacity - 0.5).abs() < 1e-5,
+        "mean_opacity should be ~0.5"
+    );
+    assert!(
+        (snap.max_opacity - 0.5).abs() < 1e-5,
+        "max_opacity should be ~0.5"
+    );
+    assert!(
+        (snap.mean_scale - 0.2).abs() < 1e-5,
+        "mean_scale should be ~0.2"
+    );
+    assert!(
+        (snap.max_scale - 0.3).abs() < 1e-5,
+        "max_scale should be 0.3"
+    );
 }
 
 #[test]
@@ -25,8 +37,14 @@ fn test_snapshot_memory_bytes() {
     let positions = vec![0.0f32; n * 3];
     let scales = vec![1.0f32; n * 3];
     let opacities = vec![0.0f32; n];
-    let snap =
-        so_compute_snapshot(&positions, &scales, &opacities, n, sh_channels, OpacitySpace::Logit);
+    let snap = so_compute_snapshot(
+        &positions,
+        &scales,
+        &opacities,
+        n,
+        sh_channels,
+        OpacitySpace::Logit,
+    );
     let expected = (3 + 4 + 3 + 1 + sh_channels) * 4 * n;
     assert_eq!(snap.memory_bytes, expected);
 }
@@ -48,18 +66,103 @@ fn test_snapshot_bounds() {
     assert!((snap.bounds_max[0] - 1.0).abs() < 1e-5);
 }
 
+#[test]
+fn test_snapshot_clamps_a_short_opacity_array() {
+    // Regression: `n` is caller-supplied and the opacity loop used to index
+    // `opacities[i]` for `i in 0..n` while every neighbouring loop clamped
+    // to the array it reads, so a scene declaring more Gaussians than it
+    // carries opacities for panicked instead of reporting what it has.
+    let positions = vec![0.0f32; 12];
+    let scales = vec![0.1f32; 12];
+    let opacities = vec![0.0f32; 2]; // 2 opacities for 4 declared Gaussians
+    let snap = so_compute_snapshot(&positions, &scales, &opacities, 4, 0, OpacitySpace::Logit);
+    assert_eq!(snap.n_gaussians, 4);
+    assert!(
+        (snap.mean_opacity - 0.5).abs() < 1e-5,
+        "mean over the opacities that exist: {}",
+        snap.mean_opacity
+    );
+    assert!((snap.max_opacity - 0.5).abs() < 1e-5);
+}
+
+#[test]
+fn test_snapshot_without_opacities_or_scales_reports_zero_not_neg_infinity() {
+    let snap = so_compute_snapshot(&[0.0f32; 3], &[], &[], 1, 0, OpacitySpace::Logit);
+    assert_eq!(snap.n_gaussians, 1);
+    for value in [
+        snap.mean_opacity,
+        snap.max_opacity,
+        snap.mean_scale,
+        snap.max_scale,
+    ] {
+        assert!(
+            value.is_finite(),
+            "running maxima must not leak -inf: {value}"
+        );
+        assert!((value - 0.0).abs() < 1e-9, "expected 0.0, got {value}");
+    }
+}
+
+// --- so_sigmoid ---
+
+#[test]
+fn test_sigmoid_stays_positive_for_large_negative_logits() {
+    // Regression: `1 / (1 + exp(-x))` overflows f32's exponent below
+    // x ≈ -88.7 (`exp(88.7) > f32::MAX`), collapsing the result to exactly
+    // 0.0 — which made `so_prune_by_opacity` delete such Gaussians even at
+    // threshold 0, where sigmoid is mathematically never zero.
+    for x in [-89.0f32, -95.0, -100.0] {
+        let s = so_sigmoid(x);
+        assert!(s > 0.0, "sigmoid({x}) must stay positive, got {s}");
+        assert!(s < 1e-38, "sigmoid({x}) must still be tiny, got {s}");
+    }
+}
+
+#[test]
+fn test_sigmoid_matches_an_f64_reference() {
+    // The stable branch must not shift the values that already worked.
+    for step in -400i32..=400 {
+        let x = step as f32 * 0.25;
+        let got = so_sigmoid(x);
+        let want = (1.0f64 / (1.0 + (-(x as f64)).exp())) as f32;
+        if want > 1e-30 {
+            assert!(
+                (got - want).abs() <= 1e-5 * want,
+                "sigmoid({x}): got {got}, want {want}"
+            );
+        } else {
+            // Subnormal territory: a relative comparison is below f32's
+            // resolution, so just require the sign and the magnitude.
+            assert!(
+                got > 0.0 && got < 1e-30,
+                "sigmoid({x}) must be a tiny positive, got {got}"
+            );
+        }
+    }
+    assert!((so_sigmoid(0.0) - 0.5).abs() < 1e-7);
+    assert!(so_sigmoid(f32::INFINITY) >= 1.0 - 1e-7);
+    assert_eq!(so_sigmoid(f32::NEG_INFINITY), 0.0);
+    assert!(so_sigmoid(f32::NAN).is_nan());
+}
+
 // --- so_prune_by_opacity ---
 
 #[test]
 fn test_prune_high_logit_kept() {
     let mask = so_prune_by_opacity(&[10.0f32], 1, 0.5, OpacitySpace::Logit);
-    assert!(mask[0], "logit=10 (sigmoid≈1) should be kept with threshold=0.5");
+    assert!(
+        mask[0],
+        "logit=10 (sigmoid≈1) should be kept with threshold=0.5"
+    );
 }
 
 #[test]
 fn test_prune_low_logit_removed() {
     let mask = so_prune_by_opacity(&[-10.0f32], 1, 0.5, OpacitySpace::Logit);
-    assert!(!mask[0], "logit=-10 (sigmoid≈0) should be removed with threshold=0.5");
+    assert!(
+        !mask[0],
+        "logit=-10 (sigmoid≈0) should be removed with threshold=0.5"
+    );
 }
 
 #[test]
@@ -74,7 +177,10 @@ fn test_prune_threshold_zero_keeps_all() {
     // sigmoid(x) > 0 for all finite x, so threshold=0 keeps everything
     let opacities = vec![-100.0f32, -10.0, 0.0, 10.0];
     let mask = so_prune_by_opacity(&opacities, 4, 0.0, OpacitySpace::Logit);
-    assert!(mask.iter().all(|&v| v), "threshold=0 must keep all Gaussians");
+    assert!(
+        mask.iter().all(|&v| v),
+        "threshold=0 must keep all Gaussians"
+    );
 }
 
 #[test]
@@ -149,7 +255,7 @@ fn test_clamp_multiple_gaussians() {
     let mut scales = vec![0.2f32, 0.3, 0.4, 0.001, 0.002, 0.003];
     so_clamp_scales(&mut scales, 2, 0.01, 0.15);
     for &v in &scales {
-        assert!(v >= 0.01 && v <= 0.15);
+        assert!((0.01..=0.15).contains(&v), "{v} outside the clamp range");
     }
 }
 
@@ -158,10 +264,7 @@ fn test_clamp_multiple_gaussians() {
 #[test]
 fn test_sort_morton_non_decreasing_codes() {
     let positions = vec![
-        0.5f32, 0.5, 0.5,
-        0.1, 0.1, 0.1,
-        0.9, 0.9, 0.9,
-        0.3, 0.3, 0.3,
+        0.5f32, 0.5, 0.5, 0.1, 0.1, 0.1, 0.9, 0.9, 0.9, 0.3, 0.3, 0.3,
     ];
     let indices = so_sort_morton(&positions, 4);
     assert_eq!(indices.len(), 4);
@@ -410,8 +513,7 @@ fn test_morton_code_z1() {
 
 #[test]
 fn test_quantize_min_maps_to_zero() {
-    let [qx, qy, qz] =
-        so_quantize_position([0.0, 0.0, 0.0], [0.0; 3], [1.0; 3], 10);
+    let [qx, qy, qz] = so_quantize_position([0.0, 0.0, 0.0], [0.0; 3], [1.0; 3], 10);
     assert_eq!(qx, 0);
     assert_eq!(qy, 0);
     assert_eq!(qz, 0);
@@ -419,8 +521,7 @@ fn test_quantize_min_maps_to_zero() {
 
 #[test]
 fn test_quantize_max_maps_to_2pow_bits_minus1() {
-    let [qx, qy, qz] =
-        so_quantize_position([1.0, 1.0, 1.0], [0.0; 3], [1.0; 3], 10);
+    let [qx, qy, qz] = so_quantize_position([1.0, 1.0, 1.0], [0.0; 3], [1.0; 3], 10);
     assert_eq!(qx, 1023);
     assert_eq!(qy, 1023);
     assert_eq!(qz, 1023);
@@ -428,19 +529,20 @@ fn test_quantize_max_maps_to_2pow_bits_minus1() {
 
 #[test]
 fn test_quantize_midpoint() {
-    let [qx, _, _] =
-        so_quantize_position([0.5, 0.0, 0.0], [0.0; 3], [1.0; 3], 10);
+    let [qx, _, _] = so_quantize_position([0.5, 0.0, 0.0], [0.0; 3], [1.0; 3], 10);
     // 0.5 * 1023 = 511.5 → rounds to 512
     assert_eq!(qx, 512);
 }
 
 // --- OptimizationPipeline::run ---
 
-fn make_scene(n: usize, sh_ch: usize) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+/// `(positions, rotations, scales, opacities, sh_coefficients)` — the five
+/// flat arrays [`make_scene`] hands back, named so the tuple stays readable.
+type SceneArrays = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>);
+
+fn make_scene(n: usize, sh_ch: usize) -> SceneArrays {
     let positions: Vec<f32> = (0..n * 3).map(|i| i as f32 * 0.01).collect();
-    let rotations: Vec<f32> = (0..n)
-        .flat_map(|_| [0.0f32, 0.0, 0.0, 1.0])
-        .collect();
+    let rotations: Vec<f32> = (0..n).flat_map(|_| [0.0f32, 0.0, 0.0, 1.0]).collect();
     let scales: Vec<f32> = vec![0.05f32; n * 3];
     let opacities: Vec<f32> = (0..n).map(|i| (i as f32) * 0.5 - 2.0).collect();
     let sh: Vec<f32> = vec![0.0f32; n * sh_ch];
@@ -485,13 +587,16 @@ fn test_pipeline_n_after_le_n_before() {
     let config = SceneOptimizerConfig {
         steps: vec![
             OptimizationStep::PruneByOpacity { threshold: 0.3 },
-            OptimizationStep::DeduplicateNear { position_radius: 0.05 },
+            OptimizationStep::DeduplicateNear {
+                position_radius: 0.05,
+            },
         ],
         sh_channels: sh_ch,
         seed: 0,
     };
     let pipeline = OptimizationPipeline::new(config);
-    let (scene, report) = pipeline.run(&pos, &rot, &scl, &op, &sh, n)
+    let (scene, report) = pipeline
+        .run(&pos, &rot, &scl, &op, &sh, n)
         .expect("pipeline should succeed");
     for step_result in &report.step_results {
         assert!(step_result.n_after <= step_result.n_before);
@@ -506,7 +611,10 @@ fn test_pipeline_step_results_count() {
     let (pos, rot, scl, op, sh) = make_scene(n, sh_ch);
     let steps = vec![
         OptimizationStep::PruneByOpacity { threshold: 0.1 },
-        OptimizationStep::ClampScales { min_scale: 0.01, max_scale: 0.5 },
+        OptimizationStep::ClampScales {
+            min_scale: 0.01,
+            max_scale: 0.5,
+        },
         OptimizationStep::SortMorton,
     ];
     let config = SceneOptimizerConfig {
@@ -515,7 +623,8 @@ fn test_pipeline_step_results_count() {
         seed: 0,
     };
     let pipeline = OptimizationPipeline::new(config);
-    let (_, report) = pipeline.run(&pos, &rot, &scl, &op, &sh, n)
+    let (_, report) = pipeline
+        .run(&pos, &rot, &scl, &op, &sh, n)
         .expect("pipeline should succeed");
     assert_eq!(report.step_results.len(), steps.len());
 }
@@ -531,7 +640,8 @@ fn test_pipeline_snapshot_after_matches_scene() {
         seed: 0,
     };
     let pipeline = OptimizationPipeline::new(config);
-    let (scene, report) = pipeline.run(&pos, &rot, &scl, &op, &sh, n)
+    let (scene, report) = pipeline
+        .run(&pos, &rot, &scl, &op, &sh, n)
         .expect("pipeline should succeed");
     assert_eq!(report.snapshot_after.n_gaussians, scene.n_gaussians);
 }
@@ -547,7 +657,8 @@ fn test_report_total_removed() {
         seed: 0,
     };
     let pipeline = OptimizationPipeline::new(config);
-    let (scene, report) = pipeline.run(&pos, &rot, &scl, &op, &sh, n)
+    let (scene, report) = pipeline
+        .run(&pos, &rot, &scl, &op, &sh, n)
         .expect("pipeline should succeed");
     assert_eq!(
         report.total_removed,
@@ -567,9 +678,12 @@ fn test_report_memory_saved() {
         seed: 0,
     };
     let pipeline = OptimizationPipeline::new(config);
-    let (_, report) = pipeline.run(&pos, &rot, &scl, &op, &sh, n)
+    let (_, report) = pipeline
+        .run(&pos, &rot, &scl, &op, &sh, n)
         .expect("pipeline should succeed");
-    let expected_saved = report.snapshot_before.memory_bytes
+    let expected_saved = report
+        .snapshot_before
+        .memory_bytes
         .saturating_sub(report.snapshot_after.memory_bytes);
     assert_eq!(report.memory_saved_bytes, expected_saved);
 }
@@ -589,21 +703,30 @@ fn test_profile_quality_only_dedup() {
 #[test]
 fn test_profile_performance_includes_topn() {
     let config = so_profile_config(OptimizationProfile::Performance, 9);
-    let has_topn = config.steps.iter().any(|s| matches!(s, OptimizationStep::TopNByOpacity { .. }));
+    let has_topn = config
+        .steps
+        .iter()
+        .any(|s| matches!(s, OptimizationStep::TopNByOpacity { .. }));
     assert!(has_topn, "Performance profile must include TopNByOpacity");
 }
 
 #[test]
 fn test_profile_streaming_includes_sort_morton() {
     let config = so_profile_config(OptimizationProfile::Streaming, 9);
-    let has_sort = config.steps.iter().any(|s| matches!(s, OptimizationStep::SortMorton));
+    let has_sort = config
+        .steps
+        .iter()
+        .any(|s| matches!(s, OptimizationStep::SortMorton));
     assert!(has_sort, "Streaming profile must include SortMorton");
 }
 
 #[test]
 fn test_profile_balanced_has_multiple_steps() {
     let config = so_profile_config(OptimizationProfile::Balanced, 9);
-    assert!(config.steps.len() >= 2, "Balanced profile needs multiple steps");
+    assert!(
+        config.steps.len() >= 2,
+        "Balanced profile needs multiple steps"
+    );
 }
 
 #[test]
@@ -616,7 +739,10 @@ fn test_profile_balanced_clamp_scales_is_log_space() {
         .steps
         .iter()
         .find_map(|s| match s {
-            OptimizationStep::ClampScales { min_scale, max_scale } => Some((*min_scale, *max_scale)),
+            OptimizationStep::ClampScales {
+                min_scale,
+                max_scale,
+            } => Some((*min_scale, *max_scale)),
             _ => None,
         })
         .expect("Balanced profile must include a ClampScales step");
@@ -627,21 +753,36 @@ fn test_profile_balanced_clamp_scales_is_log_space() {
 
 // --- so_quick_optimize ---
 
+/// Borrowed view over a [`make_scene`] tuple.
+fn arrays_of(scene: &SceneArrays) -> GaussianArrays<'_> {
+    let (pos, rot, scl, op, sh) = scene;
+    GaussianArrays {
+        positions: pos,
+        rotations: rot,
+        scales: scl,
+        opacities: op,
+        sh_coefficients: sh,
+    }
+}
+
 #[test]
 fn test_quick_optimize_quality_no_error() {
     let n = 5;
     let sh_ch = 3;
-    let (pos, rot, scl, op, sh) = make_scene(n, sh_ch);
-    let result = so_quick_optimize(&pos, &rot, &scl, &op, &sh, n, sh_ch, OptimizationProfile::Quality);
-    assert!(result.is_ok(), "quick_optimize with Quality profile must succeed");
+    let scene = make_scene(n, sh_ch);
+    let result = so_quick_optimize(arrays_of(&scene), n, sh_ch, OptimizationProfile::Quality);
+    assert!(
+        result.is_ok(),
+        "quick_optimize with Quality profile must succeed"
+    );
 }
 
 #[test]
 fn test_quick_optimize_balanced_no_error() {
     let n = 5;
     let sh_ch = 3;
-    let (pos, rot, scl, op, sh) = make_scene(n, sh_ch);
-    let result = so_quick_optimize(&pos, &rot, &scl, &op, &sh, n, sh_ch, OptimizationProfile::Balanced);
+    let scene = make_scene(n, sh_ch);
+    let result = so_quick_optimize(arrays_of(&scene), n, sh_ch, OptimizationProfile::Balanced);
     assert!(result.is_ok());
 }
 
@@ -658,7 +799,8 @@ fn test_format_report_nonempty_with_step_count() {
         seed: 0,
     };
     let pipeline = OptimizationPipeline::new(config);
-    let (_, report) = pipeline.run(&pos, &rot, &scl, &op, &sh, n)
+    let (_, report) = pipeline
+        .run(&pos, &rot, &scl, &op, &sh, n)
         .expect("pipeline should succeed");
     let s = so_format_report(&report);
     assert!(!s.is_empty());
@@ -667,8 +809,14 @@ fn test_format_report_nonempty_with_step_count() {
 
 #[test]
 fn test_format_snapshot_nonempty() {
-    let snap =
-        so_compute_snapshot(&[0.0f32, 0.0, 0.0], &[0.1f32, 0.1, 0.1], &[0.0f32], 1, 3, OpacitySpace::Logit);
+    let snap = so_compute_snapshot(
+        &[0.0f32, 0.0, 0.0],
+        &[0.1f32, 0.1, 0.1],
+        &[0.0f32],
+        1,
+        3,
+        OpacitySpace::Logit,
+    );
     let s = so_format_snapshot(&snap);
     assert!(!s.is_empty());
 }
@@ -730,9 +878,13 @@ fn test_pipeline_sort_morton_preserves_count() {
         seed: 0,
     };
     let pipeline = OptimizationPipeline::new(config);
-    let (scene, _) = pipeline.run(&pos, &rot, &scl, &op, &sh, n)
+    let (scene, _) = pipeline
+        .run(&pos, &rot, &scl, &op, &sh, n)
         .expect("Morton sort pipeline should succeed");
-    assert_eq!(scene.n_gaussians, n, "SortMorton must not remove any Gaussians");
+    assert_eq!(
+        scene.n_gaussians, n,
+        "SortMorton must not remove any Gaussians"
+    );
 }
 
 #[test]
@@ -746,7 +898,8 @@ fn test_pipeline_normalize_opacity_preserves_count() {
         seed: 0,
     };
     let pipeline = OptimizationPipeline::new(config);
-    let (scene, _) = pipeline.run(&pos, &rot, &scl, &op, &sh, n)
+    let (scene, _) = pipeline
+        .run(&pos, &rot, &scl, &op, &sh, n)
         .expect("NormalizeOpacity pipeline should succeed");
     assert_eq!(scene.n_gaussians, n);
 }
@@ -798,7 +951,11 @@ fn test_pipeline_clip_sphere_removes_distant() {
         0.0, 0.0, 5.0, // outside
     ];
     let n = 5;
-    let rotations: Vec<f32> = vec![0.0, 0.0, 0.0, 1.0].into_iter().cycle().take(n * 4).collect();
+    let rotations: Vec<f32> = vec![0.0, 0.0, 0.0, 1.0]
+        .into_iter()
+        .cycle()
+        .take(n * 4)
+        .collect();
     let scales = vec![0.05f32; n * 3];
     let opacities = vec![0.0f32; n];
     let sh: Vec<f32> = vec![];
@@ -811,16 +968,20 @@ fn test_pipeline_clip_sphere_removes_distant() {
         seed: 0,
     };
     let pipeline = OptimizationPipeline::new(config);
-    let (scene, _) = pipeline.run(&positions, &rotations, &scales, &opacities, &sh, n)
+    let (scene, _) = pipeline
+        .run(&positions, &rotations, &scales, &opacities, &sh, n)
         .expect("ClipToSphere pipeline should succeed");
-    assert_eq!(scene.n_gaussians, 2, "only 2 Gaussians should survive sphere clip");
+    assert_eq!(
+        scene.n_gaussians, 2,
+        "only 2 Gaussians should survive sphere clip"
+    );
 }
 
 #[test]
 fn test_pipeline_clip_aabb_removes_outside() {
     let positions = vec![
-        0.5f32, 0.5, 0.5,  // inside
-        2.0, 0.5, 0.5,     // outside
+        0.5f32, 0.5, 0.5, // inside
+        2.0, 0.5, 0.5, // outside
     ];
     let n = 2;
     let rotations: Vec<f32> = vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
@@ -836,7 +997,8 @@ fn test_pipeline_clip_aabb_removes_outside() {
         seed: 0,
     };
     let pipeline = OptimizationPipeline::new(config);
-    let (scene, _) = pipeline.run(&positions, &rotations, &scales, &opacities, &sh, n)
+    let (scene, _) = pipeline
+        .run(&positions, &rotations, &scales, &opacities, &sh, n)
         .expect("ClipToAabb pipeline should succeed");
     assert_eq!(scene.n_gaussians, 1);
 }

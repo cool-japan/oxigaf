@@ -226,7 +226,7 @@ impl OpacityRegularization {
     /// All modes apply the chain rule through `sigmoid`:
     /// - **Sparsity**: `weight * σ*(1-σ)`
     /// - **Binary**: `weight * (1-2σ) * σ*(1-σ)`
-    /// - **Entropy**: `weight * σ*(1-σ) * logit`  (= `weight * σ*(1-σ) * log(σ/(1-σ))`)
+    /// - **Entropy**: `weight * σ*(1-σ) * (-logit)`  (= `-weight * σ*(1-σ) * log(σ/(1-σ))`)
     pub fn gradient(&self, logits: &[f32]) -> Vec<f32> {
         logits
             .iter()
@@ -237,10 +237,17 @@ impl OpacityRegularization {
                     OpacityRegMode::Sparsity => 1.0,
                     OpacityRegMode::Binary => 1.0 - 2.0 * s,
                     OpacityRegMode::Entropy => {
-                        // d/dσ [ -σ log σ - (1-σ) log(1-σ) ] = -(log σ - log(1-σ)) = -logit
-                        // So d(loss)/d(logit) = weight * (-logit) * σ*(1-σ)
-                        // But spec says: weight * σ*(1-σ) * logit — we follow the spec.
-                        l
+                        // H(σ) = -[σ·ln σ + (1-σ)·ln(1-σ)]
+                        // dH/dσ = -(ln σ - ln(1-σ)) = -logit
+                        // d(loss)/d(logit) = weight * σ*(1-σ) * (-logit)
+                        //
+                        // Descending this gradient therefore pushes σ AWAY
+                        // from 0.5 toward 0 or 1 (minimizing entropy /
+                        // maximizing certainty), matching this mode's
+                        // documented purpose of penalizing mid-range
+                        // opacities. The previous `l` (no negation) did the
+                        // opposite: it pushed every opacity toward σ=0.5.
+                        -l
                     }
                 };
                 self.weight * dloss_ds * ds_dl
@@ -950,6 +957,48 @@ mod tests {
         assert!(
             approx_eq(loss_zero, std::f32::consts::LN_2, 1e-4),
             "max entropy should be ln(2)≈0.693, got {loss_zero}"
+        );
+    }
+
+    // ── Test 10b: Entropy gradient matches finite-difference of loss, and
+    // points AWAY from the σ=0.5 maximum (descent reduces entropy) ──────────
+
+    #[test]
+    fn test_opacity_entropy_gradient_matches_finite_difference() {
+        // Regression: `gradient()` used to return `weight * σ*(1-σ) * logit`
+        // (no negation), the exact opposite sign of dH/d(logit) = -logit,
+        // which would push opacities TOWARD σ=0.5 under gradient descent
+        // instead of away from it.
+        let reg = OpacityRegularization::new(1.0, OpacityRegMode::Entropy).unwrap();
+        let h = 1e-3_f32;
+        for &logit in &[-2.5_f32, -0.5, 0.3, 1.5, 2.5] {
+            let loss_plus = reg.loss(&[logit + h]);
+            let loss_minus = reg.loss(&[logit - h]);
+            let numerical = (loss_plus - loss_minus) / (2.0 * h);
+            let analytic = reg.gradient(&[logit])[0];
+            assert!(
+                (numerical - analytic).abs() < 1e-2,
+                "logit={logit}: analytic grad {analytic} != numerical grad {numerical}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_opacity_entropy_gradient_descent_reduces_entropy() {
+        // A single gradient-descent step from a mid-range (high-entropy)
+        // opacity must REDUCE entropy (move away from σ=0.5), not increase
+        // it. This is the exact user-visible consequence of the sign bug.
+        let reg = OpacityRegularization::new(1.0, OpacityRegMode::Entropy).unwrap();
+        let logit = 0.5_f32; // moderately uncertain, not yet at the exact peak
+        let loss_before = reg.loss(&[logit]);
+        let grad = reg.gradient(&[logit])[0];
+        let lr = 0.1_f32;
+        let logit_after = logit - lr * grad;
+        let loss_after = reg.loss(&[logit_after]);
+        assert!(
+            loss_after < loss_before,
+            "descending the entropy gradient should reduce entropy: \
+             before={loss_before}, after={loss_after} (logit {logit} -> {logit_after})"
         );
     }
 

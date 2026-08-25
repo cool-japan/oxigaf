@@ -207,14 +207,39 @@ impl SvgCamera {
     /// Returns `(rotation_3x3, translation_vector)` where the rotation maps
     /// world-space vectors to camera-space vectors, and `translation` is the
     /// camera origin expressed in camera space (`-R * eye`).
+    ///
+    /// Returns `None` when `eye` and `target` coincide, since no forward
+    /// direction can be derived. A forward direction that is (anti)parallel
+    /// to `up` (e.g. a straight top-down view) does NOT fail: `right_raw`
+    /// falls back to an alternate world axis for the initial cross product,
+    /// so the result is always a well-defined orthonormal frame rather than
+    /// the NaN that `forward.cross(&up).normalize()` would otherwise produce
+    /// from a zero-length cross product.
     #[must_use]
-    fn view_matrix(&self) -> (na::Matrix3<f32>, na::Vector3<f32>) {
+    fn view_matrix(&self) -> Option<(na::Matrix3<f32>, na::Vector3<f32>)> {
         let eye = na::Point3::from(self.eye);
         let target = na::Point3::from(self.target);
         let up = na::Vector3::from(self.up);
 
-        let forward = (target - eye).normalize(); // +Z_cam points toward target (we negate below)
-        let right = forward.cross(&up).normalize();
+        let fwd_raw = target - eye;
+        if fwd_raw.norm() < 1e-9 {
+            return None;
+        }
+        let forward = fwd_raw.normalize(); // +Z_cam points toward target (we negate below)
+
+        let mut right_raw = forward.cross(&up);
+        if right_raw.norm() < 1e-6 {
+            // `up` is (anti)parallel to `forward`: fall back to whichever
+            // world axis is farthest from `forward` so the cross product is
+            // well-conditioned (same trick as `rigid_alignment::svd_compute_u`).
+            let alt = if forward.x.abs() < 0.9 {
+                na::Vector3::x()
+            } else {
+                na::Vector3::y()
+            };
+            right_raw = forward.cross(&alt);
+        }
+        let right = right_raw.normalize();
         let up_actual = right.cross(&forward); // reorthogonalise
 
         // Row-major look-at: each row is a camera axis expressed in world space.
@@ -228,17 +253,25 @@ impl SvgCamera {
         ]);
 
         let t = rot * (-eye.coords);
-        (rot, t)
+        Some((rot, t))
     }
 
-    /// Project a world-space point to SVG pixel coordinates.
+    /// Project a world-space point to SVG pixel coordinates using a
+    /// precomputed view transform (see [`SvgCamera::view_matrix`]).
     ///
-    /// Returns `None` when the point is at or behind the camera plane
-    /// (i.e., camera-space Z ≤ 0).
+    /// Shared by [`SvgCamera::project`] (which computes the transform fresh
+    /// every call — fine for a single ad-hoc projection) and by batch
+    /// callers such as [`build_wireframe_into`] that compute the transform
+    /// once and reuse it across every mesh vertex, avoiding thousands of
+    /// redundant look-at reconstructions per render.
     #[must_use]
-    pub fn project(&self, point: [f32; 3]) -> Option<(f32, f32)> {
+    fn project_with(
+        &self,
+        rot: &na::Matrix3<f32>,
+        t: &na::Vector3<f32>,
+        point: [f32; 3],
+    ) -> Option<(f32, f32)> {
         let p_world = na::Point3::from(point);
-        let (rot, t) = self.view_matrix();
         let p_cam = rot * p_world.coords + t;
 
         // Camera convention: -Z_cam is depth (toward scene). Positive cam_z
@@ -255,12 +288,15 @@ impl SvgCamera {
         Some((sx, sy))
     }
 
-    /// Transform a world-space point to camera space (for depth sorting etc.).
+    /// Project a world-space point to SVG pixel coordinates.
+    ///
+    /// Returns `None` when the point is at or behind the camera plane
+    /// (i.e., camera-space Z ≤ 0), or when `eye` and `target` coincide (no
+    /// view direction can be derived).
     #[must_use]
-    fn to_camera_space(&self, point: [f32; 3]) -> na::Vector3<f32> {
-        let p_world = na::Point3::from(point);
-        let (rot, t) = self.view_matrix();
-        rot * p_world.coords + t
+    pub fn project(&self, point: [f32; 3]) -> Option<(f32, f32)> {
+        let (rot, t) = self.view_matrix()?;
+        self.project_with(&rot, &t, point)
     }
 }
 
@@ -308,19 +344,21 @@ impl Default for WireframeOptions {
 // Internal projection helpers
 // ---------------------------------------------------------------------------
 
-/// Project all mesh vertices, returning `None` per vertex that is behind the camera.
-fn project_vertices(mesh: &Mesh, camera: &SvgCamera) -> Vec<Option<(f32, f32)>> {
+/// Project all mesh vertices using a precomputed view transform (see
+/// [`SvgCamera::view_matrix`]), returning `None` per vertex that is behind
+/// the camera. Computing the transform once per render instead of once per
+/// vertex avoids thousands of redundant look-at reconstructions for a
+/// typical FLAME mesh (5023 vertices).
+fn project_vertices_with(
+    mesh: &Mesh,
+    camera: &SvgCamera,
+    rot: &na::Matrix3<f32>,
+    t: &na::Vector3<f32>,
+) -> Vec<Option<(f32, f32)>> {
     mesh.vertices
         .iter()
-        .map(|v| camera.project([v.x, v.y, v.z]))
+        .map(|v| camera.project_with(rot, t, [v.x, v.y, v.z]))
         .collect()
-}
-
-/// Compute camera-space depth (positive = in front) for a vertex.
-fn vertex_depth(vertex: &na::Point3<f32>, camera: &SvgCamera) -> f32 {
-    // cam_z is the distance along the camera forward axis; negate so "in front" is positive.
-    let cam = camera.to_camera_space([vertex.x, vertex.y, vertex.z]);
-    -cam.z
 }
 
 /// Back-face culling test.  Returns `true` if the face should be rendered.
@@ -366,8 +404,10 @@ fn is_front_facing(face: &[u32; 3], mesh: &Mesh, camera: &SvgCamera) -> bool {
 ///
 /// # Errors
 ///
-/// Returns [`FlameError::Export`] if `mesh.faces` contains an out-of-range
-/// vertex index.
+/// Returns [`FlameError::IndexOutOfBounds`] if `mesh.faces` contains an
+/// out-of-range vertex index. Returns [`FlameError::InvalidParams`] if
+/// `camera`'s eye and target coincide, since no view direction can be
+/// derived.
 pub fn render_wireframe(
     mesh: &Mesh,
     camera: &SvgCamera,
@@ -375,103 +415,7 @@ pub fn render_wireframe(
 ) -> Result<String, FlameError> {
     let size = options.image_size;
     let mut svg = SvgBuilder::new(size, size, &options.background_color);
-
-    if mesh.faces.is_empty() {
-        return Ok(svg.build());
-    }
-
-    // Validate vertex indices up-front.
-    let n_verts = mesh.vertices.len();
-    for face in &mesh.faces {
-        for &idx in face {
-            if idx as usize >= n_verts {
-                return Err(FlameError::index_out_of_bounds(
-                    "render_wireframe face index",
-                    idx as usize,
-                    n_verts,
-                ));
-            }
-        }
-    }
-
-    // Project all vertices once.
-    let projected = project_vertices(mesh, camera);
-
-    // Collect (face_index, avg_depth) for painter's algorithm (far → near).
-    let mut face_depths: Vec<(usize, f32)> = mesh
-        .faces
-        .iter()
-        .enumerate()
-        .map(|(fi, face)| {
-            let d0 = vertex_depth(&mesh.vertices[face[0] as usize], camera);
-            let d1 = vertex_depth(&mesh.vertices[face[1] as usize], camera);
-            let d2 = vertex_depth(&mesh.vertices[face[2] as usize], camera);
-            (fi, (d0 + d1 + d2) / 3.0)
-        })
-        .collect();
-
-    // Sort far-to-near (ascending depth means farther in our convention where
-    // positive depth = in front; so sort ascending to draw far faces first).
-    face_depths.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-
-    // Edge deduplication set: always store (min, max) pairs.
-    let mut drawn_edges: HashSet<(u32, u32)> = HashSet::new();
-    // Vertex set for dot rendering.
-    let mut visible_verts: HashSet<usize> = HashSet::new();
-
-    for (fi, _depth) in &face_depths {
-        let face = &mesh.faces[*fi];
-
-        if options.cull_backfaces && !is_front_facing(face, mesh, camera) {
-            continue;
-        }
-
-        let i0 = face[0] as usize;
-        let i1 = face[1] as usize;
-        let i2 = face[2] as usize;
-
-        // All three projected vertices must be visible (in front of camera).
-        let Some(p0) = projected[i0] else { continue };
-        let Some(p1) = projected[i1] else { continue };
-        let Some(p2) = projected[i2] else { continue };
-
-        let screen_pts = [(i0, p0), (i1, p1), (i2, p2)];
-        let edges = [
-            (face[0], face[1], p0, p1),
-            (face[1], face[2], p1, p2),
-            (face[2], face[0], p2, p0),
-        ];
-
-        for (a, b, pa, pb) in edges {
-            let key = (a.min(b), a.max(b));
-            if drawn_edges.insert(key) {
-                svg.add_line(
-                    pa.0,
-                    pa.1,
-                    pb.0,
-                    pb.1,
-                    &options.edge_color,
-                    options.stroke_width,
-                );
-            }
-        }
-
-        if options.show_vertices {
-            for (vi, _) in &screen_pts {
-                visible_verts.insert(*vi);
-            }
-        }
-    }
-
-    // Draw vertex dots on top of edges.
-    if options.show_vertices {
-        for vi in visible_verts {
-            if let Some((sx, sy)) = projected[vi] {
-                svg.add_circle(sx, sy, options.vertex_radius, &options.vertex_color);
-            }
-        }
-    }
-
+    build_wireframe_into(mesh, camera, options, &mut svg)?;
     Ok(svg.build())
 }
 
@@ -527,23 +471,24 @@ pub fn render_joints_svg(
         }
     }
 
-    // Build as standalone SVG with a transparent background.
-    // Rewrite the builder to use a real background so the SVG is valid standalone.
-    let mut out_svg = SvgBuilder::new(image_size, image_size, "none");
-    out_svg.merge(svg);
-    // Override background: emit an explicit transparent rect.
-    // The SvgBuilder already handles "none" as background_color.
-    Ok(out_svg.build())
+    // `svg` was already built with a transparent ("none") background, so it
+    // is a complete, valid standalone document as-is.
+    Ok(svg.build())
 }
 
 /// Render a combined wireframe + joint overlay SVG image.
 ///
-/// This is equivalent to calling [`render_wireframe`] and
-/// [`render_joints_svg`] and compositing their elements into a single SVG.
+/// This renders the wireframe (via the same internal helper backing
+/// [`render_wireframe`]) and joint circles into one shared SVG builder,
+/// which is cheaper than rendering each separately and compositing the
+/// resulting SVG text.
 ///
 /// # Errors
 ///
-/// Propagates errors from [`render_wireframe`] and [`render_joints_svg`].
+/// Returns [`FlameError::IndexOutOfBounds`] if `mesh.faces` contains an
+/// out-of-range vertex index. Returns [`FlameError::InvalidParams`] if
+/// `camera`'s eye and target coincide, since no view direction can be
+/// derived.
 pub fn render_mesh_with_joints(
     mesh: &Mesh,
     joint_positions: &[[f32; 3]],
@@ -578,6 +523,12 @@ pub fn render_mesh_with_joints(
 }
 
 /// Internal helper: render wireframe elements into an existing [`SvgBuilder`].
+///
+/// This is the sole wireframe implementation: [`render_wireframe`] wraps it
+/// with its own builder, and [`render_mesh_with_joints`] layers joint
+/// circles on top of it, so any fix here (projection, culling, or the
+/// degenerate-camera guard) applies identically to both public entry points
+/// rather than risking the two renderers drifting apart.
 fn build_wireframe_into(
     mesh: &Mesh,
     camera: &SvgCamera,
@@ -601,28 +552,28 @@ fn build_wireframe_into(
         }
     }
 
-    let projected = project_vertices(mesh, camera);
+    // Compute the look-at transform once for the whole mesh (see
+    // `project_vertices_with`), rather than once per vertex as a naive
+    // `camera.project(...)` loop would.
+    let (rot, t) = camera.view_matrix().ok_or_else(|| {
+        FlameError::InvalidParams(
+            "SvgCamera has a degenerate view: eye and target coincide, so no view \
+             direction can be derived"
+                .to_string(),
+        )
+    })?;
+    let projected = project_vertices_with(mesh, camera, &rot, &t);
 
-    let mut face_depths: Vec<(usize, f32)> = mesh
-        .faces
-        .iter()
-        .enumerate()
-        .map(|(fi, face)| {
-            let d0 = vertex_depth(&mesh.vertices[face[0] as usize], camera);
-            let d1 = vertex_depth(&mesh.vertices[face[1] as usize], camera);
-            let d2 = vertex_depth(&mesh.vertices[face[2] as usize], camera);
-            (fi, (d0 + d1 + d2) / 3.0)
-        })
-        .collect();
-
-    face_depths.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-
+    // NOTE: face draw order does not affect the output. Every edge is drawn
+    // at most once (via `drawn_edges` below) and all edges share the same
+    // color/width, so whichever face's edge wins the dedup race produces a
+    // byte-identical `<line>`. A painter's-algorithm depth sort used to run
+    // here for no visual effect; it was removed rather than kept as dead
+    // computation (it cost ~3 look-at-space transforms per face).
     let mut drawn_edges: HashSet<(u32, u32)> = HashSet::new();
     let mut visible_verts: HashSet<usize> = HashSet::new();
 
-    for (fi, _depth) in &face_depths {
-        let face = &mesh.faces[*fi];
-
+    for face in &mesh.faces {
         if options.cull_backfaces && !is_front_facing(face, mesh, camera) {
             continue;
         }
@@ -631,6 +582,7 @@ fn build_wireframe_into(
         let i1 = face[1] as usize;
         let i2 = face[2] as usize;
 
+        // All three projected vertices must be visible (in front of camera).
         let Some(p0) = projected[i0] else { continue };
         let Some(p1) = projected[i1] else { continue };
         let Some(p2) = projected[i2] else { continue };
@@ -663,6 +615,7 @@ fn build_wireframe_into(
         }
     }
 
+    // Draw vertex dots on top of edges.
     if options.show_vertices {
         for vi in visible_verts {
             if let Some((sx, sy)) = projected[vi] {
@@ -781,6 +734,64 @@ mod tests {
             assert!((sx - cam.cx).abs() < 1.0, "on-axis X should hit cx");
             assert!((sy - cam.cy).abs() < 1.0, "on-axis Y should hit cy");
         }
+    }
+
+    #[test]
+    fn test_project_degenerate_eye_equals_target_returns_none() {
+        // No forward direction can be derived when eye == target; this must
+        // return None, not silently produce a NaN-poisoned projection.
+        let cam = SvgCamera {
+            cx: 256.0,
+            cy: 256.0,
+            focal: 700.0,
+            eye: [0.0, 0.0, 0.5],
+            target: [0.0, 0.0, 0.5],
+            up: [0.0, 1.0, 0.0],
+        };
+        assert!(
+            cam.project([0.1, 0.1, 0.1]).is_none(),
+            "degenerate eye==target camera must not silently project"
+        );
+    }
+
+    #[test]
+    fn test_project_forward_parallel_to_up_does_not_produce_nan() {
+        // Top-down view: forward = target - eye = (0,-1,0), which is
+        // anti-parallel to `up`. This used to make `forward.cross(&up)`
+        // the zero vector, and normalizing it produced NaN for every
+        // projected point.
+        let cam = SvgCamera {
+            cx: 256.0,
+            cy: 256.0,
+            focal: 700.0,
+            eye: [0.0, 1.0, 0.0],
+            target: [0.0, 0.0, 0.0],
+            up: [0.0, 1.0, 0.0],
+        };
+        let (sx, sy) = cam
+            .project([0.05, 0.0, 0.0])
+            .expect("degenerate `up` should recover via the fallback axis, not fail");
+        assert!(sx.is_finite(), "sx must not be NaN/Inf, got {sx}");
+        assert!(sy.is_finite(), "sy must not be NaN/Inf, got {sy}");
+    }
+
+    #[test]
+    fn test_render_wireframe_degenerate_camera_returns_err() {
+        let mesh = tetrahedron();
+        let cam = SvgCamera {
+            cx: 256.0,
+            cy: 256.0,
+            focal: 700.0,
+            eye: [0.0, 0.0, 0.6],
+            target: [0.0, 0.0, 0.6],
+            up: [0.0, 1.0, 0.0],
+        };
+        let opts = WireframeOptions::default();
+        let result = render_wireframe(&mesh, &cam, &opts);
+        assert!(
+            result.is_err(),
+            "degenerate eye==target camera should return Err, not a NaN-filled SVG"
+        );
     }
 
     // -----------------------------------------------------------------------

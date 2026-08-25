@@ -11,6 +11,9 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use oxigaf::render::RasterConfig;
+// `GradientClipConfig` / `LrScheduleConfig` live only under `trainer::config`;
+// the crate root re-exports the other four config types but not these two.
+use oxigaf::trainer::config::{GradientClipConfig, LrScheduleConfig};
 use oxigaf::trainer::{
     DensityConfig, InitConfig, LossConfig, OptimizerConfig, TensorBoardConfig, TrainingConfig,
     TrainingPrecision,
@@ -67,48 +70,81 @@ impl Default for ModelSection {
 #[serde(default)]
 pub struct DeviceSection {
     /// GPU backend: `vulkan`, `metal`, `dx12`, or `gl`.
+    ///
+    /// Empty (the default) or `"auto"` means "let wgpu choose", which is the
+    /// only portable answer: a concrete default here would be wrong on every
+    /// platform that does not implement it.
     pub backend: String,
     /// GPU device index.
     pub gpu_index: usize,
 }
 
 impl Default for DeviceSection {
+    /// `backend` defaults to the **empty string**, meaning "auto-detect".
+    ///
+    /// It used to default to the concrete literal `"vulkan"`, which made
+    /// "the user asked for Vulkan" and "nobody ever touched `[device]`"
+    /// indistinguishable — so [`DeviceSection::to_wgpu_backends`] could not
+    /// be wired into GPU selection at all without forcing a Vulkan-only
+    /// instance on macOS (Metal-only) and most Windows installs. An empty
+    /// default carries that distinction in the value itself, with no
+    /// `Option` (which would break the config's public field type), and lets
+    /// `pipeline::request_gpu_device` apply the mapping unconditionally.
     fn default() -> Self {
         Self {
-            backend: "vulkan".to_string(),
+            backend: String::new(),
             gpu_index: 0,
         }
     }
 }
 
+/// Backend names [`DeviceSection::resolve_backends`] accepts, for error text.
+const KNOWN_BACKEND_NAMES: &[&str] = &["vulkan", "metal", "dx12", "d3d12", "gl", "opengl"];
+
 impl DeviceSection {
-    /// Map the configured backend name to a `wgpu::Backends` bitflag.
+    /// Resolve [`DeviceSection::backend`] into an explicit backend selection.
     ///
-    /// Recognises `"vulkan"`, `"metal"`, `"dx12"`/`"d3d12"`, and
-    /// `"gl"`/`"opengl"` (case-insensitively); anything else -- including an
-    /// empty string -- maps to `wgpu::Backends::all()` (auto-select).
+    /// * `Ok(None)` — nothing was configured (empty/whitespace, or the
+    ///   explicit `"auto"`): the caller should let wgpu pick, i.e. use
+    ///   [`wgpu::Backends::all`].
+    /// * `Ok(Some(backends))` — the user named a backend; honour it.
+    /// * `Err(..)` — the user named something that is not a backend. A typo
+    ///   such as `backend = "vulcan"` must not silently degrade into
+    ///   auto-detection, because the whole point of writing the key was to
+    ///   pin the backend.
     ///
-    /// # Caution for callers
+    /// # Errors
     ///
-    /// [`DeviceSection::backend`] currently defaults to the literal string
-    /// `"vulkan"` (see [`DeviceSection::default`]), not an `Option`, so this
-    /// function cannot distinguish "the user explicitly asked for Vulkan"
-    /// from "the field is sitting at its baked-in default". Wiring this
-    /// unconditionally into `pipeline::request_gpu_device` would therefore
-    /// request a Vulkan-only instance for every user who has never touched
-    /// `[device]`, which has no adapters on macOS (Metal-only) and would
-    /// regress GPU detection there. Only apply the mapped value when some
-    /// other signal indicates the user actually chose a backend, or change
-    /// `DeviceSection::backend` to `Option<String>` with no default first.
-    #[allow(dead_code)] // not yet wired into pipeline::request_gpu_device; see followups.
-    pub fn to_wgpu_backends(&self) -> wgpu::Backends {
-        match self.backend.to_ascii_lowercase().as_str() {
-            "vulkan" => wgpu::Backends::VULKAN,
-            "metal" => wgpu::Backends::METAL,
-            "dx12" | "d3d12" => wgpu::Backends::DX12,
-            "gl" | "opengl" => wgpu::Backends::GL,
-            _ => wgpu::Backends::all(),
+    /// Returns an error naming the accepted values when `backend` is neither
+    /// empty/`"auto"` nor a recognised backend name.
+    pub fn resolve_backends(&self) -> Result<Option<wgpu::Backends>> {
+        let name = self.backend.trim().to_ascii_lowercase();
+        match name.as_str() {
+            "" | "auto" => Ok(None),
+            "vulkan" => Ok(Some(wgpu::Backends::VULKAN)),
+            "metal" => Ok(Some(wgpu::Backends::METAL)),
+            "dx12" | "d3d12" => Ok(Some(wgpu::Backends::DX12)),
+            "gl" | "opengl" => Ok(Some(wgpu::Backends::GL)),
+            other => anyhow::bail!(
+                "Unknown [device] backend {other:?}: expected one of {} \
+                 (or an empty value / \"auto\" to let wgpu choose)",
+                KNOWN_BACKEND_NAMES.join(", "),
+            ),
         }
+    }
+
+    /// Lenient form of [`DeviceSection::resolve_backends`]: maps "nothing
+    /// configured" *and* "unrecognised name" alike to
+    /// [`wgpu::Backends::all`].
+    ///
+    /// Prefer `resolve_backends` on any path that can surface an error to the
+    /// user; this exists for callers that must produce a bitflag
+    /// unconditionally (diagnostics, display).
+    pub fn to_wgpu_backends(&self) -> wgpu::Backends {
+        self.resolve_backends()
+            .ok()
+            .flatten()
+            .unwrap_or_else(wgpu::Backends::all)
     }
 }
 
@@ -129,6 +165,52 @@ pub struct TrainingSection {
     pub num_inference_steps: usize,
     pub opacity_reset_interval: u32,
 
+    /// Number of `train_step` calls whose gradients are averaged into one
+    /// optimizer update (micro-batching).
+    ///
+    /// `1` (the default) steps every iteration. Larger values trade update
+    /// frequency for a lower-variance gradient at the same VRAM cost, which is
+    /// how a bigger effective batch is reached on a small GPU.
+    pub gradient_accumulation_steps: u32,
+
+    /// Decay of the EMA shadow copy of the model, or `None` (the default) to
+    /// keep no shadow weights.
+    ///
+    /// Must be in `(0, 1)`; `0.999` is typical. When set, the trainer keeps an
+    /// exponential moving average alongside the live model and checkpoints the
+    /// **averaged** weights, which usually evaluate better.
+    pub ema_decay: Option<f32>,
+
+    /// Master RNG seed for the whole reconstruction run.
+    ///
+    /// `None` means "use the built-in default seed"
+    /// (`pipeline::DEFAULT_SEED`), which keeps runs reproducible by default.
+    /// Gaussian initialisation and the trainer's RNG — view sampling and
+    /// densification — are derived from this value, each on its own stream.
+    ///
+    /// The diffusion denoiser's noise is the documented exception: it is
+    /// seeded from the iteration counter inside `oxigaf-trainer`, so it is
+    /// reproducible but not influenced by this setting. See
+    /// `pipeline::DEFAULT_SEED` for the full account.
+    ///
+    /// This is the field `oxigaf train --seed` feeds; see the followup note
+    /// on `cmd_train` in `main.rs`.
+    pub seed: Option<u64>,
+
+    /// Run a periodic evaluation pass every *N* iterations.
+    ///
+    /// `None` disables it. This is the field `oxigaf train --eval-interval`
+    /// feeds. See `pipeline::run_evaluation` for exactly what is measured
+    /// (and what it is measured *against*).
+    pub eval_interval: Option<u32>,
+
+    /// Stop training as soon as the total loss reaches this threshold.
+    ///
+    /// `None` disables it, leaving only patience-based early stopping
+    /// (`--patience`/`--min-delta`). This is the field
+    /// `oxigaf train --early-stop-loss` feeds.
+    pub early_stop_loss: Option<f32>,
+
     /// `[training.init]`
     pub init: InitSection,
     /// `[training.optimizer]`
@@ -141,6 +223,10 @@ pub struct TrainingSection {
 
 impl Default for TrainingSection {
     fn default() -> Self {
+        // The two knobs that forward straight to `TrainingConfig` take their
+        // defaults from it rather than repeating a literal, so the TOML schema
+        // cannot silently drift from the trainer's own default behaviour.
+        let d = TrainingConfig::default();
         Self {
             total_iterations: 15_000,
             views_per_step: 4,
@@ -150,6 +236,11 @@ impl Default for TrainingSection {
             guidance_anneal_steps: 10_000,
             num_inference_steps: 50,
             opacity_reset_interval: 3_000,
+            gradient_accumulation_steps: d.gradient_accumulation_steps,
+            ema_decay: d.ema_decay,
+            seed: None,
+            eval_interval: None,
+            early_stop_loss: None,
             init: InitSection::default(),
             optimizer: OptimizerSection::default(),
             density_control: DensityControlSection::default(),
@@ -278,6 +369,14 @@ pub struct LossSection {
     pub lambda_normal: f32,
     pub lambda_gradient_penalty: f32,
     pub gradient_penalty_threshold: f32,
+    /// World-space Gaussian size (post-`exp()`) above which `lambda_scale_reg`
+    /// starts to charge.
+    ///
+    /// A threshold rather than a weight, hence the bare name — same convention
+    /// as `gradient_penalty_threshold`. Defaults to the trainer's
+    /// `oxigaf_trainer::loss::MAX_REASONABLE_WORLD_SCALE`; raising it tolerates
+    /// larger Gaussians, lowering it fights growth sooner.
+    pub scale_reg_max_scale: f32,
 }
 
 impl Default for LossSection {
@@ -294,6 +393,7 @@ impl Default for LossSection {
             lambda_normal: d.w_normal,
             lambda_gradient_penalty: d.w_gradient_penalty,
             gradient_penalty_threshold: d.gradient_penalty_threshold,
+            scale_reg_max_scale: d.w_scale_reg_max_scale,
         }
     }
 }
@@ -366,6 +466,7 @@ impl ProjectConfig {
                 w_normal: t.loss.lambda_normal,
                 w_gradient_penalty: t.loss.lambda_gradient_penalty,
                 gradient_penalty_threshold: t.loss.gradient_penalty_threshold,
+                w_scale_reg_max_scale: t.loss.scale_reg_max_scale,
             },
             density: DensityConfig {
                 grad_threshold: t.density_control.grad_threshold,
@@ -384,6 +485,19 @@ impl ProjectConfig {
             tensorboard: TensorBoardConfig::default(),
             precision: TrainingPrecision::Float32,
             enable_profiling: false,
+            gradient_accumulation_steps: t.gradient_accumulation_steps,
+            ema_decay: t.ema_decay,
+            // `lr_schedule` and `gradient_clip` are sum types whose variants
+            // each carry their own parameters, and no `[training.*]` key in
+            // this schema is enum-valued (`precision` above is hardcoded for
+            // the same reason). They therefore take the trainer's own default
+            // — `Fixed` / `Disabled`, i.e. exactly the behaviour every run had
+            // before those knobs existed. Spelled `::default()` rather than as
+            // the literal variants so the CLI follows the trainer if it ever
+            // changes its mind about the neutral setting. Giving them a
+            // decoupled TOML surface is a schema addition, filed as a followup.
+            lr_schedule: LrScheduleConfig::default(),
+            gradient_clip: GradientClipConfig::default(),
         }
     }
 
@@ -417,6 +531,45 @@ impl ProjectConfig {
             "Total Gaussian count must be > 0"
         );
         anyhow::ensure!(self.training.init.sh_degree <= 3, "SH degree must be <= 3");
+        // Reaches `DiffusionTargetConfig`, whose own validator rejects 0 —
+        // catch it here so the message names the TOML key.
+        anyhow::ensure!(
+            self.training.num_inference_steps > 0,
+            "num_inference_steps must be > 0"
+        );
+        if let Some(interval) = self.training.eval_interval {
+            anyhow::ensure!(
+                interval > 0,
+                "eval_interval must be > 0 (omit it to disable evaluation)"
+            );
+        }
+        if let Some(threshold) = self.training.early_stop_loss {
+            anyhow::ensure!(
+                threshold.is_finite(),
+                "early_stop_loss must be a finite number, got {threshold}"
+            );
+        }
+        // `Trainer::new` reads `gradient_accumulation_steps <= 1` as "no
+        // accumulation", so a `0` written here would silently disable a feature
+        // the user was trying to configure. `TrainingConfig::validate` rejects
+        // it, but nothing on the CLI path calls that — so reject it here, where
+        // the message can name the TOML key.
+        anyhow::ensure!(
+            self.training.gradient_accumulation_steps > 0,
+            "gradient_accumulation_steps must be > 0 (use 1 to step every iteration)"
+        );
+        // The trainer rejects an out-of-range decay too, but only once the
+        // FLAME model, the frame sequence and the GPU are already up; catch it
+        // while the failure is still cheap.
+        if let Some(decay) = self.training.ema_decay {
+            anyhow::ensure!(
+                decay > 0.0 && decay < 1.0,
+                "ema_decay must be in (0, 1), got {decay} (omit it to keep no shadow weights)"
+            );
+        }
+        // Surface a bad `[device] backend` here rather than at GPU-init time,
+        // after the FLAME model and the whole frame sequence have been loaded.
+        self.device.resolve_backends()?;
         Ok(())
     }
 }
@@ -682,6 +835,20 @@ fn merge_training_section(base: TrainingSection, override_cfg: TrainingSection) 
         } else {
             base.opacity_reset_interval
         },
+        gradient_accumulation_steps: if override_cfg.gradient_accumulation_steps
+            != default.gradient_accumulation_steps
+        {
+            override_cfg.gradient_accumulation_steps
+        } else {
+            base.gradient_accumulation_steps
+        },
+        // The four `Option` knobs default to `None`, so "differs from the
+        // default" is exactly "the override actually set it" — no
+        // sentinel-value ambiguity to work around here.
+        ema_decay: override_cfg.ema_decay.or(base.ema_decay),
+        seed: override_cfg.seed.or(base.seed),
+        eval_interval: override_cfg.eval_interval.or(base.eval_interval),
+        early_stop_loss: override_cfg.early_stop_loss.or(base.early_stop_loss),
         init: merge_init_section(base.init, override_cfg.init),
         optimizer: merge_optimizer_section(base.optimizer, override_cfg.optimizer),
         density_control: merge_density_control_section(
@@ -928,6 +1095,14 @@ fn merge_loss_section(base: LossSection, override_cfg: LossSection) -> LossSecti
         } else {
             base.gradient_penalty_threshold
         },
+        scale_reg_max_scale: if (override_cfg.scale_reg_max_scale - default.scale_reg_max_scale)
+            .abs()
+            > f32::EPSILON
+        {
+            override_cfg.scale_reg_max_scale
+        } else {
+            base.scale_reg_max_scale
+        },
     }
 }
 
@@ -1017,9 +1192,36 @@ fn apply_env_overrides(mut config: ProjectConfig) -> Result<ProjectConfig> {
             .with_context(|| format!("Invalid OXIGAF_SH_LR: {}", val))?;
     }
 
+    if let Ok(val) = env::var("OXIGAF_SEED") {
+        config.training.seed = Some(
+            val.parse()
+                .with_context(|| format!("Invalid OXIGAF_SEED: {}", val))?,
+        );
+    }
+
+    if let Ok(val) = env::var("OXIGAF_EVAL_INTERVAL") {
+        config.training.eval_interval = Some(
+            val.parse()
+                .with_context(|| format!("Invalid OXIGAF_EVAL_INTERVAL: {}", val))?,
+        );
+    }
+
+    if let Ok(val) = env::var("OXIGAF_EARLY_STOP_LOSS") {
+        config.training.early_stop_loss = Some(
+            val.parse()
+                .with_context(|| format!("Invalid OXIGAF_EARLY_STOP_LOSS: {}", val))?,
+        );
+    }
+
     // Device parameters
     if let Ok(val) = env::var("OXIGAF_DEVICE_BACKEND") {
         config.device.backend = val;
+        // Reject a typo here, where the variable's name is still available
+        // for the message, instead of silently degrading to auto-detect.
+        config
+            .device
+            .resolve_backends()
+            .context("Invalid OXIGAF_DEVICE_BACKEND")?;
     }
 
     if let Ok(val) = env::var("OXIGAF_DEVICE_GPU_INDEX") {
@@ -1078,7 +1280,6 @@ fn apply_env_overrides(mut config: ProjectConfig) -> Result<ProjectConfig> {
 // callers anywhere in this crate or its test suites.
 
 /// Generate a default TOML configuration string that can be written to a file.
-#[allow(dead_code)]
 pub fn generate_default_config() -> Result<String> {
     let config = ProjectConfig::default();
     toml::to_string_pretty(&config).context("Failed to serialize default config")
@@ -1190,6 +1391,226 @@ total_iterations = 5000
         assert_eq!(device.to_wgpu_backends(), wgpu::Backends::all());
         device.backend = String::new();
         assert_eq!(device.to_wgpu_backends(), wgpu::Backends::all());
+    }
+
+    // -----------------------------------------------------------------------
+    // DeviceSection: "auto" default + strict resolution
+    //
+    // Regression coverage for: `backend` used to default to the literal
+    // "vulkan", so `to_wgpu_backends()` could not be wired into GPU selection
+    // at all -- doing so would have requested a Vulkan-only instance for
+    // every user who never touched `[device]`, which finds no adapters on
+    // macOS. The default must therefore stay "unset", and an unrecognised
+    // name must be an error rather than silently becoming auto-detect.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn device_backend_defaults_to_auto_not_a_concrete_backend() {
+        let device = DeviceSection::default();
+        assert!(
+            device.backend.is_empty(),
+            "a concrete default backend ({:?}) makes 'user chose it' and \
+             'never configured' indistinguishable and breaks macOS",
+            device.backend
+        );
+        assert_eq!(
+            device.resolve_backends().expect("empty backend is valid"),
+            None,
+            "the default must resolve to 'let wgpu choose'"
+        );
+        assert_eq!(device.to_wgpu_backends(), wgpu::Backends::all());
+    }
+
+    #[test]
+    fn resolve_backends_accepts_auto_and_known_names() {
+        let mut device = DeviceSection::default();
+        for spelling in ["", "   ", "auto", "AUTO"] {
+            device.backend = spelling.to_string();
+            assert_eq!(
+                device.resolve_backends().expect("auto spelling is valid"),
+                None,
+                "{spelling:?} must mean auto-detect"
+            );
+        }
+        device.backend = " Metal ".to_string();
+        assert_eq!(
+            device.resolve_backends().expect("metal is valid"),
+            Some(wgpu::Backends::METAL),
+            "resolution must be case- and whitespace-insensitive"
+        );
+        device.backend = "d3d12".to_string();
+        assert_eq!(
+            device.resolve_backends().expect("d3d12 is valid"),
+            Some(wgpu::Backends::DX12)
+        );
+    }
+
+    #[test]
+    fn resolve_backends_rejects_typos() {
+        let mut device = DeviceSection::default();
+        device.backend = "vulcan".to_string();
+        let err = device
+            .resolve_backends()
+            .expect_err("a typo must not silently become auto-detect");
+        let msg = err.to_string();
+        assert!(msg.contains("vulcan"), "must quote the bad value: {msg}");
+        assert!(msg.contains("vulkan"), "must list valid values: {msg}");
+    }
+
+    #[test]
+    fn validate_rejects_unknown_backend() {
+        let mut config = ProjectConfig::default();
+        config.device.backend = "openkl".to_string();
+        assert!(
+            config.validate().is_err(),
+            "a bad backend must fail validation, not GPU init after the \
+             FLAME model and every frame have already been loaded"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // seed / eval_interval / early_stop_loss
+    //
+    // Regression coverage for: `--seed`, `--eval-interval` and
+    // `--early-stop-loss` were accepted by the CLI and then ignored, because
+    // no configuration field carried them as far as the pipeline.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn training_knobs_default_to_unset() {
+        let t = TrainingSection::default();
+        assert_eq!(t.seed, None);
+        assert_eq!(t.eval_interval, None);
+        assert_eq!(t.early_stop_loss, None);
+    }
+
+    #[test]
+    fn training_knobs_round_trip_through_toml() -> Result<()> {
+        let toml_str = r#"
+[training]
+seed = 7
+eval_interval = 250
+early_stop_loss = 0.015
+"#;
+        let config: ProjectConfig =
+            toml::from_str(toml_str).context("Failed to parse training knobs")?;
+        assert_eq!(config.training.seed, Some(7));
+        assert_eq!(config.training.eval_interval, Some(250));
+        assert_eq!(config.training.early_stop_loss, Some(0.015));
+
+        // And they survive a serialise/deserialise cycle.
+        let rendered = toml::to_string_pretty(&config).context("serialize")?;
+        let parsed: ProjectConfig = toml::from_str(&rendered).context("re-parse")?;
+        assert_eq!(parsed.training.seed, Some(7));
+        assert_eq!(parsed.training.eval_interval, Some(250));
+        Ok(())
+    }
+
+    #[test]
+    fn optimisation_knobs_reach_the_training_config() -> Result<()> {
+        // `gradient_accumulation_steps` / `ema_decay` / `scale_reg_max_scale`
+        // are only worth exposing if they actually arrive at the trainer, so
+        // assert the whole TOML → `TrainingConfig` path rather than the field.
+        let toml_str = r#"
+[training]
+gradient_accumulation_steps = 4
+ema_decay = 0.999
+
+[training.loss]
+scale_reg_max_scale = 0.02
+"#;
+        let config: ProjectConfig =
+            toml::from_str(toml_str).context("Failed to parse optimisation knobs")?;
+        let training = config.to_training_config();
+        assert_eq!(training.gradient_accumulation_steps, 4);
+        assert_eq!(training.ema_decay, Some(0.999));
+        assert_eq!(training.loss.w_scale_reg_max_scale, 0.02);
+
+        // The two enum-valued knobs are not part of this schema; they must
+        // land on the trainer's own neutral defaults, i.e. the behaviour every
+        // run had before those knobs existed.
+        assert_eq!(training.lr_schedule, LrScheduleConfig::Fixed);
+        assert_eq!(training.gradient_clip, GradientClipConfig::Disabled);
+
+        // Unset leaves the trainer's defaults in place.
+        let bare = ProjectConfig::default().to_training_config();
+        assert_eq!(bare.gradient_accumulation_steps, 1);
+        assert_eq!(bare.ema_decay, None);
+        assert_eq!(
+            bare.loss.w_scale_reg_max_scale,
+            LossConfig::default().w_scale_reg_max_scale
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn validate_rejects_out_of_range_optimisation_knobs() {
+        // `Trainer::new` reads `<= 1` as "no accumulation", so a `0` would be
+        // silently ignored rather than reported.
+        let mut config = ProjectConfig::default();
+        config.training.gradient_accumulation_steps = 0;
+        let err = config
+            .validate()
+            .expect_err("zero accumulation steps must be rejected");
+        assert!(err.to_string().contains("gradient_accumulation_steps"));
+
+        let mut config = ProjectConfig::default();
+        config.training.ema_decay = Some(1.0);
+        assert!(config.validate().is_err(), "decay of 1.0 never converges");
+        config.training.ema_decay = Some(0.0);
+        assert!(config.validate().is_err(), "decay of 0.0 keeps no history");
+        config.training.ema_decay = Some(0.999);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_zero_num_inference_steps() {
+        // The value now reaches `DiffusionTargetConfig`, which rejects 0 with
+        // a message that does not mention `oxigaf.toml` at all.
+        let mut config = ProjectConfig::default();
+        config.training.num_inference_steps = 0;
+        let err = config
+            .validate()
+            .expect_err("zero inference steps must be rejected");
+        assert!(err.to_string().contains("num_inference_steps"));
+    }
+
+    #[test]
+    fn validate_rejects_zero_eval_interval() {
+        let mut config = ProjectConfig::default();
+        config.training.eval_interval = Some(0);
+        assert!(config.validate().is_err());
+        config.training.eval_interval = Some(1);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_non_finite_early_stop_loss() {
+        let mut config = ProjectConfig::default();
+        config.training.early_stop_loss = Some(f32::NAN);
+        assert!(config.validate().is_err());
+        config.training.early_stop_loss = Some(f32::INFINITY);
+        assert!(config.validate().is_err());
+        config.training.early_stop_loss = Some(0.01);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn merge_training_section_keeps_set_optional_knobs() {
+        let mut base = TrainingSection::default();
+        base.seed = Some(11);
+        base.eval_interval = Some(100);
+        let mut overlay = TrainingSection::default();
+        overlay.seed = Some(22);
+        // `overlay` leaves eval_interval unset, so base's must survive.
+        let merged = merge_training_section(base, overlay);
+        assert_eq!(merged.seed, Some(22), "the override must win when set");
+        assert_eq!(
+            merged.eval_interval,
+            Some(100),
+            "an unset override must not erase the lower-priority layer"
+        );
+        assert_eq!(merged.early_stop_loss, None);
     }
 
     // -----------------------------------------------------------------------

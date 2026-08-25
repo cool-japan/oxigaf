@@ -1046,8 +1046,8 @@ mod tests {
         let out = apply_dropout_mask(&params, 0.5, 2024).expect("dropout failed");
         // Structural: every element is either dropped or exactly 1/(1-0.5) = 2.
         assert!(out.iter().all(|&v| v == 0.0 || v == 2.0));
-        assert!(out.iter().any(|&v| v == 0.0), "expected some drops");
-        assert!(out.iter().any(|&v| v == 2.0), "expected some survivors");
+        assert!(out.contains(&0.0), "expected some drops");
+        assert!(out.contains(&2.0), "expected some survivors");
         // Statistical: mean preserved (0.5 away from the un-rescaled value).
         let mean: f32 = out.iter().sum::<f32>() / out.len() as f32;
         assert!(approx(mean, 1.0, 0.1), "expected mean ~1.0, got {}", mean);

@@ -198,7 +198,7 @@ impl NamedExpression {
                 "expression_basis must contain at least one displacement vector".to_owned(),
             ));
         }
-        if neutral_verts.is_empty() || neutral_verts.len() % 3 != 0 {
+        if neutral_verts.is_empty() || !neutral_verts.len().is_multiple_of(3) {
             return Err(FlameError::InvalidParams(format!(
                 "neutral_verts must be a non-empty multiple of 3, got {}",
                 neutral_verts.len()
@@ -1307,21 +1307,28 @@ mod tests {
         assert_eq!(result.expression.len(), 50);
 
         // Leading 10: interpolated halfway toward 1.0
-        for i in 0..10 {
-            let expected = current[i] + (1.0 - current[i]) * 0.5;
+        for (i, (&cur, &res)) in current
+            .iter()
+            .zip(result.expression.iter())
+            .enumerate()
+            .take(10)
+        {
+            let expected = cur + (1.0 - cur) * 0.5;
             assert!(
-                (result.expression[i] - expected).abs() < 1e-6,
-                "expression[{i}] must be {expected}, got {}",
-                result.expression[i]
+                (res - expected).abs() < 1e-6,
+                "expression[{i}] must be {expected}, got {res}"
             );
         }
         // Trailing 40: bit-for-bit unchanged
-        for i in 10..50 {
+        for (i, (&cur, &res)) in current
+            .iter()
+            .zip(result.expression.iter())
+            .enumerate()
+            .skip(10)
+        {
             assert!(
-                (result.expression[i] - current[i]).abs() < f32::EPSILON,
-                "expression[{i}] must stay at {}, got {}",
-                current[i],
-                result.expression[i]
+                (res - cur).abs() < f32::EPSILON,
+                "expression[{i}] must stay at {cur}, got {res}"
             );
         }
     }
@@ -1336,12 +1343,16 @@ mod tests {
         let result = params.blend_expression_toward_zero(&target, 0.5);
         assert_eq!(result.expression.len(), 20);
         // Trailing coefficients are treated as target = 0 and halve.
-        for i in 10..20 {
-            let expected = current[i] * 0.5;
+        for (i, (&cur, &res)) in current
+            .iter()
+            .zip(result.expression.iter())
+            .enumerate()
+            .skip(10)
+        {
+            let expected = cur * 0.5;
             assert!(
-                (result.expression[i] - expected).abs() < 1e-6,
-                "expression[{i}] must be {expected}, got {}",
-                result.expression[i]
+                (res - expected).abs() < 1e-6,
+                "expression[{i}] must be {expected}, got {res}"
             );
         }
         // At t = 1.0 the result is exactly the zero-padded target.

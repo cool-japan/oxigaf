@@ -372,7 +372,7 @@ impl<'a> Unpickler<'a> {
     }
 
     fn pairs_from(items: Vec<Value>) -> Result<Vec<(Value, Value)>> {
-        if items.len() % 2 != 0 {
+        if !items.len().is_multiple_of(2) {
             bail!("pickle: dict opcode with an odd number of values");
         }
         let mut pairs = Vec::with_capacity(items.len() / 2);
@@ -821,7 +821,7 @@ fn descr_from_value(value: &Value) -> Result<String> {
     });
     let descr = match order.and_then(|o| o.chars().next()) {
         Some(order) => {
-            let stripped = base.trim_start_matches(|c| matches!(c, '<' | '>' | '|' | '='));
+            let stripped = base.trim_start_matches(['<', '>', '|', '=']);
             format!("{order}{stripped}")
         }
         None => base,

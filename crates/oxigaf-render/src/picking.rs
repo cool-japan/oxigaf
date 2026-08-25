@@ -403,7 +403,8 @@ pub fn ray_sphere_intersect(ray: &Ray, center: [f32; 3], radius: f32) -> Option<
 ///
 /// Only Gaussians with `opacity >= config.min_opacity` are considered.
 /// The bounding sphere is scaled by `config.radius_scale` before the test.
-/// The perpendicular ray-to-center distance must be ≤ `config.max_hit_distance`.
+/// The sphere-entry `t` must be ≤ `config.max_t`, and the perpendicular
+/// ray-to-center distance must be ≤ `config.max_hit_distance`.
 ///
 /// Returns `None` if no Gaussian is hit.
 pub fn pick_nearest(
@@ -425,6 +426,11 @@ pub fn pick_nearest(
             Some(t) => t,
             None => continue,
         };
+
+        // Step 2b: ray-length gate (config.max_t).
+        if sphere_t > config.max_t {
+            continue;
+        }
 
         // Step 3: closest approach for quality metrics.
         let (t_closest, dist) = ray_point_distance(ray, g.center);
@@ -453,7 +459,7 @@ pub fn pick_nearest(
 
 /// Pick **all** Gaussians hit by `ray`, sorted by `t` (nearest first).
 ///
-/// Applies the same filters as [`pick_nearest`].
+/// Applies the same filters as [`pick_nearest`], including `config.max_t`.
 pub fn pick_all(ray: &Ray, gaussians: &[GaussianPickData], config: &PickConfig) -> Vec<PickHit> {
     let mut hits = Vec::new();
 
@@ -467,6 +473,10 @@ pub fn pick_all(ray: &Ray, gaussians: &[GaussianPickData], config: &PickConfig) 
             Some(t) => t,
             None => continue,
         };
+
+        if sphere_t > config.max_t {
+            continue;
+        }
 
         let (t_closest, dist) = ray_point_distance(ray, g.center);
         let closest_point = ray.at(t_closest);
@@ -888,6 +898,45 @@ mod tests {
         }
         // The nearest should be at z=−4.
         assert_eq!(hits[0].index, 1, "nearest hit should be index 1 (z=−4)");
+    }
+
+    // ── max_t enforcement (pick_nearest / pick_all) ───────────────────────────
+
+    #[test]
+    fn test_pick_nearest_respects_max_t() {
+        let cam = forward_camera();
+        let ray = cam.ray_for_pixel(50, 50).unwrap();
+        // Far beyond PickConfig::default().max_t == 1000.0.
+        let gaussians = vec![gaussian_on_axis(-2000.0)];
+        let hit = pick_nearest(&ray, &gaussians, &PickConfig::default());
+        assert!(hit.is_none(), "hit beyond max_t should be rejected");
+    }
+
+    #[test]
+    fn test_pick_nearest_max_t_allows_hit_just_inside() {
+        let cam = forward_camera();
+        let ray = cam.ray_for_pixel(50, 50).unwrap();
+        let config = PickConfig {
+            max_t: 10.0,
+            ..PickConfig::default()
+        };
+        let gaussians = vec![gaussian_on_axis(-5.0)];
+        let hit = pick_nearest(&ray, &gaussians, &config);
+        assert!(hit.is_some(), "hit within max_t should still be found");
+    }
+
+    #[test]
+    fn test_pick_all_respects_max_t() {
+        let cam = forward_camera();
+        let ray = cam.ray_for_pixel(50, 50).unwrap();
+        let gaussians = vec![gaussian_on_axis(-4.0), gaussian_on_axis(-2000.0)];
+        let hits = pick_all(&ray, &gaussians, &PickConfig::default());
+        assert_eq!(
+            hits.len(),
+            1,
+            "only the in-range Gaussian should be returned"
+        );
+        assert_eq!(hits[0].index, 0);
     }
 
     // ── Test 18: pick_all returns empty vec for empty scene ───────────────────

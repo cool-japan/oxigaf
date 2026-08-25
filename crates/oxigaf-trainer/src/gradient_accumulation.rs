@@ -29,6 +29,7 @@
 //! assert_eq!(normalized[0][0], 1.0); // mean over 4 steps of 1.0
 //! ```
 
+use std::collections::VecDeque;
 use std::fmt::Write as FmtWrite;
 use thiserror::Error;
 
@@ -126,6 +127,7 @@ impl AccumulationConfig {
 /// micro-batch.  When [`should_update`](GradientAccumulator::should_update)
 /// returns `true`, call [`apply`](GradientAccumulator::apply) to get
 /// normalized gradients ready for the optimizer.
+#[derive(Debug)]
 pub struct GradientAccumulator {
     /// Configuration controlling accumulation behaviour.
     pub config: AccumulationConfig,
@@ -200,21 +202,13 @@ impl GradientAccumulator {
                 actual: gradients.len(),
             });
         }
-        for (group_idx, (acc, grad)) in self
-            .accumulated
-            .iter_mut()
-            .zip(gradients.iter())
-            .enumerate()
-        {
+        for (acc, grad) in self.accumulated.iter_mut().zip(gradients.iter()) {
             if acc.len() != grad.len() {
                 return Err(AccumulationError::LengthMismatch {
                     expected: acc.len(),
                     actual: grad.len(),
                 });
             }
-            // Suppress the unused variable warning — group_idx is there for
-            // future diagnostics but we reference it here explicitly.
-            let _ = group_idx;
             for (a, g) in acc.iter_mut().zip(grad.iter()) {
                 *a += g;
             }
@@ -230,6 +224,27 @@ impl GradientAccumulator {
     /// optimizer update should be applied.
     pub fn should_update(&self) -> bool {
         self.steps_accumulated >= self.config.accumulation_steps
+    }
+
+    /// Update the number of accumulation steps used to decide when
+    /// [`should_update`](Self::should_update) returns `true`.
+    ///
+    /// This lets a caller (e.g. [`AccumulationScheduler`], see
+    /// [`AccumulationMonitor::with_scheduler`]) dynamically adjust the
+    /// accumulation window between calls to [`accumulate`](Self::accumulate).
+    /// Changing it mid-window does not retroactively affect
+    /// `steps_accumulated`; it only changes the threshold checked by future
+    /// calls to [`should_update`](Self::should_update).
+    ///
+    /// Returns [`AccumulationError::InvalidConfig`] if `n == 0`.
+    pub fn set_accumulation_steps(&mut self, n: usize) -> Result<(), AccumulationError> {
+        if n == 0 {
+            return Err(AccumulationError::InvalidConfig(
+                "accumulation_steps must be ≥ 1".to_string(),
+            ));
+        }
+        self.config.accumulation_steps = n;
+        Ok(())
     }
 
     /// Return the normalized accumulated gradients, ready to pass to the
@@ -304,6 +319,50 @@ impl GradientAccumulator {
         self.batch_sizes.clear();
     }
 
+    /// Per-micro-step batch sizes recorded so far in the *current*
+    /// accumulation window, in the order they were accumulated.
+    ///
+    /// Cleared by [`clear`](Self::clear) (and therefore by
+    /// [`apply`](Self::apply) when `auto_clear` is set), so this is bounded by
+    /// `accumulation_steps` rather than growing with the training run.
+    pub fn window_batch_sizes(&self) -> &[usize] {
+        &self.batch_sizes
+    }
+
+    /// Total samples seen in the current accumulation window.
+    ///
+    /// This is the divisor used by [`GradNormalization::TotalBatchSize`].
+    pub fn window_total_samples(&self) -> usize {
+        self.total_samples
+    }
+
+    /// Mean micro-batch size in the current window, or `None` when no
+    /// micro-batch has been accumulated yet.
+    pub fn mean_batch_size(&self) -> Option<f32> {
+        if self.batch_sizes.is_empty() {
+            return None;
+        }
+        Some(self.total_samples as f32 / self.batch_sizes.len() as f32)
+    }
+
+    /// Ratio `max_batch_size / min_batch_size` across the current window, or
+    /// `None` when the window is empty or its smallest micro-batch is zero.
+    ///
+    /// A ratio above `1.0` means the micro-batches are uneven, which biases
+    /// [`GradNormalization::MeanOverSteps`]: that mode weights every
+    /// micro-batch equally regardless of how many samples it held, so an
+    /// imbalanced window silently over-weights the small micro-batches.
+    /// [`GradNormalization::TotalBatchSize`] is the unbiased choice when this
+    /// is far from `1.0`.
+    pub fn batch_size_imbalance(&self) -> Option<f32> {
+        let min = *self.batch_sizes.iter().min()?;
+        let max = *self.batch_sizes.iter().max()?;
+        if min == 0 {
+            return None;
+        }
+        Some(max as f32 / min as f32)
+    }
+
     /// Accumulation progress within the current window: `steps_accumulated /
     /// accumulation_steps`, clamped to `[0.0, 1.0]`.
     pub fn progress(&self) -> f64 {
@@ -328,7 +387,11 @@ impl GradientAccumulator {
 
     /// Format a one-line status summary.
     ///
-    /// Example: `"acc=2/4 updates=3 steps=12 efficiency=25.00%"`
+    /// Example:
+    /// `"acc=2/4 updates=3 steps=12 efficiency=25.00% samples=16 mean_batch=8.00 imbalance=1.00"`
+    ///
+    /// The trailing window statistics are omitted while the current window is
+    /// still empty (nothing has been accumulated since the last `clear`).
     pub fn format_status(&self) -> String {
         let mut out = String::new();
         let _ = write!(
@@ -340,6 +403,16 @@ impl GradientAccumulator {
             self.total_steps,
             self.update_efficiency() * 100.0,
         );
+        if let Some(mean_batch) = self.mean_batch_size() {
+            let _ = write!(
+                out,
+                " samples={} mean_batch={mean_batch:.2}",
+                self.total_samples
+            );
+            if let Some(imbalance) = self.batch_size_imbalance() {
+                let _ = write!(out, " imbalance={imbalance:.2}");
+            }
+        }
         out
     }
 }
@@ -403,6 +476,7 @@ pub fn gradients_have_nan(gradients: &[Vec<f32>]) -> bool {
 /// `initial_steps`; after that it switches to `target_steps`.  This allows
 /// a warm-up period with a different accumulation factor (e.g. smaller at
 /// the start when gradients are noisy, larger once training is stable).
+#[derive(Debug)]
 pub struct AccumulationScheduler {
     /// Accumulation steps used at the start of training.
     pub initial_steps: usize,
@@ -463,8 +537,17 @@ impl AccumulationScheduler {
     ///
     /// Returns `true` when
     /// `micro_step % current_accumulation_steps() == current_accumulation_steps() - 1`.
+    ///
+    /// The validating constructor ([`Self::new`]) rejects `initial_steps` /
+    /// `target_steps` of `0`, but both fields are `pub`, so a struct literal
+    /// can still reach this method with `current_accumulation_steps() == 0`;
+    /// guard that case explicitly to avoid a modulo-by-zero panic and a
+    /// `usize` underflow on `n - 1`.
     pub fn should_update(&self, micro_step: usize) -> bool {
         let n = self.current_accumulation_steps();
+        if n == 0 {
+            return true;
+        }
         micro_step % n == n - 1
     }
 }
@@ -490,29 +573,106 @@ pub struct AccumulationStats {
     pub overflows: usize,
 }
 
+/// Default number of recent per-micro-step gradient norms
+/// [`AccumulationMonitor`] retains.
+///
+/// Only the running mean is needed for [`AccumulationStats`], and that is kept
+/// exactly (as a running sum plus a count) regardless of this window — the
+/// window exists so recent norms can be *inspected*
+/// ([`AccumulationMonitor::recent_grad_norms`]) without the buffer growing for
+/// the whole training run.
+pub const DEFAULT_GRAD_NORM_WINDOW: usize = 1024;
+
 /// Wraps a [`GradientAccumulator`] with automatic norm tracking and overflow
 /// detection.
+#[derive(Debug)]
 pub struct AccumulationMonitor {
     accumulator: GradientAccumulator,
-    /// L2 norms computed for each micro-step.
-    grad_norms: Vec<f32>,
+    /// Sliding window of the most recent per-micro-step L2 norms, bounded by
+    /// `grad_norm_window`.
+    grad_norms: VecDeque<f32>,
+    /// Maximum number of entries retained in `grad_norms`.
+    grad_norm_window: usize,
+    /// Sum of *every* recorded micro-step norm (not just the retained
+    /// window), accumulated in `f64` so a long run does not lose precision.
+    grad_norm_sum: f64,
+    /// Number of micro-step norms folded into `grad_norm_sum`.
+    grad_norm_count: usize,
     /// Count of micro-steps where [`gradients_have_inf`] was true.
     overflows: usize,
+    /// Optional dynamic accumulation-step schedule. When present, its
+    /// current value is pushed into the wrapped [`GradientAccumulator`] at
+    /// the start of every [`step`](Self::step) call (via
+    /// [`GradientAccumulator::set_accumulation_steps`]), and it is then
+    /// advanced by one training step -- see [`Self::with_scheduler`].
+    scheduler: Option<AccumulationScheduler>,
 }
 
 impl AccumulationMonitor {
-    /// Create a new monitor wrapping a fresh accumulator built from `config`.
+    /// Create a new monitor wrapping a fresh accumulator built from `config`,
+    /// retaining [`DEFAULT_GRAD_NORM_WINDOW`] recent gradient norms.
     pub fn new(config: AccumulationConfig) -> Result<Self, AccumulationError> {
+        Self::with_grad_norm_window(config, DEFAULT_GRAD_NORM_WINDOW)
+    }
+
+    /// Create a new monitor that retains at most `grad_norm_window` recent
+    /// per-micro-step gradient norms.
+    ///
+    /// The window is bounded so a long training run cannot grow the norm
+    /// buffer without limit; [`AccumulationStats::mean_grad_norm`] stays the
+    /// mean over *all* recorded micro-steps regardless, because it is
+    /// maintained as a running sum rather than recomputed from the buffer.
+    ///
+    /// Returns [`AccumulationError::InvalidConfig`] if `grad_norm_window` is
+    /// zero (or the accumulation config is invalid).
+    pub fn with_grad_norm_window(
+        config: AccumulationConfig,
+        grad_norm_window: usize,
+    ) -> Result<Self, AccumulationError> {
+        if grad_norm_window == 0 {
+            return Err(AccumulationError::InvalidConfig(
+                "grad_norm_window must be ≥ 1".to_string(),
+            ));
+        }
         let accumulator = GradientAccumulator::new(config)?;
         Ok(Self {
             accumulator,
-            grad_norms: Vec::new(),
+            grad_norms: VecDeque::with_capacity(grad_norm_window),
+            grad_norm_window,
+            grad_norm_sum: 0.0,
+            grad_norm_count: 0,
             overflows: 0,
+            scheduler: None,
         })
+    }
+
+    /// Attach a dynamic accumulation-step [`AccumulationScheduler`] to this
+    /// monitor.
+    ///
+    /// Once attached, every [`step`](Self::step) call first reads
+    /// [`AccumulationScheduler::current_accumulation_steps`], pushes it into
+    /// the wrapped accumulator, and then advances the scheduler's internal
+    /// training-step counter -- so the schedule configured on the scheduler
+    /// actually changes when the accumulator fires optimizer updates,
+    /// instead of the two types being constructed independently and never
+    /// interacting.
+    #[must_use]
+    pub fn with_scheduler(mut self, scheduler: AccumulationScheduler) -> Self {
+        self.scheduler = Some(scheduler);
+        self
+    }
+
+    /// Shared reference to the attached scheduler, if any (see
+    /// [`Self::with_scheduler`]).
+    pub fn scheduler(&self) -> Option<&AccumulationScheduler> {
+        self.scheduler.as_ref()
     }
 
     /// Process one micro-batch.
     ///
+    /// - If a scheduler is attached (see [`Self::with_scheduler`]), pushes
+    ///   its current accumulation-step count into the wrapped accumulator
+    ///   and advances it.
     /// - Lazily initializes the accumulator on the first call using the sizes
     ///   of `gradients`.
     /// - Accumulates `gradients`.
@@ -524,6 +684,12 @@ impl AccumulationMonitor {
         gradients: &[Vec<f32>],
         batch_size: usize,
     ) -> Result<Option<Vec<Vec<f32>>>, AccumulationError> {
+        if let Some(scheduler) = &mut self.scheduler {
+            let n = scheduler.current_accumulation_steps();
+            self.accumulator.set_accumulation_steps(n)?;
+            scheduler.advance();
+        }
+
         // Lazy initialization: if the inner accumulator has no buffers yet,
         // derive the sizes from the provided gradients.
         if self.accumulator.accumulated.is_empty() {
@@ -540,7 +706,13 @@ impl AccumulationMonitor {
             .flat_map(|g| g.iter())
             .map(|&v| v * v)
             .sum();
-        self.grad_norms.push(sq_sum.sqrt());
+        let norm = sq_sum.sqrt();
+        self.grad_norm_sum += f64::from(norm);
+        self.grad_norm_count += 1;
+        if self.grad_norms.len() == self.grad_norm_window {
+            self.grad_norms.pop_front();
+        }
+        self.grad_norms.push_back(norm);
 
         // Track overflow.
         if gradients_have_inf(gradients) {
@@ -556,12 +728,26 @@ impl AccumulationMonitor {
         Ok(None)
     }
 
+    /// The most recent per-micro-step gradient norms, oldest first.
+    ///
+    /// Bounded by [`grad_norm_window`](Self::grad_norm_window); norms older
+    /// than the window have been evicted (their contribution to
+    /// [`AccumulationStats::mean_grad_norm`] is retained regardless).
+    pub fn recent_grad_norms(&self) -> Vec<f32> {
+        self.grad_norms.iter().copied().collect()
+    }
+
+    /// Maximum number of recent gradient norms retained by this monitor.
+    pub fn grad_norm_window(&self) -> usize {
+        self.grad_norm_window
+    }
+
     /// Return a snapshot of the current accumulation statistics.
     pub fn stats(&self) -> AccumulationStats {
-        let mean_grad_norm = if self.grad_norms.is_empty() {
+        let mean_grad_norm = if self.grad_norm_count == 0 {
             0.0
         } else {
-            self.grad_norms.iter().sum::<f32>() / self.grad_norms.len() as f32
+            (self.grad_norm_sum / self.grad_norm_count as f64) as f32
         };
         AccumulationStats {
             total_steps: self.accumulator.total_steps,
@@ -1057,5 +1243,190 @@ mod tests {
         assert!(sched.should_update(3));
         assert!(!sched.should_update(4));
         assert!(sched.should_update(7));
+    }
+
+    // ── set_accumulation_steps / should_update(0) panic sweep ────────────────
+
+    #[test]
+    fn test_scheduler_should_update_zero_steps_no_panic() {
+        // Bypass the validating constructor via a direct struct literal (as
+        // a misused external caller might, since the fields are `pub`).
+        let sched = AccumulationScheduler {
+            initial_steps: 0,
+            target_steps: 4,
+            switch_at_step: 100,
+            current_training_step: 0,
+        };
+        // Must not panic (modulo/division by zero, or a `0 - 1` underflow).
+        assert!(sched.should_update(0));
+        assert!(sched.should_update(12345));
+    }
+
+    #[test]
+    fn test_set_accumulation_steps_updates_config_and_validates() {
+        let mut acc = make_acc(4, GradNormalization::MeanOverSteps);
+        acc.set_accumulation_steps(10).expect("valid");
+        assert_eq!(acc.config.accumulation_steps, 10);
+
+        let err = acc.set_accumulation_steps(0);
+        assert!(matches!(err, Err(AccumulationError::InvalidConfig(_))));
+        // A rejected update must not have mutated the config.
+        assert_eq!(acc.config.accumulation_steps, 10);
+    }
+
+    // ── AccumulationMonitor::with_scheduler ───────────────────────────────────
+
+    #[test]
+    fn test_monitor_with_scheduler_changes_effective_accumulation_steps() {
+        // Base config uses accumulation_steps=99 -- irrelevant once the
+        // scheduler is attached, since its value takes over on the very
+        // first `step()` call.
+        let config = AccumulationConfig {
+            accumulation_steps: 99,
+            normalization: GradNormalization::MeanOverSteps,
+            auto_clear: true,
+        };
+        let scheduler = AccumulationScheduler::new(2, 5, 4).expect("valid scheduler");
+        let mut monitor = AccumulationMonitor::new(config)
+            .expect("new")
+            .with_scheduler(scheduler);
+
+        let g = vec![vec![1.0_f32]];
+        // Before switch_at_step=4: scheduler reports initial_steps=2, so an
+        // update should fire every 2 micro-steps.
+        let r1 = monitor.step(&g, 1).expect("step 1");
+        assert!(r1.is_none(), "1 of 2 accumulated");
+        let r2 = monitor.step(&g, 1).expect("step 2");
+        assert!(r2.is_some(), "2 of 2 accumulated -> update");
+
+        let r3 = monitor.step(&g, 1).expect("step 3");
+        assert!(r3.is_none(), "1 of 2 accumulated (still initial_steps)");
+        let r4 = monitor.step(&g, 1).expect("step 4");
+        assert!(r4.is_some(), "2 of 2 accumulated -> update");
+
+        // By now the scheduler's internal training-step counter has
+        // advanced to 4, at/after switch_at_step=4, so the accumulation
+        // window should have grown to target_steps=5.
+        assert_eq!(
+            monitor
+                .scheduler()
+                .expect("scheduler attached")
+                .current_accumulation_steps(),
+            5,
+            "scheduler should have switched to target_steps by now"
+        );
+        for i in 0..4 {
+            let r = monitor.step(&g, 1).expect("mid-window step");
+            assert!(r.is_none(), "step {i} of 5 should not update yet");
+        }
+        let r_final = monitor.step(&g, 1).expect("5th step");
+        assert!(r_final.is_some(), "5 of 5 accumulated -> update");
+    }
+
+    // ── Regression (F284): the monitor's norm buffer is a bounded window ─────
+    // `grad_norms` used to be an unbounded `Vec<f32>` pushed once per
+    // micro-step, so it grew for the whole training run. The window is now
+    // bounded, and `mean_grad_norm` must still be the mean over *every*
+    // recorded micro-step, not just the retained tail.
+    #[test]
+    fn test_monitor_grad_norms_bounded_but_mean_covers_all_steps() {
+        let config = make_config(1, GradNormalization::MeanOverSteps);
+        let mut monitor =
+            AccumulationMonitor::with_grad_norm_window(config, 4).expect("window 4 is valid");
+        assert_eq!(monitor.grad_norm_window(), 4);
+
+        // 100 micro-steps with norms 1.0 .. 100.0 (single-element gradients,
+        // so the L2 norm is the element itself).
+        for i in 1..=100 {
+            monitor.step(&[vec![i as f32]], 1).expect("step");
+        }
+
+        let recent = monitor.recent_grad_norms();
+        assert_eq!(recent.len(), 4, "norm buffer must stay bounded");
+        for (j, &v) in recent.iter().enumerate() {
+            let expected = (97 + j) as f32;
+            assert!(
+                (v - expected).abs() < 1e-3,
+                "entry {j} was {v}, expected {expected}"
+            );
+        }
+
+        // Mean over all 100 steps = (1 + ... + 100) / 100 = 50.5, NOT the
+        // mean of the retained window (98.5).
+        let stats = monitor.stats();
+        assert!(
+            (stats.mean_grad_norm - 50.5).abs() < 1e-2,
+            "mean_grad_norm must cover every step, got {}",
+            stats.mean_grad_norm
+        );
+        assert_eq!(stats.total_steps, 100);
+    }
+
+    #[test]
+    fn test_monitor_zero_grad_norm_window_is_rejected() {
+        let config = make_config(2, GradNormalization::MeanOverSteps);
+        let err = AccumulationMonitor::with_grad_norm_window(config, 0)
+            .expect_err("zero window must be rejected");
+        assert!(matches!(err, AccumulationError::InvalidConfig(_)));
+    }
+
+    // ── Regression (F285): batch_sizes feeds real window statistics ──────────
+    // The field was pushed and cleared but never read by anything.
+    #[test]
+    fn test_window_batch_size_statistics() {
+        let config = AccumulationConfig {
+            accumulation_steps: 3,
+            normalization: GradNormalization::TotalBatchSize,
+            auto_clear: false,
+        };
+        let mut acc = GradientAccumulator::new(config).expect("new");
+        acc.initialize(&[1]).expect("init");
+        assert!(acc.window_batch_sizes().is_empty());
+        assert!(acc.mean_batch_size().is_none());
+        assert!(acc.batch_size_imbalance().is_none());
+
+        acc.accumulate(&[vec![1.0_f32]], 2).expect("s1");
+        acc.accumulate(&[vec![1.0_f32]], 4).expect("s2");
+        acc.accumulate(&[vec![1.0_f32]], 6).expect("s3");
+
+        assert_eq!(acc.window_batch_sizes(), &[2, 4, 6]);
+        assert_eq!(acc.window_total_samples(), 12);
+        let mean = acc.mean_batch_size().expect("window is non-empty");
+        assert!((mean - 4.0).abs() < 1e-6, "mean batch size was {mean}");
+        let imbalance = acc.batch_size_imbalance().expect("window is non-empty");
+        assert!((imbalance - 3.0).abs() < 1e-6, "imbalance was {imbalance}");
+
+        let status = acc.format_status();
+        assert!(status.contains("samples=12"), "status: {status}");
+        assert!(status.contains("mean_batch=4.00"), "status: {status}");
+        assert!(status.contains("imbalance=3.00"), "status: {status}");
+
+        // Clearing the window resets the statistics with it.
+        acc.clear();
+        assert!(acc.window_batch_sizes().is_empty());
+        assert!(acc.mean_batch_size().is_none());
+        assert!(!acc.format_status().contains("mean_batch"));
+    }
+
+    #[test]
+    fn test_batch_size_imbalance_none_on_zero_sized_micro_batch() {
+        let mut acc = make_acc(2, GradNormalization::MeanOverSteps);
+        acc.initialize(&[1]).expect("init");
+        acc.accumulate(&[vec![1.0_f32]], 0).expect("s1");
+        acc.accumulate(&[vec![1.0_f32]], 4).expect("s2");
+        assert!(
+            acc.batch_size_imbalance().is_none(),
+            "a zero-sized micro-batch has no finite imbalance ratio"
+        );
+        // The mean is still well defined.
+        let mean = acc.mean_batch_size().expect("window is non-empty");
+        assert!((mean - 2.0).abs() < 1e-6, "mean batch size was {mean}");
+    }
+
+    #[test]
+    fn test_monitor_without_scheduler_has_none() {
+        let config = make_config(4, GradNormalization::MeanOverSteps);
+        let monitor = AccumulationMonitor::new(config).expect("new");
+        assert!(monitor.scheduler().is_none());
     }
 }

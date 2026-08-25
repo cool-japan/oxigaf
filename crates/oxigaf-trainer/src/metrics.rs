@@ -14,7 +14,12 @@ use crate::loss;
 ///
 /// $\text{PSNR} = -10 \log_{10}(\text{MSE})$  (for peak value = 1).
 pub fn psnr(pred: &[f32], target: &[f32]) -> f32 {
-    if pred.is_empty() || target.is_empty() {
+    if pred.is_empty() || target.is_empty() || pred.len() != target.len() {
+        // A length mismatch means `pred`/`target` are not comparable at
+        // all — report the worst possible score (matching the empty-input
+        // convention below) rather than silently computing MSE over the
+        // zipped/truncated shorter length and dividing by the longer
+        // length's count, which understates the true error.
         return 0.0;
     }
     let mse: f32 = pred
@@ -48,7 +53,17 @@ pub fn psnr_from_mse(mse: f32) -> f32 {
 // ---------------------------------------------------------------------------
 
 /// Compute mean SSIM ∈ [0, 1] between two HWC float images.
+///
+/// Returns `0.0` (the worst possible score) if either buffer is smaller
+/// than `width * height * 3`, rather than delegating straight into
+/// [`loss::ssim_loss`]: that function's own size-mismatch short-circuit
+/// returns `0.0` *dissimilarity*, which this function would otherwise
+/// invert into a perfect `1.0` similarity score for a broken input.
 pub fn ssim(pred: &[f32], target: &[f32], width: usize, height: usize) -> f32 {
+    let expected_len = width.saturating_mul(height).saturating_mul(3);
+    if pred.len() < expected_len || target.len() < expected_len {
+        return 0.0;
+    }
     let kernel = loss::gaussian_kernel_1d(11, 1.5);
     // ssim_loss returns 1 − SSIM, so invert.
     1.0 - loss::ssim_loss(pred, target, width, height, &kernel)
@@ -196,6 +211,32 @@ mod tests {
         let val = psnr(&a, &b);
         assert!(val.is_finite());
         assert!(val < 10.0);
+    }
+
+    #[test]
+    fn psnr_length_mismatch_returns_worst_score_not_inflated() {
+        // Regression: `pred` (1000 identical-to-`target` elements plus a lot
+        // of extra padding) used to be zipped against a much shorter
+        // `target` (truncating at 100), then divided by `pred.len()`
+        // (1000) instead of the zipped count (100) — silently deflating
+        // the MSE by 10x and inflating PSNR by ~10 dB. A mismatch must now
+        // report the worst score (0.0) instead of a plausible-looking one.
+        let target = vec![0.0_f32; 100];
+        let mut pred = vec![0.0_f32; 100];
+        pred.extend(vec![1.0_f32; 900]);
+        assert_eq!(pred.len(), 1000);
+        assert_eq!(psnr(&pred, &target), 0.0);
+    }
+
+    #[test]
+    fn ssim_size_mismatch_returns_worst_score_not_perfect() {
+        // Regression: a buffer smaller than width*height*3 used to fall
+        // through to `loss::ssim_loss`'s own `return 0.0` (dissimilarity)
+        // short-circuit, which `ssim()` then inverted into a perfect 1.0
+        // similarity score instead of signalling the broken input.
+        let target = vec![0.5_f32; 4 * 4 * 3];
+        let pred_too_small = vec![0.5_f32; 4 * 4 * 3 - 1];
+        assert_eq!(ssim(&pred_too_small, &target, 4, 4), 0.0);
     }
 
     #[test]

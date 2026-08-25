@@ -9,20 +9,20 @@
 //
 // Bindings
 // ────────
+// This is a GENERIC one-buffer-at-a-time converter: it holds exactly three
+// bindings and the caller re-binds and re-dispatches it once per gradient
+// buffer (rasterizer.rs does so for grad_means2d, grad_conics and grad_colors;
+// grad_opacities needs no conversion because it is read back as raw bytes).
+//
 // group:binding  type              description
-//    0:0         storage (ro)      src_colors     — atomic<u32> grad_colors
-//    0:1         storage (ro)      src_opacities  — atomic<u32> grad_opacities
-//    0:2         storage (ro)      src_means2d    — atomic<u32> grad_means2d
-//    0:3         storage (ro)      src_conics     — atomic<u32> grad_conics
-//    0:4         storage (rw)      dst_colors     — f32 grad_colors
-//    0:5         storage (rw)      dst_opacities  — f32 grad_opacities
-//    0:6         storage (rw)      dst_means2d    — f32 grad_means2d
-//    0:7         storage (rw)      dst_conics     — f32 grad_conics
-//    0:8         uniform (vec4u)   params         — x = num_gaussians
+//    0:0         uniform (u32)     num_elements — number of f32 SLOTS to copy
+//    0:1         storage (rw)      atomic_buffer — atomic<u32> source
+//    0:2         storage (rw)      f32_buffer    — f32 destination
 //
 // Dispatch dimensions
 // ───────────────────
-// 1D: ceil(num_gaussians / 256) × 256 threads.
+// 1D: ceil(num_elements / 256) × 256 threads.  The unit is ELEMENTS, not
+// Gaussians: callers pass `n * 2` for means2d and `n * 3` for conics/colors.
 //
 // Math
 // ────

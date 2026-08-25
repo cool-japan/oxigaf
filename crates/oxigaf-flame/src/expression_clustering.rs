@@ -766,10 +766,7 @@ pub fn describe_clusters(
     // calling `cluster_members` (an O(n) scan) once per cluster.
     let membership = result.membership_table();
 
-    for id in 0..k {
-        let centroid = &result.centroids[id];
-        let members = membership[id].clone();
-
+    for (id, (centroid, members)) in result.centroids.iter().zip(membership).enumerate() {
         let mut sum_dist = 0.0_f32;
         let mut max_dist = 0.0_f32;
         for &m in &members {
@@ -1448,9 +1445,9 @@ mod tests {
         };
         let table = result.membership_table();
         assert_eq!(table.len(), 3);
-        for id in 0..3 {
-            assert_eq!(table[id], result.cluster_members(id), "cluster {id}");
-            assert_eq!(table[id].len(), result.cluster_size(id), "cluster {id}");
+        for (id, members) in table.iter().enumerate() {
+            assert_eq!(members, &result.cluster_members(id), "cluster {id}");
+            assert_eq!(members.len(), result.cluster_size(id), "cluster {id}");
         }
     }
 

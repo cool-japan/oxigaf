@@ -90,6 +90,14 @@ pub struct StepDecaySchedule {
 
 impl LrSchedule for StepDecaySchedule {
     fn lr_at(&self, step: usize) -> f64 {
+        // `StepDecaySchedule` has all-`pub` fields, so a struct literal can
+        // bypass the `step_size == 0` check in `LrScheduler::step_decay`.
+        // Guard here too (matching `CyclicSchedule::lr_at`'s guard on its
+        // own divisor) so the public `lr_at` trait method never divides by
+        // zero.
+        if self.step_size == 0 {
+            return self.base_lr;
+        }
         let exponent = step / self.step_size; // integer floor division
         self.base_lr * self.decay_factor.powi(exponent as i32)
     }
@@ -726,6 +734,22 @@ mod tests {
             "floor: step 5 starts bucket 1"
         );
         Ok(())
+    }
+
+    // ── 3b. StepDecay: zero step_size must not panic ──────────────────────────
+
+    #[test]
+    fn test_step_decay_zero_step_size_no_panic() {
+        // `StepDecaySchedule` has all-`pub` fields, so a struct literal can
+        // bypass `LrScheduler::step_decay`'s `step_size == 0` validation.
+        // `lr_at` must still not divide by zero.
+        let sched = StepDecaySchedule {
+            base_lr: 1e-3,
+            decay_factor: 0.5,
+            step_size: 0,
+        };
+        assert!((sched.lr_at(0) - 1e-3).abs() < EPS);
+        assert!((sched.lr_at(100) - 1e-3).abs() < EPS);
     }
 
     // ── 4. Exponential: decay per step is geometric ───────────────────────────

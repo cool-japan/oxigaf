@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use oxigaf_render::camera_path::{keyframe_to_render_camera, CameraKeyframe};
 use oxigaf_render::gaussian::GaussianModel;
+use oxigaf_render::gltf::GltfError;
 use oxigaf_render::{RasterConfig, Rasterizer, RenderCamera};
 
 use super::OxigafError;
@@ -381,12 +382,6 @@ pub fn export<P: AsRef<Path>, Q: AsRef<Path>>(
 /// Degree-0 spherical-harmonics basis constant, `0.5 / sqrt(pi)`.
 const SH_C0: f32 = 0.282_094_79;
 
-/// glTF `componentType` value for 32-bit floats.
-const GLTF_COMPONENT_TYPE_FLOAT: u32 = 5126;
-
-/// glTF primitive `mode` value for `POINTS`.
-const GLTF_MODE_POINTS: u32 = 0;
-
 /// Number of spherical-harmonics floats stored per Gaussian: `(degree + 1)² × 3`.
 fn sh_coeffs_per_gaussian(sh_degree: u32) -> usize {
     let bands = (sh_degree + 1) as usize;
@@ -403,30 +398,6 @@ fn dc_color(sh_coeffs: &[f32], base: usize) -> [f32; 3] {
         (0.5 + SH_C0 * dc).clamp(0.0, 1.0)
     };
     [channel(0), channel(1), channel(2)]
-}
-
-/// Escape a string so it can be embedded inside a JSON string literal.
-fn json_escape(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    for ch in input.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out
-}
-
-/// Append little-endian `f32` values to a byte buffer.
-fn append_f32_le(buf: &mut Vec<u8>, values: &[f32]) {
-    for value in values {
-        buf.extend_from_slice(&value.to_le_bytes());
-    }
 }
 
 /// Write a Gaussian model as a Wavefront OBJ point cloud.
@@ -465,216 +436,36 @@ fn write_obj(model: &GaussianModel, path: &Path) -> Result<(), OxigafError> {
 
 /// Write a Gaussian model as a glTF 2.0 document plus a binary buffer sidecar.
 ///
-/// Two files are produced:
+/// This is a thin adapter over [`oxigaf_render::gltf::write_gltf`], which is
+/// the workspace's single glTF writer — see that module for the file layout,
+/// the binary buffer layout, and the specification requirements it satisfies.
 ///
-/// * `path` — the JSON glTF document,
-/// * `path` with the extension replaced by `bin` — the raw little-endian
-///   `f32` attribute buffer, referenced by its file name from the document.
+/// The implementation used to live here, duplicated (incompatibly) by
+/// `oxigaf_cli::export_gltf` and again by `oxigaf_cli::export`'s GLB writer.
+/// Three emitters sharing one format name meant a consumer written against one
+/// silently mis-read the others; hoisting the writer into `oxigaf-render`,
+/// which both crates already depend on, is what makes that impossible.
 ///
-/// The buffer is written first so a failed write never leaves a JSON document
-/// pointing at a missing file.
-///
-/// Positions are exposed through the standard `POSITION` attribute of a
-/// `POINTS` primitive, so ordinary glTF viewers show the model as a point
-/// cloud. Attributes with no standard glTF equivalent (rotation, scale,
-/// opacity and the SH coefficients) are reachable through the custom
-/// `OXIGAF_gaussian_splat` extension, which records their accessor indices.
-/// Each accessor owns its own buffer view, so no `byteStride` is required.
+/// Only the error type differs from the hoisted writer: a path that collides
+/// with its own `.bin` sidecar (or yields no usable buffer file name) is a
+/// caller mistake and keeps surfacing as [`OxigafError::InvalidConfig`], while
+/// a filesystem failure stays an [`OxigafError::Io`] carrying the original
+/// [`std::io::Error`] — the two must not collapse into one message, or a full
+/// disk would be reported as a bad output path.
 fn write_gltf(model: &GaussianModel, path: &Path) -> Result<(), OxigafError> {
-    let count = model.len();
-    let sh_degree = model.sh_degree;
-
-    // An empty model has no buffer to point at, and glTF forbids zero-length
-    // buffers and buffer views. `scene`, `scenes` and `nodes` are optional but
-    // may not be empty arrays (`minItems: 1`), so omit them entirely and emit
-    // an asset-only document. No `.bin` sidecar is produced.
-    if count == 0 {
-        let file = std::fs::File::create(path)?;
-        let mut w = BufWriter::new(file);
-        write_gltf_header(&mut w)?;
-        writeln!(w, r#"  "extensionsUsed": ["OXIGAF_gaussian_splat"],"#)?;
-        writeln!(
-            w,
-            r#"  "extensions": {{ "OXIGAF_gaussian_splat": {{ "gaussianCount": 0, "shDegree": {sh_degree} }} }}"#
-        )?;
-        writeln!(w, "}}")?;
-        w.flush()?;
-        return Ok(());
-    }
-
-    let stride = sh_coeffs_per_gaussian(sh_degree);
-    let sh_len = count * stride;
-
-    // --- Binary buffer: five tightly-packed f32 blocks, all 4-byte aligned ---
-    let mut bin = Vec::<u8>::with_capacity(count * (3 + 4 + 3 + 1 + stride) * 4);
-
-    let positions_offset = bin.len();
-    for gaussian in &model.gaussians {
-        append_f32_le(&mut bin, &gaussian.position);
-    }
-    let rotations_offset = bin.len();
-    for gaussian in &model.gaussians {
-        append_f32_le(&mut bin, &gaussian.rotation);
-    }
-    let scales_offset = bin.len();
-    for gaussian in &model.gaussians {
-        append_f32_le(&mut bin, &gaussian.scale);
-    }
-    let opacities_offset = bin.len();
-    for gaussian in &model.gaussians {
-        append_f32_le(&mut bin, &[gaussian.opacity]);
-    }
-    let sh_offset = bin.len();
-    let mut sh_coeffs = model.sh_coeffs.clone();
-    // Pad or trim so the accessor count always matches the declared stride.
-    sh_coeffs.resize(sh_len, 0.0);
-    append_f32_le(&mut bin, &sh_coeffs);
-
-    let bin_path = path.with_extension("bin");
-    if bin_path.as_path() == path {
-        return Err(OxigafError::InvalidConfig(format!(
-            "glTF output path {} collides with its own .bin buffer sidecar; \
-             use a different extension such as .gltf",
-            path.display()
-        )));
-    }
-    let bin_name = bin_path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .ok_or_else(|| {
-            OxigafError::InvalidConfig(format!(
-                "cannot derive a glTF buffer file name from {}",
-                path.display()
-            ))
-        })?
-        .to_string();
-    let bin_len = bin.len();
-
-    {
-        let file = std::fs::File::create(&bin_path)?;
-        let mut w = BufWriter::new(file);
-        w.write_all(&bin)?;
-        w.flush()?;
-    }
-
-    // --- JSON document ---
-    let file = std::fs::File::create(path)?;
-    let mut w = BufWriter::new(file);
-
-    write_gltf_header(&mut w)?;
-    writeln!(w, r#"  "extensionsUsed": ["OXIGAF_gaussian_splat"],"#)?;
-    writeln!(w, r#"  "scene": 0,"#)?;
-    writeln!(
-        w,
-        r#"  "scenes": [{{ "name": "GaussianScene", "nodes": [0] }}],"#
-    )?;
-    writeln!(w, r#"  "nodes": [{{"#)?;
-    writeln!(w, r#"    "name": "GaussianSplat","#)?;
-    writeln!(w, r#"    "mesh": 0,"#)?;
-    writeln!(w, r#"    "extensions": {{ "OXIGAF_gaussian_splat": {{"#)?;
-    writeln!(w, r#"      "gaussianCount": {count},"#)?;
-    writeln!(w, r#"      "shDegree": {sh_degree},"#)?;
-    writeln!(w, r#"      "positionsAccessor": 0,"#)?;
-    writeln!(w, r#"      "rotationsAccessor": 1,"#)?;
-    writeln!(w, r#"      "scalesAccessor": 2,"#)?;
-    writeln!(w, r#"      "opacitiesAccessor": 3,"#)?;
-    writeln!(w, r#"      "shCoefficientsAccessor": 4"#)?;
-    writeln!(w, r#"    }} }}"#)?;
-    writeln!(w, r#"  }}],"#)?;
-    writeln!(
-        w,
-        r#"  "meshes": [{{ "name": "GaussianMesh", "primitives": [{{ "attributes": {{ "POSITION": 0 }}, "mode": {mode} }}] }}],"#,
-        mode = GLTF_MODE_POINTS
-    )?;
-    writeln!(
-        w,
-        r#"  "buffers": [{{ "uri": "{}", "byteLength": {bin_len} }}],"#,
-        json_escape(&bin_name)
-    )?;
-
-    writeln!(w, r#"  "bufferViews": ["#)?;
-    write_gltf_buffer_view(&mut w, positions_offset, count * 3 * 4, true)?;
-    write_gltf_buffer_view(&mut w, rotations_offset, count * 4 * 4, true)?;
-    write_gltf_buffer_view(&mut w, scales_offset, count * 3 * 4, true)?;
-    write_gltf_buffer_view(&mut w, opacities_offset, count * 4, true)?;
-    write_gltf_buffer_view(&mut w, sh_offset, sh_len * 4, false)?;
-    writeln!(w, r#"  ],"#)?;
-
-    // The POSITION accessor is required by the glTF spec to carry min/max.
-    let (min, max) = bounding_box(model).unwrap_or(([0.0; 3], [0.0; 3]));
-    writeln!(w, r#"  "accessors": ["#)?;
-    writeln!(
-        w,
-        r#"    {{ "bufferView": 0, "byteOffset": 0, "componentType": {ct}, "count": {count}, "type": "VEC3", "min": [{min_x}, {min_y}, {min_z}], "max": [{max_x}, {max_y}, {max_z}] }},"#,
-        ct = GLTF_COMPONENT_TYPE_FLOAT,
-        min_x = min[0],
-        min_y = min[1],
-        min_z = min[2],
-        max_x = max[0],
-        max_y = max[1],
-        max_z = max[2]
-    )?;
-    write_gltf_accessor(&mut w, 1, count, "VEC4", true)?;
-    write_gltf_accessor(&mut w, 2, count, "VEC3", true)?;
-    write_gltf_accessor(&mut w, 3, count, "SCALAR", true)?;
-    write_gltf_accessor(&mut w, 4, sh_len, "SCALAR", false)?;
-    writeln!(w, r#"  ],"#)?;
-
-    writeln!(
-        w,
-        r#"  "extensions": {{ "OXIGAF_gaussian_splat": {{ "gaussianCount": {count}, "shDegree": {sh_degree} }} }}"#
-    )?;
-    writeln!(w, "}}")?;
-    w.flush()?;
-
-    Ok(())
-}
-
-/// Write the opening brace and `asset` block shared by every glTF document.
-fn write_gltf_header<W: Write>(w: &mut W) -> Result<(), OxigafError> {
-    writeln!(w, "{{")?;
-    writeln!(
-        w,
-        r#"  "asset": {{ "version": "2.0", "generator": "OxiGAF v{}" }},"#,
-        json_escape(env!("CARGO_PKG_VERSION"))
-    )?;
-    Ok(())
-}
-
-/// Write one glTF `bufferView` entry over the single binary buffer.
-///
-/// `trailing_comma` must be `false` for the final entry of the array.
-fn write_gltf_buffer_view<W: Write>(
-    w: &mut W,
-    byte_offset: usize,
-    byte_length: usize,
-    trailing_comma: bool,
-) -> Result<(), OxigafError> {
-    let comma = if trailing_comma { "," } else { "" };
-    writeln!(
-        w,
-        r#"    {{ "buffer": 0, "byteOffset": {byte_offset}, "byteLength": {byte_length} }}{comma}"#
-    )?;
-    Ok(())
-}
-
-/// Write one glTF `accessor` entry that owns buffer view `buffer_view`.
-///
-/// `trailing_comma` must be `false` for the final entry of the array.
-fn write_gltf_accessor<W: Write>(
-    w: &mut W,
-    buffer_view: usize,
-    count: usize,
-    kind: &str,
-    trailing_comma: bool,
-) -> Result<(), OxigafError> {
-    let comma = if trailing_comma { "," } else { "" };
-    writeln!(
-        w,
-        r#"    {{ "bufferView": {buffer_view}, "byteOffset": 0, "componentType": {ct}, "count": {count}, "type": "{kind}" }}{comma}"#,
-        ct = GLTF_COMPONENT_TYPE_FLOAT
-    )?;
-    Ok(())
+    oxigaf_render::gltf::write_gltf(model, path).map_err(|e| match e {
+        GltfError::InvalidOutputPath(message) => {
+            OxigafError::InvalidConfig(format!("glTF output path {message}"))
+        }
+        GltfError::Io {
+            action,
+            path,
+            source,
+        } => OxigafError::Io(std::io::Error::new(
+            source.kind(),
+            format!("cannot {action} {}: {source}", path.display()),
+        )),
+    })
 }
 
 // ============================================================================
@@ -758,28 +549,19 @@ pub fn validate_config(config: &PipelineConfig) -> Result<(), OxigafError> {
 /// Returns a `Vec<String>` of file names that are **missing** from
 /// `asset_dir`. An empty vec means all expected assets are present.
 ///
-/// The checked set is exactly the one `oxigaf_flame::io::load_flame_model`
-/// reads, which is what `scripts/convert_flame.py` writes:
-/// `"v_template.npy"`, `"faces.npy"`, `"shapedirs.npy"`,
-/// `"expressiondirs.npy"`, `"posedirs.npy"`, `"j_regressor.npy"`,
-/// `"kintree_table.npy"`, `"lbs_weights.npy"`.
+/// The checked set is not spelled out here: it is
+/// [`oxigaf_flame::io::REQUIRED_NPY_FILES`], the same constant
+/// `oxigaf_flame::io::load_flame_model` names each of its `.npy` inputs with.
+/// Sharing the constant — rather than repeating the names in a second list, as
+/// this function used to — is what stops the two from drifting apart, which
+/// they already had once (`shape_dirs.npy` / `J_regressor.npy` were checked
+/// while the loader opened `shapedirs.npy` / `j_regressor.npy`).
 ///
 /// The names are compared exactly as spelled, so a directory that satisfies
 /// this check also loads on case-sensitive filesystems.
 pub fn verify_assets<P: AsRef<Path>>(asset_dir: P) -> Vec<String> {
-    const EXPECTED: &[&str] = &[
-        "v_template.npy",
-        "faces.npy",
-        "shapedirs.npy",
-        "expressiondirs.npy",
-        "posedirs.npy",
-        "j_regressor.npy",
-        "kintree_table.npy",
-        "lbs_weights.npy",
-    ];
-
     let dir = asset_dir.as_ref();
-    EXPECTED
+    oxigaf_flame::io::REQUIRED_NPY_FILES
         .iter()
         .filter(|&&name| !dir.join(name).exists())
         .map(|&s| s.to_string())
@@ -828,16 +610,14 @@ mod tests {
     use oxigaf_render::gaussian::GaussianAttributes;
 
     /// The exact file set read by `oxigaf_flame::io::load_flame_model`.
-    const LOADER_NPY_FILES: &[&str] = &[
-        "v_template.npy",
-        "faces.npy",
-        "shapedirs.npy",
-        "expressiondirs.npy",
-        "posedirs.npy",
-        "j_regressor.npy",
-        "kintree_table.npy",
-        "lbs_weights.npy",
-    ];
+    ///
+    /// This deliberately aliases the loader's own constant rather than
+    /// restating the names: a second literal list here would be a third copy
+    /// able to drift, and a test that agrees with a stale copy of the list
+    /// proves nothing. `oxigaf_flame` owns the "is every listed name really
+    /// opened?" direction (see its `io::tests`); these tests only assert that
+    /// `verify_assets` checks exactly that set.
+    const LOADER_NPY_FILES: &[&str] = oxigaf_flame::io::REQUIRED_NPY_FILES;
 
     /// Create a fresh temporary directory dedicated to one test.
     fn temp_subdir(name: &str) -> PathBuf {
@@ -955,6 +735,28 @@ mod tests {
                 "{stale} is not read by the FLAME loader and must not be checked"
             );
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_assets_reports_the_loaders_own_list_verbatim() {
+        // The drift guard itself: `verify_assets` must derive its file set
+        // from `oxigaf_flame::io::REQUIRED_NPY_FILES`, not from a private copy
+        // that can fall behind. Against an empty directory the reported
+        // missing set is the checked set, so comparing it to the loader's
+        // constant — order included — pins the wiring rather than the names.
+        let dir = temp_subdir("verify_assets_shared_const");
+
+        let expected: Vec<String> = oxigaf_flame::io::REQUIRED_NPY_FILES
+            .iter()
+            .map(|&s| s.to_string())
+            .collect();
+        assert_eq!(
+            verify_assets(&dir),
+            expected,
+            "verify_assets must check exactly oxigaf_flame::io::REQUIRED_NPY_FILES"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1227,14 +1029,9 @@ mod tests {
 
     // ---- helpers ----
 
-    #[test]
-    fn json_escape_handles_quotes_backslashes_and_controls() {
-        assert_eq!(json_escape("plain"), "plain");
-        assert_eq!(json_escape("a\"b"), "a\\\"b");
-        assert_eq!(json_escape("a\\b"), "a\\\\b");
-        assert_eq!(json_escape("a\nb"), "a\\nb");
-        assert_eq!(json_escape("a\u{1}b"), "a\\u0001b");
-    }
+    // `json_escape` moved to `oxigaf_render::gltf` along with the glTF writer
+    // that was its only caller; its unit test moved with it. The remaining
+    // OBJ writer needs no escaping (it emits no quoted strings).
 
     #[test]
     fn sh_coeffs_per_gaussian_matches_the_ply_layout() {

@@ -82,7 +82,7 @@ impl ImageQualityMetrics {
     /// with [`Self::ssim`]'s `None` case to surface that distinctly to a
     /// caller who cares, e.g. as [`check_quality`] does.
     pub fn passes_threshold(&self, min_psnr: f32, min_ssim: f32) -> bool {
-        self.psnr >= min_psnr && self.ssim.map_or(true, |s| s >= min_ssim)
+        self.psnr >= min_psnr && self.ssim.is_none_or(|s| s >= min_ssim)
     }
 
     /// Returns a single-line human-readable summary of the key metrics.
@@ -1392,7 +1392,11 @@ mod tests {
         let ssim = m
             .ssim
             .expect("32x32 should produce enough patches to evaluate");
-        assert!(ssim >= 0.0 && ssim <= 1.0001, "SSIM out of range: {}", ssim);
+        assert!(
+            (0.0..=1.0001).contains(&ssim),
+            "SSIM out of range: {}",
+            ssim
+        );
     }
 
     // -----------------------------------------------------------------------

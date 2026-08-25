@@ -20,12 +20,30 @@ const SH_C0: f32 = 0.282_094_8_f32;
 const SH_C1: f32 = 0.488_602_52_f32;
 
 /// L=2 SH normalisation constants (five, one per m-index).
+///
+/// `m=-1` and `m=+1` carry a negative sign to match the 3DGS convention
+/// used by the rest of the crate - see `shaders/preprocess.wgsl`'s
+/// `SH_C2_1`/`SH_C2_3` and `cpu_reference.rs`'s `SH_C2_1`/`SH_C2_3`, both
+/// of which are `-1.092_548_5`.
 const SH_C2: [f32; 5] = [
     1.092_548_5_f32,  // m=-2: sqrt(15/(4*pi))
-    1.092_548_5_f32,  // m=-1: sqrt(15/(4*pi))
+    -1.092_548_5_f32, // m=-1: -sqrt(15/(4*pi))
     0.315_391_57_f32, // m= 0: sqrt(5/(16*pi))
-    1.092_548_5_f32,  // m=+1: sqrt(15/(4*pi))
+    -1.092_548_5_f32, // m=+1: -sqrt(15/(4*pi))
     0.546_274_24_f32, // m=+2: sqrt(15/(16*pi))
+];
+
+/// L=3 SH normalisation constants (seven, one per m-index), matching
+/// `shaders/preprocess.wgsl`'s `SH_C3_0..SH_C3_6` and `cpu_reference.rs`'s
+/// identical constants exactly (values and signs).
+const SH_C3: [f32; 7] = [
+    -0.590_043_6_f32, // m=-3
+    2.890_611_4_f32,  // m=-2
+    -0.457_045_8_f32, // m=-1
+    0.373_176_33_f32, // m= 0
+    -0.457_045_8_f32, // m=+1
+    1.445_305_7_f32,  // m=+2
+    -0.590_043_6_f32, // m=+3
 ];
 
 // ---------------------------------------------------------------------------
@@ -37,6 +55,18 @@ const SH_C2: [f32; 5] = [
 /// `direction` must be a unit vector `[x, y, z]`.
 ///
 /// Returns `[Y_0_0, Y_1_{-1}, Y_1_0, Y_1_1, Y_2_{-2}, Y_2_{-1}, Y_2_0, Y_2_1, Y_2_2]`.
+///
+/// Sign convention: `Y_1_{-1}` and `Y_1_1` (and, via the `SH_C2`
+/// coefficients, `Y_2_{-1}` and `Y_2_1`) are negated relative to the
+/// textbook real-SH basis, to match
+/// the 3DGS convention this crate's rasterizer actually uses - see
+/// `shaders/preprocess.wgsl`'s `l1_weights = SH_C1 * vec3(-y, z, -x)` and
+/// `cpu_reference.rs`'s identical `SH_C1 * (-y)` / `SH_C1 * (-x)` terms,
+/// both of which are exercised by this crate's GPU-vs-CPU gradient
+/// verification tests. Every caller of this function (per-Gaussian SH
+/// evaluation, environment-map SH projection) must agree with the shader on
+/// this sign or view-dependent colour comes out mirrored for every
+/// Gaussian with `sh_degree >= 1`.
 pub fn sh_basis_up_to_l2(direction: [f32; 3]) -> [f32; 9] {
     let x = direction[0];
     let y = direction[1];
@@ -46,15 +76,57 @@ pub fn sh_basis_up_to_l2(direction: [f32; 3]) -> [f32; 9] {
         // L=0
         SH_C0,
         // L=1
-        SH_C1 * y,
+        -SH_C1 * y,
         SH_C1 * z,
-        SH_C1 * x,
+        -SH_C1 * x,
         // L=2
         SH_C2[0] * (x * y),
         SH_C2[1] * (y * z),
         SH_C2[2] * (3.0 * z * z - 1.0),
         SH_C2[3] * (x * z),
         SH_C2[4] * (x * x - y * y),
+    ]
+}
+
+/// Evaluate the 7 additional degree-L=3 spherical-harmonic basis functions
+/// (`Y_3_{-3}` through `Y_3_{+3}`).
+///
+/// `direction` must be a unit vector `[x, y, z]`. Matches
+/// `shaders/preprocess.wgsl`'s `eval_sh_degree3_optimized` cubic terms and
+/// `cpu_reference.rs` exactly (constants and polynomials).
+fn sh_basis_l3_extra(direction: [f32; 3]) -> [f32; 7] {
+    let x = direction[0];
+    let y = direction[1];
+    let z = direction[2];
+    let xx = x * x;
+    let yy = y * y;
+    let zz = z * z;
+
+    [
+        SH_C3[0] * y * (3.0 * xx - yy),
+        SH_C3[1] * x * y * z,
+        SH_C3[2] * y * (4.0 * zz - xx - yy),
+        SH_C3[3] * z * (2.0 * zz - 3.0 * xx - 3.0 * yy),
+        SH_C3[4] * x * (4.0 * zz - xx - yy),
+        SH_C3[5] * z * (xx - yy),
+        SH_C3[6] * x * (xx - 3.0 * yy),
+    ]
+}
+
+/// Evaluate all 16 spherical-harmonic basis functions through degree L=3.
+///
+/// `direction` must be a unit vector `[x, y, z]`.
+///
+/// Returns the 9 [`sh_basis_up_to_l2`] values followed by the 7 additional
+/// degree-3 values (`Y_3_{-3}` through `Y_3_{+3}`). This is the highest SH
+/// degree [`crate::gaussian::GaussianModel`] supports (48 floats per
+/// Gaussian).
+pub fn sh_basis_up_to_l3(direction: [f32; 3]) -> [f32; 16] {
+    let l2 = sh_basis_up_to_l2(direction);
+    let l3 = sh_basis_l3_extra(direction);
+    [
+        l2[0], l2[1], l2[2], l2[3], l2[4], l2[5], l2[6], l2[7], l2[8], l3[0], l3[1], l3[2], l3[3],
+        l3[4], l3[5], l3[6],
     ]
 }
 
@@ -152,8 +224,18 @@ pub struct EnvironmentMap {
 impl EnvironmentMap {
     /// Construct from existing pixel data.
     ///
-    /// Returns `Err` if `data.len() != width * height * 3`.
+    /// # Errors
+    ///
+    /// - [`RenderError::ValidationError`] if `width == 0` or `height == 0`
+    ///   (a degenerate map has no valid pixel to sample or wrap coordinates
+    ///   against, and would otherwise panic later in [`Self::sample`]).
+    /// - [`RenderError::MismatchedBufferSizes`] if `data.len() != width * height * 3`.
     pub fn new(width: usize, height: usize, data: Vec<f32>) -> Result<Self, RenderError> {
+        if width == 0 || height == 0 {
+            return Err(RenderError::ValidationError(format!(
+                "EnvironmentMap width and height must both be non-zero, got {width}×{height}"
+            )));
+        }
         let expected = width * height * 3;
         if data.len() != expected {
             return Err(RenderError::MismatchedBufferSizes {
@@ -209,11 +291,23 @@ impl EnvironmentMap {
         }
     }
 
-    /// Read pixel `(px, py)` (no bounds-checking clamp is applied; caller ensures validity).
+    /// Read pixel `(px, py)`.
+    ///
+    /// Out-of-range coordinates (including on a degenerate `0×0` map built
+    /// directly via the struct's public fields rather than [`Self::new`])
+    /// return `[0.0, 0.0, 0.0]` rather than panicking - this is a `pub`,
+    /// safe (non-`unsafe`) function, so it must not have a "caller ensures
+    /// validity" panic contract.
     #[inline]
     pub fn pixel(&self, px: usize, py: usize) -> [f32; 3] {
+        if px >= self.width || py >= self.height {
+            return [0.0, 0.0, 0.0];
+        }
         let idx = (py * self.width + px) * 3;
-        [self.data[idx], self.data[idx + 1], self.data[idx + 2]]
+        match self.data.get(idx..idx + 3) {
+            Some(slice) => [slice[0], slice[1], slice[2]],
+            None => [0.0, 0.0, 0.0],
+        }
     }
 
     /// Sample the environment map in the given direction using bilinear interpolation.
@@ -281,14 +375,28 @@ fn lerp_rgb(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
 }
 
 /// Wrap an integer coordinate into `[0, size)`.
+///
+/// Returns `0` for a degenerate `size <= 0` (`coord % 0` would otherwise
+/// panic) rather than requiring every caller to check first - `sample`
+/// only ever reaches this with `self.width`/`self.height` as `size`, and a
+/// `0×0` map has no valid pixel to return regardless.
 #[inline]
 fn wrap_coord(coord: i64, size: i64) -> i64 {
+    if size <= 0 {
+        return 0;
+    }
     ((coord % size) + size) % size
 }
 
 /// Clamp an integer coordinate into `[0, size-1]`.
+///
+/// Returns `0` for a degenerate `size <= 0` (`i64::clamp` panics when
+/// `min > max`, which `0..=size-1` would be) - see `wrap_coord`.
 #[inline]
 fn clamp_coord(coord: i64, size: i64) -> i64 {
+    if size <= 0 {
+        return 0;
+    }
     coord.clamp(0, size - 1)
 }
 
@@ -344,13 +452,22 @@ pub fn project_environment_to_sh(
 /// Evaluate view-dependent colour for a single Gaussian given its SH coefficients.
 ///
 /// `sh_coeffs` layout: `[r0,g0,b0, r1,g1,b1, …]` for SH basis indices 0, 1, 2, …
-/// (length must be a multiple of 3; the number of basis functions used is `len / 3`).
+/// (length must be a multiple of 3; the number of basis functions used is
+/// `(len / 3).min(16)` - i.e. up to degree L=3 / 48 floats, the highest
+/// degree [`crate::gaussian::GaussianModel`] supports. Any coefficients
+/// beyond the 16th basis function are ignored rather than causing an
+/// out-of-bounds panic.
 ///
 /// The result includes the **+0.5** DC offset used in the 3DGS implementation, and
 /// is clamped to `[0, 1]`.
 pub fn evaluate_gaussian_sh(sh_coeffs: &[f32], direction: [f32; 3]) -> [f32; 3] {
-    let num_basis = sh_coeffs.len() / 3;
-    let basis = sh_basis_up_to_l2(direction);
+    // `sh_basis_up_to_l2` alone only has 9 entries, so indexing it with a
+    // degree-3 Gaussian's `num_basis = 16` (48 floats, which
+    // `GaussianModel` supports and its PLY save/load round-trips) panicked
+    // out of bounds. `sh_basis_up_to_l3` always covers the full range this
+    // function can be asked to evaluate.
+    let num_basis = (sh_coeffs.len() / 3).min(16);
+    let basis = sh_basis_up_to_l3(direction);
 
     let mut rgb = [0.5_f32; 3]; // +0.5 DC bias
     for i in 0..num_basis {
@@ -408,16 +525,45 @@ mod tests {
 
     #[test]
     fn test_sh_basis_l1_x_direction() {
-        // For direction [1, 0, 0]: Y_1_1 = SH_C1 * x = SH_C1.
+        // For direction [1, 0, 0]: Y_1_1 = -SH_C1 * x = -SH_C1 (the 3DGS
+        // sign convention negates the m=+1 term - see `sh_basis_up_to_l2`'s
+        // doc and `shaders/preprocess.wgsl`'s `vec3(-y, z, -x)`).
         let b = sh_basis_up_to_l2([1.0, 0.0, 0.0]);
         assert!(
-            approx_eq(b[3], SH_C1, EPS),
-            "Y_1_1 should be SH_C1 for [1,0,0], got {}",
+            approx_eq(b[3], -SH_C1, EPS),
+            "Y_1_1 should be -SH_C1 for [1,0,0], got {}",
             b[3]
         );
         // Y_1_-1 and Y_1_0 should be zero.
         assert!(approx_eq(b[1], 0.0, EPS), "Y_1_-1 != 0 for [1,0,0]");
         assert!(approx_eq(b[2], 0.0, EPS), "Y_1_0 != 0 for [1,0,0]");
+    }
+
+    #[test]
+    fn test_sh_basis_l1_y_direction_matches_3dgs_sign_convention() {
+        // Regression test for the sign-convention bug: for direction
+        // [0,1,0], Y_1_{-1} = -SH_C1*y = -SH_C1 (not +SH_C1), matching
+        // shaders/preprocess.wgsl's `l1_weights = SH_C1 * vec3(-y, z, -x)`
+        // and cpu_reference.rs's identical `SH_C1 * (-y)` term - both are
+        // exercised by this crate's GPU-vs-CPU gradient verification.
+        let b = sh_basis_up_to_l2([0.0, 1.0, 0.0]);
+        assert!(
+            approx_eq(b[1], -SH_C1, EPS),
+            "Y_1_-1 should be -SH_C1 for [0,1,0], got {}",
+            b[1]
+        );
+    }
+
+    #[test]
+    fn test_sh_basis_l2_m_minus1_and_plus1_signs_match_3dgs() {
+        // Regression test: Y_2_{-1} (SH_C2[1]*y*z) and Y_2_{+1}
+        // (SH_C2[3]*x*z) must be negative for a direction with y*z > 0 and
+        // x*z > 0 respectively, matching shaders/preprocess.wgsl's negative
+        // `SH_C2_1`/`SH_C2_3` and cpu_reference.rs's identical constants.
+        let d = [1.0_f32 / 3.0_f32.sqrt(); 3]; // unit vector, all components equal
+        let b = sh_basis_up_to_l2(d);
+        assert!(b[5] < 0.0, "Y_2_-1 should be negative, got {}", b[5]);
+        assert!(b[7] < 0.0, "Y_2_1 should be negative, got {}", b[7]);
     }
 
     #[test]
@@ -547,6 +693,42 @@ mod tests {
         let data = vec![0.0_f32; 5]; // Wrong length.
         let result = EnvironmentMap::new(4, 2, data);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_environment_map_new_rejects_zero_dimensions() {
+        // Regression test: `EnvironmentMap::new(0, 0, vec![])` used to
+        // succeed (`0*0*3 == vec![].len()`) and only panic later, deep
+        // inside `sample`'s coordinate wrapping/clamping.
+        assert!(EnvironmentMap::new(0, 0, vec![]).is_err());
+        assert!(EnvironmentMap::new(0, 5, vec![]).is_err());
+        assert!(EnvironmentMap::new(5, 0, vec![]).is_err());
+    }
+
+    #[test]
+    fn test_environment_map_pixel_out_of_bounds_does_not_panic() {
+        // `solid()` builds a 1x1 map; any out-of-range coordinate must
+        // return a fallback instead of panicking - `pixel` is a safe (not
+        // `unsafe`) public function.
+        let env = EnvironmentMap::solid([0.5, 0.5, 0.5]);
+        assert_eq!(env.pixel(5, 5), [0.0, 0.0, 0.0]);
+        assert_eq!(env.pixel(1, 0), [0.0, 0.0, 0.0]);
+        assert_eq!(env.pixel(0, 1), [0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn test_environment_map_sample_on_degenerate_map_does_not_panic() {
+        // Regression test: a 0x0 map (constructed directly via the
+        // struct's public fields, bypassing `new`'s validation) must not
+        // panic when sampled - `wrap_coord`/`clamp_coord` used to
+        // divide/clamp by a zero size.
+        let env = EnvironmentMap {
+            data: vec![],
+            width: 0,
+            height: 0,
+        };
+        let result = env.sample([0.0, 1.0, 0.0]);
+        assert_eq!(result, [0.0, 0.0, 0.0]);
     }
 
     #[test]
@@ -707,10 +889,10 @@ mod tests {
         coeffs[10] = 0.0;
         coeffs[11] = 0.0;
 
-        let direction = [1.0_f32, 0.0, 0.0]; // x=1 → Y_1_1 = SH_C1
+        let direction = [1.0_f32, 0.0, 0.0]; // x=1 → Y_1_1 = -SH_C1
         let result = evaluate_gaussian_sh(&coeffs, direction);
 
-        // R = clamp(0.5 + 0.5*SH_C0 + 1.0*SH_C1)
+        // R = clamp(0.5 + 0.5*SH_C0 + 1.0*Y_1_1)
         let basis = sh_basis_up_to_l2(direction);
         let expected_r = (0.5 + 0.5 * basis[0] + 1.0 * basis[3]).clamp(0.0, 1.0);
         assert!(
@@ -719,6 +901,57 @@ mod tests {
             result[0],
             expected_r
         );
+    }
+
+    #[test]
+    fn test_evaluate_gaussian_sh_degree_3_does_not_panic() {
+        // Regression test: a full 48-float (16-basis, degree-3) SH
+        // coefficient slice - exactly what `GaussianModel`'s PLY save/load
+        // round-trips for a degree-3 Gaussian - must evaluate without an
+        // out-of-bounds panic (previously indexed a 9-element basis array
+        // with `i` up to 15).
+        let mut coeffs = [0.0_f32; 48];
+        for (i, c) in coeffs.iter_mut().enumerate() {
+            *c = (i as f32) * 0.001;
+        }
+        let direction = [0.577_350_3_f32, 0.577_350_3_f32, 0.577_350_3_f32]; // unit vector
+        let result = evaluate_gaussian_sh(&coeffs, direction);
+        for &v in &result {
+            assert!((0.0..=1.0).contains(&v), "result channel out of [0,1]: {v}");
+        }
+    }
+
+    #[test]
+    fn test_evaluate_gaussian_sh_degree_3_uses_l3_basis() {
+        // Regression test: the 7 degree-3 coefficients (sh_coeffs[27..48])
+        // must actually influence the result - a fix that merely clamped
+        // `num_basis` down to 9 to avoid the panic would silently drop
+        // real degree-3 view-dependent colour data.
+        let mut coeffs = [0.0_f32; 48];
+        coeffs[27] = 1.0; // R channel of the first degree-3 basis function
+        let direction = [0.577_350_3_f32, 0.577_350_3_f32, 0.577_350_3_f32];
+        let result = evaluate_gaussian_sh(&coeffs, direction);
+        let basis = sh_basis_up_to_l3(direction);
+        let expected_r = (0.5 + basis[9]).clamp(0.0, 1.0);
+        assert!(
+            approx_eq(result[0], expected_r, EPS),
+            "expected the degree-3 coefficient to contribute: got {}, expected {}",
+            result[0],
+            expected_r
+        );
+    }
+
+    #[test]
+    fn test_sh_basis_l3_matches_shader_reference() {
+        // Cross-check degree-3 basis values against
+        // shaders/preprocess.wgsl's `eval_sh_degree3_optimized` formulas at
+        // a simple, hand-computable direction.
+        let d = [1.0_f32, 0.0, 0.0];
+        let b = sh_basis_up_to_l3(d);
+        // l3_w0 = SH_C3_0 * y * (3xx - yy) = 0 since y = 0.
+        assert!(approx_eq(b[9], 0.0, EPS));
+        // l3_w6 = SH_C3_6 * x * (xx - 3yy) = SH_C3_6 * 1 * 1 = SH_C3_6.
+        assert!(approx_eq(b[15], SH_C3[6], EPS));
     }
 
     // -----------------------------------------------------------------------

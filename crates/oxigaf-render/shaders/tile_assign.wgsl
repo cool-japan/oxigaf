@@ -27,6 +27,21 @@
 // ────
 // Bounding box: [mean2d − radius, mean2d + radius] converted to tile coordinates.
 // For each covered tile: key = (tile_y * tile_grid_x + tile_x, reinterpret_f32(depth)).
+//
+// Capacity
+// ────────
+// The tile bounding box MUST be derived with the same `uniforms.tile_size` that
+// preprocess.wgsl used to fill `tile_counts`, otherwise the prefix-summed write
+// offsets and the number of entries written here disagree and every Gaussian
+// overruns its neighbour's slot range.
+//
+// `sort_keys` / `sort_values` are allocated for `max_pairs` entries, which is
+// only an estimate (`IntermediateBuffers::estimate_max_pairs`). `arrayLength`
+// gives the real capacity, so the write loop stops instead of letting WGSL
+// bounds-clamping collapse every overflowing pair onto the last slot. The host
+// separately validates the exact pair total against the capacity
+// (`IntermediateBuffers::verify_pair_capacity`) and reports
+// `RenderError::TooManyTilePairs`; this guard is the in-shader safety net.
 
 struct Uniforms {
     view: mat4x4<f32>,
@@ -71,7 +86,9 @@ fn tile_assign(@builtin(global_invocation_id) gid: vec3<u32>) {
     let mean = means2d[idx];
     let depth = depths[idx];
     let r = f32(radius);
-    let tile_size = 16.0;
+    // Must match preprocess.wgsl's `f32(uniforms.tile_size)`; a hardcoded 16.0
+    // here silently desyncs from the prefix-summed tile counts.
+    let tile_size = f32(uniforms.tile_size);
 
     let tile_min_x = u32(max(0, i32(floor((mean.x - r) / tile_size))));
     let tile_max_x = u32(min(i32(uniforms.tile_grid.x) - 1, i32(floor((mean.x + r) / tile_size))));
@@ -91,9 +108,20 @@ fn tile_assign(@builtin(global_invocation_id) gid: vec3<u32>) {
         base_offset = tile_offsets[idx - 1u];
     }
 
+    // Allocated pair capacity: both buffers are sized to max_pairs, so take the
+    // smaller of the two lengths and never write past it.
+    let max_pairs = min(arrayLength(&sort_keys), arrayLength(&sort_values));
+
     var write_idx = base_offset;
     for (var ty = tile_min_y; ty <= tile_max_y; ty++) {
         for (var tx = tile_min_x; tx <= tile_max_x; tx++) {
+            if write_idx >= max_pairs {
+                // Out of capacity: stop rather than let bounds-clamping fold
+                // every remaining pair onto the final slot. There is no
+                // workgroup barrier in this kernel, so returning early from a
+                // subset of threads is safe.
+                return;
+            }
             let tile_id = ty * uniforms.tile_grid.x + tx;
             // Key: high 32 bits = tile_id, low 32 bits = depth
             sort_keys[write_idx] = vec2<u32>(tile_id, depth_bits);

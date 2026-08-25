@@ -26,9 +26,45 @@ pub enum LensDistortionError {
     #[error("Iteration did not converge after {iterations} steps")]
     ConvergenceError { iterations: usize },
 
+    /// The distorted point has no undistorted pre-image: its radius is beyond
+    /// the largest radius the forward model can produce.
+    ///
+    /// The forward radial map `r_d = r_u * (1 + k1*r_u² + k2*r_u⁴ + k3*r_u⁶)`
+    /// is only monotonic up to the first stationary point of that polynomial.
+    /// For barrel distortion (`k1 < 0`) it peaks and then folds back, so
+    /// every distorted radius above the peak is simply outside the image of
+    /// the map -- no undistorted point maps there, and no amount of iterating
+    /// will find one. This is a normal geometric fact (it is what leaves the
+    /// corners of a barrel-distorted frame empty), not a numerical failure,
+    /// which is why it is distinct from
+    /// [`LensDistortionError::ConvergenceError`].
+    #[error(
+        "Distorted radius {r_d} exceeds the model's maximum representable \
+         distorted radius {r_d_max}: no undistorted point maps here"
+    )]
+    OutsideDistortionDomain {
+        /// The distorted radius that was requested.
+        r_d: f32,
+        /// The largest distorted radius the model can produce.
+        r_d_max: f32,
+    },
+
     /// Pixel buffer is empty (zero length).
     #[error("Empty image")]
     EmptyImage,
+
+    /// Pixel buffer length does not match `width * height * 3`.
+    #[error("Image buffer length {actual} does not match {width}×{height}×3 = {expected}")]
+    BufferSizeMismatch {
+        /// Actual buffer length.
+        actual: usize,
+        /// Expected buffer length (`width * height * 3`).
+        expected: usize,
+        /// Stated width.
+        width: usize,
+        /// Stated height.
+        height: usize,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -306,48 +342,51 @@ pub fn distort_point(xu: f32, yu: f32, model: &DistortionModel) -> (f32, f32) {
     }
 }
 
-// Internal fisheye projection types.
-enum FisheyeProjection {
-    Equidistant,
-    Equisolid,
-    Stereographic,
-}
+/// Fisheye projection kernels (forward map plus Newton inverse). In their
+/// own file purely to keep this one under the 2000-line limit.
+mod fisheye;
 
-/// Shared implementation for all fisheye distortion variants.
-fn fisheye_distort(xu: f32, yu: f32, k1: f32, k2: f32, proj: FisheyeProjection) -> (f32, f32) {
-    let r = (xu * xu + yu * yu).sqrt();
-    if r < 1e-9 {
-        return (xu, yu);
-    }
-    // theta = angle of incoming ray from optical axis (in the undistorted pinhole model, r = tan(theta))
-    let theta = r.atan();
-    let theta2 = theta * theta;
-    let theta4 = theta2 * theta2;
+use fisheye::{fisheye_distort, undistort_fisheye, FisheyeProjection};
 
-    // Fisheye distortion polynomial on theta
-    let theta_d = theta * (1.0 + k1 * theta2 + k2 * theta4);
+// ---------------------------------------------------------------------------
+// Radial inversion (exact, on the monotonic branch)
+// ---------------------------------------------------------------------------
 
-    // Map distorted theta to radius in the image plane
-    let r_d = match proj {
-        FisheyeProjection::Equidistant => theta_d,
-        FisheyeProjection::Equisolid => 2.0 * (theta_d / 2.0).sin(),
-        FisheyeProjection::Stereographic => 2.0 * (theta_d / 2.0).tan(),
-    };
+/// Exact inversion of a model's radial term, on the branch where the forward
+/// map is monotonic. Lives in its own file purely to keep this one under the
+/// 2000-line limit.
+mod radial_branch;
 
-    let scale = r_d / r;
-    (xu * scale, yu * scale)
-}
+use radial_branch::RadialBranch;
 
 // ---------------------------------------------------------------------------
 // Iterative undistortion
 // ---------------------------------------------------------------------------
 
-/// Undistort a normalised distorted point using fixed-point iteration.
+/// Undistort a normalised distorted point.
 ///
-/// Iteratively refines the estimate `x_u` until `distort(x_u) ≈ x_d` within
-/// `tol` (L∞ norm) or `max_iters` is reached.
+/// Dispatches to a model-specific inversion:
+/// - [`DistortionModel::Division`]: closed-form via the quadratic formula.
+/// - [`DistortionModel::SimpleRadial`] / [`DistortionModel::BrownConrady`]:
+///   the radial part is inverted *exactly* on its monotonic branch (see
+///   `RadialBranch`), and any tangential terms are then refined with the
+///   OpenCV-style division iteration `xu_{n+1} = (xd - tangential(xu_n)) /
+///   radial(xu_n)` seeded from that exact radial solution.
+/// - Fisheye variants: a 1-D Newton solve for the undistorted ray angle
+///   `theta` on `theta_d = theta*(1 + k1*theta² + k2*theta⁴)`, converging
+///   quadratically instead of linearly.
 ///
-/// Returns [`LensDistortionError::ConvergenceError`] if convergence fails.
+/// `max_iters` and `tol` govern the iterative parts only (the tangential
+/// refinement and the fisheye Newton solve); the radial inversion is
+/// bracketed and always converges.
+///
+/// # Errors
+///
+/// - [`LensDistortionError::OutsideDistortionDomain`] when the distorted
+///   radius is beyond what the model can produce, i.e. the point has no
+///   pre-image at all (see that variant's documentation).
+/// - [`LensDistortionError::ConvergenceError`] when an iterative refinement
+///   fails to reach `tol` within `max_iters`.
 pub fn undistort_point_iterative(
     xd: f32,
     yd: f32,
@@ -355,40 +394,198 @@ pub fn undistort_point_iterative(
     max_iters: usize,
     tol: f32,
 ) -> Result<(f32, f32), LensDistortionError> {
-    // Division model has a closed-form inverse via the quadratic formula.
-    // Forward: r_d = r_u / (1 + lambda * r_u^2)
-    // Rearranging: lambda * r_d * r_u^2 - r_u + r_d = 0
-    // r_u = (1 - sqrt(1 - 4*lambda*r_d^2)) / (2*lambda*r_d)  [the root ≈ r_d when lambda→0]
-    // Special case lambda≈0: r_u ≈ r_d (no distortion).
-    if let DistortionModel::Division { lambda } = model {
-        let r_d = (xd * xd + yd * yd).sqrt();
-        if r_d < 1e-12 {
-            return Ok((xd, yd));
+    undistort_point_cached(
+        xd,
+        yd,
+        model,
+        model_radial_branch(model).as_ref(),
+        max_iters,
+        tol,
+    )
+}
+
+/// The radial branch of `model`, for the models that have one.
+///
+/// Building it involves a stationary-point search, which is per-model work,
+/// not per-pixel work: whole-image passes build it once and hand it to
+/// [`undistort_point_cached`].
+fn model_radial_branch(model: &DistortionModel) -> Option<RadialBranch> {
+    match model {
+        DistortionModel::SimpleRadial { k1, k2 } => Some(RadialBranch::new(*k1, *k2, 0.0)),
+        DistortionModel::BrownConrady { k1, k2, k3, .. } => Some(RadialBranch::new(*k1, *k2, *k3)),
+        _ => None,
+    }
+}
+
+/// [`undistort_point_iterative`] with a pre-built radial branch.
+///
+/// `branch` must have been built from `model` (see [`model_radial_branch`]);
+/// it is rebuilt on the spot if it is missing, so a mismatch costs
+/// performance, never correctness.
+fn undistort_point_cached(
+    xd: f32,
+    yd: f32,
+    model: &DistortionModel,
+    branch: Option<&RadialBranch>,
+    max_iters: usize,
+    tol: f32,
+) -> Result<(f32, f32), LensDistortionError> {
+    match model {
+        DistortionModel::Division { lambda } => {
+            // Closed-form inverse via the quadratic formula.
+            // Forward: r_d = r_u / (1 + lambda * r_u^2)
+            // Rearranging: lambda * r_d * r_u^2 - r_u + r_d = 0
+            // r_u = (1 - sqrt(1 - 4*lambda*r_d^2)) / (2*lambda*r_d)
+            let r_d = (xd * xd + yd * yd).sqrt();
+            if r_d < 1e-12 || lambda.abs() < 1e-12 {
+                return Ok((xd, yd));
+            }
+            let discriminant = 1.0 - 4.0 * lambda * r_d * r_d;
+            if discriminant < 0.0 {
+                // Same geometry as the radial family's fold: for `lambda > 0`
+                // the forward map `r_d = r_u / (1 + lambda*r_u²)` peaks at
+                // `r_u = 1/sqrt(lambda)` with `r_d = 1/(2*sqrt(lambda))`, and
+                // a negative discriminant is exactly "past that peak". It is
+                // a point with no pre-image, not a numerical failure, and
+                // whole-image passes must treat it the same way they treat
+                // the radial models' folded corners.
+                return Err(LensDistortionError::OutsideDistortionDomain {
+                    r_d,
+                    r_d_max: if *lambda > 0.0 {
+                        0.5 / lambda.sqrt()
+                    } else {
+                        f32::INFINITY
+                    },
+                });
+            }
+            let two_lambda_rd = 2.0 * lambda * r_d;
+            let r_u = (1.0 - discriminant.sqrt()) / two_lambda_rd;
+            let scale = r_u / r_d;
+            Ok((xd * scale, yd * scale))
         }
-        if lambda.abs() < 1e-12 {
-            // No distortion.
-            return Ok((xd, yd));
+
+        DistortionModel::SimpleRadial { k1, k2 } => {
+            let owned;
+            let branch = match branch {
+                Some(b) => b,
+                None => {
+                    owned = RadialBranch::new(*k1, *k2, 0.0);
+                    &owned
+                }
+            };
+            undistort_radial(xd, yd, branch, 0.0, 0.0, max_iters, tol)
         }
-        let discriminant = 1.0 - 4.0 * lambda * r_d * r_d;
-        if discriminant < 0.0 {
-            return Err(LensDistortionError::ConvergenceError { iterations: 0 });
+
+        DistortionModel::BrownConrady { k1, k2, k3, p1, p2 } => {
+            let owned;
+            let branch = match branch {
+                Some(b) => b,
+                None => {
+                    owned = RadialBranch::new(*k1, *k2, *k3);
+                    &owned
+                }
+            };
+            undistort_radial(xd, yd, branch, *p1, *p2, max_iters, tol)
         }
-        let two_lambda_rd = 2.0 * lambda * r_d;
-        let r_u = (1.0 - discriminant.sqrt()) / two_lambda_rd;
-        let scale = r_u / r_d;
-        return Ok((xd * scale, yd * scale));
+
+        DistortionModel::FisheyeEquidistant { k1, k2 } => undistort_fisheye(
+            xd,
+            yd,
+            *k1,
+            *k2,
+            FisheyeProjection::Equidistant,
+            max_iters,
+            tol,
+        ),
+        DistortionModel::FisheyeEquisolid { k1, k2 } => undistort_fisheye(
+            xd,
+            yd,
+            *k1,
+            *k2,
+            FisheyeProjection::Equisolid,
+            max_iters,
+            tol,
+        ),
+        DistortionModel::FisheyeStereographic { k1, k2 } => undistort_fisheye(
+            xd,
+            yd,
+            *k1,
+            *k2,
+            FisheyeProjection::Stereographic,
+            max_iters,
+            tol,
+        ),
+    }
+}
+
+/// Invert Brown-Conrady / simple-radial distortion.
+///
+/// The radial part is solved exactly on its monotonic branch (see
+/// [`RadialBranch::invert`]), which both removes the old iteration's
+/// convergence limits and makes "this point has no pre-image" a distinct,
+/// detectable outcome instead of an iteration that runs out of steps.
+///
+/// With tangential coefficients present the radial solution is only the
+/// starting point: the OpenCV-style division iteration
+/// `xu_{n+1} = (xd - tangential(xu_n)) / radial(xu_n)` then refines it. Real
+/// tangential coefficients are two to three orders of magnitude smaller than
+/// the radial ones, so seeded this way it converges in very few steps.
+///
+/// The domain test uses the radial part alone; with tangential terms it is
+/// therefore an approximation of the true domain boundary (an excellent one
+/// for any physically plausible `p1`/`p2`).
+fn undistort_radial(
+    xd: f32,
+    yd: f32,
+    branch: &RadialBranch,
+    p1: f32,
+    p2: f32,
+    max_iters: usize,
+    tol: f32,
+) -> Result<(f32, f32), LensDistortionError> {
+    let r_d = (xd * xd + yd * yd).sqrt();
+    if r_d <= 0.0 {
+        // The optical centre maps to itself under both the radial and the
+        // tangential terms.
+        return Ok((xd, yd));
     }
 
-    // Fixed-point iteration: xu_{n+1} = xu_n + (xd - distort(xu_n))
-    let mut xu = xd;
-    let mut yu = yd;
+    let r_u = branch.invert(r_d)?;
+    let scale = r_u / r_d;
+    let mut xu = xd * scale;
+    let mut yu = yd * scale;
+
+    if p1 == 0.0 && p2 == 0.0 {
+        // Purely radial: the solve above is already the exact inverse.
+        return Ok((xu, yu));
+    }
+
+    let tangential = |x: f32, y: f32| {
+        let r2 = x * x + y * y;
+        (
+            2.0 * p1 * x * y + p2 * (r2 + 2.0 * x * x),
+            p1 * (r2 + 2.0 * y * y) + 2.0 * p2 * x * y,
+        )
+    };
+    let radial_factor = |x: f32, y: f32| {
+        let r2 = x * x + y * y;
+        1.0 + branch.k1 * r2 + branch.k2 * r2 * r2 + branch.k3 * r2 * r2 * r2
+    };
 
     for iter in 0..max_iters {
-        let (xd_est, yd_est) = distort_point(xu, yu, model);
-        let ex = xd - xd_est;
-        let ey = yd - yd_est;
-        xu += ex;
-        yu += ey;
+        let radial = radial_factor(xu, yu);
+        if !radial.is_finite() || radial.abs() < 1e-8 {
+            return Err(LensDistortionError::ConvergenceError { iterations: iter });
+        }
+        let (dx_tan, dy_tan) = tangential(xu, yu);
+
+        let xu_next = (xd - dx_tan) / radial;
+        let yu_next = (yd - dy_tan) / radial;
+        let ex = xu_next - xu;
+        let ey = yu_next - yu;
+        xu = xu_next;
+        yu = yu_next;
+
         if ex.abs().max(ey.abs()) < tol {
             return Ok((xu, yu));
         }
@@ -399,13 +596,18 @@ pub fn undistort_point_iterative(
         }
     }
 
-    // max_iters == 0 edge case: check if already converged.
-    let (xd_est, yd_est) = distort_point(xu, yu, model);
-    if (xd - xd_est).abs().max((yd - yd_est).abs()) < tol {
-        Ok((xu, yu))
-    } else {
-        Err(LensDistortionError::ConvergenceError { iterations: 0 })
+    // `max_iters == 0`: accept the radial seed if the tangential terms leave
+    // it a fixed point within tolerance anyway.
+    let radial = radial_factor(xu, yu);
+    if radial.is_finite() && radial.abs() >= 1e-8 {
+        let (dx_tan, dy_tan) = tangential(xu, yu);
+        let xu_next = (xd - dx_tan) / radial;
+        let yu_next = (yd - dy_tan) / radial;
+        if (xu_next - xu).abs().max((yu_next - yu).abs()) < tol {
+            return Ok((xu_next, yu_next));
+        }
     }
+    Err(LensDistortionError::ConvergenceError { iterations: 0 })
 }
 
 // ---------------------------------------------------------------------------
@@ -422,6 +624,26 @@ fn validate_image(pixels: &[u8], width: usize, height: usize) -> Result<(), Lens
             h: height,
         });
     }
+    // Every caller (`distort_image`, `undistort_image`, `remap_image`,
+    // `barrel_distort_image`) relies on this to guarantee `bilinear_sample`
+    // can safely index up to `((height-1)*width + (width-1)) * 3 + 2`
+    // without an out-of-bounds panic. `checked_mul` guards the dimension
+    // product itself against overflow.
+    let expected = width
+        .checked_mul(height)
+        .and_then(|n| n.checked_mul(3))
+        .ok_or(LensDistortionError::InvalidDimensions {
+            w: width,
+            h: height,
+        })?;
+    if pixels.len() != expected {
+        return Err(LensDistortionError::BufferSizeMismatch {
+            actual: pixels.len(),
+            expected,
+            width,
+            height,
+        });
+    }
     Ok(())
 }
 
@@ -429,13 +651,48 @@ fn validate_image(pixels: &[u8], width: usize, height: usize) -> Result<(), Lens
 // Full-image distortion / undistortion
 // ---------------------------------------------------------------------------
 
+/// Colour written to destination pixels that have no source ("no data").
+///
+/// Matches the OpenCV `remap`/`warp` convention of a constant border, which
+/// is what an unmapped region of the destination frame is.
+const UNMAPPED_PIXEL: [u8; 3] = [0, 0, 0];
+
 /// Apply lens distortion to an entire RGB image.
 ///
 /// For each destination (distorted) pixel, finds the corresponding undistorted
-/// source location using `undistort_point_iterative`, then samples via bilinear
-/// interpolation with clamp-to-edge.
+/// source location using [`undistort_point_iterative`], then samples via
+/// bilinear interpolation with clamp-to-edge.
 ///
 /// `pixels` must be row-major HxWx3 u8.
+///
+/// # Unmapped destination pixels
+///
+/// Barrel distortion (`k1 < 0`) pulls the image inward, so beyond a certain
+/// radius *no* undistorted point maps into the destination frame at all: the
+/// forward radial map `r_u -> r_u * (1 + k1*r_u² + ...)` peaks and folds
+/// back, and every destination radius above that peak is outside its image.
+/// A plain 8x8 frame with `k1 = -0.1` and a `min(w,h)/2` focal length already
+/// has corners past the peak (corner radius 1.414 vs. a peak of 1.217).
+///
+/// A fisheye model produces unmapped pixels the same way wherever the
+/// distorted radius corresponds to a ray at or past 90° off-axis, which a
+/// pinhole undistorted plane cannot represent (the fisheye inverse reports
+/// it as `OutsideDistortionDomain`, handled identically).
+///
+/// Those pixels are filled with the module's unmapped-pixel colour (black)
+/// — the honest answer for "no source content exists here" — and counted in a
+/// `tracing::debug` record. They are *not* an error: failing the whole call
+/// would make ordinary barrel distortion unusable, and substituting the
+/// identity mapping (what a much earlier version did) invents content and
+/// leaves a discontinuous seam with no indication anything happened.
+///
+/// # Errors
+/// In addition to the buffer/intrinsics/model validation errors, propagates
+/// [`LensDistortionError::ConvergenceError`] from
+/// [`undistort_point_iterative`] if any pixel's inverse mapping fails to
+/// converge. With the exact radial inversion this can now only come from the
+/// tangential refinement or a fisheye model, i.e. from genuinely pathological
+/// coefficients rather than from ordinary geometry.
 pub fn distort_image(
     pixels: &[u8],
     width: usize,
@@ -448,21 +705,42 @@ pub fn distort_image(
     model.validate()?;
 
     let mut out = vec![0u8; width * height * 3];
+    // Per-model work (a stationary-point search), hoisted out of the pixel
+    // loop.
+    let branch = model_radial_branch(model);
+    let mut unmapped = 0usize;
 
     for row in 0..height {
         for col in 0..width {
             // Destination pixel is the distorted image; find where in the
             // undistorted source to sample from.
             let (xd_n, yd_n) = intrinsics.to_normalized(col as f32, row as f32);
-            let (xu_n, yu_n) =
-                undistort_point_iterative(xd_n, yd_n, model, 20, 1e-6).unwrap_or((xd_n, yd_n)); // Fall back to identity on non-convergence.
-            let (src_x, src_y) = intrinsics.to_pixel(xu_n, yu_n);
-            let sample = bilinear_sample(pixels, width, height, src_x, src_y);
             let idx = (row * width + col) * 3;
+            let sample = match undistort_point_cached(xd_n, yd_n, model, branch.as_ref(), 20, 1e-6)
+            {
+                Ok((xu_n, yu_n)) => {
+                    let (src_x, src_y) = intrinsics.to_pixel(xu_n, yu_n);
+                    bilinear_sample(pixels, width, height, src_x, src_y)
+                }
+                Err(LensDistortionError::OutsideDistortionDomain { .. }) => {
+                    unmapped += 1;
+                    UNMAPPED_PIXEL
+                }
+                Err(e) => return Err(e),
+            };
             out[idx] = sample[0];
             out[idx + 1] = sample[1];
             out[idx + 2] = sample[2];
         }
+    }
+
+    if unmapped > 0 {
+        tracing::debug!(
+            unmapped,
+            total = width * height,
+            "Destination pixels outside the distortion model's image were \
+             filled with the unmapped-pixel colour"
+        );
     }
 
     Ok(out)
@@ -731,10 +1009,15 @@ pub fn compute_distortion_stats(
     intrinsics.validate()?;
     model.validate()?;
 
-    let n = (width * height) as f32;
+    let n = (width * height) as f64;
     let mut max_shift = 0.0f32;
-    let mut sum_shift = 0.0f32;
-    let mut sum_sq = 0.0f32;
+    // f64 accumulators: for a 4K image (~8.3M pixels) with shifts around
+    // 10px, an f32 accumulator for `sum_shift` reaches ~8.3e7 — past f32's
+    // 1.67e7 exact-integer limit — so late additions get silently
+    // quantised away (worse still for `sum_sq`, ~8.3e8), systematically
+    // underestimating `mean_shift_px` / `rms_shift_px`.
+    let mut sum_shift = 0.0f64;
+    let mut sum_sq = 0.0f64;
 
     for row in 0..height {
         for col in 0..width {
@@ -747,13 +1030,14 @@ pub fn compute_distortion_stats(
             if shift > max_shift {
                 max_shift = shift;
             }
-            sum_shift += shift;
-            sum_sq += shift * shift;
+            let shift_f64 = shift as f64;
+            sum_shift += shift_f64;
+            sum_sq += shift_f64 * shift_f64;
         }
     }
 
-    let mean_shift = sum_shift / n;
-    let rms_shift = (sum_sq / n).sqrt();
+    let mean_shift = (sum_shift / n) as f32;
+    let rms_shift = (sum_sq / n).sqrt() as f32;
 
     // Barrel/pincushion: average outward radial shift at the four corners.
     let corners = [
@@ -1340,5 +1624,282 @@ mod tests {
 
         // Solid-colour source: all pixels should be the same.
         assert_eq!(expected, got);
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_image / BufferSizeMismatch regression tests (critical OOB fix)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_distort_image_buffer_too_short_error() {
+        // Regression: `validate_image` never checked `pixels.len()` against
+        // `width*height*3`, so this call previously panicked with an
+        // out-of-bounds index inside `bilinear_sample` instead of
+        // returning a clean error.
+        let pixels = vec![0u8; 3]; // 1 pixel's worth, claiming 1000x1000
+        let k = CameraIntrinsics::pinhole(100.0, 1000, 1000);
+        let model = DistortionModel::SimpleRadial { k1: 0.0, k2: 0.0 };
+        let result = distort_image(&pixels, 1000, 1000, &k, &model);
+        assert!(
+            matches!(result, Err(LensDistortionError::BufferSizeMismatch { .. })),
+            "expected BufferSizeMismatch, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_undistort_image_buffer_too_short_error() {
+        let pixels = vec![0u8; 3];
+        let k = CameraIntrinsics::pinhole(100.0, 1000, 1000);
+        let model = DistortionModel::SimpleRadial { k1: 0.0, k2: 0.0 };
+        let result = undistort_image(&pixels, 1000, 1000, &k, &model);
+        assert!(matches!(
+            result,
+            Err(LensDistortionError::BufferSizeMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn test_remap_image_buffer_too_short_error() {
+        let pixels = vec![0u8; 3];
+        let w = 1000;
+        let h = 1000;
+        let dx = vec![0.0f32; w * h];
+        let dy = vec![0.0f32; w * h];
+        let result = remap_image(&pixels, w, h, &dx, &dy);
+        assert!(matches!(
+            result,
+            Err(LensDistortionError::BufferSizeMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn test_barrel_distort_image_buffer_too_short_error() {
+        let pixels = vec![0u8; 3];
+        let result = barrel_distort_image(&pixels, 1000, 1000, -0.1);
+        assert!(matches!(
+            result,
+            Err(LensDistortionError::BufferSizeMismatch { .. })
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // undistort_point_iterative: convergence over a wide k1 range (division form)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_undistort_converges_across_wide_k1_range() {
+        // Regression: the old unit-Jacobian fixed point only converges
+        // while |d(distort)/dx - 1| < 1, which fails for |k1| as small as
+        // ~0.3 — well within normal lens ranges. The division-form
+        // iteration must converge across a much wider sweep.
+        let mut k1 = -0.5_f32;
+        while k1 <= 0.5 {
+            if k1.abs() > 1e-6 {
+                let model = DistortionModel::SimpleRadial { k1, k2: 0.0 };
+                for &(xu0, yu0) in &[(0.3_f32, 0.2_f32), (0.5, -0.4), (0.1, 0.1)] {
+                    let (xd, yd) = distort_point(xu0, yu0, &model);
+                    let result = undistort_point_iterative(xd, yd, &model, 50, 1e-6);
+                    let (xu1, yu1) = result.unwrap_or_else(|e| {
+                        panic!("k1={k1} did not converge from ({xu0},{yu0}): {e}")
+                    });
+                    assert!(
+                        (xu1 - xu0).abs() < 1e-3 && (yu1 - yu0).abs() < 1e-3,
+                        "k1={k1}: roundtrip ({xu1},{yu1}) vs ({xu0},{yu0})"
+                    );
+                }
+            }
+            k1 += 0.05;
+        }
+    }
+
+    #[test]
+    fn test_undistort_point_iterative_reports_points_with_no_preimage() {
+        // `xd = 0.5, k1 = -4` used to be described as a "singular radial
+        // denominator" (`1 + k1*r²` is exactly 0 at the first iterate) and
+        // could only be reported as a `ConvergenceError`. It is in fact a
+        // point with *no pre-image at all*: the forward map
+        // `g(r) = r*(1 - 4r²)` peaks at `r = 1/sqrt(12) = 0.288675` with
+        // `g = 0.192450`, so no undistorted point maps to a distorted radius
+        // of 0.5. Iterating harder can never find one, and the error now
+        // says so.
+        let model = DistortionModel::SimpleRadial { k1: -4.0, k2: 0.0 };
+        let result = undistort_point_iterative(0.5, 0.0, &model, 10, 1e-6);
+        match result {
+            Err(LensDistortionError::OutsideDistortionDomain { r_d, r_d_max }) => {
+                assert!((r_d - 0.5).abs() < 1e-6, "r_d: {r_d}");
+                assert!(
+                    (r_d_max - 0.192_450_09).abs() < 1e-5,
+                    "r_d_max should be the analytic peak 0.19245009, got {r_d_max}"
+                );
+            }
+            other => panic!("expected OutsideDistortionDomain, got {other:?}"),
+        }
+
+        // Just below the peak the inverse exists and must round-trip.
+        let r_u_probe = 0.2_f32;
+        let (xd, yd) = distort_point(r_u_probe, 0.0, &model);
+        let (xu, yu) =
+            undistort_point_iterative(xd, yd, &model, 10, 1e-6).expect("inside the domain");
+        assert!((xu - r_u_probe).abs() < 1e-4, "xu: {xu}");
+        assert!(yu.abs() < 1e-6, "yu: {yu}");
+    }
+
+    #[test]
+    fn test_division_model_reports_points_with_no_preimage() {
+        // The division model folds the same way: `r_d = r_u / (1 + λ r_u²)`
+        // peaks at `r_u = 1/sqrt(λ)` with `r_d = 1/(2 sqrt(λ))`, which for
+        // λ = 1 is 0.5. A distorted radius past that has no pre-image, and
+        // must be reported as such rather than as a convergence failure --
+        // otherwise `distort_image` would hard-error a whole image for the
+        // division model while filling the same geometry for the radial
+        // family.
+        let model = DistortionModel::Division { lambda: 1.0 };
+        match undistort_point_iterative(0.75, 0.0, &model, 20, 1e-6) {
+            Err(LensDistortionError::OutsideDistortionDomain { r_d, r_d_max }) => {
+                assert!((r_d - 0.75).abs() < 1e-6, "r_d: {r_d}");
+                assert!((r_d_max - 0.5).abs() < 1e-6, "r_d_max: {r_d_max}");
+            }
+            other => panic!("expected OutsideDistortionDomain, got {other:?}"),
+        }
+
+        // Inside the domain it still round-trips exactly (closed form).
+        let (xd, yd) = distort_point(0.4, 0.0, &model);
+        let (xu, _) = undistort_point_iterative(xd, yd, &model, 20, 1e-6).expect("inside");
+        assert!((xu - 0.4).abs() < 1e-4, "xu: {xu}");
+
+        // A whole-image pass now fills those pixels instead of failing.
+        let pixels = vec![10u8, 20u8, 30u8];
+        let k = CameraIntrinsics::new(1.0, 1.0, -0.75, 0.0, 1, 1);
+        let out = distort_image(&pixels, 1, 1, &k, &model).expect("unmapped pixels are geometry");
+        assert_eq!(out, UNMAPPED_PIXEL.to_vec());
+    }
+
+    #[test]
+    fn test_distort_image_marks_unmapped_pixels_instead_of_inventing_content() {
+        // Regression: a pixel with no source used to silently fall back to
+        // the identity mapping, i.e. it invented content (the source colour)
+        // with no indication anything had happened. A single pixel whose
+        // normalized coordinate is exactly (0.5, 0.0), combined with
+        // k1 = -4.0, is past the forward map's fold (see
+        // `test_undistort_point_iterative_reports_points_with_no_preimage`),
+        // so it must come back as the explicit "no data" colour rather than
+        // as the source pixel.
+        let pixels = vec![10u8, 20u8, 30u8];
+        let k = CameraIntrinsics::new(1.0, 1.0, -0.5, 0.0, 1, 1);
+        let model = DistortionModel::SimpleRadial { k1: -4.0, k2: 0.0 };
+        let out = distort_image(&pixels, 1, 1, &k, &model)
+            .expect("an unmapped pixel is geometry, not an error");
+        assert_eq!(
+            out,
+            UNMAPPED_PIXEL.to_vec(),
+            "a destination pixel with no pre-image must be marked unmapped, \
+             not filled with the source colour"
+        );
+    }
+
+    #[test]
+    fn test_barrel_distort_fills_folded_corners_and_keeps_centre() {
+        // `barrel_distort_image` uses a `min(w,h)/2` focal length and a
+        // `w/2, h/2` principal point, so an 8x8 frame spans normalized
+        // coordinates -1.0 ..= 0.75 on both axes. With k1 = -0.1 the forward
+        // map peaks at r_u = 1/sqrt(0.3) = 1.82574, r_d = 1.21716; the
+        // destination pixels whose radius exceeds that peak have no
+        // pre-image at all. Enumerating the grid, exactly five do:
+        //   (-1.00,-1.00) r=1.4142   (col 0, row 0)
+        //   (-1.00,-0.75) r=1.2500   (col 0, row 1)
+        //   (-0.75,-1.00) r=1.2500   (col 1, row 0)
+        //   (-1.00, 0.75) r=1.2500   (col 0, row 7)
+        //   ( 0.75,-1.00) r=1.2500   (col 7, row 0)
+        // The next-largest radius on the grid is 1.118 (e.g. -1.0,-0.5),
+        // comfortably inside the domain.
+        let w = 8usize;
+        let h = 8usize;
+        let pixels = solid_image(w, h, 128, 128, 128);
+        let out = barrel_distort_image(&pixels, w, h, -0.1).expect("barrel distort");
+        assert_eq!(out.len(), w * h * 3);
+
+        let px = |col: usize, row: usize| {
+            let i = (row * w + col) * 3;
+            [out[i], out[i + 1], out[i + 2]]
+        };
+        for &(col, row) in &[(0, 0), (0, 1), (1, 0), (0, 7), (7, 0)] {
+            assert_eq!(
+                px(col, row),
+                UNMAPPED_PIXEL,
+                "pixel (col {col}, row {row}) is past the fold and has no pre-image"
+            );
+        }
+        assert_eq!(px(4, 4), [128, 128, 128], "the centre must be sampled");
+        assert_eq!(
+            px(w - 1, h - 1),
+            [128, 128, 128],
+            "(0.75, 0.75) has radius 1.0607, inside the domain"
+        );
+
+        // Every pixel is either sampled from the (solid) source or marked
+        // unmapped -- nothing in between, and nothing invented -- and
+        // exactly the five enumerated pixels are unmapped.
+        let unmapped = out
+            .chunks(3)
+            .filter(|chunk| {
+                assert!(
+                    *chunk == [128, 128, 128] || *chunk == UNMAPPED_PIXEL,
+                    "unexpected pixel {chunk:?}"
+                );
+                *chunk == UNMAPPED_PIXEL
+            })
+            .count();
+        assert_eq!(unmapped, 5, "expected exactly 5 unmapped pixels");
+
+        // A milder coefficient keeps the whole frame inside the domain.
+        let mild = barrel_distort_image(&pixels, w, h, -0.02).expect("mild barrel distort");
+        assert!(
+            mild.chunks(3).all(|c| c == [128, 128, 128]),
+            "k1 = -0.02 folds at r_d = 2.72, well outside the frame, so no \
+             pixel should be unmapped"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // compute_distortion_stats: f64 accumulation precision
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compute_distortion_stats_f64_accumulation_precision() {
+        // Regression: `sum_shift` / `sum_sq` were f32 accumulators. Once a
+        // running sum exceeds f32's ~1.677e7 exact-integer limit, further
+        // additions smaller than the current value's ULP are silently
+        // dropped, systematically *underestimating* mean/rms shift. Use a
+        // wide-FOV setup (large per-pixel shifts) so the true sum
+        // comfortably exceeds that threshold, and compare against an
+        // independent f64-accumulated reference computed the same way.
+        let w = 1000usize;
+        let h = 1000usize;
+        let k = CameraIntrinsics::pinhole(50.0, w, h);
+        let model = DistortionModel::SimpleRadial { k1: -0.4, k2: 0.0 };
+
+        let mut ref_sum = 0.0f64;
+        for row in 0..h {
+            for col in 0..w {
+                let (xu_n, yu_n) = k.to_normalized(col as f32, row as f32);
+                let (xd_n, yd_n) = distort_point(xu_n, yu_n, &model);
+                let (dst_x, dst_y) = k.to_pixel(xd_n, yd_n);
+                let dx = dst_x - col as f32;
+                let dy = dst_y - row as f32;
+                ref_sum += ((dx * dx + dy * dy).sqrt()) as f64;
+            }
+        }
+        assert!(
+            ref_sum > 1.677e7,
+            "test setup should exceed f32's exact-integer accumulation limit, got {ref_sum:e}"
+        );
+        let ref_mean = (ref_sum / (w * h) as f64) as f32;
+
+        let stats = compute_distortion_stats(w, h, &k, &model).expect("stats");
+        assert!(
+            (stats.mean_shift_px - ref_mean).abs() < 1.0,
+            "mean_shift_px={} should match the f64 reference {ref_mean}",
+            stats.mean_shift_px
+        );
     }
 }

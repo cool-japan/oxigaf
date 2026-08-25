@@ -182,7 +182,11 @@ impl Default for WhiteBalance {
 
 /// Full color calibration configuration combining multiple correction stages.
 ///
-/// Pipeline order: white balance → color matrix → gamma → saturation → brightness.
+/// Pipeline order: white balance → color matrix → saturation → gamma → brightness.
+/// White balance, the optional color matrix, and saturation are all linear
+/// operations (see [`saturation_matrix`]'s "operating in linear RGB space"),
+/// so they are composed into a single matrix and applied together, in
+/// linear light, before the nonlinear gamma encode.
 #[derive(Debug, Clone)]
 pub struct ColorCalibrationConfig {
     /// White balance adjustment.
@@ -541,7 +545,10 @@ pub fn apply_saturation_image(
 
 /// Apply the full calibration pipeline to an RGBA image.
 ///
-/// Order of operations: white balance → color matrix → gamma → saturation → brightness.
+/// Order of operations: white balance → color matrix → saturation → gamma → brightness.
+/// The first three stages are linear (matrix) operations and are composed
+/// into one matrix applied in a single pass, still ahead of the nonlinear
+/// gamma step — see [`ColorCalibrationConfig`]'s doc.
 pub fn apply_calibration(
     pixels: &[u8],
     width: u32,
@@ -1350,6 +1357,61 @@ mod tests {
         let out = apply_calibration(&img, 2, 2, &config).unwrap();
         // Half brightness.
         assert!(out[0] < 128);
+    }
+
+    #[test]
+    fn test_apply_calibration_pipeline_order_saturation_then_gamma() {
+        // Regression test pinning the documented pipeline order: white
+        // balance -> color matrix -> saturation -> gamma -> brightness.
+        // Saturation is folded into the same linear matrix as white
+        // balance/color matrix and applied *before* the nonlinear gamma
+        // step -- see `saturation_matrix`'s doc ("operating in linear RGB
+        // space"). Uses a non-gray pixel with saturation != 1 and gamma !=
+        // 1 so the two possible orderings (saturation-then-gamma vs.
+        // gamma-then-saturation) provably diverge.
+        let config = ColorCalibrationConfig {
+            white_balance: WhiteBalance::default(),
+            color_matrix: None,
+            gamma: 2.2,
+            saturation: 0.4,
+            brightness: 1.0,
+        };
+        let img = vec![200u8, 80, 40, 255]; // single non-gray pixel
+        let out = apply_calibration(&img, 1, 1, &config).unwrap();
+
+        let wb_matrix = white_balance_matrix(&config.white_balance).unwrap();
+        let sat_matrix = saturation_matrix(config.saturation);
+        let r = img[0] as f32 / 255.0;
+        let g = img[1] as f32 / 255.0;
+        let b = img[2] as f32 / 255.0;
+
+        // Reference computed in the documented order: matrix (WB * sat),
+        // then gamma, then brightness.
+        let full_matrix = sat_matrix.mul(&wb_matrix);
+        let [mr, mg, mb] = full_matrix.apply([r, g, b]);
+        let expected = [mr, mg, mb].map(|c| {
+            (apply_gamma_f32(c.clamp(0.0, 1.0), config.gamma) * config.brightness).clamp(0.0, 1.0)
+        });
+        for (i, &e) in expected.iter().enumerate() {
+            let got = out[i] as f32 / 255.0;
+            assert!(
+                (got - e).abs() < 1.0 / 255.0 + 1e-4,
+                "channel {i}: expected {e}, got {got} (saturation-then-gamma order)"
+            );
+        }
+
+        // The alternate order (gamma applied first, then saturation) must
+        // give a *different* result for this input, or the two orderings
+        // wouldn't be distinguishable and the assertion above would be
+        // vacuous.
+        let [wr, wg, wb_] = wb_matrix.apply([r, g, b]);
+        let gamma_first = [wr, wg, wb_].map(|c| apply_gamma_f32(c.clamp(0.0, 1.0), config.gamma));
+        let [ar, ag, ab] = sat_matrix.apply(gamma_first);
+        let alt = [ar, ag, ab].map(|c| (c * config.brightness).clamp(0.0, 1.0));
+        assert!(
+            (alt[0] - expected[0]).abs() > 1e-3 || (alt[1] - expected[1]).abs() > 1e-3,
+            "test input should distinguish saturation-then-gamma from gamma-then-saturation"
+        );
     }
 
     // ── compute_correction_matrix tests ──────────────────────────────────────

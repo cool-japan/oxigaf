@@ -57,6 +57,24 @@ impl LossComponent {
                 | Self::OpacityRegularizer
         )
     }
+
+    /// A cheap, allocation-free sort key ordering components the same way
+    /// [`LossComponent::name`] would (alphabetically by name, `Custom`
+    /// ordered by its numeric id). Used by display helpers that would
+    /// otherwise allocate a fresh `String` per comparison via
+    /// `sort_by_key(|c| c.name())`.
+    fn sort_key(&self) -> (u8, u32) {
+        match self {
+            Self::Custom(id) => (0, *id),
+            Self::DiffusionTarget => (1, 0),
+            Self::NormalConsistency => (2, 0),
+            Self::OpacityRegularizer => (3, 0),
+            Self::Perceptual => (4, 0),
+            Self::Photometric => (5, 0),
+            Self::PositionRegularizer => (6, 0),
+            Self::ScaleRegularizer => (7, 0),
+        }
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -74,26 +92,41 @@ pub struct LossHistory {
     pub ema: f32,
     /// Smoothing factor for EMA (α = 0.05 by default).
     pub ema_alpha: f32,
+    /// Whether `ema` has been seeded by at least one observed sample yet.
+    has_ema: bool,
 }
 
 impl LossHistory {
     /// Creates a new history with the given window size and default EMA α = 0.05.
+    ///
+    /// `window_size` is clamped to at least `1`.
     pub fn new(window_size: usize) -> Self {
         Self {
             window: VecDeque::new(),
-            window_size,
+            window_size: window_size.max(1),
             ema: 0.0,
             ema_alpha: 0.05,
+            has_ema: false,
         }
     }
 
     /// Appends a new loss sample, evicting the oldest if the window is full.
+    ///
+    /// The EMA is seeded directly from the first observed sample rather than
+    /// blended against the artificial `ema = 0.0` starting value — with the
+    /// default `ema_alpha = 0.05` that blend would otherwise read ~5% of the
+    /// true loss and take ~60 samples to converge.
     pub fn push(&mut self, loss: f32) {
         if self.window.len() >= self.window_size {
             self.window.pop_front();
         }
         self.window.push_back(loss);
-        self.ema = self.ema_alpha * loss + (1.0 - self.ema_alpha) * self.ema;
+        if self.has_ema {
+            self.ema = self.ema_alpha * loss + (1.0 - self.ema_alpha) * self.ema;
+        } else {
+            self.ema = loss;
+            self.has_ema = true;
+        }
     }
 
     /// Mean of the current window values; returns 0.0 if the window is empty.
@@ -114,8 +147,11 @@ impl LossHistory {
         sum_sq / (self.window.len() - 1) as f32
     }
 
-    /// Rate of change: `(last − first) / window_size`. Returns 0.0 if fewer
-    /// than 2 samples are present.
+    /// Per-sample rate of change: `(last − first) / (n_samples − 1)`, where
+    /// `n_samples` is the number of values currently in the window (*not*
+    /// the configured `window_size`, which would under-report the trend by
+    /// up to `window_size / n_samples` while the window is still filling).
+    /// Returns 0.0 if fewer than 2 samples are present.
     pub fn trend(&self) -> f32 {
         let first = match self.window.front() {
             Some(v) => *v,
@@ -125,10 +161,11 @@ impl LossHistory {
             Some(v) => *v,
             None => return 0.0,
         };
-        if self.window.len() < 2 {
+        let n = self.window.len();
+        if n < 2 {
             return 0.0;
         }
-        (last - first) / self.window_size as f32
+        (last - first) / (n - 1) as f32
     }
 
     /// Number of samples currently stored in the window.
@@ -295,7 +332,7 @@ impl AdaptiveLossWeights {
     pub fn format_weights(&self) -> String {
         let mut lines = vec!["Loss Weights:".to_string()];
         let mut pairs: Vec<(&LossComponent, &f32)> = self.weights.iter().collect();
-        pairs.sort_by_key(|a| a.0.name());
+        pairs.sort_by_key(|a| a.0.sort_key());
         for (component, weight) in pairs {
             lines.push(format!("  {:30} = {:.6}", component.name(), weight));
         }
@@ -408,15 +445,36 @@ impl AdaptiveLossController {
     ///
     /// Called automatically by `record_losses` every `update_interval` steps.
     pub fn update_weights(&mut self, _step: usize) {
-        match &self.weights.strategy.clone() {
-            WeightingStrategy::Fixed(_) => {
+        // Determine which strategy is active and, for the adaptive ones,
+        // extract just the scalar rate needed below. This avoids cloning
+        // the whole `WeightingStrategy` — including its
+        // `HashMap<LossComponent, f32>` of base weights / sigmas — purely
+        // to sidestep a borrow conflict with `&mut self` below; the
+        // extracted `f32` is `Copy`, so the immutable borrow of
+        // `self.weights.strategy` ends as soon as this match completes.
+        enum Kind {
+            Fixed,
+            GradNorm(f32),
+            LossRatio(f32),
+            Uncertainty(f32),
+        }
+        let kind = match &self.weights.strategy {
+            WeightingStrategy::Fixed(_) => Kind::Fixed,
+            WeightingStrategy::GradNormBalanced {
+                adaptation_rate, ..
+            } => Kind::GradNorm(*adaptation_rate),
+            WeightingStrategy::LossRatioBalanced {
+                adaptation_rate, ..
+            } => Kind::LossRatio(*adaptation_rate),
+            WeightingStrategy::Uncertainty { update_rate, .. } => Kind::Uncertainty(*update_rate),
+        };
+
+        match kind {
+            Kind::Fixed => {
                 // No-op: fixed weights never change.
             }
 
-            WeightingStrategy::GradNormBalanced {
-                adaptation_rate, ..
-            } => {
-                let rate = *adaptation_rate;
+            Kind::GradNorm(rate) => {
                 let recent_means = self.grad_tracker.all_recent_means(10);
 
                 if recent_means.is_empty() {
@@ -455,10 +513,7 @@ impl AdaptiveLossController {
                 }
             }
 
-            WeightingStrategy::LossRatioBalanced {
-                adaptation_rate, ..
-            } => {
-                let rate = *adaptation_rate;
+            Kind::LossRatio(rate) => {
                 let min_w = self.weights.min_weight;
 
                 // Collect recent means from loss histories.
@@ -468,13 +523,16 @@ impl AdaptiveLossController {
                     .map(|(c, h)| (c.clone(), h.mean()))
                     .collect();
 
-                // Compute inverse loss, using min_weight for near-zero losses.
+                // Inverse loss: a SMALLER loss must earn a LARGER inverse
+                // (and hence a larger weight), per the documented
+                // `w_i = (1/l_i) / Σ(1/l_j)`. Clamp the loss itself away
+                // from zero rather than substituting `min_weight` for the
+                // inverse — that previously drove a converged component's
+                // weight toward zero, the opposite of the intended
+                // behaviour.
                 let inv_losses: HashMap<LossComponent, f32> = loss_means
                     .iter()
-                    .map(|(c, &l)| {
-                        let inv = if l < 1e-8 { min_w } else { 1.0 / l };
-                        (c.clone(), inv)
-                    })
+                    .map(|(c, &l)| (c.clone(), 1.0 / l.max(1e-8)))
                     .collect();
 
                 let inv_sum: f32 = inv_losses.values().sum();
@@ -495,9 +553,7 @@ impl AdaptiveLossController {
                 }
             }
 
-            WeightingStrategy::Uncertainty { update_rate, .. } => {
-                let rate = *update_rate;
-
+            Kind::Uncertainty(rate) => {
                 // Collect current loss means before taking any mutable borrows.
                 let component_losses: Vec<(LossComponent, f32)> = self
                     .loss_histories
@@ -516,13 +572,27 @@ impl AdaptiveLossController {
 
                 if let WeightingStrategy::Uncertainty { sigma, .. } = &mut self.weights.strategy {
                     for (comp, loss) in &component_losses {
-                        let target_sigma = (loss / 2.0 + 1e-8_f32).sqrt();
+                        // `loss` (a `LossHistory::mean()`) is unconstrained
+                        // in sign — a signed regularizer, or a window mean
+                        // that dipped negative. `sqrt` of a negative input
+                        // is NaN, which would otherwise be written into
+                        // `sigma` and stay NaN forever (every later update
+                        // reads it back as `old_sigma`). Clamp the loss to
+                        // non-negative before taking the square root.
+                        let target_sigma = (loss.max(0.0) / 2.0 + 1e-8_f32).sqrt();
                         let old_sigma = sigma.get(comp).copied().unwrap_or(1.0);
-                        let new_sigma = (1.0 - rate) * old_sigma + rate * target_sigma;
+                        let mut new_sigma = (1.0 - rate) * old_sigma + rate * target_sigma;
+                        if !new_sigma.is_finite() {
+                            new_sigma = old_sigma;
+                        }
                         sigma.insert(comp.clone(), new_sigma);
 
                         let raw_w = 1.0 / (2.0 * new_sigma * new_sigma).max(1e-8);
-                        let clamped_w = raw_w.clamp(min_w, max_w);
+                        // `.max().min()` rather than `.clamp()`: `clamp`
+                        // panics unconditionally (not just in debug builds)
+                        // if `min_w > max_w`, which a caller-supplied
+                        // `with_bounds` could produce.
+                        let clamped_w = raw_w.max(min_w).min(max_w);
                         updates.push((comp.clone(), new_sigma, clamped_w));
                     }
                 }
@@ -556,7 +626,7 @@ impl AdaptiveLossController {
         lines.push("Loss histories (EMA | mean | trend):".to_string());
         let mut hist_pairs: Vec<(&LossComponent, &LossHistory)> =
             self.loss_histories.iter().collect();
-        hist_pairs.sort_by_key(|a| a.0.name());
+        hist_pairs.sort_by_key(|a| a.0.sort_key());
         for (comp, hist) in hist_pairs {
             lines.push(format!(
                 "  {:30} ema={:.4}  mean={:.4}  trend={:.4}  n={}",
@@ -657,22 +727,23 @@ mod tests {
         assert_eq!(h.trend(), 0.0); // single sample
 
         h.push(3.0);
-        // trend = (3 - 1) / 4 = 0.5
+        // trend = (3 - 1) / (2 samples - 1 interval) = 2.0 — a per-sample
+        // rate, not divided by the (still-filling) configured window_size.
         let t = h.trend();
-        assert!((t - 0.5).abs() < 1e-5, "trend={}", t);
+        assert!((t - 2.0).abs() < 1e-5, "trend={}", t);
     }
 
     #[test]
     fn test_loss_history_ema() {
         let mut h = LossHistory::new(10);
-        // Initial EMA is 0.0.
+        // The EMA is seeded directly from the first observation rather than
+        // blended against the artificial ema=0.0 starting value.
         h.push(100.0);
-        // EMA after first push: 0.05 * 100 + 0.95 * 0 = 5.0
-        assert!((h.ema - 5.0).abs() < 1e-5, "ema={}", h.ema);
+        assert!((h.ema - 100.0).abs() < 1e-5, "ema={}", h.ema);
 
         h.push(100.0);
-        // EMA: 0.05 * 100 + 0.95 * 5.0 = 5 + 4.75 = 9.75
-        assert!((h.ema - 9.75).abs() < 1e-5, "ema={}", h.ema);
+        // Constant input keeps the EMA at the same value.
+        assert!((h.ema - 100.0).abs() < 1e-5, "ema={}", h.ema);
     }
 
     #[test]
@@ -762,6 +833,45 @@ mod tests {
     }
 
     #[test]
+    fn test_loss_ratio_balanced_near_zero_loss_is_not_silenced() {
+        // Regression: a component whose loss has (near-)converged to ~0
+        // must receive a HIGH weight (it dominates 1/l), not be silenced
+        // by falling back to `min_weight` (which defaults to 0.0).
+        let mut base = HashMap::new();
+        base.insert(LossComponent::Photometric, 1.0_f32);
+        base.insert(LossComponent::Perceptual, 1.0_f32);
+
+        let strategy = WeightingStrategy::LossRatioBalanced {
+            base_weights: base,
+            adaptation_rate: 1.0,
+        };
+        let mut ctrl = AdaptiveLossController::new(
+            vec![LossComponent::Photometric, LossComponent::Perceptual],
+            strategy,
+        );
+
+        for _ in 0..20 {
+            if let Some(h) = ctrl.loss_histories.get_mut(&LossComponent::Photometric) {
+                h.push(1e-9)
+            }
+            if let Some(h) = ctrl.loss_histories.get_mut(&LossComponent::Perceptual) {
+                h.push(1.0)
+            }
+        }
+
+        ctrl.update_weights(10);
+
+        let wp = ctrl.weight(&LossComponent::Photometric);
+        let we = ctrl.weight(&LossComponent::Perceptual);
+        assert!(
+            wp > we,
+            "near-converged component should keep a high weight: photo={} percep={}",
+            wp,
+            we
+        );
+    }
+
+    #[test]
     fn test_adaptive_weights_grad_norm_balanced() {
         let mut base = HashMap::new();
         base.insert(LossComponent::Photometric, 1.0_f32);
@@ -830,6 +940,36 @@ mod tests {
             wp,
             we
         );
+    }
+
+    #[test]
+    fn test_adaptive_weights_uncertainty_negative_loss_stays_finite() {
+        // Regression: a signed component (e.g. a regularizer) can report a
+        // negative mean loss; `sqrt` of a negative value must not poison
+        // `sigma` — and hence every future weight — with NaN.
+        let mut sigma = HashMap::new();
+        sigma.insert(LossComponent::PositionRegularizer, 1.0_f32);
+
+        let strategy = WeightingStrategy::Uncertainty {
+            sigma,
+            update_rate: 1.0,
+        };
+        let mut ctrl =
+            AdaptiveLossController::new(vec![LossComponent::PositionRegularizer], strategy);
+
+        for _ in 0..20 {
+            if let Some(h) = ctrl
+                .loss_histories
+                .get_mut(&LossComponent::PositionRegularizer)
+            {
+                h.push(-3.0)
+            }
+        }
+
+        ctrl.update_weights(10);
+
+        let w = ctrl.weight(&LossComponent::PositionRegularizer);
+        assert!(w.is_finite(), "weight went non-finite: {}", w);
     }
 
     #[test]

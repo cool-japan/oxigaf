@@ -314,11 +314,13 @@ impl LinearEmbedding {
 // the same fixed seeds every time. Cache built matrices keyed by
 // `(in_dim, out_dim, seed)` so repeated calls with the same shape/seed reuse
 // one instance instead of re-running xorshift64 from scratch.
-static EMBEDDING_CACHE: std::sync::OnceLock<
-    std::sync::Mutex<
-        std::collections::HashMap<(usize, usize, u64), std::sync::Arc<LinearEmbedding>>,
-    >,
-> = std::sync::OnceLock::new();
+
+/// Key: `(in_dim, out_dim, seed)`. Value: the cached, shared embedding.
+type EmbeddingCacheMap =
+    std::collections::HashMap<(usize, usize, u64), std::sync::Arc<LinearEmbedding>>;
+
+static EMBEDDING_CACHE: std::sync::OnceLock<std::sync::Mutex<EmbeddingCacheMap>> =
+    std::sync::OnceLock::new();
 
 /// Fetches (or lazily builds and caches) a [`LinearEmbedding`] for the given
 /// shape and seed.
@@ -508,7 +510,7 @@ pub fn encode_expression_params(
 /// their outputs incomparable even though both had `dim == embed_dim` — so
 /// [`blend_conditioning`]/[`conditioning_similarity`] would silently
 /// blend/compare noise. `params` is now normalised to `n_coeffs` via
-/// [`take_or_pad`] first, exactly like the other components, so the
+/// `take_or_pad` first, exactly like the other components, so the
 /// projection matrix is a pure function of `(n_coeffs, embed_dim, seed)`.
 ///
 /// Each (normalised) pose value is wrapped to `[-π, π]` to handle angle
@@ -524,7 +526,7 @@ pub fn encode_expression_params(
 ///   bug rather than an intentional "neutral pose").
 /// * [`ConditioningError::NonFiniteValue`] — if any value in `params` is NaN
 ///   or infinite (an unguarded non-finite value could otherwise hang angle
-///   wrapping; see [`wrap_to_pi`]).
+///   wrapping; see `wrap_to_pi`).
 pub fn encode_pose_params(
     params: &[f32],
     n_coeffs: usize,
@@ -1766,7 +1768,7 @@ mod tests {
         // identical embeddings regardless of how long the raw input was.
         let short = vec![0.2f32, -0.1, 0.05];
         let mut long = short.clone();
-        long.extend(std::iter::repeat(0.0f32).take(12)); // pad to 15 explicitly
+        long.extend(std::iter::repeat_n(0.0f32, 12)); // pad to 15 explicitly
         let n_coeffs = 15;
 
         let enc_short = encode_pose_params(&short, n_coeffs, 32, 0x3000).expect("ok");

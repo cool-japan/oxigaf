@@ -613,27 +613,37 @@ fn cost_from_landmarks(
     }
 }
 
+/// Shared, unchanging inputs to every cost evaluation during a landmark fit:
+/// the model, its landmark observations and vertex indices, and the camera
+/// and fitting configuration. Bundling these keeps the per-evaluation helper
+/// functions below to a handful of arguments each.
+struct FitProblem<'a, F: FlameForward + ?Sized> {
+    model: &'a F,
+    observations: &'a [LandmarkObservation],
+    indices: &'a [usize],
+    camera: &'a PinholeCamera,
+    config: &'a FittingConfig,
+}
+
 /// Evaluate the forward pass at the landmark vertices and compute the cost.
 ///
-/// `scratch` must already be sized to `observations.len()`; it is reused
-/// across the many evaluations of the finite-difference loop so the gradient
-/// estimate allocates nothing per parameter dimension.
+/// `scratch` must already be sized to `problem.observations.len()`; it is
+/// reused across the many evaluations of the finite-difference loop so the
+/// gradient estimate allocates nothing per parameter dimension.
 fn compute_cost_into<F: FlameForward + ?Sized>(
-    model: &F,
+    problem: &FitProblem<F>,
     params: &FittingParams,
-    observations: &[LandmarkObservation],
-    indices: &[usize],
-    camera: &PinholeCamera,
-    config: &FittingConfig,
     scratch: &mut [[f32; 3]],
 ) -> Result<CostEval, FittingError> {
-    model.forward_landmarks(params, indices, scratch)?;
+    problem
+        .model
+        .forward_landmarks(params, problem.indices, scratch)?;
     Ok(cost_from_landmarks(
         scratch,
         params,
-        observations,
-        camera,
-        config,
+        problem.observations,
+        problem.camera,
+        problem.config,
     ))
 }
 
@@ -656,21 +666,117 @@ fn compute_cost<F: FlameForward + ?Sized>(
 ) -> Result<f32, FittingError> {
     let indices: Vec<usize> = observations.iter().map(|o| o.vertex_index).collect();
     let mut scratch = vec![[0.0f32; 3]; observations.len()];
-    let eval = compute_cost_into(
+    let problem = FitProblem {
         model,
-        params,
         observations,
-        &indices,
+        indices: &indices,
         camera,
         config,
-        &mut scratch,
-    )?;
+    };
+    let eval = compute_cost_into(&problem, params, &mut scratch)?;
     Ok(eval.cost)
 }
 
 // ---------------------------------------------------------------------------
 // Main fitting function
 // ---------------------------------------------------------------------------
+
+/// Numerical gradient via central differences: two forward evaluations per
+/// parameter dimension, restoring `probe` to `params` after each.
+fn estimate_gradient<F: FlameForward + ?Sized>(
+    problem: &FitProblem<F>,
+    params: &FittingParams,
+    probe: &mut FittingParams,
+    scratch: &mut [[f32; 3]],
+    grad: &mut [f32],
+    eps: f32,
+) -> Result<(), FittingError> {
+    for (dim, g) in grad.iter_mut().enumerate() {
+        let center = params.dim_value(dim);
+
+        probe.set_dim_value(dim, center + eps);
+        let cost_plus = compute_cost_into(problem, probe, scratch)?.cost;
+
+        probe.set_dim_value(dim, center - eps);
+        let cost_minus = compute_cost_into(problem, probe, scratch)?.cost;
+
+        // Restore the probe so the next dimension perturbs around the
+        // current parameters, not a previously perturbed copy.
+        probe.set_dim_value(dim, center);
+
+        *g = (cost_plus - cost_minus) / (2.0 * eps);
+    }
+    Ok(())
+}
+
+/// Clip `grad` to unit L2 norm if it exceeds it — keeping the optimizer
+/// stable regardless of the cost-function scale — then apply a
+/// gradient-descent step to `params` (mirrored into `probe`). Returns the L2
+/// norm of the step actually taken.
+fn apply_gradient_step(
+    params: &mut FittingParams,
+    probe: &mut FittingParams,
+    grad: &[f32],
+    learning_rate: f32,
+) -> f32 {
+    let grad_norm_sq: f32 = grad.iter().map(|g| g * g).sum();
+    let grad_norm = grad_norm_sq.sqrt();
+    let scale = if grad_norm > 1.0 {
+        1.0 / grad_norm
+    } else {
+        1.0
+    };
+
+    for (dim, &g) in grad.iter().enumerate() {
+        let updated = params.dim_value(dim) - learning_rate * g * scale;
+        params.set_dim_value(dim, updated);
+        probe.set_dim_value(dim, updated);
+    }
+
+    learning_rate * grad_norm.min(1.0)
+}
+
+/// Per-landmark reprojection error at the final parameters (`scratch` holds
+/// the corresponding landmark positions), plus the count of camera-visible
+/// landmarks and their mean error (visible and finite only).
+fn compute_reprojection_errors(
+    observations: &[LandmarkObservation],
+    scratch: &[[f32; 3]],
+    camera: &PinholeCamera,
+) -> (Vec<f32>, usize, f32) {
+    let mut reprojection_errors = Vec::with_capacity(observations.len());
+    let mut n_visible_landmarks = 0usize;
+
+    for (obs, &vertex) in observations.iter().zip(scratch.iter()) {
+        let err = match camera.project(vertex) {
+            Some(proj) => {
+                n_visible_landmarks += 1;
+                let dx = proj[0] - obs.position_2d[0];
+                let dy = proj[1] - obs.position_2d[1];
+                (dx * dx + dy * dy).sqrt()
+            }
+            None => f32::INFINITY,
+        };
+        reprojection_errors.push(err);
+    }
+
+    let mean_reprojection_error = if n_visible_landmarks == 0 {
+        f32::INFINITY
+    } else {
+        reprojection_errors
+            .iter()
+            .copied()
+            .filter(|e| e.is_finite())
+            .sum::<f32>()
+            / n_visible_landmarks as f32
+    };
+
+    (
+        reprojection_errors,
+        n_visible_landmarks,
+        mean_reprojection_error,
+    )
+}
 
 /// Fit FLAME model parameters to 2D landmark observations by gradient descent
 /// on a finite-difference gradient.
@@ -681,10 +787,10 @@ fn compute_cost<F: FlameForward + ?Sized>(
 /// 2. For each iteration:
 ///    a. Compute the cost at the current parameters.
 ///    b. Estimate the gradient by **central differences**: perturb each
-///       parameter by `+eps` and `−eps` in turn and take
-///       `(cost₊ − cost₋) / (2·eps)`, which is `O(eps²)`-accurate.
+///    parameter by `+eps` and `−eps` in turn and take
+///    `(cost₊ − cost₋) / (2·eps)`, which is `O(eps²)`-accurate.
 ///    c. Clip the gradient to unit L2 norm and update every parameter:
-///       `pᵢ -= learning_rate * grad_i`.
+///    `pᵢ -= learning_rate * grad_i`.
 ///    d. Stop early if `||step|| < convergence_delta`.
 /// 3. Compute final per-landmark reprojection errors.
 ///
@@ -732,6 +838,13 @@ pub fn fit_landmarks<F: FlameForward + ?Sized>(
 
     let indices: Vec<usize> = observations.iter().map(|o| o.vertex_index).collect();
     let mut scratch = vec![[0.0f32; 3]; observations.len()];
+    let problem = FitProblem {
+        model,
+        observations,
+        indices: &indices,
+        camera,
+        config,
+    };
 
     let mut params = FittingParams::zero(config.shape_dim, config.expr_dim);
     let ndims = params.total_dims();
@@ -748,15 +861,7 @@ pub fn fit_landmarks<F: FlameForward + ?Sized>(
         iterations = iter + 1;
 
         // Current cost
-        let base = compute_cost_into(
-            model,
-            &params,
-            observations,
-            &indices,
-            camera,
-            config,
-            &mut scratch,
-        )?;
+        let base = compute_cost_into(&problem, &params, &mut scratch)?;
         final_cost = base.cost;
 
         if iter == 0 && base.n_visible == 0 {
@@ -770,121 +875,29 @@ pub fn fit_landmarks<F: FlameForward + ?Sized>(
 
         // Numerical gradient — central differences, two forward evaluations
         // per parameter dimension.
-        for (dim, g) in grad.iter_mut().enumerate() {
-            let center = params.dim_value(dim);
+        estimate_gradient(&problem, &params, &mut probe, &mut scratch, &mut grad, eps)?;
 
-            probe.set_dim_value(dim, center + eps);
-            let cost_plus = compute_cost_into(
-                model,
-                &probe,
-                observations,
-                &indices,
-                camera,
-                config,
-                &mut scratch,
-            )?
-            .cost;
-
-            probe.set_dim_value(dim, center - eps);
-            let cost_minus = compute_cost_into(
-                model,
-                &probe,
-                observations,
-                &indices,
-                camera,
-                config,
-                &mut scratch,
-            )?
-            .cost;
-
-            // Restore the probe so the next dimension perturbs around the
-            // current parameters, not a previously perturbed copy.
-            probe.set_dim_value(dim, center);
-
-            *g = (cost_plus - cost_minus) / (2.0 * eps);
-        }
-
-        // Gradient norm clipping: scale gradient to have unit L2 norm when it
-        // would otherwise produce an oversized step.  This keeps the optimizer
-        // stable regardless of the cost-function scale.
-        let grad_norm_sq: f32 = grad.iter().map(|g| g * g).sum();
-        let grad_norm = grad_norm_sq.sqrt();
-        let scale = if grad_norm > 1.0 {
-            1.0 / grad_norm
-        } else {
-            1.0
-        };
-
-        // Gradient descent update, applied in place.
-        for (dim, &g) in grad.iter().enumerate() {
-            let updated = params.dim_value(dim) - config.learning_rate * g * scale;
-            params.set_dim_value(dim, updated);
-            probe.set_dim_value(dim, updated);
-        }
-
-        // Convergence check: L2 norm of the step taken
-        let step_norm = config.learning_rate * grad_norm.min(1.0);
+        // Gradient norm clipping + gradient descent update, applied in place.
+        let step_norm = apply_gradient_step(&mut params, &mut probe, &grad, config.learning_rate);
 
         if step_norm < config.convergence_delta {
             converged = true;
             // Recompute final cost at the updated params
-            final_cost = compute_cost_into(
-                model,
-                &params,
-                observations,
-                &indices,
-                camera,
-                config,
-                &mut scratch,
-            )?
-            .cost;
+            final_cost = compute_cost_into(&problem, &params, &mut scratch)?.cost;
             break;
         }
     }
 
     if !converged {
         // Ensure final_cost reflects the last params after the loop
-        final_cost = compute_cost_into(
-            model,
-            &params,
-            observations,
-            &indices,
-            camera,
-            config,
-            &mut scratch,
-        )?
-        .cost;
+        final_cost = compute_cost_into(&problem, &params, &mut scratch)?.cost;
     }
 
     // Compute per-landmark reprojection errors at the final parameters.
     // `scratch` already holds the final landmark positions from the cost
     // evaluation immediately above.
-    let mut reprojection_errors = Vec::with_capacity(observations.len());
-    let mut n_visible_landmarks = 0usize;
-
-    for (obs, &vertex) in observations.iter().zip(scratch.iter()) {
-        let err = match camera.project(vertex) {
-            Some(proj) => {
-                n_visible_landmarks += 1;
-                let dx = proj[0] - obs.position_2d[0];
-                let dy = proj[1] - obs.position_2d[1];
-                (dx * dx + dy * dy).sqrt()
-            }
-            None => f32::INFINITY,
-        };
-        reprojection_errors.push(err);
-    }
-
-    let mean_reprojection_error = if n_visible_landmarks == 0 {
-        f32::INFINITY
-    } else {
-        reprojection_errors
-            .iter()
-            .copied()
-            .filter(|e| e.is_finite())
-            .sum::<f32>()
-            / n_visible_landmarks as f32
-    };
+    let (reprojection_errors, n_visible_landmarks, mean_reprojection_error) =
+        compute_reprojection_errors(observations, &scratch, camera);
 
     // A fit whose landmark term carried no information never converged,
     // whatever the step norm said.
@@ -1621,13 +1634,82 @@ mod tests {
             .forward_landmarks(&params, &indices, &mut subset)
             .expect("subset forward failed");
 
+        // The fast path is not an approximation — it is the same arithmetic
+        // reassociated, so the only legitimate difference is f32 summation
+        // order in the joint-regressor product. Measured residual on this
+        // model is below 1e-9; 1e-5 leaves four orders of magnitude of
+        // platform headroom while still catching a real divergence. (The old
+        // 1e-4 bound was barely above the 1.08e-4 error produced by the
+        // expression-in-joints bug this pair of tests now pins down — see
+        // `test_landmark_fitter_joints_ignore_expression`.)
         for (slot, &idx) in subset.iter().zip(indices.iter()) {
             for c in 0..3 {
                 assert!(
-                    (slot[c] - full[idx][c]).abs() < 1e-4,
+                    (slot[c] - full[idx][c]).abs() < 1e-5,
                     "vertex {idx} component {c}: subset {} vs full {}",
                     slot[c],
                     full[idx][c]
+                );
+            }
+        }
+    }
+
+    /// Regression: the fitter must NOT let expression coefficients move the
+    /// joint pivots.
+    ///
+    /// `FlameModel::forward` regresses the joints from the *shape-only* rest
+    /// mesh (`apply_shape_only`) and only then adds expression on top for the
+    /// posing/skinning stage. The fitter used to precompute a
+    /// `J · expressiondirs[:, :, k]` table and accumulate `Σₖ ψₖ (J·Eₖ)` into
+    /// its joints, shifting every skinning transform and putting the fast path
+    /// ~0.7% off the full forward pass.
+    ///
+    /// The parameters below are chosen to isolate exactly that term:
+    ///
+    /// - **zero shape** — so both paths compute the joint pivots from
+    ///   `v_template` alone and no floating-point reassociation noise from the
+    ///   `Σₖ βₖ (J·Sₖ)` reassociation enters the comparison;
+    /// - **nonzero expression** — the erroneous `Σₖ ψₖ (J·Eₖ)` term is
+    ///   proportional to it, so it vanishes when expression is zero;
+    /// - **nonzero rotation and jaw** — with every joint at identity the
+    ///   skinning transforms collapse to `A_j = G_j − pad(G_j·[J_j, 0]ᵀ) = I`
+    ///   regardless of where the joints sit, so the joint positions cancel out
+    ///   of the output entirely and the bug is invisible. A rotated root and
+    ///   jaw are what make a displaced pivot show up in the vertices.
+    #[test]
+    fn test_landmark_fitter_joints_ignore_expression() {
+        let model = synthetic_model();
+        let indices = vec![0usize, 2, 5, 7];
+        let fitter =
+            FlameLandmarkFitter::new(&model, &indices, 4, 3).expect("fitter construction failed");
+
+        let params = FittingParams {
+            shape: vec![0.0; 4],
+            expression: vec![0.9, -0.75, 0.6],
+            global_rotation: [0.3, -0.25, 0.15],
+            translation: [0.0; 3],
+            jaw: [0.4, 0.1, -0.2],
+        };
+
+        let full = FlameForward::forward(&model, &params).expect("full forward failed");
+        let mut subset = vec![[0.0f32; 3]; indices.len()];
+        fitter
+            .forward_landmarks(&params, &indices, &mut subset)
+            .expect("subset forward failed");
+
+        // With shape zeroed the two paths regress identical joint pivots, so
+        // the only remaining difference is f32 summation order in the
+        // regressor dot product. 1e-5 is ~100x that noise floor and ~1000x
+        // tighter than the discrepancy the expression term used to cause.
+        for (slot, &idx) in subset.iter().zip(indices.iter()) {
+            for c in 0..3 {
+                assert!(
+                    (slot[c] - full[idx][c]).abs() < 1e-5,
+                    "expression must not move joint pivots: vertex {idx} component {c}: \
+                     subset {} vs full {} (delta {})",
+                    slot[c],
+                    full[idx][c],
+                    (slot[c] - full[idx][c]).abs()
                 );
             }
         }

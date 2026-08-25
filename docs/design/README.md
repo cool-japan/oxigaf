@@ -62,7 +62,7 @@ Only two of the originally-planned design documents in this directory were ever 
 ### Code Quality Standards
 - No unwrap policy (use proper error handling)
 - No expect in library code
-- File size limit: < 2000 lines
+- File size limit target: < 2000 lines (enforced by `splitrs` refactors)
 - Workspace version management (`*.workspace = true`)
 - Comprehensive automated test suite (see `CHANGELOG.md` / CI for current counts)
 

@@ -248,10 +248,11 @@ mod tests {
         let result =
             SafeTensors::deserialize(&data).map_err(|e| BridgeError::SafeTensors(e.to_string()))?;
 
-        // "unet." is a recognized prefix and is stripped; the existing
-        // underscore in "conv_in" is doubled before dots become underscores.
+        // "unet." is a recognized prefix and is stripped; the rest of the
+        // dot-separated path is preserved verbatim, which is exactly the
+        // form `candle_nn::VarBuilder::pp` walks.
         let conv_tensor = result
-            .tensor("conv__in_weight")
+            .tensor("conv_in.weight")
             .map_err(|e| BridgeError::SafeTensors(e.to_string()))?;
         assert_eq!(conv_tensor.shape(), &[2, 2]);
         assert_eq!(conv_tensor.dtype(), Dtype::F32);
@@ -272,6 +273,69 @@ mod tests {
         let int_data: [i64; 4] = [10, 20, 30, 40];
         let expected_bytes: Vec<u8> = int_data.iter().flat_map(|x| x.to_le_bytes()).collect();
         assert_eq!(int_tensor.data(), expected_bytes.as_slice());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_converted_checkpoint_loads_in_candle_varbuilder() -> Result<()> {
+        // Regression test for the architecture gap this crate carried: a
+        // checkpoint produced by `pytorch_to_oxigaf::convert` used to carry
+        // flat, double-underscore-escaped names
+        // (`down__blocks_0_resnets_0_norm1_weight`) that
+        // `candle_nn::VarBuilder::pp` cannot walk, so it was not loadable by
+        // `oxigaf-diffusion`'s model code (`vs.pp("down_blocks").pp("0")...`,
+        // see `oxigaf-diffusion/src/unet.rs`). It must now load.
+        use candle_core::{DType, Device};
+        use candle_nn as nn;
+
+        let temp_dir = tempfile::tempdir().expect("test: failed to create temp dir");
+        let pytorch_path = temp_dir.path().join("varbuilder_in.safetensors");
+        let oxigaf_path = temp_dir.path().join("varbuilder_out.safetensors");
+
+        let conv: Vec<u8> = [1.0f32, 2.0, 3.0, 4.0]
+            .iter()
+            .flat_map(|x| x.to_le_bytes())
+            .collect();
+        let norm: Vec<u8> = [0.5f32, 0.25]
+            .iter()
+            .flat_map(|x| x.to_le_bytes())
+            .collect();
+
+        let mut tensors = BTreeMap::new();
+        tensors.insert(
+            "unet.conv_in.weight".to_string(),
+            TensorView::new(Dtype::F32, vec![2, 2], &conv).expect("test: tensor view"),
+        );
+        tensors.insert(
+            "unet.down_blocks.0.resnets.0.norm1.weight".to_string(),
+            TensorView::new(Dtype::F32, vec![2], &norm).expect("test: tensor view"),
+        );
+        let serialized =
+            safetensors::serialize(&tensors, None).expect("test: serialize should succeed");
+        std::fs::write(&pytorch_path, &serialized)?;
+
+        convert(
+            &pytorch_path,
+            &oxigaf_path,
+            &LayerMapping::new(),
+            &PrecisionConfig::new(),
+        )?;
+
+        let data = std::fs::read(&oxigaf_path)?;
+        let vb = nn::VarBuilder::from_buffered_safetensors(data, DType::F32, &Device::Cpu)
+            .expect("test: VarBuilder should load the converted checkpoint");
+
+        vb.pp("conv_in")
+            .get((2, 2), "weight")
+            .expect("test: conv_in.weight should be reachable via VarBuilder::pp");
+        vb.pp("down_blocks")
+            .pp("0")
+            .pp("resnets")
+            .pp("0")
+            .pp("norm1")
+            .get((2,), "weight")
+            .expect("test: nested path should be reachable via VarBuilder::pp");
 
         Ok(())
     }

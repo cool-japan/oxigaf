@@ -702,7 +702,6 @@ pub fn format_schedule_summary(analysis: &ScheduleAnalysis) -> String {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

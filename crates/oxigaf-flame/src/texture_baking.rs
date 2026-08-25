@@ -88,7 +88,9 @@ impl BakedTexture {
     ///
     /// # Panics
     ///
-    /// Panics (in debug mode) if `x >= self.width` or `y >= self.height`.
+    /// Panics if `x >= self.width` or `y >= self.height` -- this is an
+    /// ordinary slice-range index, so the bounds check is not
+    /// debug-only; it applies in release builds too.
     #[inline]
     #[must_use]
     pub fn get_pixel(&self, x: usize, y: usize) -> &[f32] {
@@ -129,6 +131,11 @@ impl BakedTexture {
     }
 
     /// Return `true` if texel `(x, y)` has been written.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `x >= self.width` or `y >= self.height` (ordinary slice
+    /// indexing, checked in release builds too).
     #[inline]
     #[must_use]
     pub fn is_filled(&self, x: usize, y: usize) -> bool {
@@ -255,6 +262,13 @@ fn rasterize_triangle(
     let width = texture.width as f32;
     let height = texture.height as f32;
     let channels = texture.channels;
+    // `validate_config` restricts channels to 1, 3, or 4 on every public
+    // entry point that reaches here; the fixed-size scratch buffer below
+    // relies on that.
+    debug_assert!(
+        channels <= 4,
+        "rasterize_triangle only supports up to 4 channels, got {channels}"
+    );
 
     // Signed area (×2) — skip degenerate triangles.
     let area = edge_fn_2d(p0, p1, p2);
@@ -269,6 +283,10 @@ fn rasterize_triangle(
     let max_y = (p0[1].max(p1[1]).max(p2[1]).min(height - 1.0)) as usize;
 
     let inv_area = 1.0 / area;
+
+    // Interpolated-attribute scratch buffer, reused across every covered
+    // texel instead of heap-allocated per texel.
+    let mut interp = [0.0f32; 4];
 
     for py in min_y..=max_y {
         for px in min_x..=max_x {
@@ -285,7 +303,6 @@ fn rasterize_triangle(
             }
 
             // Interpolate attribute.
-            let mut interp = vec![0.0f32; channels];
             for c in 0..channels {
                 let v0 = if c < a0.len() { a0[c] } else { 0.0 };
                 let v1 = if c < a1.len() { a1[c] } else { 0.0 };
@@ -293,7 +310,7 @@ fn rasterize_triangle(
                 interp[c] = w0 * v0 + w1 * v1 + w2 * v2;
             }
 
-            texture.set_pixel(px, py, &interp);
+            texture.set_pixel(px, py, &interp[..channels]);
         }
     }
 }
@@ -301,11 +318,14 @@ fn rasterize_triangle(
 /// Convert a UV coordinate to pixel position (f32) in a texture of the given
 /// dimensions.
 ///
-/// Y is flipped: `v = 0` → top row, `v = 1` → bottom row.
+/// `v = 0` → top row, `v = 1` → bottom row (the image/texture convention
+/// documented on [`crate::uv_texture::TextureMap`] and used by
+/// [`crate::uv_texture::UvTextureSampler::sample`], so a texture baked
+/// here and sampled there round-trips without a vertical flip).
 #[inline]
 fn uv_to_pixel(uv: [f32; 2], width: usize, height: usize) -> [f32; 2] {
     let px = uv[0] * (width as f32 - 1.0);
-    let py = (1.0 - uv[1]) * (height as f32 - 1.0);
+    let py = uv[1] * (height as f32 - 1.0);
     [px, py]
 }
 
@@ -490,13 +510,24 @@ pub fn bake(
 #[must_use]
 pub fn apply_uv_padding(texture: &BakedTexture, iterations: usize) -> BakedTexture {
     let mut current = texture.clone();
+    let (width, height, channels) = (current.width, current.height, current.channels);
 
     for _ in 0..iterations {
-        let prev = current.clone();
+        // Only the filled mask needs double-buffering (to avoid cascading
+        // dilation within a single pass); pixel *data* is read directly
+        // from `current.data` below. That's safe because dilation only
+        // ever reads a texel that was already filled at the start of this
+        // pass (`prev_filled[n_idx]`), and such a texel is never written
+        // to during this same pass (the loop below only writes texels
+        // where `prev_filled[idx]` is false) -- so its data cannot have
+        // changed since the snapshot was taken. This avoids a full
+        // `BakedTexture` clone (data + mask) every iteration.
+        let prev_filled = current.filled.clone();
 
-        for y in 0..prev.height {
-            for x in 0..prev.width {
-                if prev.is_filled(x, y) {
+        for y in 0..height {
+            for x in 0..width {
+                let idx = y * width + x;
+                if prev_filled[idx] {
                     continue;
                 }
                 // 4-connected neighbours: left, right, up, down.
@@ -504,19 +535,19 @@ pub fn apply_uv_padding(texture: &BakedTexture, iterations: usize) -> BakedTextu
                 for (dx, dy) in neighbours {
                     let nx: isize = x.cast_signed() + dx;
                     let ny: isize = y.cast_signed() + dy;
-                    if nx < 0
-                        || ny < 0
-                        || nx >= prev.width.cast_signed()
-                        || ny >= prev.height.cast_signed()
-                    {
+                    if nx < 0 || ny < 0 || nx >= width.cast_signed() || ny >= height.cast_signed() {
                         continue;
                     }
                     let nx = nx as usize;
                     let ny = ny as usize;
-                    if prev.is_filled(nx, ny) {
-                        let src_base = (ny * prev.width + nx) * prev.channels;
-                        let src: Vec<f32> = prev.data[src_base..src_base + prev.channels].to_vec();
-                        current.set_pixel(x, y, &src);
+                    let n_idx = ny * width + nx;
+                    if prev_filled[n_idx] {
+                        let src_base = n_idx * channels;
+                        let dst_base = idx * channels;
+                        current
+                            .data
+                            .copy_within(src_base..src_base + channels, dst_base);
+                        current.filled[idx] = true;
                         break;
                     }
                 }
@@ -1486,7 +1517,8 @@ mod tests {
             background: vec![0.3, 0.5, 0.7],
         };
         let tex = bake_attribute(&verts, &faces, &attrs, &uvs, &cfg).expect("bake must succeed");
-        // Pixel (15, 0) is at UV (1, 1) — far from the triangle.
+        // Pixel (15, 0) is at UV (1, 0) — far from the triangle, which sits
+        // near UV (0,0)-(0.1,0.1).
         let p = tex.get_pixel(15, 0);
         assert!(
             (p[0] - 0.3).abs() < 1e-6,
@@ -1502,6 +1534,43 @@ mod tests {
             (p[2] - 0.7).abs() < 1e-6,
             "B background = 0.7, got {}",
             p[2]
+        );
+    }
+
+    // Regression test for the uv_to_pixel V-flip bug: bakes attribute
+    // value = v itself, so bake and `uv_texture::UvTextureSampler` must
+    // agree on which row corresponds to which v to recover it. A
+    // vertical-flip mismatch between the two would sample v=0.1 from the
+    // row baked for v=0.9 (and vice versa) -- a large, obvious discrepancy.
+    #[test]
+    fn test_bake_sample_roundtrip_no_vertical_flip() {
+        use crate::uv_texture::{FilterMode, TextureMap, UvTextureSampler, WrapMode};
+
+        let verts = [[0.0f32; 3]; 4];
+        let faces = [[0u32, 1, 2], [0, 2, 3]];
+        let uvs: [UvCoord; 4] = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+        let attrs: Vec<Vec<f32>> = uvs.iter().map(|uv| vec![uv[1]]).collect();
+        let cfg = BakeConfig {
+            width: 32,
+            height: 32,
+            channels: 1,
+            padding: 0,
+            background: vec![0.0],
+        };
+        let tex = bake_attribute(&verts, &faces, &attrs, &uvs, &cfg).expect("bake must succeed");
+        let map = TextureMap::new(tex.width, tex.height, tex.channels, tex.data.clone())
+            .expect("texture map must be valid");
+        let sampler = UvTextureSampler::new(FilterMode::Bilinear, WrapMode::Clamp);
+
+        let low = sampler.sample(&map, [0.5, 0.1])[0];
+        let high = sampler.sample(&map, [0.5, 0.9])[0];
+        assert!(
+            (low - 0.1).abs() < 0.15,
+            "sampling at v=0.1 should recover ~0.1, got {low}"
+        );
+        assert!(
+            (high - 0.9).abs() < 0.15,
+            "sampling at v=0.9 should recover ~0.9, got {high}"
         );
     }
 

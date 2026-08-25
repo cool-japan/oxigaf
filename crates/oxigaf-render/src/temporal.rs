@@ -2,6 +2,22 @@
 //!
 //! Provides motion vector fields, frame accumulators, and temporal blending
 //! for ghosting-reduced TAA using neighborhood clamping and disocclusion detection.
+//!
+//! # Relationship to [`crate::temporal_aa`]
+//!
+//! Two temporal-accumulation modules coexist in this crate and are *not*
+//! interchangeable:
+//!
+//! | Module | History reprojection | Ghosting control | Extras |
+//! |---|---|---|---|
+//! | [`crate::temporal`] (this one) | motion-vector warping with bilinear resampling | 3×3 neighbourhood min/max clamp + disocclusion blend | arbitrary channel count |
+//! | [`crate::temporal_aa`] | none — history is aligned by construction | variance clipping (local mean ± σ) | Halton jitter, unsharp sharpening, RGB only |
+//!
+//! Pick this module when you have a motion-vector field; pick
+//! [`crate::temporal_aa`] for a static or jitter-only camera. Both modules
+//! define their own `TaaConfig` and `TaaError` with different fields and
+//! variants — the crate root re-exports *this* module's pair, so
+//! [`crate::temporal_aa`]'s must be reached through its full path.
 
 use thiserror::Error;
 
@@ -172,19 +188,45 @@ impl Default for TaaConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Frame view
+// ---------------------------------------------------------------------------
+
+/// Borrowed view of an HWC frame buffer: the pixels plus the shape needed to
+/// index them.
+///
+/// Bundling the four values keeps the per-pixel helpers below inside the
+/// argument-count budget and makes it impossible to pass a buffer with
+/// another buffer's dimensions.
+#[derive(Clone, Copy)]
+struct FrameView<'a> {
+    /// Pixel data, `width * height * channels` entries in HWC order.
+    image: &'a [f32],
+    /// Frame width in pixels.
+    width: usize,
+    /// Frame height in pixels.
+    height: usize,
+    /// Components per pixel.
+    channels: usize,
+}
+
+// ---------------------------------------------------------------------------
 // Bilinear sampling helper
 // ---------------------------------------------------------------------------
 
 /// Sample `image` (HWC layout) at fractional pixel position `(x, y)` using bilinear
-/// interpolation with edge clamping. Returns a `Vec<f32>` of length `channels`.
-fn sample_bilinear(
-    image: &[f32],
-    width: usize,
-    height: usize,
-    channels: usize,
-    x: f32,
-    y: f32,
-) -> Vec<f32> {
+/// interpolation with edge clamping, writing the `channels` result components into
+/// `out` (any entries at or beyond `out.len()` are silently skipped).
+///
+/// Takes an output buffer rather than returning a fresh `Vec` so a caller
+/// sampling many positions (e.g. once per pixel) can reuse a single
+/// allocation instead of paying a heap allocation per call.
+fn sample_bilinear_into(view: FrameView<'_>, x: f32, y: f32, out: &mut [f32]) {
+    let FrameView {
+        image,
+        width,
+        height,
+        channels,
+    } = view;
     // Clamp to valid range
     let x0f = x.clamp(0.0, (width.saturating_sub(1)) as f32);
     let y0f = y.clamp(0.0, (height.saturating_sub(1)) as f32);
@@ -197,8 +239,7 @@ fn sample_bilinear(
     let fx = x0f - x0f.floor();
     let fy = y0f - y0f.floor();
 
-    let mut out = vec![0.0_f32; channels];
-    for (c, out_val) in out.iter_mut().enumerate() {
+    for c in 0..channels {
         let p00 = image
             .get((y0 * width + x0) * channels + c)
             .copied()
@@ -216,28 +257,44 @@ fn sample_bilinear(
             .copied()
             .unwrap_or(0.0);
 
-        *out_val = (1.0 - fy) * ((1.0 - fx) * p00 + fx * p10) + fy * ((1.0 - fx) * p01 + fx * p11);
+        let value = (1.0 - fy) * ((1.0 - fx) * p00 + fx * p10) + fy * ((1.0 - fx) * p01 + fx * p11);
+        if let Some(slot) = out.get_mut(c) {
+            *slot = value;
+        }
     }
-    out
 }
 
 // ---------------------------------------------------------------------------
 // Neighborhood AABB clamp helper
 // ---------------------------------------------------------------------------
 
-/// Compute the per-channel min/max over the 3×3 neighborhood (including center) at `(px, py)`.
+/// Compute the per-channel min/max over the 3×3 neighborhood (including center) at
+/// `(px, py)`, writing into `min_out`/`max_out` (any entries at or beyond
+/// `channels` are silently skipped).
 ///
-/// Returns `(min_per_channel, max_per_channel)`.
-fn neighborhood_minmax(
-    image: &[f32],
-    width: usize,
-    height: usize,
-    channels: usize,
+/// Takes output buffers rather than returning fresh `Vec`s for the same
+/// reason as [`sample_bilinear_into`]: this is called once per pixel by
+/// [`TemporalAccumulator::accumulate`], and reusing a caller-owned buffer
+/// avoids two heap allocations per call.
+fn neighborhood_minmax_into(
+    view: FrameView<'_>,
     px: usize,
     py: usize,
-) -> (Vec<f32>, Vec<f32>) {
-    let mut min_c = vec![f32::INFINITY; channels];
-    let mut max_c = vec![f32::NEG_INFINITY; channels];
+    min_out: &mut [f32],
+    max_out: &mut [f32],
+) {
+    let FrameView {
+        image,
+        width,
+        height,
+        channels,
+    } = view;
+    for v in min_out.iter_mut().take(channels) {
+        *v = f32::INFINITY;
+    }
+    for v in max_out.iter_mut().take(channels) {
+        *v = f32::NEG_INFINITY;
+    }
 
     let y_start = py.saturating_sub(1);
     let y_end = (py + 2).min(height);
@@ -249,11 +306,15 @@ fn neighborhood_minmax(
             let base = (ny * width + nx) * channels;
             for c in 0..channels {
                 let v = image.get(base + c).copied().unwrap_or(0.0);
-                if v < min_c[c] {
-                    min_c[c] = v;
+                if let Some(min_slot) = min_out.get_mut(c) {
+                    if v < *min_slot {
+                        *min_slot = v;
+                    }
                 }
-                if v > max_c[c] {
-                    max_c[c] = v;
+                if let Some(max_slot) = max_out.get_mut(c) {
+                    if v > *max_slot {
+                        *max_slot = v;
+                    }
                 }
             }
         }
@@ -261,13 +322,15 @@ fn neighborhood_minmax(
 
     // Guard against empty neighborhood (zero-size image edge case)
     for c in 0..channels {
-        if min_c[c] == f32::INFINITY {
-            min_c[c] = 0.0;
-            max_c[c] = 0.0;
+        if min_out.get(c).copied() == Some(f32::INFINITY) {
+            if let Some(slot) = min_out.get_mut(c) {
+                *slot = 0.0;
+            }
+            if let Some(slot) = max_out.get_mut(c) {
+                *slot = 0.0;
+            }
         }
     }
-
-    (min_c, max_c)
 }
 
 // ---------------------------------------------------------------------------
@@ -287,6 +350,12 @@ pub struct TemporalAccumulator {
     pub channels: usize,
     /// Total number of frames accumulated so far.
     pub frame_count: usize,
+    /// Fraction of pixels the most recent [`Self::accumulate`] call classified
+    /// as disoccluded (`color_dist > disocclusion_threshold`, the same
+    /// predicate used to pick the blend weight), or `0.0` if `accumulate`
+    /// has not yet run its per-pixel comparison (no history, or the
+    /// bootstrap first frame). Read by [`TemporalStats::compute`].
+    last_disocclusion_fraction: f32,
 }
 
 impl TemporalAccumulator {
@@ -299,6 +368,7 @@ impl TemporalAccumulator {
             height,
             channels,
             frame_count: 0,
+            last_disocclusion_fraction: 0.0,
         }
     }
 
@@ -321,6 +391,7 @@ impl TemporalAccumulator {
     pub fn reset(&mut self) {
         self.history = None;
         self.frame_count = 0;
+        self.last_disocclusion_fraction = 0.0;
     }
 
     /// Accumulate `current_frame` using `motion_vectors` for history warping.
@@ -384,6 +455,28 @@ impl TemporalAccumulator {
 
         let mut blended = vec![0.0_f32; expected_frame];
 
+        // Reusable per-pixel scratch buffers, allocated once for the whole
+        // call instead of once per pixel (`sample_bilinear_into` and
+        // `neighborhood_minmax_into` write into these rather than
+        // returning a fresh `Vec` each call).
+        let mut warped = vec![0.0_f32; ch];
+        let mut n_min = vec![0.0_f32; ch];
+        let mut n_max = vec![0.0_f32; ch];
+        let mut disoccluded_count = 0usize;
+
+        let history_view = FrameView {
+            image: history,
+            width: w,
+            height: h,
+            channels: ch,
+        };
+        let current_view = FrameView {
+            image: current_frame,
+            width: w,
+            height: h,
+            channels: ch,
+        };
+
         for py in 0..h {
             for px in 0..w {
                 let mv = motion_vectors.get(px, py).copied().unwrap_or_default();
@@ -391,11 +484,11 @@ impl TemporalAccumulator {
                 // Warp: sample history at (x - dx, y - dy)
                 let src_x = px as f32 - mv.dx;
                 let src_y = py as f32 - mv.dy;
-                let mut warped = sample_bilinear(history, w, h, ch, src_x, src_y);
+                sample_bilinear_into(history_view, src_x, src_y, &mut warped);
 
                 // Neighborhood clamp
                 if self.config.enable_neighborhood_clamp {
-                    let (n_min, n_max) = neighborhood_minmax(current_frame, w, h, ch, px, py);
+                    neighborhood_minmax_into(current_view, px, py, &mut n_min, &mut n_max);
                     for c in 0..ch {
                         warped[c] = warped[c].clamp(n_min[c], n_max[c]);
                     }
@@ -412,8 +505,17 @@ impl TemporalAccumulator {
                     }
                 }
 
-                // Choose blend weight
-                let weight = if color_dist > self.config.disocclusion_threshold {
+                // Choose blend weight. This is also the ground-truth
+                // per-pixel disocclusion decision recorded below for
+                // `TemporalStats::mean_disocclusion_fraction` -- unlike a
+                // metric that only inspects history brightness, this one
+                // actually compares the warped history against the current
+                // frame, exactly as the blend itself does.
+                let is_disoccluded = color_dist > self.config.disocclusion_threshold;
+                if is_disoccluded {
+                    disoccluded_count += 1;
+                }
+                let weight = if is_disoccluded {
                     self.config.disocclusion_blend
                 } else {
                     self.config.current_weight
@@ -427,6 +529,8 @@ impl TemporalAccumulator {
                 }
             }
         }
+
+        self.last_disocclusion_fraction = disoccluded_count as f32 / (w * h) as f32;
 
         self.history = Some(blended.clone());
         self.frame_count += 1;
@@ -473,36 +577,16 @@ impl TemporalStats {
 
         let mean_motion_magnitude = motion_field.mean_magnitude();
 
-        // Estimate disocclusion fraction from history if available.
-        let mean_disocclusion_fraction =
-            if let (Some(history), true) = (&accumulator.history, accumulator.has_history()) {
-                let w = accumulator.width;
-                let h = accumulator.height;
-                let ch = accumulator.channels;
-                let threshold = accumulator.config().disocclusion_threshold;
-                let total_pixels = w * h;
-
-                if total_pixels == 0 || ch == 0 {
-                    0.0
-                } else {
-                    let disoccluded: usize = (0..h)
-                        .flat_map(|py| (0..w).map(move |px| (px, py)))
-                        .filter(|&(px, py)| {
-                            let base = (py * w + px) * ch;
-                            let max_diff = (0..ch)
-                                .map(|c| {
-                                    let h_val = history.get(base + c).copied().unwrap_or(0.0);
-                                    h_val.abs()
-                                })
-                                .fold(0.0_f32, f32::max);
-                            max_diff > threshold
-                        })
-                        .count();
-                    disoccluded as f32 / total_pixels as f32
-                }
-            } else {
-                0.0
-            };
+        // The fraction of pixels the most recent `accumulate` call actually
+        // classified as disoccluded (color_dist > disocclusion_threshold,
+        // comparing the warped history against the current frame -- the
+        // same predicate used to pick the blend weight). Recorded by
+        // `accumulate` itself rather than re-derived here, since this
+        // struct only has access to the history buffer and the motion
+        // field, not the current frame the comparison needs; inspecting
+        // history brightness alone (the previous implementation) measured
+        // nothing to do with disocclusion.
+        let mean_disocclusion_fraction = accumulator.last_disocclusion_fraction;
 
         Self {
             frame_count,
@@ -717,12 +801,62 @@ mod tests {
     }
 
     #[test]
+    fn test_disocclusion_fraction_reflects_current_vs_history_not_brightness() {
+        // Regression test: `mean_disocclusion_fraction` must reflect a
+        // comparison between the warped history and the CURRENT frame, not
+        // merely whether the history buffer is "bright". A bright history
+        // that still matches the current frame closely (e.g. a static
+        // bright scene) must not register as disoccluded.
+        let w = 4;
+        let h = 4;
+        let ch = 3;
+        let cfg = TaaConfig {
+            disocclusion_threshold: 0.1,
+            enable_neighborhood_clamp: false,
+            ..TaaConfig::default()
+        };
+        let mut acc = TemporalAccumulator::new(w, h, ch, cfg);
+        let field = zero_field(w, h);
+
+        // Bootstrap with a BRIGHT frame (would falsely read as fully
+        // disoccluded under a "|history| > threshold" metric).
+        let bright = make_frame(w, h, ch, 0.9);
+        acc.accumulate(&bright, &field)
+            .expect("bootstrap accumulate");
+
+        // Second frame matches the (bright) history closely: no real change.
+        acc.accumulate(&bright, &field).expect("second accumulate");
+        let stats = TemporalStats::compute(&acc, &field);
+        assert!(
+            stats.mean_disocclusion_fraction < 0.01,
+            "a static bright scene must not register as disoccluded, got {}",
+            stats.mean_disocclusion_fraction
+        );
+
+        // Third frame changes drastically: genuine disocclusion.
+        let changed = make_frame(w, h, ch, 0.0);
+        acc.accumulate(&changed, &field).expect("third accumulate");
+        let stats = TemporalStats::compute(&acc, &field);
+        assert!(
+            stats.mean_disocclusion_fraction > 0.9,
+            "a drastic frame-to-frame change must register as disoccluded, got {}",
+            stats.mean_disocclusion_fraction
+        );
+    }
+
+    #[test]
     fn test_neighborhood_clamp_edge_pixel() {
-        // Ensure neighborhood_minmax works at corner pixel (0,0).
+        // Ensure neighborhood_minmax_into works at corner pixel (0,0).
         let image: Vec<f32> = (0..9).map(|i| i as f32 * 0.1).collect(); // 3x3x1
-        let (mn, mx) = neighborhood_minmax(&image, 3, 3, 1, 0, 0);
-        assert!(!mn.is_empty());
-        assert!(!mx.is_empty());
+        let mut mn = vec![0.0_f32; 1];
+        let mut mx = vec![0.0_f32; 1];
+        let view = FrameView {
+            image: &image,
+            width: 3,
+            height: 3,
+            channels: 1,
+        };
+        neighborhood_minmax_into(view, 0, 0, &mut mn, &mut mx);
         assert!(mn[0] <= mx[0]);
     }
 
@@ -730,10 +864,33 @@ mod tests {
     fn test_bilinear_sample_integer_coords() {
         // At integer coords bilinear should match direct lookup.
         let image: Vec<f32> = (0..9).map(|i| i as f32).collect(); // 3x3, 1 channel
-        let v = sample_bilinear(&image, 3, 3, 1, 1.0, 1.0);
+        let mut v = vec![0.0_f32; 1];
+        let view = FrameView {
+            image: &image,
+            width: 3,
+            height: 3,
+            channels: 1,
+        };
+        sample_bilinear_into(view, 1.0, 1.0, &mut v);
         // pixel (1,1) in row-major = index 4
         assert_eq!(v.len(), 1);
         assert!((v[0] - 4.0).abs() < 1e-5, "expected 4.0, got {}", v[0]);
+    }
+
+    #[test]
+    fn test_sample_bilinear_into_ignores_short_output_buffer() {
+        // A caller-provided buffer shorter than `channels` must not panic;
+        // entries beyond its length are simply not written.
+        let image: Vec<f32> = (0..9).map(|i| i as f32).collect(); // 3x3, 3 "channels" worth
+        let mut v = vec![-1.0_f32; 1]; // shorter than channels=3
+        let view = FrameView {
+            image: &image,
+            width: 1,
+            height: 3,
+            channels: 3,
+        };
+        sample_bilinear_into(view, 0.0, 1.0, &mut v);
+        assert!((v[0] - 3.0).abs() < 1e-5, "expected 3.0, got {}", v[0]);
     }
 
     #[test]

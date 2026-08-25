@@ -22,6 +22,11 @@
 pub enum ProgressiveError {
     #[error("No training stages defined")]
     NoStages,
+    /// A stage index does not exist in the configured schedule.
+    ///
+    /// Constructed by [`ProgressiveTrainer::stage`] and
+    /// [`ProgressiveTrainer::set_current_stage`]; the payload is the index
+    /// that was asked for.
     #[error("Stage {0} not found")]
     StageNotFound(usize),
     #[error("Invalid stage configuration: {0}")]
@@ -251,6 +256,45 @@ impl ProgressiveTrainer {
         &self.config.stages[self.current_stage_idx]
     }
 
+    /// Borrow the stage at `idx`.
+    ///
+    /// Returns [`ProgressiveError::StageNotFound`] when `idx` is past the end
+    /// of the configured schedule.
+    pub fn stage(&self, idx: usize) -> Result<&TrainingStage, ProgressiveError> {
+        self.config
+            .stages
+            .get(idx)
+            .ok_or(ProgressiveError::StageNotFound(idx))
+    }
+
+    /// Force the active stage to `idx`, as when resuming a run from a
+    /// checkpoint taken mid-schedule.
+    ///
+    /// Unlike [`update`](Self::update) this does not consult the step
+    /// boundaries, so it can restore a stage the step counter alone would not
+    /// select. Nothing is written to the transition log — no transition
+    /// happened during *this* run — and the within-stage progress origin is
+    /// reset to the stage's own `start_step`.
+    ///
+    /// Returns [`ProgressiveError::StageNotFound`] when `idx` is past the end
+    /// of the configured schedule; the active stage is then left untouched.
+    pub fn set_current_stage(&mut self, idx: usize) -> Result<(), ProgressiveError> {
+        let start_step = self.stage(idx)?.start_step;
+        self.current_stage_idx = idx;
+        self.stage_entry_step = start_step;
+        Ok(())
+    }
+
+    /// Index of the active stage.
+    pub fn current_stage_index(&self) -> usize {
+        self.current_stage_idx
+    }
+
+    /// Step at which the active stage was entered.
+    pub fn stage_entry_step(&self) -> usize {
+        self.stage_entry_step
+    }
+
     /// Advance the schedule to `step`.
     ///
     /// Returns `Some(StageTransition)` if the active stage changed, or `None`
@@ -477,11 +521,22 @@ pub fn loss_weights_at_step(
 
     // Check whether we have a next stage and we are in the blend window.
     if let Some(next) = stages.get(current_idx + 1) {
-        if blend_steps > 0 && current.end_step > blend_steps {
-            let blend_start = current.end_step - blend_steps;
-            if step >= blend_start {
+        if blend_steps > 0 {
+            // Clamp the window to the current stage's own bounds: the old
+            // `current.end_step - blend_steps` guard only prevented `usize`
+            // underflow, not `blend_start` landing before `current.start_step`
+            // when `blend_steps` exceeds this stage's length — which made the
+            // blend window start partway into (or entirely before) the
+            // *previous* stage, so the weights jumped discontinuously right
+            // at stage entry instead of ramping 0→1 across the stage.
+            let blend_start = current
+                .end_step
+                .saturating_sub(blend_steps)
+                .max(current.start_step);
+            let window = current.end_step - blend_start;
+            if window > 0 && step >= blend_start {
                 let elapsed_in_blend = step - blend_start;
-                let t = (elapsed_in_blend as f32 / blend_steps as f32).clamp(0.0, 1.0);
+                let t = (elapsed_in_blend as f32 / window as f32).clamp(0.0, 1.0);
                 return interpolate_loss_weights(&current.loss_weights, &next.loss_weights, t);
             }
         }
@@ -1219,6 +1274,87 @@ mod tests {
     }
 
     #[test]
+    fn test_loss_weights_at_step_blend_window_does_not_precede_stage_start() {
+        // Regression: when blend_steps exceeds the CURRENT stage's own
+        // length, `blend_start = current.end_step - blend_steps` used to
+        // land before `current.start_step` (inside the previous stage), so
+        // the blend window covered the ENTIRE short stage and weights
+        // jumped discontinuously right at stage entry instead of ramping
+        // 0->1 across the stage's own span.
+        //
+        // Stage A: [0, 1000). Stage B (short middle stage): [1000, 1300).
+        // Stage C: [1300, 5000). blend_steps=1000 exceeds B's own length
+        // (300), which is exactly the failure condition.
+        let weights_a = StageLossWeights {
+            photometric: 1.0,
+            perceptual: 0.0,
+            position_reg: 0.1,
+            scale_reg: 0.1,
+            opacity_reg: 0.01,
+        };
+        let weights_b = StageLossWeights {
+            photometric: 1.0,
+            perceptual: 0.2,
+            position_reg: 0.05,
+            scale_reg: 0.05,
+            opacity_reg: 0.005,
+        };
+        let weights_c = StageLossWeights::default();
+        let config = ProgressiveConfig {
+            stages: vec![
+                TrainingStage {
+                    name: "a".to_string(),
+                    start_step: 0,
+                    end_step: 1000,
+                    image_resolution: (256, 256),
+                    max_gaussians: None,
+                    loss_weights: weights_a,
+                    densification_enabled: true,
+                    opacity_reset_enabled: true,
+                    sh_degree: 0,
+                },
+                TrainingStage {
+                    name: "b".to_string(),
+                    start_step: 1000,
+                    end_step: 1300,
+                    image_resolution: (256, 256),
+                    max_gaussians: None,
+                    loss_weights: weights_b.clone(),
+                    densification_enabled: true,
+                    opacity_reset_enabled: true,
+                    sh_degree: 1,
+                },
+                TrainingStage {
+                    name: "c".to_string(),
+                    start_step: 1300,
+                    end_step: 5000,
+                    image_resolution: (256, 256),
+                    max_gaussians: None,
+                    loss_weights: weights_c,
+                    densification_enabled: true,
+                    opacity_reset_enabled: false,
+                    sh_degree: 2,
+                },
+            ],
+            total_steps: 5000,
+            warmup_steps: 0,
+        };
+
+        // Right at the start of stage B: the blend window must not have
+        // started yet — weights should equal B's own, not already
+        // significantly blended toward C.
+        let w_at_entry = loss_weights_at_step(&config, 1000, 1000);
+        assert!(
+            (w_at_entry.perceptual - weights_b.perceptual).abs() < 1e-4,
+            "weights at stage-B entry should equal B's own weights, got \
+             perceptual={} (expected {}); a large gap indicates the blend \
+             window started before the stage did",
+            w_at_entry.perceptual,
+            weights_b.perceptual
+        );
+    }
+
+    #[test]
     fn test_loss_weights_at_step_no_blend() {
         let config = three_stage_config();
         // blend_steps=0: never blend
@@ -1428,5 +1564,55 @@ mod tests {
     #[test]
     fn test_opacity_reset_enabled_empty_stages_returns_false() {
         assert!(!opacity_reset_enabled_at_step(&[], 0));
+    }
+
+    // ── Regression (F296): StageNotFound is actually constructed ─────────────
+    // The variant used to be declared but never built anywhere in the
+    // workspace; `stage()` and `set_current_stage()` now return it.
+    #[test]
+    fn test_stage_lookup_out_of_range_is_stage_not_found() {
+        let trainer =
+            ProgressiveTrainer::new(ProgressiveConfig::default()).expect("default config is valid");
+        let n = trainer.n_stages();
+        assert!(n > 0);
+        let first = trainer.stage(0).expect("stage 0 exists");
+        assert_eq!(first.name, trainer.current_stage().name);
+
+        let err = trainer
+            .stage(n)
+            .expect_err("index n is past the last stage");
+        match err {
+            ProgressiveError::StageNotFound(idx) => assert_eq!(idx, n),
+            other => panic!("expected StageNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_set_current_stage_restores_a_mid_schedule_stage() {
+        let mut trainer =
+            ProgressiveTrainer::new(ProgressiveConfig::default()).expect("default config is valid");
+        let n = trainer.n_stages();
+        assert!(n >= 2, "default schedule should have several stages");
+
+        let last = n - 1;
+        let expected_start = trainer.stage(last).expect("last stage exists").start_step;
+        let expected_name = trainer.stage(last).expect("last stage exists").name.clone();
+
+        trainer
+            .set_current_stage(last)
+            .expect("last stage index is valid");
+        assert_eq!(trainer.current_stage_index(), last);
+        assert_eq!(trainer.current_stage().name, expected_name);
+        assert_eq!(trainer.stage_entry_step(), expected_start);
+        assert!(trainer.is_final_stage());
+        // Restoring a stage is not a transition that happened this run.
+        assert!(trainer.transition_log().is_empty());
+
+        // A rejected index leaves the active stage untouched.
+        let err = trainer
+            .set_current_stage(n + 5)
+            .expect_err("index past the end must be rejected");
+        assert!(matches!(err, ProgressiveError::StageNotFound(_)), "{err:?}");
+        assert_eq!(trainer.current_stage_index(), last);
     }
 }

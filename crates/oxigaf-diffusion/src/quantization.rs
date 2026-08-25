@@ -668,7 +668,11 @@ pub fn estimate_model_compression(plans: &[LayerQuantizationPlan]) -> (usize, us
 // ---------------------------------------------------------------------------
 
 /// Validate that `shape` is non-empty and `data.len() == product(shape)`.
-fn validate_shape_data(data: &[f32], shape: &[usize]) -> Result<(), DiffusionError> {
+///
+/// Generic over the element type so it can guard both the `f32` source buffers
+/// handed to the quantizers and the `i8` payload of a hand-built
+/// [`QuantizedTensor`]; only the element *count* is ever inspected.
+fn validate_shape_data<T>(data: &[T], shape: &[usize]) -> Result<(), DiffusionError> {
     if shape.is_empty() {
         return Err(DiffusionError::InvalidConfig(
             "quantization: shape must not be empty".to_owned(),
@@ -1225,6 +1229,176 @@ mod tests {
             Err(other) => panic!("wrong error variant: {other:?}"),
             Ok(_) => panic!("expected error"),
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // QuantizedTensor::validate / dequantize error handling
+    // -------------------------------------------------------------------------
+
+    // Regression tests: every `QuantizedTensor` field is `pub`, so a
+    // hand-built tensor with inconsistent metadata used to make
+    // `dequantize()` panic (out-of-bounds `scales[0]` / `shape[axis+1..]` /
+    // `scales[channel]`) instead of returning a typed error.
+
+    #[test]
+    fn test_validate_rejects_empty_shape() {
+        let qt = QuantizedTensor {
+            data: vec![],
+            scales: vec![1.0],
+            zero_points: vec![0],
+            shape: vec![],
+            mode: QuantizationMode::Symmetric,
+            scope: QuantizationScope::PerTensor,
+        };
+        assert!(matches!(
+            qt.validate(),
+            Err(DiffusionError::InvalidConfig(_))
+        ));
+    }
+
+    #[test]
+    fn test_validate_rejects_data_shape_mismatch() {
+        let qt = QuantizedTensor {
+            data: vec![1, 2, 3], // 3 elements
+            scales: vec![1.0],
+            zero_points: vec![0],
+            shape: vec![4], // declares 4
+            mode: QuantizationMode::Symmetric,
+            scope: QuantizationScope::PerTensor,
+        };
+        assert!(matches!(
+            qt.validate(),
+            Err(DiffusionError::InvalidConfig(_))
+        ));
+    }
+
+    #[test]
+    fn test_validate_rejects_wrong_scales_len_per_tensor() {
+        let qt = QuantizedTensor {
+            data: vec![1, 2, 3, 4],
+            scales: vec![1.0, 2.0], // PerTensor needs exactly 1
+            zero_points: vec![0],
+            shape: vec![4],
+            mode: QuantizationMode::Symmetric,
+            scope: QuantizationScope::PerTensor,
+        };
+        assert!(matches!(
+            qt.validate(),
+            Err(DiffusionError::InvalidConfig(_))
+        ));
+    }
+
+    #[test]
+    fn test_validate_rejects_wrong_scales_len_per_channel() {
+        // shape [4, 2], axis 0 -> needs 4 scales, only 2 given.
+        let qt = QuantizedTensor {
+            data: vec![1, 2, 3, 4, 5, 6, 7, 8],
+            scales: vec![1.0, 2.0],
+            zero_points: vec![0, 0],
+            shape: vec![4, 2],
+            mode: QuantizationMode::Symmetric,
+            scope: QuantizationScope::PerChannel(0),
+        };
+        assert!(matches!(
+            qt.validate(),
+            Err(DiffusionError::InvalidConfig(_))
+        ));
+    }
+
+    #[test]
+    fn test_validate_rejects_axis_out_of_bounds() {
+        let qt = QuantizedTensor {
+            data: vec![1, 2, 3, 4],
+            scales: vec![1.0],
+            zero_points: vec![0],
+            shape: vec![4],
+            mode: QuantizationMode::Symmetric,
+            scope: QuantizationScope::PerChannel(5), // shape has only 1 dim
+        };
+        assert!(matches!(
+            qt.validate(),
+            Err(DiffusionError::InvalidConfig(_))
+        ));
+    }
+
+    #[test]
+    fn test_validate_accepts_well_formed_tensor() {
+        let data = vec![0.1_f32, -0.5, 0.3, 0.8];
+        let shape = vec![4];
+        let qt = AbsmaxQuantizer::per_tensor()
+            .quantize(&data, &shape)
+            .expect("quantize");
+        assert!(qt.validate().is_ok());
+    }
+
+    #[test]
+    fn test_dequantize_returns_error_not_panic_for_malformed_tensor() {
+        let qt = QuantizedTensor {
+            data: vec![1, 2, 3],
+            scales: vec![], // wrong: PerTensor needs 1
+            zero_points: vec![],
+            shape: vec![3],
+            mode: QuantizationMode::Symmetric,
+            scope: QuantizationScope::PerTensor,
+        };
+        // Must return Err, not panic on `self.scales[0]`.
+        assert!(matches!(
+            qt.dequantize(),
+            Err(DiffusionError::InvalidConfig(_))
+        ));
+    }
+
+    #[test]
+    fn test_dequantize_returns_error_not_panic_for_out_of_bounds_axis() {
+        let qt = QuantizedTensor {
+            data: vec![1, 2, 3, 4],
+            scales: vec![1.0],
+            zero_points: vec![0],
+            shape: vec![4],
+            mode: QuantizationMode::Symmetric,
+            scope: QuantizationScope::PerChannel(9), // wrong: out of bounds
+        };
+        // Must return Err, not panic on `self.shape[axis]`.
+        assert!(matches!(
+            qt.dequantize(),
+            Err(DiffusionError::InvalidConfig(_))
+        ));
+    }
+
+    // -------------------------------------------------------------------------
+    // compute_quantization_metrics error handling
+    // -------------------------------------------------------------------------
+
+    // Regression test: an empty `original` used to silently produce
+    // `0.0 / 0.0 = NaN` metrics instead of an error.
+    #[test]
+    fn test_metrics_rejects_empty_original() {
+        let qt = QuantizedTensor {
+            data: vec![],
+            scales: vec![1.0],
+            zero_points: vec![0],
+            shape: vec![0],
+            mode: QuantizationMode::Symmetric,
+            scope: QuantizationScope::PerTensor,
+        };
+        let result = compute_quantization_metrics(&[], &qt);
+        assert!(matches!(result, Err(DiffusionError::InvalidConfig(_))));
+    }
+
+    // Regression test: a length mismatch between `original` and
+    // `quantized_tensor` used to silently truncate the comparison to the
+    // shorter of the two (via `zip`) while still dividing by
+    // `original.len()`, under-reporting error instead of failing loudly.
+    #[test]
+    fn test_metrics_rejects_length_mismatch() {
+        let data = vec![0.1_f32, -0.5, 0.3, 0.8];
+        let shape = vec![4];
+        let qt = AbsmaxQuantizer::per_tensor()
+            .quantize(&data, &shape)
+            .expect("quantize");
+        let shorter_original = vec![0.1_f32, -0.5]; // only 2, tensor has 4
+        let result = compute_quantization_metrics(&shorter_original, &qt);
+        assert!(matches!(result, Err(DiffusionError::InvalidConfig(_))));
     }
 
     // -------------------------------------------------------------------------

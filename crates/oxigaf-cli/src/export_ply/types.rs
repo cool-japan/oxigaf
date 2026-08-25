@@ -51,7 +51,22 @@ pub struct PlySceneStats {
     /// Number of Gaussians in the scene.
     pub n_gaussians: usize,
     /// SH degree inferred from rest coefficient count.
+    ///
+    /// Meaningful only when [`Self::sh_degree_known`] is `true`. When the
+    /// first Gaussian's `f_rest` length does not correspond to any valid SH
+    /// degree (0, 9, 24, or 45 coefficients), this is set to `0` as a
+    /// placeholder — callers must check `sh_degree_known` rather than
+    /// trusting `0` as a genuine degree-0 result.
     pub sh_degree: usize,
+    /// Whether [`Self::sh_degree`] was actually inferred from a valid rest
+    /// coefficient count, as opposed to falling back to a placeholder `0`
+    /// because the count was malformed (e.g. produced by hand-built or
+    /// corrupted `PlyGaussian` data rather than [`crate::ply_read`], which
+    /// already rejects a malformed count before any `PlyGaussian` exists).
+    /// `true` for an empty scene: zero Gaussians unambiguously implies zero
+    /// rest coefficients, i.e. a genuine (if degenerate) SH degree 0 — not a
+    /// malformed-input case.
+    pub sh_degree_known: bool,
     /// Mean opacity after sigmoid, across all Gaussians.
     pub mean_opacity: f32,
     /// Mean world-space scale (averaged over x/y/z and all Gaussians).

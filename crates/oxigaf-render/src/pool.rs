@@ -7,10 +7,14 @@
 //! ## Size Classes
 //!
 //! Buffers are allocated in fixed size classes to reduce fragmentation:
-//! - 1KB, 4KB, 16KB, 64KB, 256KB, 1MB, 4MB, 16MB
+//! - 1KB, 4KB, 16KB, 64KB, 256KB, 1MB, 4MB, 16MB, 64MB, 256MB
 //!
 //! When a buffer is requested, we round up to the next size class and
-//! check if a buffer of that class is available in the pool.
+//! check if a buffer of that class, whose usage flags are a superset of
+//! the request, is available in the pool. A request larger than the
+//! largest size class is still served: an exact-size buffer is allocated
+//! as a one-off and is not returned to a free list on drop (there is no
+//! size class for it to rejoin), so it is never reused.
 //!
 //! ## LRU Eviction
 //!
@@ -23,30 +27,57 @@
 //! the pool when dropped, enabling zero-overhead buffer reuse.
 
 use std::collections::VecDeque;
+use std::mem::ManuallyDrop;
 use std::ops::Deref;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Instant;
+
+/// Lock `mutex` for [`PooledBuffer`]'s `Drop` fallback, recovering the inner
+/// guard if the mutex was poisoned.
+///
+/// This is deliberately used only on the `Drop::drop` return-to-pool path,
+/// not on `BufferPool`'s other lock sites: `return_buffer`'s own operations
+/// are simple, self-contained, non-panicking field updates, so recovering
+/// there cannot compound whatever inconsistency caused the poisoning.
+/// Silently skipping this step instead (the previous behaviour) would leave
+/// `in_use_count` and `total_allocated_bytes` permanently overcounted from
+/// that point on, since every subsequent `lock()` on a poisoned mutex also
+/// returns `Err`. Other call sites keep failing closed on poison.
+fn lock_recover(mutex: &Mutex<BufferPoolInner>) -> MutexGuard<'_, BufferPoolInner> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// Size classes for the buffer pool (in bytes).
 ///
 /// Each class is 4x the previous, providing good coverage with minimal waste.
 pub const SIZE_CLASSES: &[u64] = &[
-    1024,             // 1KB
-    4 * 1024,         // 4KB
-    16 * 1024,        // 16KB
-    64 * 1024,        // 64KB
-    256 * 1024,       // 256KB
-    1024 * 1024,      // 1MB
-    4 * 1024 * 1024,  // 4MB
-    16 * 1024 * 1024, // 16MB
+    1024,              // 1KB
+    4 * 1024,          // 4KB
+    16 * 1024,         // 16KB
+    64 * 1024,         // 64KB
+    256 * 1024,        // 256KB
+    1024 * 1024,       // 1MB
+    4 * 1024 * 1024,   // 4MB
+    16 * 1024 * 1024,  // 16MB
+    64 * 1024 * 1024,  // 64MB
+    256 * 1024 * 1024, // 256MB
 ];
 
 /// Internal entry in the buffer pool.
 struct PoolEntry {
     /// The GPU buffer.
     buffer: wgpu::Buffer,
-    /// Size class this buffer belongs to.
+    /// Size class this buffer belongs to (or, for a one-off allocation that
+    /// exceeded the largest size class, the exact requested size -- see
+    /// [`BufferPoolInner::return_buffer`]).
     size_class: u64,
+    /// The `wgpu::BufferUsages` this buffer was created with. A cache hit
+    /// must only reuse an entry whose usage is a superset of what the new
+    /// request needs, otherwise the buffer fails wgpu validation at
+    /// bind/copy time.
+    usage: wgpu::BufferUsages,
     /// Last time this buffer was used (for LRU eviction).
     last_used: Instant,
 }
@@ -102,6 +133,50 @@ impl BufferPoolInner {
     /// Find the appropriate size class index for a given size.
     fn size_class_index(size: u64) -> Option<usize> {
         SIZE_CLASSES.iter().position(|&class| class >= size)
+    }
+}
+
+/// How a request should be satisfied, given the device's `max_buffer_size`.
+///
+/// Rounding a request up to its size class is what makes the pool reusable,
+/// but the rounded-up size is a real `wgpu::Buffer` size and is therefore
+/// subject to `wgpu::Limits::max_buffer_size`. Creating a buffer past that
+/// limit is a validation error, which wgpu reports through the device's
+/// uncaptured-error handler -- i.e. it *aborts the process* rather than
+/// returning an error the pool could propagate. So the decision has to be
+/// made before `create_buffer` is ever called.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AllocationPlan {
+    /// Allocate (or reuse) `SIZE_CLASSES[idx]` bytes.
+    SizeClass(usize),
+    /// Allocate exactly the requested size as a one-off: either the request
+    /// is above the largest size class, or its size class would exceed the
+    /// device limit even though the request itself fits. Such a buffer has
+    /// no free list to rejoin and is released on drop.
+    Exact,
+    /// The request exceeds `max_buffer_size`: it cannot be served at all on
+    /// this device.
+    TooLarge,
+}
+
+impl BufferPoolInner {
+    /// Decide how to serve a request of `min_size` bytes on a device whose
+    /// buffer-size limit is `max_buffer_size`.
+    ///
+    /// Pure function of its inputs so the (device-specific) policy can be
+    /// unit-tested without a GPU.
+    fn plan_allocation(min_size: u64, max_buffer_size: u64) -> AllocationPlan {
+        if min_size > max_buffer_size {
+            return AllocationPlan::TooLarge;
+        }
+        match Self::size_class_index(min_size) {
+            // Size class fits within the device limit: pool it normally.
+            Some(idx) if SIZE_CLASSES[idx] <= max_buffer_size => AllocationPlan::SizeClass(idx),
+            // Either no class covers the request, or the covering class is
+            // itself over the limit while the request is not. Both are
+            // served exactly.
+            _ => AllocationPlan::Exact,
+        }
     }
 
     /// Get statistics about the pool.
@@ -179,21 +254,57 @@ impl BufferPoolInner {
     }
 
     /// Return a buffer to the pool.
+    ///
+    /// A buffer whose `size_class` matches one of [`SIZE_CLASSES`] rejoins
+    /// that class's free list for later reuse. A buffer allocated as a
+    /// one-off (its requested size exceeded the largest size class -- see
+    /// [`BufferPool::acquire`]) has no free list to rejoin: its allocation
+    /// accounting is released here and the buffer itself is simply dropped.
     fn return_buffer(&mut self, entry: PoolEntry) {
-        let class_idx = SIZE_CLASSES
-            .iter()
-            .position(|&c| c == entry.size_class)
-            .unwrap_or(0);
-
         self.in_use_count = self.in_use_count.saturating_sub(1);
-        self.available[class_idx].push_back(entry);
 
-        tracing::trace!(
-            size_class = SIZE_CLASSES[class_idx],
-            in_use = self.in_use_count,
-            available = self.available[class_idx].len(),
-            "Returned buffer to pool"
-        );
+        match SIZE_CLASSES.iter().position(|&c| c == entry.size_class) {
+            Some(class_idx) => {
+                let size_class = entry.size_class;
+                self.available[class_idx].push_back(entry);
+
+                tracing::trace!(
+                    size_class = size_class,
+                    in_use = self.in_use_count,
+                    available = self.available[class_idx].len(),
+                    "Returned buffer to pool"
+                );
+            }
+            None => {
+                // One-off allocation that exceeded the largest size class:
+                // it was never inserted into a free list, so release its
+                // allocation accounting and let the buffer drop here.
+                self.total_allocated_bytes =
+                    self.total_allocated_bytes.saturating_sub(entry.size_class);
+
+                tracing::trace!(
+                    size = entry.size_class,
+                    in_use = self.in_use_count,
+                    "Dropped oversized one-off buffer (not pooled)"
+                );
+            }
+        }
+    }
+
+    /// Remove and return the available entry in `class_idx` whose usage
+    /// flags are a superset of `usage`, if one exists.
+    ///
+    /// A buffer created with usage flags `U` may only be used for
+    /// operations covered by `U`; handing back an entry whose flags do not
+    /// contain the request would fail wgpu validation at bind/copy time.
+    /// Searches from the most-recently-returned entry first, preserving the
+    /// LRU-friendly ordering the old unconditional `pop_back` provided.
+    fn take_matching(&mut self, class_idx: usize, usage: wgpu::BufferUsages) -> Option<PoolEntry> {
+        let queue = &mut self.available[class_idx];
+        let pos = queue
+            .iter()
+            .rposition(|entry| entry.usage.contains(usage))?;
+        queue.remove(pos)
     }
 }
 
@@ -241,8 +352,24 @@ impl BufferPool {
     ///
     /// # Returns
     ///
-    /// A `PooledBuffer` that will return to the pool when dropped.
-    /// Returns `None` if the requested size exceeds the largest size class.
+    /// A `PooledBuffer` that will return to the pool when dropped. A cache
+    /// hit only reuses a pooled buffer whose usage flags are a superset of
+    /// `usage` (a buffer created for a narrower set of operations would
+    /// fail wgpu validation if handed back for a wider one); otherwise a
+    /// fresh buffer is allocated with exactly the requested `usage`.
+    ///
+    /// A request larger than the largest size class is still served, via a
+    /// one-off exact-size allocation that is not returned to a free list on
+    /// drop (there is no size class for it to rejoin) -- so size alone no
+    /// longer causes this to return `None`.
+    ///
+    /// `None` is returned when the pool's internal mutex is poisoned, or when
+    /// `min_size` exceeds the device's `max_buffer_size` limit -- the latter
+    /// cannot be served by any allocation strategy, and creating the buffer
+    /// anyway would trip wgpu validation, which aborts the process through
+    /// the uncaptured-error handler instead of returning a recoverable error.
+    /// A request that fits the device but whose *size class* would not is
+    /// downgraded to an exact-size one-off allocation rather than refused.
     pub fn acquire(
         &self,
         device: &wgpu::Device,
@@ -250,63 +377,125 @@ impl BufferPool {
         usage: wgpu::BufferUsages,
         label: &str,
     ) -> Option<PooledBuffer> {
-        let class_idx = BufferPoolInner::size_class_index(min_size)?;
-        let size_class = SIZE_CLASSES[class_idx];
+        let max_buffer_size = device.limits().max_buffer_size;
+        let plan = BufferPoolInner::plan_allocation(min_size, max_buffer_size);
+        if plan == AllocationPlan::TooLarge {
+            tracing::error!(
+                requested = min_size,
+                max_buffer_size,
+                label = label,
+                "Buffer request exceeds the device's maximum buffer size; cannot be served"
+            );
+            return None;
+        }
 
         let mut inner = self.inner.lock().ok()?;
         inner.total_acquisitions += 1;
 
-        // Try to get a buffer from the pool
-        let entry = if let Some(mut entry) = inner.available[class_idx].pop_back() {
-            // Update last_used time
-            entry.last_used = Instant::now();
-            inner.in_use_count += 1;
-            tracing::trace!(
-                size_class = size_class,
-                label = label,
-                "Reused buffer from pool"
-            );
-            entry
-        } else {
-            // Need to allocate a new buffer
-            inner.total_allocations += 1;
+        let entry = match plan {
+            AllocationPlan::SizeClass(class_idx) => {
+                let size_class = SIZE_CLASSES[class_idx];
 
-            // Evict if over budget before allocating
-            if inner.total_allocated_bytes + size_class > inner.max_bytes {
-                let evicted = inner.evict_until_under_budget();
-                if evicted > 0 {
-                    tracing::debug!(evicted_bytes = evicted, "Evicted buffers to make room");
+                if let Some(mut entry) = inner.take_matching(class_idx, usage) {
+                    // Cache hit: reuse a pooled buffer whose usage flags
+                    // cover this request.
+                    entry.last_used = Instant::now();
+                    inner.in_use_count += 1;
+                    tracing::trace!(
+                        size_class = size_class,
+                        label = label,
+                        "Reused buffer from pool"
+                    );
+                    entry
+                } else {
+                    // Need to allocate a new buffer
+                    inner.total_allocations += 1;
+
+                    // Evict if over budget before allocating
+                    if inner.total_allocated_bytes + size_class > inner.max_bytes {
+                        let evicted = inner.evict_until_under_budget();
+                        if evicted > 0 {
+                            tracing::debug!(
+                                evicted_bytes = evicted,
+                                "Evicted buffers to make room"
+                            );
+                        }
+                    }
+
+                    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some(label),
+                        size: size_class,
+                        usage,
+                        mapped_at_creation: false,
+                    });
+
+                    inner.total_allocated_bytes += size_class;
+                    inner.in_use_count += 1;
+
+                    tracing::debug!(
+                        size_class = size_class,
+                        label = label,
+                        total_mb = inner.total_allocated_bytes / (1024 * 1024),
+                        "Allocated new buffer"
+                    );
+
+                    PoolEntry {
+                        buffer,
+                        size_class,
+                        usage,
+                        last_used: Instant::now(),
+                    }
                 }
             }
+            AllocationPlan::Exact => {
+                // Either larger than the largest size class, or its size
+                // class would exceed the device's `max_buffer_size` while
+                // the request itself fits. Serve it as a one-off exact-size
+                // allocation instead of failing the request.
+                // `return_buffer` recognizes that its size does not match
+                // any class and releases it on drop rather than pooling it.
+                inner.total_allocations += 1;
 
-            let buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(label),
-                size: size_class,
-                usage,
-                mapped_at_creation: false,
-            });
+                if inner.total_allocated_bytes + min_size > inner.max_bytes {
+                    let evicted = inner.evict_until_under_budget();
+                    if evicted > 0 {
+                        tracing::debug!(evicted_bytes = evicted, "Evicted buffers to make room");
+                    }
+                }
 
-            inner.total_allocated_bytes += size_class;
-            inner.in_use_count += 1;
+                let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(label),
+                    size: min_size,
+                    usage,
+                    mapped_at_creation: false,
+                });
 
-            tracing::debug!(
-                size_class = size_class,
-                label = label,
-                total_mb = inner.total_allocated_bytes / (1024 * 1024),
-                "Allocated new buffer"
-            );
+                inner.total_allocated_bytes += min_size;
+                inner.in_use_count += 1;
 
-            PoolEntry {
-                buffer,
-                size_class,
-                last_used: Instant::now(),
+                tracing::debug!(
+                    size = min_size,
+                    label = label,
+                    max_buffer_size,
+                    total_mb = inner.total_allocated_bytes / (1024 * 1024),
+                    "Allocated exact-size one-off buffer (no usable pool size class)"
+                );
+
+                PoolEntry {
+                    buffer,
+                    size_class: min_size,
+                    usage,
+                    last_used: Instant::now(),
+                }
             }
+            // Rejected before the lock was taken.
+            AllocationPlan::TooLarge => return None,
         };
 
         drop(inner); // Release lock before creating PooledBuffer
 
         Some(PooledBuffer {
-            entry: Some(entry),
+            entry: ManuallyDrop::new(entry),
             pool: Arc::downgrade(&self.inner),
             actual_size: min_size,
         })
@@ -379,8 +568,13 @@ impl BufferPool {
 /// `PooledBuffer` implements `Deref<Target = wgpu::Buffer>`, allowing
 /// it to be used anywhere a `&wgpu::Buffer` is expected.
 pub struct PooledBuffer {
-    /// The pool entry (buffer + metadata).
-    entry: Option<PoolEntry>,
+    /// The pool entry (buffer + metadata). Always initialized for the
+    /// lifetime of a live `PooledBuffer`; taken out exactly once, in
+    /// `Drop::drop`, via `ManuallyDrop::take`. Using `ManuallyDrop` here
+    /// (rather than `Option`) means there is no "already returned" state
+    /// for safe code to ever observe, so `buffer()` and the `Deref` impl
+    /// need no fallback branch and cannot panic.
+    entry: ManuallyDrop<PoolEntry>,
     /// Weak reference to the pool for return on drop.
     pool: Weak<Mutex<BufferPoolInner>>,
     /// The actual requested size (may be less than size class).
@@ -392,7 +586,7 @@ impl PooledBuffer {
     #[inline]
     #[must_use]
     pub fn size_class(&self) -> u64 {
-        self.entry.as_ref().map(|e| e.size_class).unwrap_or(0)
+        self.entry.size_class
     }
 
     /// Get the actual requested size.
@@ -403,30 +597,22 @@ impl PooledBuffer {
     }
 
     /// Get the underlying wgpu buffer.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the buffer has already been returned to the pool
-    /// (which should never happen in normal usage).
     #[inline]
     #[must_use]
     pub fn buffer(&self) -> &wgpu::Buffer {
-        match self.entry.as_ref() {
-            Some(entry) => &entry.buffer,
-            None => {
-                // This should never happen in correct usage - the buffer
-                // is only None after Drop, and we can't call methods after Drop.
-                // Using unreachable! instead of expect to satisfy no-unwrap policy.
-                unreachable!("PooledBuffer accessed after being returned to pool")
-            }
-        }
+        &self.entry.buffer
     }
 
-    /// Get the underlying wgpu buffer, returning None if already returned.
+    /// Get the underlying wgpu buffer.
+    ///
+    /// Kept for API compatibility with the previous `Option`-based
+    /// representation. A live `PooledBuffer` always holds its buffer (it is
+    /// only released in `Drop`), so this now always returns `Some`; prefer
+    /// [`Self::buffer`] in new code.
     #[inline]
     #[must_use]
     pub fn try_buffer(&self) -> Option<&wgpu::Buffer> {
-        self.entry.as_ref().map(|e| &e.buffer)
+        Some(&self.entry.buffer)
     }
 }
 
@@ -434,30 +620,36 @@ impl Deref for PooledBuffer {
     type Target = wgpu::Buffer;
 
     fn deref(&self) -> &Self::Target {
-        self.buffer()
+        &self.entry.buffer
     }
 }
 
 impl Drop for PooledBuffer {
     fn drop(&mut self) {
-        if let Some(mut entry) = self.entry.take() {
-            // Update last_used time for LRU
-            entry.last_used = Instant::now();
+        // Safety: `Drop::drop` runs at most once per value (Rust's
+        // ownership model guarantees this), so this is the only place
+        // `entry` is ever taken out of its `ManuallyDrop` wrapper, and no
+        // other code can observe `self` afterward.
+        let mut entry = unsafe { ManuallyDrop::take(&mut self.entry) };
 
-            // Try to return to pool
-            if let Some(pool) = self.pool.upgrade() {
-                if let Ok(mut inner) = pool.lock() {
-                    inner.return_buffer(entry);
-                    return;
-                }
-            }
+        // Update last_used time for LRU
+        entry.last_used = Instant::now();
 
-            // Pool is gone or locked, buffer will be dropped
-            tracing::trace!(
-                size_class = entry.size_class,
-                "Buffer dropped (pool unavailable)"
-            );
+        // Try to return to pool. A poisoned mutex is recovered rather than
+        // silently skipped, so pool accounting (`in_use_count`,
+        // `total_allocated_bytes`) cannot drift out from under a panic
+        // elsewhere -- see `lock_recover`.
+        if let Some(pool) = self.pool.upgrade() {
+            lock_recover(&pool).return_buffer(entry);
+            return;
         }
+
+        // Pool itself is gone: nothing left to account for, buffer is
+        // simply dropped.
+        tracing::trace!(
+            size_class = entry.size_class,
+            "Buffer dropped (pool unavailable)"
+        );
     }
 }
 
@@ -483,10 +675,25 @@ mod tests {
         assert_eq!(BufferPoolInner::size_class_index(4096), Some(1)); // 4KB -> 4KB
         assert_eq!(BufferPoolInner::size_class_index(4097), Some(2)); // 4KB+1 -> 16KB
         assert_eq!(BufferPoolInner::size_class_index(16 * 1024 * 1024), Some(7)); // 16MB -> 16MB
+
+        // Regression: sizes just above the old 16MB ceiling used to return
+        // `None` (the pool was inert for any readback above 1024x1024).
+        // They now land in the 64MB class. A 1920x1080 f32 RGBA readback is
+        // ~33MB and a 2560x1440 one is ~59MB -- both are covered now.
         assert_eq!(
             BufferPoolInner::size_class_index(16 * 1024 * 1024 + 1),
+            Some(8)
+        ); // > 16MB -> 64MB class
+        assert_eq!(BufferPoolInner::size_class_index(33 * 1024 * 1024), Some(8)); // 1920x1080 RGBA f32 readback -> 64MB
+        assert_eq!(BufferPoolInner::size_class_index(59 * 1024 * 1024), Some(8)); // 2560x1440 RGBA f32 readback -> 64MB
+        assert_eq!(
+            BufferPoolInner::size_class_index(256 * 1024 * 1024),
+            Some(9)
+        ); // 256MB -> 256MB
+        assert_eq!(
+            BufferPoolInner::size_class_index(256 * 1024 * 1024 + 1),
             None
-        ); // > 16MB
+        ); // > 256MB: no class covers it (served as a one-off, see `BufferPool::acquire`)
     }
 
     #[test]
@@ -548,6 +755,7 @@ mod tests {
     #[test]
     fn test_size_class_coverage() {
         // Verify all expected size classes are present
+        assert_eq!(SIZE_CLASSES.len(), 10);
         assert_eq!(SIZE_CLASSES[0], 1024); // 1KB
         assert_eq!(SIZE_CLASSES[1], 4 * 1024); // 4KB
         assert_eq!(SIZE_CLASSES[2], 16 * 1024); // 16KB
@@ -556,6 +764,8 @@ mod tests {
         assert_eq!(SIZE_CLASSES[5], 1024 * 1024); // 1MB
         assert_eq!(SIZE_CLASSES[6], 4 * 1024 * 1024); // 4MB
         assert_eq!(SIZE_CLASSES[7], 16 * 1024 * 1024); // 16MB
+        assert_eq!(SIZE_CLASSES[8], 64 * 1024 * 1024); // 64MB
+        assert_eq!(SIZE_CLASSES[9], 256 * 1024 * 1024); // 256MB
     }
 
     #[test]
@@ -576,5 +786,212 @@ mod tests {
         // Still no eviction if no buffers in pool
         let evicted = inner.evict_until_under_budget();
         assert_eq!(evicted, 0);
+    }
+
+    /// Regression test for two bugs together:
+    ///
+    /// 1. A cache hit used to reuse a pooled buffer regardless of its usage
+    ///    flags, so a `MAP_READ`-flavoured buffer could be handed back for a
+    ///    `STORAGE` request of the same size class (fails wgpu validation).
+    ///    A cache hit must now only reuse an entry whose usage is a
+    ///    superset of the request.
+    /// 2. Requests above the largest size class used to return `None`
+    ///    instead of being served; they must now succeed via a one-off
+    ///    allocation.
+    #[test]
+    fn test_acquire_respects_usage_flags_and_oversized_fallback() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::all(),
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
+
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+            apply_limit_buckets: false,
+        }));
+        let adapter = match adapter {
+            Ok(a) => a,
+            Err(_) => {
+                eprintln!("No GPU adapter available, skipping GPU test");
+                return;
+            }
+        };
+
+        let device = match pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("pool_test_device"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::default(),
+            memory_hints: wgpu::MemoryHints::Performance,
+            experimental_features: wgpu::ExperimentalFeatures::default(),
+            trace: wgpu::Trace::Off,
+        })) {
+            Ok((device, _queue)) => device,
+            Err(_) => {
+                eprintln!("Failed to create GPU device, skipping GPU test");
+                return;
+            }
+        };
+
+        let pool = BufferPool::new(512 * 1024 * 1024);
+
+        let storage_usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
+        let staging_usage = wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST;
+        let small_size = SIZE_CLASSES[0];
+
+        // Acquire and drop a STORAGE buffer so it returns to the pool.
+        drop(
+            pool.acquire(&device, small_size, storage_usage, "storage")
+                .expect("acquire should succeed"),
+        );
+        assert_eq!(
+            pool.stats().available_count,
+            1,
+            "buffer should return to the pool on drop"
+        );
+
+        // A same-size request for a non-superset usage must NOT reuse the
+        // STORAGE buffer -- it should allocate fresh instead.
+        let staged = pool
+            .acquire(&device, small_size, staging_usage, "staging")
+            .expect("acquire should succeed");
+        assert_eq!(
+            staged.buffer().usage(),
+            staging_usage,
+            "must not reuse a buffer whose usage flags don't cover the request"
+        );
+        assert_eq!(
+            pool.stats().available_count,
+            1,
+            "the original STORAGE buffer must remain untouched in the pool"
+        );
+        drop(staged);
+
+        // A request whose usage the pooled STORAGE buffer covers should now
+        // hit the cache (no fresh allocation).
+        let allocations_before = pool.stats().total_allocations;
+        let reused = pool
+            .acquire(&device, small_size, storage_usage, "storage-reuse")
+            .expect("acquire should succeed");
+        assert_eq!(reused.buffer().usage(), storage_usage);
+        assert_eq!(
+            pool.stats().total_allocations,
+            allocations_before,
+            "matching usage should be served from the pool, not a fresh allocation"
+        );
+        drop(reused);
+
+        // A request the *device* cannot satisfy must be declined gracefully.
+        // Creating the buffer anyway is a wgpu validation error, which is
+        // delivered to the device's uncaptured-error handler and aborts the
+        // process -- it is not an error `acquire` could propagate, so the
+        // limit has to be checked before allocating.
+        let max_buffer_size = device.limits().max_buffer_size;
+        assert!(
+            pool.acquire(
+                &device,
+                max_buffer_size + 1,
+                wgpu::BufferUsages::COPY_DST,
+                "beyond-device-limit",
+            )
+            .is_none(),
+            "a request above the device's max_buffer_size ({max_buffer_size}) must return None"
+        );
+
+        // Oversized fallback: a request larger than the largest size class
+        // must still succeed (previously returned None and the pool was
+        // inert for every readback above 1024x1024) -- as long as the device
+        // can hold such a buffer at all. `wgpu::Limits::default()` caps
+        // `max_buffer_size` at exactly the largest size class (256 MB), so on
+        // a default-limits device this branch is unreachable and the
+        // `TooLarge` assertion above is the meaningful one; the
+        // `plan_allocation` unit tests cover both policies without a GPU.
+        let oversized_size = SIZE_CLASSES[SIZE_CLASSES.len() - 1] + 1;
+        if oversized_size <= max_buffer_size {
+            let oversized = pool
+                .acquire(
+                    &device,
+                    oversized_size,
+                    wgpu::BufferUsages::COPY_DST,
+                    "oversized",
+                )
+                .expect("requests above the largest size class must still be served");
+            assert_eq!(oversized.actual_size(), oversized_size);
+            assert!(oversized.buffer().size() >= oversized_size);
+            drop(oversized);
+        }
+    }
+
+    /// The device-limit policy behind `BufferPool::acquire`, unit-tested
+    /// without a GPU (the interesting cases need a device whose
+    /// `max_buffer_size` is not one of the size-class values).
+    #[test]
+    fn test_plan_allocation_respects_device_limit() {
+        let largest = SIZE_CLASSES[SIZE_CLASSES.len() - 1];
+        let generous = largest * 4;
+
+        // Normal case: the size class fits the device.
+        assert_eq!(
+            BufferPoolInner::plan_allocation(1, generous),
+            AllocationPlan::SizeClass(0)
+        );
+        assert_eq!(
+            BufferPoolInner::plan_allocation(33 * 1024 * 1024, generous),
+            AllocationPlan::SizeClass(8)
+        );
+
+        // Above the largest size class but within the device limit: exact
+        // one-off allocation.
+        assert_eq!(
+            BufferPoolInner::plan_allocation(largest + 1, generous),
+            AllocationPlan::Exact
+        );
+
+        // Above the device limit: unservable.
+        assert_eq!(
+            BufferPoolInner::plan_allocation(generous + 1, generous),
+            AllocationPlan::TooLarge
+        );
+        assert_eq!(
+            BufferPoolInner::plan_allocation(largest + 1, largest),
+            AllocationPlan::TooLarge
+        );
+
+        // Request fits the device but its size class does not: the class is
+        // downgraded to an exact-size allocation instead of refusing (or,
+        // as before this policy existed, tripping wgpu validation).
+        // Device limit 24 MB: a 20 MB request rounds up to the 64 MB class.
+        let device_limit = 24 * 1024 * 1024;
+        let request = 20 * 1024 * 1024;
+        assert_eq!(BufferPoolInner::size_class_index(request), Some(8));
+        assert!(SIZE_CLASSES[8] > device_limit);
+        assert_eq!(
+            BufferPoolInner::plan_allocation(request, device_limit),
+            AllocationPlan::Exact
+        );
+
+        // Exactly at the limit is still servable.
+        assert_eq!(
+            BufferPoolInner::plan_allocation(largest, largest),
+            AllocationPlan::SizeClass(SIZE_CLASSES.len() - 1)
+        );
+    }
+
+    /// An exact-size one-off allocation must never be mistaken for a pooled
+    /// size class on return (`return_buffer` identifies classes by value).
+    #[test]
+    fn test_exact_plan_sizes_never_collide_with_a_size_class() {
+        // `plan_allocation` only returns `Exact` for sizes that are not
+        // themselves size-class values: a size equal to `SIZE_CLASSES[i]`
+        // always selects class `i`, and that class is <= the device limit
+        // whenever the request is.
+        for (idx, &class) in SIZE_CLASSES.iter().enumerate() {
+            assert_eq!(
+                BufferPoolInner::plan_allocation(class, class),
+                AllocationPlan::SizeClass(idx),
+                "a request of exactly SIZE_CLASSES[{idx}] must use that class"
+            );
+        }
     }
 }

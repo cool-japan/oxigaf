@@ -871,7 +871,7 @@ impl AoBvh {
             let t = &tris[ti as usize];
             (t[0][axis] + t[1][axis] + t[2][axis]) / 3.0
         };
-        let mid = (start + end) / 2;
+        let mid = start.midpoint(end);
         let _ = order[start..end]
             .select_nth_unstable_by(mid - start, |a, b| centroid(*a).total_cmp(&centroid(*b)));
 

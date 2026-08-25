@@ -47,7 +47,7 @@ pub fn convert(
     // "unet") for the whole checkpoint. A checkpoint with no such metadata
     // (e.g. produced by some other tool) gets no prefix added back, which
     // matches how a name with no recognized prefix behaved going forward.
-    let prefixes = read_prefix_metadata(&oxigaf_tensors)?;
+    let prefixes = read_prefix_metadata(&buffer)?;
 
     // Convert each tensor
     let mut pytorch_tensors: HashMap<String, (Vec<u8>, Vec<usize>, Dtype)> = HashMap::new();
@@ -133,15 +133,21 @@ pub fn convert(
 /// Reads and decodes the per-tensor prefix map `pytorch_to_oxigaf::convert`
 /// persists in `__metadata__` under [`PREFIX_METADATA_KEY`], if present.
 ///
+/// Takes the raw file bytes rather than the already-deserialized
+/// [`SafeTensors`]: as of safetensors 0.8 the `__metadata__` map is reachable
+/// only through [`SafeTensors::read_metadata`], not from a deserialized
+/// `SafeTensors` value.
+///
 /// Absent metadata, or metadata that fails to parse (e.g. a checkpoint from
 /// an older version of this crate, or a hand-crafted/third-party file),
 /// yields an empty map -- names are then reconstructed with no prefix
 /// rather than the conversion failing.
-fn read_prefix_metadata(tensors: &SafeTensors<'_>) -> Result<HashMap<String, String>> {
-    let Some(metadata) = tensors.metadata() else {
+fn read_prefix_metadata(buffer: &[u8]) -> Result<HashMap<String, String>> {
+    let (_, metadata) = SafeTensors::read_metadata(buffer)?;
+    let Some(entries) = metadata.metadata().as_ref() else {
         return Ok(HashMap::new());
     };
-    let Some(encoded) = metadata.get(PREFIX_METADATA_KEY) else {
+    let Some(encoded) = entries.get(PREFIX_METADATA_KEY) else {
         return Ok(HashMap::new());
     };
     match serde_json::from_str(encoded) {
@@ -230,7 +236,7 @@ mod tests {
 
         let mut tensors = BTreeMap::new();
         tensors.insert(
-            "conv_in_weight".to_string(),
+            "conv_in.weight".to_string(),
             TensorView::new(Dtype::F32, vec![2, 2], &bytes).expect("test: tensor view"),
         );
         let serialized =
@@ -259,11 +265,11 @@ mod tests {
             SafeTensors::deserialize(&data).map_err(|e| BridgeError::SafeTensors(e.to_string()))?;
 
         assert!(
-            result.tensor("conv.in.weight").is_ok(),
-            "expected 'conv.in.weight' with no prefix; got names: {:?}",
+            result.tensor("conv_in.weight").is_ok(),
+            "expected 'conv_in.weight' with no prefix; got names: {:?}",
             result.names()
         );
-        assert!(result.tensor("unet.conv.in.weight").is_err());
+        assert!(result.tensor("unet.conv_in.weight").is_err());
 
         Ok(())
     }
@@ -326,8 +332,16 @@ mod tests {
     #[test]
     fn test_convert_rejects_colliding_names() -> Result<()> {
         // Regression test: two OxiGAF names that both map to the same
-        // PyTorch name under the same restored prefix used to silently
-        // overwrite one another; this must now be a hard error.
+        // PyTorch name used to silently overwrite one another; this must be
+        // a hard error.
+        //
+        // Under the dot-preserving convention the reverse transform is the
+        // identity plus an optional recorded prefix, so a collision needs
+        // the prefix map to disagree with the names: "a.b" carrying a
+        // recorded prefix of "unet" restores to "unet.a.b", which is
+        // *also* what the literal name "unet.a.b" (no recorded prefix)
+        // produces. That is reachable from a hand-edited or third-party
+        // checkpoint whose `__metadata__` does not match its tensor names.
         let temp_dir = tempfile::tempdir().expect("test: failed to create temp dir");
         let oxigaf_path = temp_dir.path().join("colliding.safetensors");
         let pytorch_path = temp_dir.path().join("colliding_out.safetensors");
@@ -335,24 +349,24 @@ mod tests {
         let data = [1.0f32, 2.0, 3.0, 4.0];
         let bytes: Vec<u8> = data.iter().flat_map(|x| x.to_le_bytes()).collect();
 
-        // "conv_weight" and "conv.weight" both decode (with no recorded
-        // prefix for either) to the same PyTorch name "conv.weight": the
-        // reverse transform turns a plain underscore into a dot, but
-        // passes an already-literal dot through untouched, so an OxiGAF
-        // name that happens to already contain a '.' (e.g. from a
-        // checkpoint produced by some other tool) collides with its
-        // underscore-escaped equivalent.
         let mut tensors = BTreeMap::new();
         tensors.insert(
-            "conv_weight".to_string(),
+            "a.b".to_string(),
             TensorView::new(Dtype::F32, vec![2, 2], &bytes).expect("test: tensor view"),
         );
         tensors.insert(
-            "conv.weight".to_string(),
+            "unet.a.b".to_string(),
             TensorView::new(Dtype::F32, vec![2, 2], &bytes).expect("test: tensor view"),
         );
-        let serialized =
-            safetensors::serialize(&tensors, None).expect("test: serialize should succeed");
+
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            PREFIX_METADATA_KEY.to_string(),
+            r#"{"a.b":"unet"}"#.to_string(),
+        );
+
+        let serialized = safetensors::serialize(&tensors, Some(metadata))
+            .expect("test: serialize should succeed");
         std::fs::write(&oxigaf_path, &serialized)?;
 
         let mapping = LayerMapping::new();

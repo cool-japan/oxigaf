@@ -4,28 +4,32 @@
 //! (f32 RGBA, row-major). All metrics exclude the alpha channel.
 
 use crate::RenderError;
+use rayon::prelude::*;
 
 // ─── Gaussian kernel ────────────────────────────────────────────────────────
 
-/// Build a normalized 11×11 Gaussian kernel with the given `sigma`.
+/// Build a normalized 1-D Gaussian kernel with 11 taps (radius 5), in `f64`.
+/// Values sum to exactly 1.0.
 ///
-/// Values are laid out row-major; the kernel sums to exactly 1.0.
-fn gaussian_kernel_11x11(sigma: f32) -> Vec<f32> {
+/// The 11×11 2-D window the SSIM formula conceptually convolves with is the
+/// outer product of this kernel with itself
+/// (`kernel2d[ky][kx] = kernel1d[ky] * kernel1d[kx]`) — see
+/// [`ssim_over_channels`]'s doc comment for why that lets a horizontal pass
+/// followed by a vertical pass reproduce the same (border-truncated) result
+/// as a direct 2-D convolution, exactly.
+fn gaussian_kernel_1d_11(sigma: f32) -> [f64; 11] {
     const K: usize = 11;
     const HALF: i32 = 5; // (K - 1) / 2
 
     let sigma_sq = (sigma * sigma) as f64;
-    let mut kernel = Vec::with_capacity(K * K);
+    let mut kernel = [0.0f64; K];
     let mut sum = 0.0f64;
 
-    for ky in 0..K {
-        for kx in 0..K {
-            let dy = (ky as i32 - HALF) as f64;
-            let dx = (kx as i32 - HALF) as f64;
-            let val = (-(dx * dx + dy * dy) / (2.0 * sigma_sq)).exp();
-            kernel.push(val);
-            sum += val;
-        }
+    for (k, slot) in kernel.iter_mut().enumerate() {
+        let d = (k as i32 - HALF) as f64;
+        let val = (-(d * d) / (2.0 * sigma_sq)).exp();
+        *slot = val;
+        sum += val;
     }
 
     // Normalise so weights sum to 1.
@@ -33,7 +37,37 @@ fn gaussian_kernel_11x11(sigma: f32) -> Vec<f32> {
         *v /= sum;
     }
 
-    kernel.into_iter().map(|v| v as f32).collect()
+    kernel
+}
+
+/// For each output position along one axis, the sum of `kernel1d` weights
+/// whose tap falls inside `[0, n)` — i.e. the retained weight after the
+/// border discards zero, some, or none of the 11 taps.
+///
+/// The two-axis product `wx[cx] * wy[cy]` is exactly the 2-D retained
+/// weight sum for pixel `(cx, cy)` under border truncation, because a tap's
+/// x-coordinate is in bounds independently of whether its y-coordinate is
+/// (see [`ssim_over_channels`]'s doc comment). Always `> 0` when `n > 0`:
+/// the kernel's centre tap (`k == kernel1d.len() / 2`) always lands on
+/// `p == c`, which is in bounds.
+fn valid_weight_sums(n: usize, kernel1d: &[f64]) -> Vec<f64> {
+    let half = (kernel1d.len() / 2) as i32;
+    (0..n)
+        .map(|c| {
+            kernel1d
+                .iter()
+                .enumerate()
+                .filter_map(|(k, &w)| {
+                    let p = c as i32 + k as i32 - half;
+                    if p >= 0 && p < n as i32 {
+                        Some(w)
+                    } else {
+                        None
+                    }
+                })
+                .sum()
+        })
+        .collect()
 }
 
 // ─── Downsample ─────────────────────────────────────────────────────────────
@@ -151,91 +185,146 @@ pub fn compute_ssim(
         });
     }
 
-    let kernel = gaussian_kernel_11x11(1.5);
+    let kernel = gaussian_kernel_1d_11(1.5);
     let ssim_total = ssim_over_channels(predicted, reference, width, height, &kernel);
     Ok(ssim_total as f32)
 }
 
 /// Compute mean SSIM averaged across R, G, B channels.
+///
+/// Uses a separable formulation of the (border-truncated) 11×11 Gaussian
+/// window: `kernel1d` is applied once along rows and once along columns,
+/// instead of a single non-separable 2-D convolution (121 taps/pixel vs.
+/// 11+11). This is exact, not an approximation: whether a tap's
+/// x-coordinate falls inside `[0, width)` depends only on `(cx, kx, width)`,
+/// and whether its y-coordinate falls inside `[0, height)` depends only on
+/// `(cy, ky, height)` — the two conditions are independent. So for any
+/// pixel `(cx, cy)` and function `f`,
+///
+/// ```text
+/// sum_{kx,ky: px in-bounds AND py in-bounds} w[ky]*w[kx]*f(px,py)
+///   == sum_{ky: py in-bounds} w[ky] * (sum_{kx: px in-bounds} w[kx]*f(px,py))
+/// ```
+///
+/// i.e. a horizontal pass followed by a vertical pass reproduces the full
+/// 2-D truncated sum exactly, and by the same argument the retained weight
+/// sum factors into `wx[cx] * wy[cy]` (see [`valid_weight_sums`]). Checked
+/// against a direct 2-D reference implementation in
+/// `test_ssim_separable_matches_naive_reference_asymmetric_image`.
 fn ssim_over_channels(
     pred: &[f32],
     refer: &[f32],
     width: usize,
     height: usize,
-    kernel: &[f32],
+    kernel1d: &[f64],
 ) -> f64 {
     // SSIM stability constants (L = 1.0)
     const L: f64 = 1.0;
     const C1: f64 = (0.01 * L) * (0.01 * L); // 1e-4
     const C2: f64 = (0.03 * L) * (0.03 * L); // 9e-4
-
-    const K: usize = 11;
     const HALF: i32 = 5;
+
+    if width == 0 || height == 0 {
+        // Matches the non-separable implementation's behaviour: an empty
+        // image has no pixels to disagree over, and each channel's
+        // zero-pixel average was defined as 1.0.
+        return 1.0;
+    }
+
+    // Retained 1-D weight sum at each output position, shared across all
+    // three channels; see the factorization note above. Always > 0 (the
+    // kernel's centre tap always lands in-bounds).
+    let wx = valid_weight_sums(width, kernel1d);
+    let wy = valid_weight_sums(height, kernel1d);
 
     let mut channel_ssims = [0.0f64; 3];
 
-    for ch in 0..3usize {
-        let mut ssim_sum = 0.0f64;
-        let mut pixel_count = 0u64;
-
-        for cy in 0..height {
-            for cx in 0..width {
-                let mut mu_x = 0.0f64;
-                let mut mu_y = 0.0f64;
-                let mut sigma_x2 = 0.0f64;
-                let mut sigma_y2 = 0.0f64;
-                let mut sigma_xy = 0.0f64;
-
-                // Convolve 11×11 window (zero-pad outside boundaries).
-                for ky in 0..K {
-                    let py = cy as i32 + (ky as i32 - HALF);
-                    if py < 0 || py >= height as i32 {
-                        continue;
-                    }
-                    let py = py as usize;
-                    for kx in 0..K {
-                        let px = cx as i32 + (kx as i32 - HALF);
+    for (ch, channel_ssim) in channel_ssims.iter_mut().enumerate() {
+        // Horizontal pass: for every pixel, blur the five raw per-pixel
+        // moment terms (x, y, x*x, y*y, x*y) along its row into a single
+        // `[f64; 5]` plane. Parallelised over rows -- each row writes only
+        // to its own disjoint output slice, so this is deterministic
+        // regardless of how rayon schedules it.
+        let mut horiz: Vec<[f64; 5]> = vec![[0.0; 5]; width * height];
+        horiz
+            .par_chunks_mut(width)
+            .enumerate()
+            .for_each(|(py, row_out)| {
+                for (cx, slot) in row_out.iter_mut().enumerate() {
+                    let mut acc = [0.0f64; 5];
+                    for (kx, &w) in kernel1d.iter().enumerate() {
+                        let px = cx as i32 + kx as i32 - HALF;
                         if px < 0 || px >= width as i32 {
                             continue;
                         }
                         let px = px as usize;
-                        let w = kernel[ky * K + kx] as f64;
                         let x_val = pred[(py * width + px) * 4 + ch] as f64;
                         let y_val = refer[(py * width + px) * 4 + ch] as f64;
-                        mu_x += w * x_val;
-                        mu_y += w * y_val;
-                        sigma_x2 += w * x_val * x_val;
-                        sigma_y2 += w * y_val * y_val;
-                        sigma_xy += w * x_val * y_val;
+                        acc[0] += w * x_val;
+                        acc[1] += w * y_val;
+                        acc[2] += w * x_val * x_val;
+                        acc[3] += w * y_val * y_val;
+                        acc[4] += w * x_val * y_val;
                     }
+                    *slot = acc;
                 }
+            });
 
-                // Convert weighted second moments to variances/covariance.
-                sigma_x2 -= mu_x * mu_x;
-                sigma_y2 -= mu_y * mu_y;
-                sigma_xy -= mu_x * mu_y;
+        // Vertical pass, fused with the per-pixel SSIM formula so the
+        // doubly-blurred moments never need their own planes -- only the 5
+        // horizontally-blurred ones above are ever materialised at once.
+        // Parallelised over rows, but reduced sequentially afterward: a
+        // parallel `.sum()` reduction tree's shape depends on how rayon
+        // splits the work, and f64 addition is not associative, so summing
+        // a fixed, collected per-row order keeps the total independent of
+        // scheduling.
+        let row_sums: Vec<f64> = (0..height)
+            .into_par_iter()
+            .map(|cy| {
+                let mut row_sum = 0.0f64;
+                for cx in 0..width {
+                    let mut acc = [0.0f64; 5];
+                    for (ky, &w) in kernel1d.iter().enumerate() {
+                        let py = cy as i32 + ky as i32 - HALF;
+                        if py < 0 || py >= height as i32 {
+                            continue;
+                        }
+                        let h = horiz[py as usize * width + cx];
+                        acc[0] += w * h[0];
+                        acc[1] += w * h[1];
+                        acc[2] += w * h[2];
+                        acc[3] += w * h[3];
+                        acc[4] += w * h[4];
+                    }
 
-                // Clamp small negative due to floating-point noise.
-                if sigma_x2 < 0.0 {
-                    sigma_x2 = 0.0;
+                    // Renormalize by the retained kernel weight -- see the
+                    // factorization note on `valid_weight_sums`.
+                    let w_sum = wx[cx] * wy[cy];
+                    let mu_x = acc[0] / w_sum;
+                    let mu_y = acc[1] / w_sum;
+
+                    // Convert weighted second moments to variances/covariance.
+                    let mut sigma_x2 = acc[2] / w_sum - mu_x * mu_x;
+                    let mut sigma_y2 = acc[3] / w_sum - mu_y * mu_y;
+                    let sigma_xy = acc[4] / w_sum - mu_x * mu_y;
+
+                    // Clamp small negative due to floating-point noise.
+                    if sigma_x2 < 0.0 {
+                        sigma_x2 = 0.0;
+                    }
+                    if sigma_y2 < 0.0 {
+                        sigma_y2 = 0.0;
+                    }
+
+                    let numerator = (2.0 * mu_x * mu_y + C1) * (2.0 * sigma_xy + C2);
+                    let denominator = (mu_x * mu_x + mu_y * mu_y + C1) * (sigma_x2 + sigma_y2 + C2);
+                    row_sum += numerator / denominator;
                 }
-                if sigma_y2 < 0.0 {
-                    sigma_y2 = 0.0;
-                }
+                row_sum
+            })
+            .collect();
 
-                let numerator = (2.0 * mu_x * mu_y + C1) * (2.0 * sigma_xy + C2);
-                let denominator = (mu_x * mu_x + mu_y * mu_y + C1) * (sigma_x2 + sigma_y2 + C2);
-
-                ssim_sum += numerator / denominator;
-                pixel_count += 1;
-            }
-        }
-
-        if pixel_count == 0 {
-            channel_ssims[ch] = 1.0;
-        } else {
-            channel_ssims[ch] = ssim_sum / (pixel_count as f64);
-        }
+        *channel_ssim = row_sums.iter().sum::<f64>() / (width * height) as f64;
     }
 
     (channel_ssims[0] + channel_ssims[1] + channel_ssims[2]) / 3.0
@@ -272,7 +361,7 @@ pub fn compute_ms_ssim(
     const WEIGHTS: [f64; 3] = [0.0448, 0.2856, 0.3001];
     const MIN_DIM: usize = 11;
 
-    let kernel = gaussian_kernel_11x11(1.5);
+    let kernel = gaussian_kernel_1d_11(1.5);
 
     let mut pred_cur: Vec<f32> = predicted.to_vec();
     let mut ref_cur: Vec<f32> = reference.to_vec();
@@ -636,6 +725,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_ssim_border_pixels_use_renormalized_weighted_moments() {
+        // Regression test for the border-renormalization bug. For two
+        // DIFFERENT solid-colour images, every pixel -- border or interior
+        // -- is locally constant on both sides, so the true local variance
+        // and covariance are exactly zero everywhere and the per-pixel
+        // SSIM must equal the closed form (2ab + C1) / (a^2 + b^2 + C1)
+        // (the sigma terms cancel out entirely). This holds independent of
+        // the kernel's shape or how much of the 11x11 window falls outside
+        // the image, so `compute_ssim`'s image-wide average must equal
+        // this closed form too. Before the fix, un-renormalized weighted
+        // sums fabricated spurious nonzero "variance" near every border
+        // (roughly 53% of pixels in a 32x32 image are within 5px of an
+        // edge), pulling the average well away from this value.
+        const A: f32 = 0.7;
+        const B: f32 = 0.5;
+        let predicted = solid_rgba(A, A, A, 1.0, 32, 32);
+        let reference = solid_rgba(B, B, B, 1.0, 32, 32);
+
+        let ssim = compute_ssim(&predicted, &reference, 32, 32).expect("ssim failed");
+
+        let c1 = (0.01_f64 * 1.0) * (0.01_f64 * 1.0);
+        let (a, b) = (A as f64, B as f64);
+        let expected = (2.0 * a * b + c1) / (a * a + b * b + c1);
+
+        assert!(
+            (ssim as f64 - expected).abs() < 1e-3,
+            "expected SSIM \u{2248} {expected} (closed form for two constant images), got {ssim}"
+        );
+    }
+
     // ── MS-SSIM tests ────────────────────────────────────────────────────────
 
     #[test]
@@ -662,13 +782,174 @@ mod tests {
     // ── Gaussian kernel test ─────────────────────────────────────────────────
 
     #[test]
-    fn test_gaussian_kernel_sums_to_one() {
-        let kernel = gaussian_kernel_11x11(1.5);
-        assert_eq!(kernel.len(), 121, "kernel must have 121 entries");
-        let sum: f32 = kernel.iter().sum();
+    fn test_gaussian_kernel_1d_sums_to_one() {
+        let kernel = gaussian_kernel_1d_11(1.5);
+        assert_eq!(kernel.len(), 11, "1-D kernel must have 11 entries");
+        let sum: f64 = kernel.iter().sum();
         assert!(
-            (sum - 1.0).abs() < 1e-5,
-            "kernel must sum to 1.0, got {sum}"
+            (sum - 1.0).abs() < 1e-10,
+            "1-D kernel must sum to 1.0, got {sum}"
+        );
+        // The 11x11 2-D window is this kernel's outer product with itself,
+        // so it sums to 1.0 automatically (sum_x * sum_y == 1.0 * 1.0) --
+        // no separate 2-D normalization step is needed.
+    }
+
+    // ── Separable-vs-naive-2D equivalence ────────────────────────────────────
+
+    /// Direct (non-separable) 2-D reference implementation of the SSIM
+    /// window convolution, mirroring the pre-refactor algorithm exactly.
+    /// Used only to cross-check `ssim_over_channels`'s separable
+    /// implementation below; kept test-only so it can't bit-rot into an
+    /// `unused`/`dead_code` warning in a normal build.
+    fn gaussian_kernel_11x11_reference(sigma: f32) -> Vec<f64> {
+        const K: usize = 11;
+        const HALF: i32 = 5;
+        let sigma_sq = (sigma * sigma) as f64;
+        let mut kernel = Vec::with_capacity(K * K);
+        let mut sum = 0.0f64;
+        for ky in 0..K {
+            for kx in 0..K {
+                let dy = (ky as i32 - HALF) as f64;
+                let dx = (kx as i32 - HALF) as f64;
+                let val = (-(dx * dx + dy * dy) / (2.0 * sigma_sq)).exp();
+                kernel.push(val);
+                sum += val;
+            }
+        }
+        for v in &mut kernel {
+            *v /= sum;
+        }
+        kernel
+    }
+
+    fn ssim_over_channels_naive_reference(
+        pred: &[f32],
+        refer: &[f32],
+        width: usize,
+        height: usize,
+        kernel2d: &[f64],
+    ) -> f64 {
+        const K: usize = 11;
+        const HALF: i32 = 5;
+        const C1: f64 = 0.0001;
+        const C2: f64 = 0.0009;
+
+        let mut channel_ssims = [0.0f64; 3];
+        for ch in 0..3usize {
+            let mut ssim_sum = 0.0f64;
+            let mut pixel_count = 0u64;
+            for cy in 0..height {
+                for cx in 0..width {
+                    let mut mu_x = 0.0f64;
+                    let mut mu_y = 0.0f64;
+                    let mut sigma_x2 = 0.0f64;
+                    let mut sigma_y2 = 0.0f64;
+                    let mut sigma_xy = 0.0f64;
+                    let mut w_sum = 0.0f64;
+                    for ky in 0..K {
+                        let py = cy as i32 + (ky as i32 - HALF);
+                        if py < 0 || py >= height as i32 {
+                            continue;
+                        }
+                        let py = py as usize;
+                        for kx in 0..K {
+                            let px = cx as i32 + (kx as i32 - HALF);
+                            if px < 0 || px >= width as i32 {
+                                continue;
+                            }
+                            let px = px as usize;
+                            let w = kernel2d[ky * K + kx];
+                            let x_val = pred[(py * width + px) * 4 + ch] as f64;
+                            let y_val = refer[(py * width + px) * 4 + ch] as f64;
+                            mu_x += w * x_val;
+                            mu_y += w * y_val;
+                            sigma_x2 += w * x_val * x_val;
+                            sigma_y2 += w * y_val * y_val;
+                            sigma_xy += w * x_val * y_val;
+                            w_sum += w;
+                        }
+                    }
+                    mu_x /= w_sum;
+                    mu_y /= w_sum;
+                    sigma_x2 /= w_sum;
+                    sigma_y2 /= w_sum;
+                    sigma_xy /= w_sum;
+                    sigma_x2 -= mu_x * mu_x;
+                    sigma_y2 -= mu_y * mu_y;
+                    sigma_xy -= mu_x * mu_y;
+                    if sigma_x2 < 0.0 {
+                        sigma_x2 = 0.0;
+                    }
+                    if sigma_y2 < 0.0 {
+                        sigma_y2 = 0.0;
+                    }
+                    let numerator = (2.0 * mu_x * mu_y + C1) * (2.0 * sigma_xy + C2);
+                    let denominator = (mu_x * mu_x + mu_y * mu_y + C1) * (sigma_x2 + sigma_y2 + C2);
+                    ssim_sum += numerator / denominator;
+                    pixel_count += 1;
+                }
+            }
+            channel_ssims[ch] = if pixel_count == 0 {
+                1.0
+            } else {
+                ssim_sum / (pixel_count as f64)
+            };
+        }
+        (channel_ssims[0] + channel_ssims[1] + channel_ssims[2]) / 3.0
+    }
+
+    #[test]
+    fn test_ssim_separable_matches_naive_reference_asymmetric_image() {
+        // Regression test for the separable-convolution rewrite: a
+        // deliberately non-uniform, non-square, asymmetric image (a
+        // transpose bug swapping the horizontal/vertical passes would be
+        // invisible on a uniform or square-symmetric image, but is
+        // detectable here) must produce the same SSIM, within floating-
+        // point reassociation error, as the original direct 2-D 11x11
+        // convolution.
+        let width = 13usize;
+        let height = 9usize;
+        let mut predicted = vec![0.0f32; width * height * 4];
+        let mut reference = vec![0.0f32; width * height * 4];
+        for y in 0..height {
+            for x in 0..width {
+                let idx = (y * width + x) * 4;
+                let gx = x as f32 / (width - 1) as f32;
+                let gy = y as f32 / (height - 1) as f32;
+                // Off-centre bright patch, asymmetric in both axes.
+                let patch = if (8..=10).contains(&x) && (1..=2).contains(&y) {
+                    0.4
+                } else {
+                    0.0
+                };
+                predicted[idx] = (0.2 + 0.5 * gx + patch).clamp(0.0, 1.0);
+                predicted[idx + 1] = (0.3 + 0.4 * gy).clamp(0.0, 1.0);
+                predicted[idx + 2] = (0.1 + 0.3 * gx * gy).clamp(0.0, 1.0);
+                predicted[idx + 3] = 1.0;
+                reference[idx] = (0.25 + 0.45 * gx).clamp(0.0, 1.0);
+                reference[idx + 1] = (0.35 + 0.35 * gy + patch * 0.5).clamp(0.0, 1.0);
+                reference[idx + 2] = (0.15 + 0.25 * gx * gy).clamp(0.0, 1.0);
+                reference[idx + 3] = 1.0;
+            }
+        }
+
+        let kernel1d = gaussian_kernel_1d_11(1.5);
+        let kernel2d_ref = gaussian_kernel_11x11_reference(1.5);
+
+        let separable = ssim_over_channels(&predicted, &reference, width, height, &kernel1d);
+        let naive = ssim_over_channels_naive_reference(
+            &predicted,
+            &reference,
+            width,
+            height,
+            &kernel2d_ref,
+        );
+
+        assert!(
+            (separable - naive).abs() < 1e-9,
+            "separable SSIM {separable} must match naive 2-D reference {naive} (diff {})",
+            (separable - naive).abs()
         );
     }
 

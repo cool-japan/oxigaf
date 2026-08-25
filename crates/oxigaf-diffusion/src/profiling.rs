@@ -485,9 +485,9 @@ mod tests {
     #[test]
     fn attention_memory_score_component_quadratic() {
         // Isolate the score component by choosing head_dim=0 (zero QKV bytes).
-        // score = batch × heads × seq × seq × 4
-        let scores_128: usize = 1 * 8 * 128 * 128 * 4;
-        let scores_256: usize = 1 * 8 * 256 * 256 * 4;
+        // score = batch × heads × seq × seq × 4, at batch = 1.
+        let scores_128: usize = 8 * 128 * 128 * 4;
+        let scores_256: usize = 8 * 256 * 256 * 4;
         assert_eq!(
             scores_256,
             4 * scores_128,

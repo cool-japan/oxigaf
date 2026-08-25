@@ -317,11 +317,52 @@ pub fn compute_depth_stats(map: &DepthMap, background: f32) -> DepthStats {
 // Camera helpers
 // ---------------------------------------------------------------------------
 
+/// World-to-camera "view flip" shared by every depth camera in this module.
+///
+/// `diag(1, -1, -1)` — the same matrix [`Camera::default_front`] uses. It turns
+/// a world frame whose axes are "+X right, +Y up, +Z toward the viewer" into
+/// the [`Camera`] convention "`+X_cam` right, `+Y_cam` **down**, `+Z_cam` forward":
+/// world `+Y` (up) maps to `-Y_cam`, i.e. screen up (decreasing pixel row), and
+/// world `+Z` (out of the face) maps to `-Z_cam`, i.e. *toward* the camera.
+///
+/// Every camera below is `VIEW_FLIP * R_y(yaw)`: yaw orbits the camera around
+/// the head, the flip keeps it looking at the head, right-side up.
+#[rustfmt::skip]
+const VIEW_FLIP: [f32; 9] = [
+    1.0,  0.0,  0.0,
+    0.0, -1.0,  0.0,
+    0.0,  0.0, -1.0,
+];
+
+/// Build `VIEW_FLIP * R_y(yaw)` as the world-to-camera rotation.
+///
+/// The resulting camera centre is `-Rᵀ · [0, 0, distance]`, which orbits the
+/// world origin in the XZ plane: `yaw = 0` places it at `(0, 0, +distance)`
+/// (directly in front of a FLAME head, which faces `+Z`), `yaw = 90°` at
+/// `(-distance, 0, 0)`, and so on.
+fn orbit_rotation(yaw_radians: f32) -> na::Matrix3<f32> {
+    let (sin_yaw, cos_yaw) = yaw_radians.sin_cos();
+    // R_y(yaw), row-major.
+    #[rustfmt::skip]
+    let rot_y = na::Matrix3::new(
+         cos_yaw, 0.0, sin_yaw,
+             0.0, 1.0,     0.0,
+        -sin_yaw, 0.0, cos_yaw,
+    );
+    let flip = na::Matrix3::from_row_slice(&VIEW_FLIP);
+    flip * rot_y
+}
+
 /// Build a front-facing perspective camera at the given distance.
 ///
-/// Rotation = identity (camera looks in +Z world direction).
-/// Translation = `[0, 0, distance]` so a head at world origin is at
-/// camera-space Z = distance.
+/// The camera sits at world `[0, 0, distance]` — in front of a FLAME head,
+/// which faces `+Z` (see the crate-level coordinate-system docs) — and looks
+/// back along world `-Z` toward it, with world `+Y` (up) mapping to screen up.
+///
+/// Rotation = `diag(1, -1, -1)`, matching [`Camera::default_front`].
+/// Translation = `[0, 0, distance]`, so a head at the world
+/// origin is at camera-space Z = `distance`, and the nose (world `+Z`) is
+/// *nearer* than the back of the skull (world `-Z`).
 /// Focal length = `width * 1.5`.
 ///
 /// `near`/`far` become the camera's own clip planes (consulted by
@@ -332,7 +373,7 @@ pub fn compute_depth_stats(map: &DepthMap, background: f32) -> DepthStats {
 pub fn front_depth_camera(width: u32, height: u32, distance: f32, near: f32, far: f32) -> Camera {
     let focal = width as f32 * 1.5;
     Camera {
-        rotation: na::Matrix3::identity(),
+        rotation: orbit_rotation(0.0),
         translation: na::Vector3::new(0.0, 0.0, distance),
         focal_x: focal,
         focal_y: focal,
@@ -345,31 +386,30 @@ pub fn front_depth_camera(width: u32, height: u32, distance: f32, near: f32, far
     }
 }
 
-/// Build a side-view camera looking from the subject's left (-X direction).
+/// Build a side-view camera placed on world `-X`, looking along world `+X`.
 ///
-/// Rotation = -90° around Y: maps +Z world → -X camera and +X world → +Z camera.
-/// With `t = [0, 0, distance]`, a head at world origin sits at camera Z = distance.
+/// Per the crate-level coordinate-system docs `+X` is the subject's **left**,
+/// so this camera observes the subject's **right** profile. The camera centre
+/// is `[-distance, 0, 0]`; with `t = [0, 0, distance]` a head at the world
+/// origin sits at camera Z = `distance`.
 ///
-/// Rotation matrix (R_y(-90°)):
+/// Rotation = `VIEW_FLIP` (see `front_depth_camera`) `* R_y(90°)`:
 /// ```text
-/// [ 0,  0, -1 ]
-/// [ 0,  1,  0 ]
+/// [ 0,  0,  1 ]
+/// [ 0, -1,  0 ]
 /// [ 1,  0,  0 ]
 /// ```
-/// Check: R * \[0,0,0\] + t = [0, 0, distance]. ✓
-/// Head at world origin → cam = R * \[0,0,0\] + \[0,0,d\] = [0, 0, d]. ✓
-/// Axis check: R * \[0,0,1\] = \[-1,0,0\] (+Z world → -X camera);
-/// R * \[1,0,0\] = \[0,0,1\] (+X world → +Z camera).
+/// Axis check: `R * [1,0,0] = [0,0,1]` (+X world → +Z camera, i.e. the view
+/// direction); `R * [0,0,1] = [1,0,0]` (+Z world, the face, → +X camera =
+/// screen right, so the nose points right); `R * [0,1,0] = [0,-1,0]` (+Y world
+/// → -Y camera = screen up, so the head is not vertically mirrored).
 ///
 /// See [`front_depth_camera`] for the meaning of `near`/`far`.
 #[must_use]
 pub fn side_depth_camera(width: u32, height: u32, distance: f32, near: f32, far: f32) -> Camera {
     let focal = width as f32 * 1.5;
-    // R_y(-90°): rotates -90 degrees around Y axis.
-    // R[row][col]: col-major storage, but na::Matrix3::new is row-major input.
-    let rotation = na::Matrix3::new(0.0, 0.0, -1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0);
     Camera {
-        rotation,
+        rotation: orbit_rotation(std::f32::consts::FRAC_PI_2),
         translation: na::Vector3::new(0.0, 0.0, distance),
         focal_x: focal,
         focal_y: focal,
@@ -382,16 +422,21 @@ pub fn side_depth_camera(width: u32, height: u32, distance: f32, near: f32, far:
     }
 }
 
-/// Build a three-quarter view camera (45° yaw looking from front-left).
+/// Build a three-quarter view camera (45° yaw between front and side).
 ///
-/// Rotation = -45° around Y.
+/// The camera centre is `[-distance/√2, 0, distance/√2]` — in front of the head
+/// and off to the subject's right (`-X`; the viewer's left) — looking back at
+/// the world origin. It is exactly halfway between [`front_depth_camera`] and
+/// [`side_depth_camera`].
+///
+/// Rotation = `VIEW_FLIP` (see `front_depth_camera`) `* R_y(45°)`:
 /// ```text
-/// R_y(-45°):
-/// [  cos45,  0, -sin45 ]     [ √2/2,  0, -√2/2 ]
-/// [     0,   1,      0 ]  =  [   0,  1,     0  ]
-/// [  sin45,  0,  cos45 ]     [ √2/2,  0,  √2/2 ]
+/// [  √2/2,  0,  √2/2 ]
+/// [     0, -1,     0 ]
+/// [  √2/2,  0, -√2/2 ]
 /// ```
-/// Check: R * \[0,0,0\] + t = \[0,0,d\]. ✓
+/// Check: `R * [0,0,0] + t = [0,0,distance]`, and world `+Y` → `-Y_cam`
+/// (screen up), like every other camera here.
 ///
 /// See [`front_depth_camera`] for the meaning of `near`/`far`.
 #[must_use]
@@ -403,10 +448,8 @@ pub fn three_quarter_depth_camera(
     far: f32,
 ) -> Camera {
     let focal = width as f32 * 1.5;
-    let c = std::f32::consts::FRAC_1_SQRT_2; // cos(45°) = sin(45°) = 1/√2
-    let rotation = na::Matrix3::new(c, 0.0, -c, 0.0, 1.0, 0.0, c, 0.0, c);
     Camera {
-        rotation,
+        rotation: orbit_rotation(std::f32::consts::FRAC_PI_4),
         translation: na::Vector3::new(0.0, 0.0, distance),
         focal_x: focal,
         focal_y: focal,
@@ -1008,13 +1051,12 @@ mod tests {
     #[test]
     fn project_point_behind_camera_returns_none() {
         let cam = test_camera();
-        // Point at z=0 in world, camera is at z=1 looking forward.
-        // cam.z = 0 * R_identity + 1.0 = 1.0 → OK.
-        // Place point very far behind: world z = 100 would be cam.z = 1 - 100 = ... no.
-        // With identity rotation and translation [0,0,1]:
-        //   cam.z = world.z + 1.0. Behind near = cam.z <= 0.01.
-        //   Need world.z + 1.0 <= 0.01 → world.z <= -0.99.
-        let result = project_point(&cam, [0.0, 0.0, -1.0]);
+        // The camera sits at world [0, 0, 1] looking back along world -Z, so
+        // with rotation diag(1, -1, -1) and translation [0, 0, 1]:
+        //   cam.z = 1.0 - world.z.
+        // Behind the near plane means cam.z <= 0.01 → world.z >= 0.99.
+        // world.z = 1.0 puts the point level with the camera centre.
+        let result = project_point(&cam, [0.0, 0.0, 1.0]);
         assert!(result.is_none(), "point behind camera should return None");
     }
 
@@ -1024,7 +1066,7 @@ mod tests {
         // World origin → cam = [0,0,1.0]. Should project to principal point (cx, cy).
         let result = project_point(&cam, [0.0, 0.0, 0.0]);
         assert!(result.is_some());
-        let (sx, sy, depth) = result.unwrap();
+        let (sx, sy, depth) = result.expect("world origin is in front of the camera");
         assert!((sx - cam.cx).abs() < 1e-4, "on-axis should project to cx");
         assert!((sy - cam.cy).abs() < 1e-4, "on-axis should project to cy");
         assert!((depth - 1.0).abs() < 1e-6, "depth should be 1.0");
@@ -1033,11 +1075,11 @@ mod tests {
     #[test]
     fn project_point_positive_x_offset() {
         let cam = test_camera();
-        // World [1, 0, 0] → cam = [1, 0, 1.0].
+        // World [1, 0, 0] → cam = [1, 0, 1.0] (rotation diag(1,-1,-1) leaves X).
         // screen_x = focal_x * 1.0 / 1.0 + cx.
         let result = project_point(&cam, [1.0, 0.0, 0.0]);
         assert!(result.is_some());
-        let (sx, _sy, _depth) = result.unwrap();
+        let (sx, _sy, _depth) = result.expect("point is in front of the camera");
         let expected_x = cam.focal_x + cam.cx;
         assert!((sx - expected_x).abs() < 1e-4);
     }
@@ -1045,19 +1087,20 @@ mod tests {
     #[test]
     fn project_point_depth_equals_cam_z() {
         let cam = test_camera();
-        // World [0, 0, -0.5] → cam.z = -0.5 + 1.0 = 0.5.
-        let result = project_point(&cam, [0.0, 0.0, -0.5]);
+        // World [0, 0, 0.5] → cam.z = 1.0 - 0.5 = 0.5 (nearer to the camera,
+        // which sits at world +Z).
+        let result = project_point(&cam, [0.0, 0.0, 0.5]);
         assert!(result.is_some());
-        let (_, _, depth) = result.unwrap();
+        let (_, _, depth) = result.expect("point is in front of the camera");
         assert!((depth - 0.5).abs() < 1e-6);
     }
 
     #[test]
     fn project_point_exactly_at_near_plane_is_none() {
         // cam.near = 0.01. World z such that cam.z == 0.01.
-        // cam.z = world.z + 1.0 = 0.01 → world.z = -0.99.
+        // cam.z = 1.0 - world.z = 0.01 → world.z = 0.99.
         let cam = test_camera();
-        let result = project_point(&cam, [0.0, 0.0, -0.99]);
+        let result = project_point(&cam, [0.0, 0.0, 0.99]);
         // cam.z = 0.01 == near → should be None (not strictly greater than near).
         assert!(result.is_none());
     }
@@ -1094,22 +1137,23 @@ mod tests {
 
     #[test]
     fn render_depth_map_z_buffer_picks_closer_triangle() {
-        // Two co-planar triangles: front at z=-0.5, back at z=-0.8 (cam space nearer).
-        // With camera at [0,0,1] identity rotation:
-        // z=-0.5 → cam.z=0.5, z=-0.8 → cam.z=0.2 → nearer.
-        // Render back first (z=-0.8), then front (z=-0.5).
-        // Front is farther in cam space (cam.z=0.5), so BACK should win for the region.
+        // Two parallel triangles. The camera sits at world +Z looking back
+        // along -Z (rotation diag(1,-1,-1), t = [0,0,1]), so cam.z = 1 - world.z:
+        //   world z = 0.8 → cam.z = 0.2 (nearer)
+        //   world z = 0.5 → cam.z = 0.5 (farther)
+        // The farther triangle is rasterized FIRST, so the z-buffer — not the
+        // draw order — must decide the center pixel.
         let vertices = vec![
-            // Back triangle (cam.z = 0.2) — closer to camera
-            na::Point3::new(-0.3f32, -0.3, -0.8),
-            na::Point3::new(0.3f32, -0.3, -0.8),
-            na::Point3::new(0.0f32, 0.3, -0.8),
-            // Front triangle (cam.z = 0.5) — farther from camera
-            na::Point3::new(-0.3f32, -0.3, -0.5),
-            na::Point3::new(0.3f32, -0.3, -0.5),
-            na::Point3::new(0.0f32, 0.3, -0.5),
+            // Nearer triangle (cam.z = 0.2)
+            na::Point3::new(-0.3f32, -0.3, 0.8),
+            na::Point3::new(0.3f32, -0.3, 0.8),
+            na::Point3::new(0.0f32, 0.3, 0.8),
+            // Farther triangle (cam.z = 0.5)
+            na::Point3::new(-0.3f32, -0.3, 0.5),
+            na::Point3::new(0.3f32, -0.3, 0.5),
+            na::Point3::new(0.0f32, 0.3, 0.5),
         ];
-        let faces = vec![[3u32, 4, 5], [0, 1, 2]]; // front rendered first, then back
+        let faces = vec![[3u32, 4, 5], [0, 1, 2]]; // farther first, then nearer
         let mesh = Mesh::new(vertices, faces);
         let cam = test_camera();
         let cfg = default_test_config();
@@ -1135,8 +1179,15 @@ mod tests {
             background_depth: 5.0,
         };
         // Zoom in camera: large focal to make the unit square fill the frame.
+        // Rotation follows the `Camera` convention (see `front_depth_camera`).
+        #[rustfmt::skip]
+        let rotation = na::Matrix3::new(
+            1.0,  0.0,  0.0,
+            0.0, -1.0,  0.0,
+            0.0,  0.0, -1.0,
+        );
         let cam = Camera {
-            rotation: na::Matrix3::identity(),
+            rotation,
             translation: na::Vector3::new(0.0, 0.0, 0.6),
             focal_x: 256.0,
             focal_y: 256.0,
@@ -1201,10 +1252,10 @@ mod tests {
     #[test]
     fn front_depth_camera_head_at_origin_projects_to_principal_point() {
         let cam = front_depth_camera(128, 128, 0.6, 0.01, 10.0);
-        // Identity rotation, t=[0,0,0.6]: cam = [0,0,0.6] for world origin.
+        // t=[0,0,0.6] and R·0 = 0: cam = [0,0,0.6] for the world origin.
         let result = project_point(&cam, [0.0, 0.0, 0.0]);
         assert!(result.is_some());
-        let (sx, sy, depth) = result.unwrap();
+        let (sx, sy, depth) = result.expect("world origin is in front of the camera");
         assert!((sx - 64.0).abs() < 1e-4);
         assert!((sy - 64.0).abs() < 1e-4);
         assert!((depth - 0.6).abs() < 1e-5);
@@ -1279,18 +1330,152 @@ mod tests {
 
     #[test]
     fn test_side_depth_camera_axis_mapping() {
-        // Regression test for the doc-comment sign error: the rotation must
-        // map +Z world to -X camera and +X world to +Z camera.
+        // The side camera views along world +X, so +X world is the view
+        // direction (+Z camera) and +Z world (the face) is screen-right.
         let cam = side_depth_camera(64, 64, 1.0, 0.01, 10.0);
-        let plus_z_world = cam.rotation * na::Vector3::new(0.0f32, 0.0, 1.0);
-        assert!(
-            (plus_z_world - na::Vector3::new(-1.0, 0.0, 0.0)).norm() < 1e-6,
-            "+Z world should map to -X camera, got {plus_z_world:?}"
-        );
         let plus_x_world = cam.rotation * na::Vector3::new(1.0f32, 0.0, 0.0);
         assert!(
             (plus_x_world - na::Vector3::new(0.0, 0.0, 1.0)).norm() < 1e-6,
             "+X world should map to +Z camera, got {plus_x_world:?}"
+        );
+        let plus_z_world = cam.rotation * na::Vector3::new(0.0f32, 0.0, 1.0);
+        assert!(
+            (plus_z_world - na::Vector3::new(1.0, 0.0, 0.0)).norm() < 1e-6,
+            "+Z world should map to +X camera (nose points screen-right), got {plus_z_world:?}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Camera convention regression tests (F234)
+    // ------------------------------------------------------------------
+    //
+    // The three helpers used to build `rotation = identity` (front) or a bare
+    // `R_y(-yaw)` (side / three-quarter) with `t = [0, 0, distance]`. Because
+    // `R·0 + t = t` for EVERY rotation, the pre-existing
+    // `*_head_at_origin_in_front` tests passed under the broken convention too.
+    // The assertions below use off-origin points and the camera centre
+    // `c = -Rᵀ·t`, which is what actually distinguishes them.
+
+    /// World-space camera centre implied by `p_cam = R·p_world + t`.
+    fn camera_center(cam: &Camera) -> na::Vector3<f32> {
+        -cam.rotation.transpose() * cam.translation
+    }
+
+    #[test]
+    fn front_camera_sees_the_face_not_the_back_of_the_head() {
+        // FLAME faces +Z (crate-level coordinate docs), so the nose must be
+        // NEARER than the back of the skull. Under the old identity rotation
+        // the camera sat at world -Z and this ordering was inverted.
+        let cam = front_depth_camera(64, 64, 0.6, 0.01, 10.0);
+        let nose = cam.world_to_cam(&na::Point3::new(0.0, 0.0, 0.05));
+        let occiput = cam.world_to_cam(&na::Point3::new(0.0, 0.0, -0.05));
+        assert!(
+            nose.z < occiput.z,
+            "nose (world +Z) must be nearer than the back of the head: \
+             nose.z = {}, occiput.z = {}",
+            nose.z,
+            occiput.z
+        );
+        assert!((nose.z - 0.55).abs() < 1e-6, "nose.z = {}", nose.z);
+        assert!((occiput.z - 0.65).abs() < 1e-6, "occiput.z = {}", occiput.z);
+    }
+
+    #[test]
+    fn depth_cameras_sit_at_the_expected_world_positions() {
+        let d = 0.6f32;
+        let front = front_depth_camera(64, 64, d, 0.01, 10.0);
+        let side = side_depth_camera(64, 64, d, 0.01, 10.0);
+        let three_quarter = three_quarter_depth_camera(64, 64, d, 0.01, 10.0);
+
+        let diag = d * std::f32::consts::FRAC_1_SQRT_2;
+        let expected: [(&str, &Camera, na::Vector3<f32>); 3] = [
+            ("front", &front, na::Vector3::new(0.0, 0.0, d)),
+            ("side", &side, na::Vector3::new(-d, 0.0, 0.0)),
+            (
+                "three_quarter",
+                &three_quarter,
+                na::Vector3::new(-diag, 0.0, diag),
+            ),
+        ];
+
+        for (name, cam, want) in expected {
+            let got = camera_center(cam);
+            assert!(
+                (got - want).norm() < 1e-5,
+                "{name} camera centre should be {want:?}, got {got:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn depth_cameras_are_right_side_up_and_proper_rotations() {
+        let front = front_depth_camera(64, 64, 0.6, 0.01, 10.0);
+        let side = side_depth_camera(64, 64, 0.6, 0.01, 10.0);
+        let three_quarter = three_quarter_depth_camera(64, 64, 0.6, 0.01, 10.0);
+
+        for (name, cam) in [
+            ("front", &front),
+            ("side", &side),
+            ("three_quarter", &three_quarter),
+        ] {
+            // `+Y_cam` points DOWN on screen, so world up (+Y) must map to a
+            // NEGATIVE camera Y — otherwise the rendered head is upside down.
+            let up_cam = cam.rotation * na::Vector3::new(0.0f32, 1.0, 0.0);
+            assert!(
+                up_cam.y < -0.99,
+                "{name}: world +Y (up) must map to -Y_cam (screen up), got {up_cam:?}"
+            );
+            // A rotation, not a reflection.
+            let det = cam.rotation.determinant();
+            assert!(
+                (det - 1.0).abs() < 1e-5,
+                "{name}: rotation determinant should be +1, got {det}"
+            );
+            let should_be_identity = cam.rotation.transpose() * cam.rotation;
+            assert!(
+                (should_be_identity - na::Matrix3::identity()).norm() < 1e-5,
+                "{name}: rotation must be orthonormal"
+            );
+        }
+    }
+
+    #[test]
+    fn front_camera_forehead_is_above_chin_on_screen() {
+        // Mirrors `normal_map::test_default_front_camera_orientation`: the
+        // forehead must land on a SMALLER pixel row than the chin.
+        let cam = front_depth_camera(64, 64, 0.6, 0.01, 10.0);
+        let (_, forehead_y, _) =
+            project_point(&cam, [0.0, 0.1, 0.0]).expect("forehead is in front of the camera");
+        let (_, chin_y, _) =
+            project_point(&cam, [0.0, -0.1, 0.0]).expect("chin is in front of the camera");
+        assert!(
+            forehead_y < chin_y,
+            "forehead should be higher on screen (smaller row) than the chin: \
+             forehead_y = {forehead_y}, chin_y = {chin_y}"
+        );
+    }
+
+    #[test]
+    fn front_and_three_quarter_cameras_match_normal_map_default_front() {
+        // `front_depth_camera` must use the same world-to-camera rotation as
+        // the reference implementation `Camera::default_front`.
+        let reference = Camera::default_front(64, 64);
+        let front = front_depth_camera(64, 64, 0.6, 0.01, 10.0);
+        assert!(
+            (front.rotation - reference.rotation).norm() < 1e-6,
+            "front_depth_camera rotation {:?} != Camera::default_front {:?}",
+            front.rotation,
+            reference.rotation
+        );
+        // The three-quarter camera is exactly halfway between front and side:
+        // its centre must be equidistant from both.
+        let d = 0.6f32;
+        let tq = camera_center(&three_quarter_depth_camera(64, 64, d, 0.01, 10.0));
+        let front_c = camera_center(&front);
+        let side_c = camera_center(&side_depth_camera(64, 64, d, 0.01, 10.0));
+        assert!(
+            ((tq - front_c).norm() - (tq - side_c).norm()).abs() < 1e-5,
+            "three-quarter camera should be equidistant from front and side"
         );
     }
 

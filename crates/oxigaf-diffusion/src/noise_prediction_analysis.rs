@@ -455,7 +455,7 @@ const HIGH_FREQ_MIN_PIXELS: usize = 64;
 /// dimensions of `pred`/`true_noise` (needed only for `HighFreqArtifact`,
 /// which requires 2D structure); that check is silently skipped if
 /// `pred.len()` or `true_noise.len()` differs from `width * height *
-/// channels`, or if there are fewer than [`HIGH_FREQ_MIN_PIXELS`] pixels.
+/// channels`, or if there are fewer than `HIGH_FREQ_MIN_PIXELS` pixels.
 /// This function never panics, regardless of how `pred`/`true_noise`/
 /// `width`/`height`/`channels` relate to each other.
 pub fn detect_failure_mode(

@@ -224,12 +224,29 @@ pub fn film_luminance(r: f32, g: f32, b: f32) -> f32 {
 ///
 /// `src` must have length `src_w * src_h`.
 /// Returns a `Vec<f32>` of length `dst_w * dst_h`.
+///
+/// When `preserve_variance` is `true`, each destination sample is
+/// additionally divided by `sqrt(w00² + w10² + w01² + w11²)`, the L2 norm
+/// of its four bilinear weights. Bilinear interpolation is a convex
+/// combination of the four source samples, so if those samples are
+/// independent with unit variance (as [`generate_grain_map`]'s N(0,1)
+/// noise is), the interpolated value's variance is `Σwᵢ²` - equal to `1`
+/// only exactly on a source grid point, and strictly less than `1`
+/// everywhere else - so naive upsampled noise gets systematically quieter
+/// the further a destination pixel sits from its nearest source sample
+/// (worse as `grain_size` grows and destination pixels spend more of their
+/// area away from grid points). Dividing by `sqrt(Σwᵢ²)` restores unit
+/// variance at every destination pixel while preserving the intended
+/// spatial correlation between neighbouring pixels. This correction would
+/// be meaningless for ordinary (non-noise) image data, hence the flag
+/// rather than always-on behaviour.
 fn bilinear_upsample(
     src: &[f32],
     src_w: usize,
     src_h: usize,
     dst_w: usize,
     dst_h: usize,
+    preserve_variance: bool,
 ) -> Vec<f32> {
     let mut dst = vec![0.0_f32; dst_w * dst_h];
 
@@ -251,9 +268,19 @@ fn bilinear_upsample(
             let v01 = src[y1 * src_w + x0];
             let v11 = src[y1 * src_w + x1];
 
-            let top = v00 * (1.0 - tx) + v10 * tx;
-            let bot = v01 * (1.0 - tx) + v11 * tx;
-            dst[dy * dst_w + dx] = top * (1.0 - ty) + bot * ty;
+            let w00 = (1.0 - tx) * (1.0 - ty);
+            let w10 = tx * (1.0 - ty);
+            let w01 = (1.0 - tx) * ty;
+            let w11 = tx * ty;
+
+            let mut value = w00 * v00 + w10 * v10 + w01 * v01 + w11 * v11;
+            if preserve_variance {
+                let weight_sq_sum = w00 * w00 + w10 * w10 + w01 * w01 + w11 * w11;
+                if weight_sq_sum > 0.0 {
+                    value /= weight_sq_sum.sqrt();
+                }
+            }
+            dst[dy * dst_w + dx] = value;
         }
     }
 
@@ -287,7 +314,11 @@ pub fn generate_grain_map(width: usize, height: usize, config: &FilmGrainConfig)
     if grain_w == width && grain_h == height {
         grain_small
     } else {
-        bilinear_upsample(&grain_small, grain_w, grain_h, width, height)
+        // `preserve_variance = true`: without it, the upsampled map's
+        // *actual* standard deviation shrinks well below the intended
+        // N(0,1) as `grain_size` grows, so `intensity` would silently stop
+        // meaning "sigma of added noise" (see `bilinear_upsample`'s doc).
+        bilinear_upsample(&grain_small, grain_w, grain_h, width, height, true)
     }
 }
 
@@ -303,6 +334,28 @@ fn chroma_seed(base_seed: u64, channel_idx: u64) -> u64 {
     base_seed
         .wrapping_add(channel_idx.wrapping_mul(0x9E3779B97F4A7C15))
         .wrapping_add(0xD1B54A32D192ED03)
+}
+
+/// Derive an independent grain-stream seed from `base_seed` for a numbered
+/// stream (`tag`).
+///
+/// Used to keep the shared ("base") grain map of a sequence and every
+/// per-frame grain map on *distinct* streams. A plain `base_seed ^ (tag * K)`
+/// derivation collides with `base_seed` itself at `tag == 0`, which made
+/// frame 0's supposedly independent grain map bit-identical to the shared
+/// base map: the temporal blend `tc*base + (1-tc)*frame` then degenerated to
+/// `base / sqrt(tc² + (1-tc)²)`, inflating the measured grain sigma by up to
+/// 41% at `tc = 0.5` instead of preserving `intensity`.
+///
+/// The splitmix64 finaliser below is a bijection on `u64`, and
+/// `base_seed + tag * GOLDEN` is injective in `tag`, so distinct tags always
+/// yield distinct (and well-scattered) seeds.
+#[inline]
+fn stream_seed(base_seed: u64, tag: u64) -> u64 {
+    let mut z = base_seed.wrapping_add(tag.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
 }
 
 /// Build a fake `FilmGrainConfig` with a different seed (used to generate
@@ -393,6 +446,17 @@ pub fn apply_film_grain(
         g_b = Vec::new();
     }
 
+    // The luma/chroma blend `luma*lf + chroma*cf` combines two *independent*
+    // unit-variance sources, so its variance is `lf² + cf²` (<= 1, and < 1
+    // whenever both `lf` and `cf` are non-zero) rather than `1` - dividing
+    // by `sqrt(lf² + cf²)` restores it, so `intensity` (the target sigma)
+    // stays the actual standard deviation of the added noise regardless of
+    // `chroma_fraction`. `lf² + cf² >= 0.5` for any `cf` in `[0, 1]`, so
+    // this never divides by zero.
+    let cf = config.chroma_fraction;
+    let lf = 1.0 - cf;
+    let chroma_norm = (lf * lf + cf * cf).sqrt();
+
     let mut out = Vec::with_capacity(expected);
 
     for pi in 0..n_pixels {
@@ -411,12 +475,10 @@ pub fn apply_film_grain(
         let luma_noise = g_luma[pi] * sigma;
 
         let (r_noise, g_noise, b_noise) = if use_chroma {
-            let cf = config.chroma_fraction;
-            let lf = 1.0 - cf;
             (
-                luma_noise * lf + g_r[pi] * sigma * cf,
-                luma_noise * lf + g_g[pi] * sigma * cf,
-                luma_noise * lf + g_b[pi] * sigma * cf,
+                (luma_noise * lf + g_r[pi] * sigma * cf) / chroma_norm,
+                (luma_noise * lf + g_g[pi] * sigma * cf) / chroma_norm,
+                (luma_noise * lf + g_b[pi] * sigma * cf) / chroma_norm,
             )
         } else {
             (luma_noise, luma_noise, luma_noise)
@@ -502,13 +564,24 @@ pub fn apply_film_grain_rgba(
 // Temporal grain (per-frame and sequences)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Frame-unique seed mixing constant (Fibonacci hashing, 64-bit).
-const FRAME_SEED_MUL: u64 = 0x9E3779B97F4A7C15;
+/// Stream tag of the shared ("base") grain map of a sequence.
+///
+/// Frames use tags `frame_idx + 1`, so no frame can ever land on the base
+/// map's stream — see [`stream_seed`].
+const BASE_STREAM_TAG: u64 = 0;
+
+/// Stream tag of frame `frame_idx` (see [`BASE_STREAM_TAG`]).
+#[inline]
+fn frame_stream_tag(frame_idx: usize) -> u64 {
+    (frame_idx as u64).wrapping_add(1)
+}
 
 /// Apply grain to a specific frame using a frame-unique but reproducible seed.
 ///
-/// The per-frame seed is derived as `config.seed ^ (frame_idx as u64 * FRAME_SEED_MUL)`,
-/// ensuring each frame has independent grain while remaining fully deterministic.
+/// The per-frame seed is `stream_seed(config.seed, frame_idx + 1)`, ensuring
+/// each frame has independent grain while remaining fully deterministic, and
+/// that no frame shares the stream of the shared base map used by
+/// [`apply_film_grain_sequence`] (stream `0`).
 ///
 /// # Errors
 ///
@@ -520,7 +593,7 @@ pub fn apply_film_grain_frame(
     frame_idx: usize,
     config: &FilmGrainConfig,
 ) -> Result<Vec<f32>, FilmGrainError> {
-    let frame_seed = config.seed ^ ((frame_idx as u64).wrapping_mul(FRAME_SEED_MUL));
+    let frame_seed = stream_seed(config.seed, frame_stream_tag(frame_idx));
     let frame_config = config_with_seed(config, frame_seed);
     apply_film_grain(image, width, height, &frame_config)
 }
@@ -555,8 +628,13 @@ pub fn apply_film_grain_sequence(
         return Ok(Vec::new());
     }
 
-    // Shared (base) grain map — same for all frames.
-    let base_grain = generate_grain_map(width, height, config);
+    // Shared (base) grain map — same for all frames. It lives on its own
+    // stream (`BASE_STREAM_TAG`), disjoint from every per-frame stream, so
+    // the temporal blend below always combines two *independent*
+    // unit-variance maps and its renormalisation is exact.
+    let base_seed = stream_seed(config.seed, BASE_STREAM_TAG);
+    let base_cfg = config_with_seed(config, base_seed);
+    let base_grain = generate_grain_map(width, height, &base_cfg);
 
     // Chroma base grain maps.
     let use_chroma = config.chroma_fraction > 0.0;
@@ -564,7 +642,7 @@ pub fn apply_film_grain_sequence(
         generate_grain_map(
             width,
             height,
-            &config_with_seed(config, chroma_seed(config.seed, 1)),
+            &config_with_seed(config, chroma_seed(base_seed, 1)),
         )
     } else {
         Vec::new()
@@ -573,7 +651,7 @@ pub fn apply_film_grain_sequence(
         generate_grain_map(
             width,
             height,
-            &config_with_seed(config, chroma_seed(config.seed, 2)),
+            &config_with_seed(config, chroma_seed(base_seed, 2)),
         )
     } else {
         Vec::new()
@@ -582,7 +660,7 @@ pub fn apply_film_grain_sequence(
         generate_grain_map(
             width,
             height,
-            &config_with_seed(config, chroma_seed(config.seed, 3)),
+            &config_with_seed(config, chroma_seed(base_seed, 3)),
         )
     } else {
         Vec::new()
@@ -609,8 +687,14 @@ pub fn apply_film_grain_sequence(
 
             let n_pixels = width * height;
 
-            // Per-frame grain map (independent randomness).
-            let frame_seed = config.seed ^ ((frame_idx as u64).wrapping_mul(FRAME_SEED_MUL));
+            // Per-frame grain map (independent randomness). Frame `i` uses
+            // stream `i + 1`, so it can never coincide with the shared base
+            // map's stream (`BASE_STREAM_TAG`) — the seed derivation this
+            // replaced (`config.seed ^ (frame_idx * FRAME_SEED_MUL)`) gave
+            // frame 0 the base map's own seed, i.e. the *same* map, which
+            // turned the temporal blend into a scaled copy of the base grain
+            // (sigma inflated by `1 / sqrt(tc² + (1-tc)²)`, up to +41%).
+            let frame_seed = stream_seed(config.seed, frame_stream_tag(frame_idx));
             let frame_cfg = config_with_seed(config, frame_seed);
             let frame_grain = generate_grain_map(width, height, &frame_cfg);
 
@@ -644,6 +728,15 @@ pub fn apply_film_grain_sequence(
 
             let tc = temporal_coherence;
             let fi = 1.0 - tc;
+            // Renormalise the base/frame blend the same way as the
+            // chroma blend below: `tc*base + fi*frame` combines two
+            // independent unit-variance sources, so its variance is
+            // `tc² + fi²` (<= 1) rather than `1`. `tc² + fi² >= 0.5` for
+            // any `tc` in `[0, 1]`, so this never divides by zero.
+            let temporal_norm = (tc * tc + fi * fi).sqrt();
+            let cf = config.chroma_fraction;
+            let lf = 1.0 - cf;
+            let chroma_norm = (lf * lf + cf * cf).sqrt();
 
             let mut out = Vec::with_capacity(expected);
 
@@ -660,20 +753,19 @@ pub fn apply_film_grain_sequence(
                     config.intensity
                 };
 
-                // Blend base and frame grain maps.
-                let g_luma = tc * base_grain[pi] + fi * frame_grain[pi];
+                // Blend base and frame grain maps, renormalised to
+                // preserve unit variance (see `temporal_norm` above).
+                let g_luma = (tc * base_grain[pi] + fi * frame_grain[pi]) / temporal_norm;
                 let luma_noise = g_luma * sigma;
 
                 let (r_noise, g_noise, b_noise) = if use_chroma {
-                    let cf = config.chroma_fraction;
-                    let lf = 1.0 - cf;
-                    let gr = tc * base_gr[pi] + fi * frame_gr[pi];
-                    let gg = tc * base_gg[pi] + fi * frame_gg[pi];
-                    let gb = tc * base_gb[pi] + fi * frame_gb[pi];
+                    let gr = (tc * base_gr[pi] + fi * frame_gr[pi]) / temporal_norm;
+                    let gg = (tc * base_gg[pi] + fi * frame_gg[pi]) / temporal_norm;
+                    let gb = (tc * base_gb[pi] + fi * frame_gb[pi]) / temporal_norm;
                     (
-                        luma_noise * lf + gr * sigma * cf,
-                        luma_noise * lf + gg * sigma * cf,
-                        luma_noise * lf + gb * sigma * cf,
+                        (luma_noise * lf + gr * sigma * cf) / chroma_norm,
+                        (luma_noise * lf + gg * sigma * cf) / chroma_norm,
+                        (luma_noise * lf + gb * sigma * cf) / chroma_norm,
                     )
                 } else {
                     (luma_noise, luma_noise, luma_noise)
@@ -1308,6 +1400,197 @@ mod tests {
             tv_coarse,
             tv_fine
         );
+    }
+
+    // ── 25b. measured grain std tracks `intensity` (variance-preservation) ──
+
+    /// Sample standard deviation of `grained - original` (population, not
+    /// Bessel-corrected - `n` here is large enough that the difference is
+    /// negligible).
+    fn measured_grain_std(original: &[f32], grained: &[f32]) -> f32 {
+        let diffs: Vec<f32> = grained
+            .iter()
+            .zip(original.iter())
+            .map(|(&g, &o)| g - o)
+            .collect();
+        let n = diffs.len() as f32;
+        let mean: f32 = diffs.iter().sum::<f32>() / n;
+        let variance: f32 = diffs.iter().map(|&d| (d - mean).powi(2)).sum::<f32>() / n;
+        variance.sqrt()
+    }
+
+    #[test]
+    fn test_grain_std_tracks_intensity_across_grain_size() {
+        // Regression test: `intensity` is documented as "sigma of added
+        // noise" (`FilmGrainConfig::intensity` doc), but bilinearly
+        // upsampling independent N(0,1) source samples attenuates their
+        // variance (a weighted average of independent samples has lower
+        // variance than any individual sample) - worse as `grain_size`
+        // grows, since more destination pixels sit further from an exact
+        // source grid point. The measured std of the added noise must
+        // track `intensity` regardless of `grain_size`.
+        let w = 64;
+        let h = 64;
+        let intensity = 0.1_f32;
+
+        for &grain_size in &[1.0_f32, 1.5, 2.0, 3.0, 4.0] {
+            let cfg = FilmGrainConfig {
+                intensity,
+                grain_size,
+                luminance_scaling: false,
+                chroma_fraction: 0.0,
+                clip_output: false, // do not distort the measured statistics
+                ..FilmGrainConfig::default()
+            };
+            let original = vec![0.5_f32; w * h * 3];
+            let grained = apply_film_grain(&original, w, h, &cfg).expect("grain ok");
+            let std = measured_grain_std(&original, &grained);
+
+            assert!(
+                (std - intensity).abs() < intensity * 0.15,
+                "grain_size={grain_size}: measured std {std} should track intensity \
+                 {intensity} (within 15%), ratio = {}",
+                std / intensity
+            );
+        }
+    }
+
+    #[test]
+    fn test_grain_std_tracks_intensity_across_chroma_fraction() {
+        // Regression test: `luma*lf + chroma*cf` combines two independent
+        // unit-variance sources, so its variance is `lf² + cf²` (<= 1)
+        // rather than `1` unless renormalised - the measured std of the
+        // added noise must track `intensity` regardless of
+        // `chroma_fraction`.
+        let w = 64;
+        let h = 64;
+        let intensity = 0.1_f32;
+
+        for &chroma_fraction in &[0.0_f32, 0.25, 0.5, 0.75, 1.0] {
+            let cfg = FilmGrainConfig {
+                intensity,
+                grain_size: 1.0, // isolate the chroma-blend effect from upsampling
+                luminance_scaling: false,
+                chroma_fraction,
+                clip_output: false,
+                ..FilmGrainConfig::default()
+            };
+            let original = vec![0.5_f32; w * h * 3];
+            let grained = apply_film_grain(&original, w, h, &cfg).expect("grain ok");
+            let std = measured_grain_std(&original, &grained);
+
+            assert!(
+                (std - intensity).abs() < intensity * 0.15,
+                "chroma_fraction={chroma_fraction}: measured std {std} should track \
+                 intensity {intensity} (within 15%), ratio = {}",
+                std / intensity
+            );
+        }
+    }
+
+    #[test]
+    fn test_sequence_base_and_frame_grain_streams_are_independent() {
+        // Regression test for the seed collision behind the temporal-blend
+        // variance bug: the per-frame seed used to be
+        // `config.seed ^ (frame_idx * FRAME_SEED_MUL)`, which for frame 0 is
+        // `config.seed` — exactly the seed of the shared base grain map. The
+        // two "independent" maps were then bit-identical, so
+        // `tc*base + (1-tc)*frame` was just `base` divided by the
+        // renormaliser (sigma inflated by up to 41%).
+        //
+        // With disjoint streams, rendering frame 0 with `tc = 1.0` (base map
+        // only) and with `tc = 0.0` (frame map only) must give *different*
+        // noise, and the two noise fields must be essentially uncorrelated.
+        let w = 32;
+        let h = 32;
+        let cfg = FilmGrainConfig {
+            intensity: 0.1,
+            grain_size: 1.0,
+            luminance_scaling: false,
+            chroma_fraction: 0.0,
+            clip_output: false,
+            ..FilmGrainConfig::default()
+        };
+        let frames: Vec<Vec<f32>> = (0..2).map(|_| vec![0.5_f32; w * h * 3]).collect();
+
+        let base_only = apply_film_grain_sequence(&frames, w, h, &cfg, 1.0).expect("tc=1 ok");
+        let frame_only = apply_film_grain_sequence(&frames, w, h, &cfg, 0.0).expect("tc=0 ok");
+
+        let noise_base: Vec<f32> = base_only[0]
+            .iter()
+            .zip(frames[0].iter())
+            .map(|(&g, &o)| g - o)
+            .collect();
+        let noise_frame: Vec<f32> = frame_only[0]
+            .iter()
+            .zip(frames[0].iter())
+            .map(|(&g, &o)| g - o)
+            .collect();
+
+        let identical = noise_base
+            .iter()
+            .zip(noise_frame.iter())
+            .all(|(a, b)| (a - b).abs() < 1e-9);
+        assert!(
+            !identical,
+            "frame 0's own grain map must not be the shared base grain map"
+        );
+
+        // Pearson correlation of the two noise fields (both zero-mean by
+        // construction, but compute it properly anyway).
+        let n = noise_base.len() as f32;
+        let mean_a = noise_base.iter().sum::<f32>() / n;
+        let mean_b = noise_frame.iter().sum::<f32>() / n;
+        let mut cov = 0.0_f32;
+        let mut var_a = 0.0_f32;
+        let mut var_b = 0.0_f32;
+        for (&a, &b) in noise_base.iter().zip(noise_frame.iter()) {
+            let da = a - mean_a;
+            let db = b - mean_b;
+            cov += da * db;
+            var_a += da * da;
+            var_b += db * db;
+        }
+        let corr = cov / (var_a.sqrt() * var_b.sqrt() + 1e-12);
+        assert!(
+            corr.abs() < 0.1,
+            "base and frame-0 grain must be uncorrelated, got r = {corr}"
+        );
+    }
+
+    #[test]
+    fn test_grain_std_tracks_intensity_across_temporal_coherence() {
+        // Regression test: `tc*base + fi*frame` has the same
+        // variance-attenuation issue as the chroma blend above, resolved
+        // the same way. It also pins the base/frame *stream separation*: if
+        // frame 0's map were the base map again (see
+        // `test_sequence_base_and_frame_grain_streams_are_independent`), the
+        // measured sigma at tc=0.25 would come out ~28% high.
+        let w = 64;
+        let h = 64;
+        let intensity = 0.1_f32;
+
+        for &tc in &[0.0_f32, 0.25, 0.5, 0.75, 1.0] {
+            let cfg = FilmGrainConfig {
+                intensity,
+                grain_size: 1.0,
+                luminance_scaling: false,
+                chroma_fraction: 0.0,
+                clip_output: false,
+                ..FilmGrainConfig::default()
+            };
+            let frames: Vec<Vec<f32>> = (0..2).map(|_| vec![0.5_f32; w * h * 3]).collect();
+            let result =
+                apply_film_grain_sequence(&frames, w, h, &cfg, tc).expect("sequence grain ok");
+            let std = measured_grain_std(&frames[0], &result[0]);
+
+            assert!(
+                (std - intensity).abs() < intensity * 0.15,
+                "temporal_coherence={tc}: measured std {std} should track intensity \
+                 {intensity} (within 15%), ratio = {}",
+                std / intensity
+            );
+        }
     }
 
     // ── 26. apply_film_grain_rgba wrong length → error ───────────────────────

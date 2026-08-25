@@ -364,13 +364,12 @@ Rendering performance on various hardware (512×512 resolution):
 - ∂L/∂SH, ∂L/∂scale, ∂L/∂rotation, ∂L/∂mean3D (preprocess_bwd)
 - ∂L/∂local_offset for FLAME mesh-bound Gaussians (binding backward pass)
 
-**Gradient verification** — 35 finite-difference tests with <1e-3 relative error across all parameters (see `tests/gpu_gradient_verify.rs`).
+**Gradient verification** — 62 finite-difference tests (see `tests/gpu_gradient_verify.rs` and `tests/gradient_verification/`), checked with a median-error metric robust to per-pixel outliers: ≤5e-2 median relative error for most parameters, relaxed to ≤2.5e-1 for position (the tiled rasterizer's forward pass has tile-boundary discontinuities that finite differences can't model, so position gradients need a wider tolerance).
 
 ## Statistics
 
-- **Tests**: 140 (all passing)
-  - 18 unit tests (in `src/`), 122 integration tests
-  - 35 gradient verification tests (`gpu_gradient_verify.rs`)
+- **Tests**: 2,788 `#[test]`-attributed tests in source (`src/` + `tests/`) — the count that actually compiles and runs depends on enabled features and platform
+  - 62 of the `tests/`-directory tests are gradient verification (`gpu_gradient_verify.rs` plus `tests/gradient_verification/`)
 - **Shaders**: `preprocess_{sh0,sh1,sh2,sh3}`, `rasterize_fwd`, `rasterize_bwd`, `preprocess_bwd`, radix sort suite, `tile_ranges`, `binding`
 
 Run benchmarks with:

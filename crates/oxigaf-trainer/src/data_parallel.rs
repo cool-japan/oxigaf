@@ -32,6 +32,8 @@
 //! [`ring_all_reduce_bytes`] — and not a measurement.
 
 use crate::TrainerError;
+use std::future::Future;
+use std::task::{Context, Poll, Waker};
 use std::thread;
 
 /// Size of one gradient element in bytes.
@@ -108,6 +110,10 @@ impl DataParallelConfig {
 
     /// Configuration sized to the host's available parallelism.
     ///
+    /// This counts **CPU** parallelism, not devices; see
+    /// [`Self::from_gpu_devices`] to size the worker count from the GPUs that
+    /// actually exist.
+    ///
     /// Falls back to a single device when the platform cannot report a count.
     pub fn auto() -> Self {
         let workers = thread::available_parallelism()
@@ -117,6 +123,36 @@ impl DataParallelConfig {
             Self::single_device()
         } else {
             Self::multi_gpu(workers)
+        }
+    }
+
+    /// Configuration sized to the GPU adapters this machine really exposes.
+    ///
+    /// [`Self::multi_gpu`] takes the worker count on trust; this asks the
+    /// graphics stack instead, so a run configured this way cannot hand out
+    /// more worker slots than there are devices to put them on. One adapter
+    /// yields [`Self::single_device`] (no sync work for a lone GPU), several
+    /// yield [`Self::multi_gpu`] with one worker per adapter.
+    ///
+    /// `backends` selects which graphics APIs to look at;
+    /// [`gpu_backends_default`] is the usual choice.
+    ///
+    /// # Errors
+    ///
+    /// [`TrainerError::Training`] when no adapter matches `backends` — a
+    /// headless CI box, a container without a GPU, or a `backends` mask no
+    /// build feature supports. Callers that want a CPU-only fallback should
+    /// handle that explicitly rather than have a "GPU" config silently mean
+    /// "one thread".
+    pub fn from_gpu_devices(backends: wgpu::Backends) -> Result<Self, TrainerError> {
+        let devices = enumerate_gpu_devices(backends)?;
+        match devices.len() {
+            0 => Err(TrainerError::Training(format!(
+                "no GPU adapter found for backends {backends:?}; cannot size a \
+                 data-parallel configuration from real devices"
+            ))),
+            1 => Ok(Self::single_device()),
+            n => Ok(Self::multi_gpu(n)),
         }
     }
 
@@ -197,6 +233,110 @@ impl DataParallelConfig {
             plan.push(GradientBucket { start, len, bytes });
         }
         plan
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GPU device enumeration
+// ---------------------------------------------------------------------------
+
+/// What one physical adapter reports about itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GpuDeviceInfo {
+    /// Index of this adapter in the enumeration order.
+    pub index: usize,
+    /// Driver-reported adapter name, e.g. `"Apple M2 Max"`.
+    pub name: String,
+    /// Graphics API this adapter was found through.
+    pub backend: wgpu::Backend,
+    /// Discrete / integrated / virtual / CPU classification.
+    pub device_type: wgpu::DeviceType,
+    /// PCI (or platform equivalent) vendor id.
+    pub vendor: u32,
+    /// PCI (or platform equivalent) device id.
+    pub device: u32,
+}
+
+impl GpuDeviceInfo {
+    /// Whether this adapter is a discrete GPU, i.e. one worth a worker of its
+    /// own rather than a software or integrated fallback.
+    pub fn is_discrete(&self) -> bool {
+        self.device_type == wgpu::DeviceType::DiscreteGpu
+    }
+}
+
+/// Backends worth enumerating for compute work.
+///
+/// Every real API, minus [`wgpu::Backends::NOOP`] — the no-op backend reports
+/// an adapter that executes nothing, which must never be counted as a training
+/// device.
+pub fn gpu_backends_default() -> wgpu::Backends {
+    wgpu::Backends::all().difference(wgpu::Backends::NOOP)
+}
+
+/// Enumerate the GPU adapters this machine exposes for `backends`.
+///
+/// This is the real device list from the graphics stack, not a guess: it is
+/// what makes [`DataParallelConfig::from_gpu_devices`] able to size a run to
+/// the hardware. Only adapters are enumerated — no logical device is
+/// requested, so this stays cheap and does not fail on a machine whose GPU is
+/// busy.
+///
+/// Returns an empty vector on a machine with no matching adapter; that is not
+/// an error here (see [`DataParallelConfig::from_gpu_devices`], which does
+/// treat it as one).
+///
+/// # Errors
+///
+/// [`TrainerError::Training`] when the enumeration future does not resolve
+/// immediately. On every native backend it does — enumeration is a synchronous
+/// driver query behind an `async` signature — so this signals a target (such
+/// as WebGPU in a browser) whose adapter list only arrives via an async
+/// executor, which this synchronous API cannot drive.
+pub fn enumerate_gpu_devices(backends: wgpu::Backends) -> Result<Vec<GpuDeviceInfo>, TrainerError> {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends,
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
+    });
+    let adapters = poll_once(instance.enumerate_adapters(backends)).ok_or_else(|| {
+        TrainerError::Training(
+            "GPU adapter enumeration did not resolve synchronously; this target requires an \
+             async executor to list adapters"
+                .to_string(),
+        )
+    })?;
+
+    Ok(adapters
+        .iter()
+        .enumerate()
+        .map(|(index, adapter)| {
+            let info = adapter.get_info();
+            GpuDeviceInfo {
+                index,
+                name: info.name,
+                backend: info.backend,
+                device_type: info.device_type,
+                vendor: info.vendor,
+                device: info.device,
+            }
+        })
+        .collect())
+}
+
+/// Poll `future` exactly once and return its output if it is already ready.
+///
+/// Deliberately not a `block_on`: this crate has no async runtime, and the one
+/// future it drives (adapter enumeration) completes on its first poll on every
+/// native backend. Anything that actually suspends is reported to the caller
+/// as an error instead of being parked on, so a caller can never deadlock a
+/// training thread here.
+fn poll_once<F: Future>(future: F) -> Option<F::Output> {
+    let mut future = std::pin::pin!(future);
+    let waker = Waker::noop();
+    let mut cx = Context::from_waker(waker);
+    match future.as_mut().poll(&mut cx) {
+        Poll::Ready(value) => Some(value),
+        Poll::Pending => None,
     }
 }
 
@@ -931,6 +1071,84 @@ mod tests {
         let cfg = DataParallelConfig::auto();
         assert!(cfg.validate().is_ok());
         assert!(cfg.num_workers >= 1);
+    }
+
+    // --- GPU device enumeration (F122) --------------------------------------
+    // `multi_gpu(n)` takes the worker count on trust; these cover the path
+    // that sizes it from adapters that actually exist. They must pass on a
+    // headless box too, so nothing here asserts a device count.
+
+    #[test]
+    fn test_gpu_backends_default_excludes_noop() {
+        let backends = gpu_backends_default();
+        assert!(
+            !backends.contains(wgpu::Backends::NOOP),
+            "the no-op backend executes nothing and must never be counted as a device"
+        );
+        assert!(backends.contains(wgpu::Backends::PRIMARY));
+    }
+
+    #[test]
+    fn test_enumerate_gpu_devices_reports_consistent_info() {
+        let devices = enumerate_gpu_devices(gpu_backends_default())
+            .expect("adapter enumeration must resolve synchronously on native targets");
+        for (i, dev) in devices.iter().enumerate() {
+            assert_eq!(dev.index, i, "indices must match enumeration order");
+            assert_ne!(
+                dev.backend,
+                wgpu::Backend::Noop,
+                "the no-op backend was excluded from the mask"
+            );
+            assert_eq!(
+                dev.is_discrete(),
+                dev.device_type == wgpu::DeviceType::DiscreteGpu
+            );
+        }
+        // Enumerating an empty backend mask is well defined and finds nothing.
+        let none = enumerate_gpu_devices(wgpu::Backends::empty()).expect("empty mask enumerates");
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn test_from_gpu_devices_matches_the_real_device_count() {
+        let devices = enumerate_gpu_devices(gpu_backends_default()).expect("enumerate");
+        match DataParallelConfig::from_gpu_devices(gpu_backends_default()) {
+            Ok(cfg) => {
+                assert!(!devices.is_empty(), "a config implies at least one adapter");
+                assert_eq!(
+                    cfg.num_workers,
+                    devices.len(),
+                    "worker count must equal the real adapter count"
+                );
+                assert!(cfg.validate().is_ok());
+                if devices.len() == 1 {
+                    assert_eq!(cfg.sync_mode, SyncMode::NoSync, "a lone GPU needs no sync");
+                } else {
+                    assert_eq!(cfg.sync_mode, SyncMode::AllReduce);
+                }
+            }
+            Err(err) => {
+                // Only legitimate when the machine really has no adapter.
+                assert!(
+                    devices.is_empty(),
+                    "errored despite {} adapters",
+                    devices.len()
+                );
+                assert!(matches!(err, TrainerError::Training(_)), "{err:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_from_gpu_devices_errors_when_no_backend_can_match() {
+        // An empty backend mask can never yield an adapter, so this must be a
+        // reported error rather than a silent one-worker "GPU" config.
+        let err = DataParallelConfig::from_gpu_devices(wgpu::Backends::empty())
+            .expect_err("an empty backend mask has no devices");
+        match err {
+            TrainerError::Training(msg) => assert!(msg.contains("no GPU adapter"), "{msg}"),
+            other => panic!("expected Training error, got {other:?}"),
+        }
     }
 
     #[test]

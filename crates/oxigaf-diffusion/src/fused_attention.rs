@@ -253,9 +253,7 @@ impl FusedQKV {
                     q_slice,
                     k_slice,
                     v_slice,
-                    seq_len,
-                    seq_len,
-                    head_dim,
+                    HeadShape::square(seq_len, head_dim),
                     self.config.scale,
                     self.config.causal,
                     dropout,
@@ -428,6 +426,45 @@ fn apply_attention_dropout(scores: &mut [f32], dropout_prob: f32, state: &mut u6
     }
 }
 
+/// Shape of the `q`/`k`/`v` buffers one attention head is evaluated over.
+///
+/// The three extents are always passed together and are all `usize`, so
+/// keeping them as positional arguments both pushed
+/// [`scaled_dot_product_attention_with_scale`] over
+/// `clippy::too_many_arguments` and let `seq_k` and `head_dim` be transposed
+/// silently at a call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeadShape {
+    /// Number of query positions; `q` is `[seq_q * head_dim]`.
+    pub seq_q: usize,
+    /// Number of key/value positions; `k` and `v` are `[seq_k * head_dim]`.
+    pub seq_k: usize,
+    /// Width of the head.
+    pub head_dim: usize,
+}
+
+impl HeadShape {
+    /// A shape whose query and key sequences are the same length — the
+    /// self-attention case.
+    pub fn square(seq_len: usize, head_dim: usize) -> Self {
+        Self {
+            seq_q: seq_len,
+            seq_k: seq_len,
+            head_dim,
+        }
+    }
+
+    /// The canonical `1 / sqrt(head_dim)` attention scale, or `1.0` for a
+    /// zero-width head (which has no dot product to scale).
+    pub fn canonical_scale(&self) -> f32 {
+        if self.head_dim > 0 {
+            1.0 / (self.head_dim as f32).sqrt()
+        } else {
+            1.0
+        }
+    }
+}
+
 /// Scaled dot-product attention for a single head, using the canonical
 /// `1 / sqrt(head_dim)` scale, no causal mask, and no dropout.
 ///
@@ -439,16 +476,9 @@ pub fn scaled_dot_product_attention(
     q: &[f32],
     k: &[f32],
     v: &[f32],
-    seq_q: usize,
-    seq_k: usize,
-    head_dim: usize,
+    shape: HeadShape,
 ) -> Result<Vec<f32>, DiffusionError> {
-    let scale = if head_dim > 0 {
-        1.0 / (head_dim as f32).sqrt()
-    } else {
-        1.0
-    };
-    scaled_dot_product_attention_with_scale(q, k, v, seq_q, seq_k, head_dim, scale, false, None)
+    scaled_dot_product_attention_with_scale(q, k, v, shape, shape.canonical_scale(), false, None)
 }
 
 /// Scaled dot-product attention for a single head with an explicit scale,
@@ -464,18 +494,20 @@ pub fn scaled_dot_product_attention(
 /// * `dropout`: `Some((prob, rng_state))` applies inverted dropout to the
 ///   post-softmax attention probabilities (training-time only); `None`
 ///   disables dropout, matching plain inference behaviour.
-#[allow(clippy::too_many_arguments)]
 pub fn scaled_dot_product_attention_with_scale(
     q: &[f32],
     k: &[f32],
     v: &[f32],
-    seq_q: usize,
-    seq_k: usize,
-    head_dim: usize,
+    shape: HeadShape,
     scale: f32,
     causal: bool,
     dropout: Option<(f32, &mut u64)>,
 ) -> Result<Vec<f32>, DiffusionError> {
+    let HeadShape {
+        seq_q,
+        seq_k,
+        head_dim,
+    } = shape;
     if q.len() != seq_q * head_dim {
         return Err(DiffusionError::ShapeMismatch {
             op: "scaled_dot_product_attention: q".to_string(),
@@ -722,8 +754,17 @@ mod tests {
         let k = vec![1.0f32, 0.0f32, 0.0f32, 1.0f32, -1.0f32, 0.0f32];
         let v = vec![1.0f32, 2.0f32, 3.0f32, 4.0f32, 5.0f32, 6.0f32];
 
-        let out =
-            scaled_dot_product_attention(&q, &k, &v, seq_q, seq_k, head_dim).expect("sdpa failed");
+        let out = scaled_dot_product_attention(
+            &q,
+            &k,
+            &v,
+            HeadShape {
+                seq_q,
+                seq_k,
+                head_dim,
+            },
+        )
+        .expect("sdpa failed");
         assert_eq!(out.len(), seq_q * head_dim);
         // Output should be a weighted sum of V rows; all values finite
         assert!(out.iter().all(|x| x.is_finite()));
@@ -739,8 +780,17 @@ mod tests {
         let k = vec![0.2f32; seq_k * head_dim];
         let v = vec![0.3f32; seq_k * head_dim];
 
-        let out =
-            scaled_dot_product_attention(&q, &k, &v, seq_q, seq_k, head_dim).expect("sdpa failed");
+        let out = scaled_dot_product_attention(
+            &q,
+            &k,
+            &v,
+            HeadShape {
+                seq_q,
+                seq_k,
+                head_dim,
+            },
+        )
+        .expect("sdpa failed");
         assert_eq!(out.len(), seq_q * head_dim);
     }
 
@@ -750,7 +800,17 @@ mod tests {
         let k = vec![1.0f32; 4]; // seq_k=2, head_dim=2
         let v = vec![1.0f32; 3]; // wrong: should be seq_k * head_dim = 4
 
-        assert!(scaled_dot_product_attention(&q, &k, &v, 3, 2, 2).is_err());
+        assert!(scaled_dot_product_attention(
+            &q,
+            &k,
+            &v,
+            HeadShape {
+                seq_q: 3,
+                seq_k: 2,
+                head_dim: 2,
+            },
+        )
+        .is_err());
     }
 
     // --- softmax tests ------------------------------------------------------
@@ -827,7 +887,7 @@ mod tests {
         let q = vec![0.5f32; seq_len * head_dim];
         let k = vec![0.5f32; seq_len * head_dim];
 
-        let out = scaled_dot_product_attention(&q, &k, &v, seq_len, seq_len, head_dim)
+        let out = scaled_dot_product_attention(&q, &k, &v, HeadShape::square(seq_len, head_dim))
             .expect("sdpa failed");
 
         // All values must be in [0, 1]
@@ -875,14 +935,17 @@ mod tests {
         let k = vec![1.0f32, 0.0, 0.0f32, 1.0];
         let v = vec![10.0f32, 0.0, 0.0f32, 20.0];
 
-        let out_low_scale = scaled_dot_product_attention_with_scale(
-            &q, &k, &v, seq_q, seq_k, head_dim, 0.01, false, None,
-        )
-        .expect("sdpa failed");
-        let out_high_scale = scaled_dot_product_attention_with_scale(
-            &q, &k, &v, seq_q, seq_k, head_dim, 50.0, false, None,
-        )
-        .expect("sdpa failed");
+        let shape = HeadShape {
+            seq_q,
+            seq_k,
+            head_dim,
+        };
+        let out_low_scale =
+            scaled_dot_product_attention_with_scale(&q, &k, &v, shape, 0.01, false, None)
+                .expect("sdpa failed");
+        let out_high_scale =
+            scaled_dot_product_attention_with_scale(&q, &k, &v, shape, 50.0, false, None)
+                .expect("sdpa failed");
 
         let any_diff = out_low_scale
             .iter()
@@ -907,7 +970,17 @@ mod tests {
         let v = vec![10.0f32, 20.0, 30.0];
 
         let out = scaled_dot_product_attention_with_scale(
-            &q, &k, &v, seq_q, seq_k, head_dim, 1.0, true, None,
+            &q,
+            &k,
+            &v,
+            HeadShape {
+                seq_q,
+                seq_k,
+                head_dim,
+            },
+            1.0,
+            true,
+            None,
         )
         .expect("sdpa failed");
 

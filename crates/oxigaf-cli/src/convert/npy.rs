@@ -66,10 +66,13 @@ impl Scalar {
 
 /// Byte-order character of a dtype descriptor.
 fn byte_order(descr: &str) -> char {
-    match descr.chars().next() {
-        Some(c @ ('<' | '>' | '|' | '=')) => c,
-        _ => '<',
-    }
+    // Not a plain `.next().unwrap_or('<')`: an unprefixed descriptor (e.g.
+    // "f4") must also default to '<', not return its own first character.
+    descr
+        .chars()
+        .next()
+        .filter(|c| matches!(c, '<' | '>' | '|' | '='))
+        .unwrap_or('<')
 }
 
 /// Kind character of a dtype descriptor (`f`, `i`, `u`, `b`, ...).
@@ -84,7 +87,7 @@ fn kind(descr: &str) -> char {
 
 /// Byte width of a dtype descriptor such as `"<f4"`.
 pub fn item_size(descr: &str) -> Result<usize> {
-    let body = descr.trim_start_matches(|c| matches!(c, '<' | '>' | '|' | '='));
+    let body = descr.trim_start_matches(['<', '>', '|', '=']);
     let mut chars = body.chars();
     let kind = chars
         .next()
@@ -454,4 +457,29 @@ pub fn slice_last_axis(array: &NpyArray, start: usize, end: usize) -> Result<Npy
         shape,
         data,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression guard for the `manual_unwrap_or` clippy fix on
+    /// [`byte_order`]: `descr.chars().next().unwrap_or('<')` is *not*
+    /// equivalent here, because it would return the descriptor's own first
+    /// character (e.g. `'f'` for `"f4"`) instead of defaulting to `'<'` for
+    /// an unprefixed descriptor.
+    #[test]
+    fn byte_order_defaults_unprefixed_descriptors_to_little_endian() {
+        assert_eq!(byte_order("f4"), '<');
+        assert_eq!(byte_order("i8"), '<');
+        assert_eq!(byte_order(""), '<');
+    }
+
+    #[test]
+    fn byte_order_recognises_every_prefix_character() {
+        assert_eq!(byte_order("<f4"), '<');
+        assert_eq!(byte_order(">f4"), '>');
+        assert_eq!(byte_order("|u1"), '|');
+        assert_eq!(byte_order("=f8"), '=');
+    }
 }

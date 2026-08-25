@@ -15,14 +15,34 @@
 //!
 //! # Normal Map Encoding
 //!
-//! Normals are stored as unit vectors `[nx, ny, nz]` in camera space:
+//! Normals are stored as unit vectors `[nx, ny, nz]`:
 //! - `nx, ny`: tangential components (lateral)
-//! - `nz`: depth component; positive means toward the camera
+//! - `nz`: positive means toward the camera (a flat, camera-facing surface
+//!   evaluates to `[0, 0, 1]`)
+//!
+//! Note this is a *different* axis convention from `unproject`'s
+//! camera-space *position* Z axis (which increases away from the camera,
+//! into the scene, since it is literally set to the input depth value) —
+//! the two are unrelated: `nz`'s sign is a property of the final,
+//! orientation-corrected *normal* only, established by
+//! `estimate_normals_cross_product`'s orientation step and
+//! `estimate_normals_sobel`'s gradient formula (both verified against a
+//! flat, camera-facing depth map in the test suite), not inherited from
+//! how positions happen to be reconstructed along the way.
 //!
 //! Values are in `[-1, 1]`.  Storage is row-major, 3 floats per pixel:
 //! `index = (y * width + x) * 3`.
 //!
-//! Invalid pixels (e.g. INFINITY depth) are stored as `[0, 0, 0]`.
+//! Invalid / not-yet-computed pixels (e.g. INFINITY depth, or a pixel with
+//! no usable neighbours for a gradient estimate) are written as the zero
+//! sentinel `[0, 0, 0]` by both estimators, so they are correctly excluded
+//! from validity-aware consumers ([`NormalMap::num_valid`],
+//! [`NormalMap::mean_normal`], [`NormalMap::angular_deviation`],
+//! [`normal_consistency_loss`], [`compute_normal_stats`], and
+//! [`smooth_normals`]'s per-sample blend weights). [`NormalMap::new`]
+//! itself still default-initialises to `[0, 0, 1]` (a flat, camera-facing
+//! plane) rather than the invalid sentinel — it is a general-purpose
+//! constructor, not tied to either estimator's "could not compute" case.
 
 use thiserror::Error;
 
@@ -396,8 +416,10 @@ pub fn estimate_normals_cross_product(
                 (Some(a), None) => sub3(a, p_center),
                 (None, Some(b)) => sub3(p_center, b),
                 (None, None) => {
-                    // No X neighbours available — cannot estimate gradient.
-                    map.set_pixel(x, y, [0.0, 0.0, 1.0]);
+                    // No X neighbours available — cannot estimate a
+                    // gradient here; leave the invalid-pixel zero sentinel
+                    // rather than fabricating a confident "faces camera"
+                    // normal that would bias validity-aware statistics.
                     continue;
                 }
             };
@@ -408,13 +430,19 @@ pub fn estimate_normals_cross_product(
                 (Some(a), None) => sub3(a, p_center),
                 (None, Some(b)) => sub3(p_center, b),
                 (None, None) => {
-                    map.set_pixel(x, y, [0.0, 0.0, 1.0]);
                     continue;
                 }
             };
 
             let raw_normal = cross3(dx_vec, dy_vec);
-            let normal = normalize3(raw_normal).unwrap_or([0.0, 0.0, 1.0]);
+            // A degenerate (near-zero) cross product means the tangent
+            // vectors were collinear — the normal genuinely could not be
+            // estimated here, so fall back to the invalid sentinel instead
+            // of a fabricated "faces camera" value.
+            let normal = match normalize3(raw_normal) {
+                Some(n) => n,
+                None => continue,
+            };
 
             // Orient toward camera (nz must be ≥ 0).
             let oriented = if normal[2] < 0.0 {
@@ -500,8 +528,13 @@ pub fn estimate_normals_sobel(
 
     for y in 0..height {
         for x in 0..width {
-            // Border pixels default to [0,0,1] (already set by NormalMap::new).
+            // Border pixels have no full 3x3 neighbourhood to convolve —
+            // mark them as the invalid zero sentinel rather than leaving
+            // NormalMap::new's [0,0,1] default (which would otherwise be
+            // silently counted as a valid, camera-facing normal by
+            // NormalMap::num_valid / mean_normal / etc.).
             if x == 0 || y == 0 || x == width - 1 || y == height - 1 {
+                map.set_pixel(x, y, [0.0, 0.0, 0.0]);
                 continue;
             }
 
@@ -525,12 +558,13 @@ pub fn estimate_normals_sobel(
             // Check center pixel validity.
             let center_d = depth[(y as usize) * (width as usize) + x as usize];
             if !center_d.is_finite() {
-                // Invalid center — leave as [0,0,1].
+                // Invalid center — write the invalid zero sentinel.
+                map.set_pixel(x, y, [0.0, 0.0, 0.0]);
                 continue;
             }
 
             let raw = [-grad_x, -grad_y, 1.0_f32];
-            let normal = normalize3(raw).unwrap_or([0.0, 0.0, 1.0]);
+            let normal = normalize3(raw).unwrap_or([0.0, 0.0, 0.0]);
             map.set_pixel(x, y, normal);
         }
     }
@@ -569,8 +603,13 @@ fn gaussian_kernel_1d(sigma: f32) -> Vec<f32> {
 /// Apply separable Gaussian smoothing to a normal map.
 ///
 /// Each of the three components `(nx, ny, nz)` is smoothed independently
-/// with a 1-D Gaussian kernel applied first horizontally, then vertically.
-/// After smoothing, each pixel is renormalised to unit length.
+/// with a 1-D Gaussian kernel applied first horizontally, then vertically,
+/// using *normalised convolution* (Knutsson & Westin): invalid (zero
+/// sentinel, see `is_valid_normal`) samples are excluded from the blend
+/// weight instead of silently pulling the average toward zero near
+/// invalid regions. A pixel whose entire kernel window is invalid stays
+/// invalid (zero sentinel) in the output. After smoothing, each valid
+/// pixel is renormalised to unit length.
 ///
 /// Border handling: out-of-bounds pixel accesses clamp to the nearest border pixel.
 ///
@@ -587,24 +626,36 @@ pub fn smooth_normals(normal_map: &NormalMap, sigma: f32) -> NormalMap {
     let kernel = gaussian_kernel_1d(sigma);
     let radius = kernel.len() / 2;
 
-    // Temporary buffer for 3-channel image.
-    let mut tmp = vec![0.0_f32; n_pixels * 3];
+    // Horizontal pass: accumulate a (weighted value sum, weight sum) pair
+    // per pixel instead of a plain average, so the vertical pass can keep
+    // excluding invalid samples correctly (normalised convolution).
+    let mut h_sum = vec![0.0_f32; n_pixels * 3];
+    let mut h_weight = vec![0.0_f32; n_pixels];
 
-    // ── Horizontal pass ──────────────────────────────────────────────────────
     for y in 0..h {
         for x in 0..w {
             let mut acc = [0.0_f32; 3];
+            let mut wsum = 0.0_f32;
             for (ki, &kw) in kernel.iter().enumerate() {
                 let sx = (x as i64 + ki as i64 - radius as i64).clamp(0, w as i64 - 1) as usize;
                 let b = (y * w + sx) * 3;
-                acc[0] += kw * normal_map.normals[b];
-                acc[1] += kw * normal_map.normals[b + 1];
-                acc[2] += kw * normal_map.normals[b + 2];
+                let n = [
+                    normal_map.normals[b],
+                    normal_map.normals[b + 1],
+                    normal_map.normals[b + 2],
+                ];
+                if is_valid_normal(&n) {
+                    acc[0] += kw * n[0];
+                    acc[1] += kw * n[1];
+                    acc[2] += kw * n[2];
+                    wsum += kw;
+                }
             }
             let out_b = (y * w + x) * 3;
-            tmp[out_b] = acc[0];
-            tmp[out_b + 1] = acc[1];
-            tmp[out_b + 2] = acc[2];
+            h_sum[out_b] = acc[0];
+            h_sum[out_b + 1] = acc[1];
+            h_sum[out_b + 2] = acc[2];
+            h_weight[y * w + x] = wsum;
         }
     }
 
@@ -614,16 +665,25 @@ pub fn smooth_normals(normal_map: &NormalMap, sigma: f32) -> NormalMap {
     for y in 0..h {
         for x in 0..w {
             let mut acc = [0.0_f32; 3];
+            let mut wsum = 0.0_f32;
             for (ki, &kw) in kernel.iter().enumerate() {
                 let sy = (y as i64 + ki as i64 - radius as i64).clamp(0, h as i64 - 1) as usize;
                 let b = (sy * w + x) * 3;
-                acc[0] += kw * tmp[b];
-                acc[1] += kw * tmp[b + 1];
-                acc[2] += kw * tmp[b + 2];
+                let src_w = h_weight[sy * w + x];
+                acc[0] += kw * h_sum[b];
+                acc[1] += kw * h_sum[b + 1];
+                acc[2] += kw * h_sum[b + 2];
+                wsum += kw * src_w;
             }
             let out_b = (y * w + x) * 3;
-            // Renormalise.
-            let n = normalize3(acc).unwrap_or([0.0, 0.0, 1.0]);
+            let n = if wsum > 1e-8 {
+                let inv = 1.0 / wsum;
+                normalize3([acc[0] * inv, acc[1] * inv, acc[2] * inv]).unwrap_or([0.0, 0.0, 0.0])
+            } else {
+                // No valid samples anywhere in the kernel window — stay
+                // invalid rather than fabricating a normal.
+                [0.0, 0.0, 0.0]
+            };
             out_normals[out_b] = n[0];
             out_normals[out_b + 1] = n[1];
             out_normals[out_b + 2] = n[2];
@@ -1236,6 +1296,87 @@ mod tests {
                 let sm = smoothed.pixel(x, y);
                 assert_eq!(orig, sm);
             }
+        }
+    }
+
+    // ── Invalid-pixel sentinel consistency (bug: [0,0,0] vs [0,0,1]) ─────────
+
+    #[test]
+    fn test_sobel_border_pixels_are_invalid_sentinel_and_excluded() {
+        let depth = flat_depth_map(8, 8, 2.5);
+        let map = estimate_normals_sobel(&depth, 8, 8).unwrap();
+
+        // Every border pixel must be the zero sentinel, not [0,0,1].
+        for x in 0..8u32 {
+            assert_eq!(map.pixel(x, 0), [0.0, 0.0, 0.0], "top border ({x},0)");
+            assert_eq!(map.pixel(x, 7), [0.0, 0.0, 0.0], "bottom border ({x},7)");
+        }
+        for y in 0..8u32 {
+            assert_eq!(map.pixel(0, y), [0.0, 0.0, 0.0], "left border (0,{y})");
+            assert_eq!(map.pixel(7, y), [0.0, 0.0, 0.0], "right border (7,{y})");
+        }
+
+        // Only the 6x6 interior should be counted as valid (36), not all 64.
+        assert_eq!(map.num_valid(), 36);
+    }
+
+    #[test]
+    fn test_cross_product_isolated_pixel_with_no_neighbours_stays_invalid() {
+        // 3x3 depth map: only the centre pixel has finite depth, all 8
+        // surrounding pixels are INFINITY. The centre pixel therefore has
+        // no usable X or Y neighbour and cannot get a real gradient — it
+        // must stay the zero sentinel, not fall back to a fabricated
+        // "faces camera" [0,0,1].
+        let mut depth = vec![f32::INFINITY; 9];
+        depth[4] = 2.0; // centre of the 3x3 grid, row-major index (1,1)
+        let map = estimate_normals_cross_product(&depth, 3, 3, 100.0, 100.0, 1.5, 1.5).unwrap();
+        assert_eq!(map.pixel(1, 1), [0.0, 0.0, 0.0]);
+        assert_eq!(map.num_valid(), 0);
+    }
+
+    #[test]
+    fn test_smooth_normals_excludes_invalid_neighbours() {
+        // 6x1 map: columns 0..3 are a valid, camera-facing normal;
+        // columns 3..6 are the invalid zero sentinel (e.g. from a Sobel
+        // border region). A valid pixel must not be diluted toward zero
+        // by the neighbouring invalid pixels during smoothing.
+        let w = 6u32;
+        let h = 1u32;
+        let mut map = NormalMap {
+            width: w,
+            height: h,
+            normals: vec![0.0_f32; (w * h * 3) as usize],
+        };
+        for x in 0..3u32 {
+            map.set_pixel(x, 0, [0.0, 0.0, 1.0]);
+        }
+        // Columns 3..6 stay at their zero-initialised invalid sentinel.
+
+        let smoothed = smooth_normals(&map, 2.0);
+        let n0 = smoothed.pixel(0, 0);
+        let len0 = (n0[0] * n0[0] + n0[1] * n0[1] + n0[2] * n0[2]).sqrt();
+        assert!(
+            (len0 - 1.0).abs() < 1e-3,
+            "expected near-unit length after excluding invalid neighbours, got {len0}, n={n0:?}"
+        );
+        assert!(
+            (n0[2] - 1.0).abs() < 1e-3,
+            "expected the valid direction [0,0,1] to be preserved, got {n0:?}"
+        );
+    }
+
+    #[test]
+    fn test_smooth_normals_all_invalid_window_stays_invalid() {
+        // A pixel whose entire kernel window is invalid must remain the
+        // zero sentinel rather than fabricating a normal from nothing.
+        let map = NormalMap {
+            width: 4,
+            height: 1,
+            normals: vec![0.0_f32; 4 * 3], // all-invalid (zero sentinel)
+        };
+        let smoothed = smooth_normals(&map, 1.0);
+        for x in 0..4u32 {
+            assert_eq!(smoothed.pixel(x, 0), [0.0, 0.0, 0.0]);
         }
     }
 }

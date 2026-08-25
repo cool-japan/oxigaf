@@ -150,12 +150,21 @@ impl MorphTargetSet {
     }
 
     /// Evaluate the blended mesh: `base + Σ(target.deltas * target.weight)`.
+    ///
+    /// A target whose `deltas` length does not match `base_vertices` is
+    /// skipped (matching the free function [`apply_morph_targets`]'s
+    /// guard). `add_target` validates this invariant on insertion, but
+    /// `targets` is a public `Vec<MorphTarget>` (so a caller can `push`
+    /// directly) and `MorphTarget::deltas` is itself public and can be
+    /// resized after insertion, so `add_target`'s check alone cannot be
+    /// relied on here.
     #[must_use]
     pub fn evaluate(&self) -> Vec<[f32; 3]> {
         let mut result = self.base_vertices.clone();
+        let n = result.len();
         for target in &self.targets {
             let w = target.weight;
-            if w == 0.0 {
+            if w == 0.0 || target.deltas.len() != n {
                 continue;
             }
             for (i, r) in result.iter_mut().enumerate() {
@@ -502,7 +511,15 @@ pub fn morph_cubic_hermite(
 /// Apply the chosen interpolation strategy between two vertex arrays.
 ///
 /// For [`MorphInterpolation::CubicHermite`], the endpoints are duplicated
-/// (zero tangents), yielding a smooth result without oscillation.
+/// (`morph_cubic_hermite(a, a, b, b, t)`). This does *not* produce zero
+/// tangents: with `v0 = v1 = a` and `v2 = v3 = b`, the Catmull-Rom tangent
+/// formula collapses to `m0 = m1 = (b - a) / 2` at both ends (the secant
+/// slope), giving the ease curve `a + (b - a) * (1.5*t^2 - t^3 + 0.5*t)`.
+/// This is smooth (no oscillation, matching `a` at `t=0` and `b` at `t=1`),
+/// but it is *not* the same curve as a true zero-tangent Hermite/smoothstep
+/// (`3*t^2 - 2*t^3`) -- the two differ noticeably in the first and last
+/// thirds of `[0, 1]` (e.g. at `t = 0.25` this curve gives `~0.2031` vs
+/// smoothstep's `~0.1563`).
 ///
 /// # Errors
 ///
@@ -696,6 +713,23 @@ pub fn resample_morph_sequence(
     }
 
     let n_verts = sequence[0].len();
+    for frame in sequence.iter().skip(1) {
+        if frame.len() != n_verts {
+            return Err(MorphError::VertexCountMismatch {
+                a: n_verts,
+                b: frame.len(),
+            });
+        }
+    }
+
+    // A single source frame has no interval to interpolate within: every
+    // output frame is simply that frame, regardless of `n_frames`. Without
+    // this early return, `n - 2` below underflows (`n == 1`), which panics
+    // in debug builds (subtract-with-overflow) and wraps to `usize::MAX` in
+    // release, causing an out-of-bounds `&sequence[hi]` panic just after.
+    if n == 1 {
+        return Ok(vec![sequence[0].clone(); n_frames]);
+    }
 
     if n_frames == 1 {
         // Return the first frame
@@ -1040,6 +1074,28 @@ mod tests {
         assert!(verts_approx_eq(&r, &b, 1e-5));
     }
 
+    #[test]
+    fn test_morph_interpolate_cubic_hermite_matches_documented_ease_curve() {
+        // Verify the doc's claim: duplicated endpoints give tangents
+        // (b-a)/2 (not zero), producing a + (b-a)*(1.5t^2 - t^3 + 0.5t),
+        // which differs from a true zero-tangent smoothstep (3t^2 - 2t^3).
+        let a = make_verts(1, 0.0);
+        let b = make_verts(1, 1.0);
+        let t = 0.25_f32;
+        let r = morph_interpolate(&a, &b, t, &MorphInterpolation::CubicHermite).expect("cubic");
+        let expected = 1.5 * t * t - t * t * t + 0.5 * t; // a=0, b=1, so a+(b-a)*f = f
+        let smoothstep = 3.0 * t * t - 2.0 * t * t * t;
+        assert!(
+            (r[0][0] - expected).abs() < 1e-5,
+            "expected documented ease curve value {expected}, got {}",
+            r[0][0]
+        );
+        assert!(
+            (r[0][0] - smoothstep).abs() > 1e-3,
+            "sanity check: the implemented curve must differ from smoothstep at t=0.25"
+        );
+    }
+
     // ── morph_blend_n ────────────────────────────────────────────────────────
 
     #[test]
@@ -1195,6 +1251,28 @@ mod tests {
         let result = set.evaluate();
         let expected = make_verts(3, 2.0); // 0 + 1.0 * 2.0
         assert!(verts_approx_eq(&result, &expected, 1e-5));
+    }
+
+    #[test]
+    fn test_morph_target_set_evaluate_skips_mismatched_deltas_len() {
+        // `add_target` validates deltas.len() == base_vertices.len(), but
+        // `targets` is a public Vec<MorphTarget> that a caller can push
+        // into directly, and `MorphTarget::deltas` can itself be resized
+        // after insertion -- both bypass that check. `evaluate()` must not
+        // panic or read out of bounds when that happens; it should simply
+        // skip the mismatched target, exactly like the free function
+        // `apply_morph_targets` already does.
+        let base = make_verts(4, 1.0);
+        let mut set = MorphTargetSet::new(base.clone());
+        let mut t = MorphTarget::new("t", make_verts(4, 5.0));
+        t.weight = 1.0;
+        set.targets.push(t); // bypass add_target's validation
+        set.targets[0].deltas = make_verts(2, 9.0); // now mismatched (2 != 4)
+        let result = set.evaluate();
+        assert!(
+            verts_approx_eq(&result, &base, 1e-6),
+            "mismatched-length target should be skipped, not panic or corrupt output"
+        );
     }
 
     #[test]
@@ -1369,6 +1447,37 @@ mod tests {
         assert!(matches!(
             resample_morph_sequence(&seq, 0),
             Err(MorphError::InvalidParam(_))
+        ));
+    }
+
+    #[test]
+    fn test_resample_morph_sequence_single_frame_expands_without_panicking() {
+        // Upsampling a single keyframe to several frames is legal input; it
+        // previously reached `(n - 2)` with `n == 1`, underflowing `usize`
+        // (panicking in debug, or wrapping and then indexing out of bounds
+        // in release).
+        let seq = vec![make_verts(3, 4.0)];
+        let resampled = resample_morph_sequence(&seq, 5).expect("resample single frame");
+        assert_eq!(resampled.len(), 5);
+        for frame in &resampled {
+            assert!(verts_approx_eq(frame, &make_verts(3, 4.0), 1e-6));
+        }
+    }
+
+    #[test]
+    fn test_resample_morph_sequence_single_frame_to_single_frame() {
+        let seq = vec![make_verts(2, 7.0)];
+        let resampled = resample_morph_sequence(&seq, 1).expect("resample");
+        assert_eq!(resampled.len(), 1);
+        assert!(verts_approx_eq(&resampled[0], &seq[0], 1e-6));
+    }
+
+    #[test]
+    fn test_resample_morph_sequence_mismatched_frame_lengths_errs() {
+        let seq: Vec<Vec<[f32; 3]>> = vec![make_verts(3, 0.0), make_verts(5, 1.0)];
+        assert!(matches!(
+            resample_morph_sequence(&seq, 4),
+            Err(MorphError::VertexCountMismatch { .. })
         ));
     }
 

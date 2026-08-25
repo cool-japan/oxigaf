@@ -70,7 +70,6 @@ impl FlashAttentionConfig {
     }
 
     /// Enable causal masking for autoregressive attention.
-    #[allow(dead_code)]
     pub fn with_causal(mut self, causal: bool) -> Self {
         self.causal = causal;
         self

@@ -185,6 +185,32 @@ pub fn project_gradient(g_i: &[f32], g_j: &[f32]) -> Result<Vec<f32>, GradientSu
     Ok(projected)
 }
 
+/// Validate that every task gradient has the same length as the first, and
+/// that `task_gradients` is non-empty.
+///
+/// Returns the common dimension on success.
+///
+/// Returns [`GradientSurgeryError::EmptyGradients`] if `task_gradients` is
+/// empty. Returns [`GradientSurgeryError::LengthMismatch`] if any gradient's
+/// length differs from `task_gradients[0]`'s.
+fn validate_dims(task_gradients: &[TaskGradient]) -> Result<usize, GradientSurgeryError> {
+    if task_gradients.is_empty() {
+        return Err(GradientSurgeryError::EmptyGradients);
+    }
+    let dim = task_gradients[0].gradient.len();
+    for (j, tg) in task_gradients.iter().enumerate() {
+        if tg.gradient.len() != dim {
+            return Err(GradientSurgeryError::LengthMismatch {
+                task_a: 0,
+                task_b: j,
+                len_a: dim,
+                len_b: tg.gradient.len(),
+            });
+        }
+    }
+    Ok(dim)
+}
+
 /// Apply PCGrad to a set of task gradients.
 ///
 /// For each task `i`:
@@ -201,24 +227,8 @@ pub fn pcgrad(
     task_gradients: &[TaskGradient],
     step: u64,
 ) -> Result<Vec<f32>, GradientSurgeryError> {
-    if task_gradients.is_empty() {
-        return Err(GradientSurgeryError::EmptyGradients);
-    }
-
+    let dim = validate_dims(task_gradients)?;
     let n = task_gradients.len();
-    let dim = task_gradients[0].gradient.len();
-
-    // Validate all lengths match.
-    for (j, tg) in task_gradients.iter().enumerate() {
-        if tg.gradient.len() != dim {
-            return Err(GradientSurgeryError::LengthMismatch {
-                task_a: 0,
-                task_b: j,
-                len_a: dim,
-                len_b: tg.gradient.len(),
-            });
-        }
-    }
 
     let mut result = vec![0.0f32; dim];
 
@@ -367,7 +377,12 @@ pub enum AggregationStrategy {
     PCGrad,
     /// GradNorm: normalize each gradient to unit length before weighted sum.
     GradNormalized,
-    /// AlignedOnly: keep only aligned components (equivalent to PCGrad).
+    /// AlignedOnly: keep a task's gradient only when it does not conflict
+    /// (negative dot product) with ANY other task; a task that conflicts
+    /// with at least one other task contributes nothing. This is strictly
+    /// more aggressive than [`AggregationStrategy::PCGrad`], which projects
+    /// out only the conflicting component instead of dropping the whole
+    /// gradient — the two are NOT equivalent.
     AlignedOnly,
 }
 
@@ -377,21 +392,26 @@ pub enum AggregationStrategy {
 /// - `PCGrad`: delegates to [`pcgrad`].
 /// - `GradNormalized`: normalize each `g_i` to unit norm (skip if zero),
 ///   then compute weighted sum.
-/// - `AlignedOnly`: equivalent to PCGrad; delegates to [`pcgrad`].
+/// - `AlignedOnly`: for each task `i`, include `weight_i * g_i` in the sum
+///   only if `dot(g_i, g_j) >= 0` for every other task `j`; tasks that
+///   conflict with at least one other task are dropped entirely (see
+///   [`AggregationStrategy::AlignedOnly`]'s doc for why this differs from
+///   `PCGrad`).
 ///
 /// Returns [`GradientSurgeryError::EmptyGradients`] if the slice is empty.
+/// Returns [`GradientSurgeryError::LengthMismatch`] if gradient lengths
+/// differ — validated up front for every strategy (previously only the
+/// `PCGrad`/`AlignedOnly` path validated lengths; `WeightedSum` and
+/// `GradNormalized` silently truncated to the shorter length via `zip`).
 pub fn aggregate_gradients(
     task_gradients: &[TaskGradient],
     strategy: AggregationStrategy,
     step: u64,
 ) -> Result<Vec<f32>, GradientSurgeryError> {
-    if task_gradients.is_empty() {
-        return Err(GradientSurgeryError::EmptyGradients);
-    }
+    let dim = validate_dims(task_gradients)?;
 
     match strategy {
         AggregationStrategy::WeightedSum => {
-            let dim = task_gradients[0].gradient.len();
             let mut result = vec![0.0f32; dim];
             for tg in task_gradients {
                 for (r, v) in result.iter_mut().zip(tg.gradient.iter()) {
@@ -401,13 +421,31 @@ pub fn aggregate_gradients(
             Ok(result)
         }
 
-        AggregationStrategy::PCGrad | AggregationStrategy::AlignedOnly => {
-            // AlignedOnly is equivalent to PCGrad per spec.
-            pcgrad(task_gradients, step)
+        AggregationStrategy::PCGrad => pcgrad(task_gradients, step),
+
+        AggregationStrategy::AlignedOnly => {
+            let mut result = vec![0.0f32; dim];
+            for (i, tg) in task_gradients.iter().enumerate() {
+                let mut aligned_with_all = true;
+                for (j, other) in task_gradients.iter().enumerate() {
+                    if i == j {
+                        continue;
+                    }
+                    if gradients_conflict(&tg.gradient, &other.gradient)? {
+                        aligned_with_all = false;
+                        break;
+                    }
+                }
+                if aligned_with_all {
+                    for (r, v) in result.iter_mut().zip(tg.gradient.iter()) {
+                        *r += tg.weight * v;
+                    }
+                }
+            }
+            Ok(result)
         }
 
         AggregationStrategy::GradNormalized => {
-            let dim = task_gradients[0].gradient.len();
             let mut result = vec![0.0f32; dim];
             for tg in task_gradients {
                 let norm: f32 = tg.gradient.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -856,5 +894,74 @@ mod tests {
     fn test_conflict_tracker_most_conflicting_none_when_empty() {
         let tracker = ConflictTracker::new(0.3);
         assert!(tracker.most_conflicting_pair().is_none());
+    }
+
+    // 23. AlignedOnly drops a task that conflicts with another, unlike
+    //     PCGrad which projects instead of dropping — the two strategies
+    //     are not equivalent.
+    #[test]
+    fn test_aggregate_aligned_only_drops_conflicting() {
+        let g1 = TaskGradient::new("a", grad(&[1.0, 0.0]), 1.0).unwrap();
+        let g2 = TaskGradient::new("b", grad(&[-1.0, 0.5]), 1.0).unwrap();
+
+        let aligned_only = aggregate_gradients(
+            &[g1.clone(), g2.clone()],
+            AggregationStrategy::AlignedOnly,
+            0,
+        )
+        .unwrap();
+        assert!(
+            aligned_only.iter().all(|&x| x.abs() < 1e-6),
+            "both tasks conflict with each other, so AlignedOnly should drop both: {aligned_only:?}"
+        );
+
+        let pcgrad_result = aggregate_gradients(&[g1, g2], AggregationStrategy::PCGrad, 0).unwrap();
+        assert!(
+            pcgrad_result.iter().any(|&x| x.abs() > 1e-6),
+            "PCGrad should NOT drop the gradient entirely: {pcgrad_result:?}"
+        );
+    }
+
+    // 24. AlignedOnly matches WeightedSum when nothing conflicts.
+    #[test]
+    fn test_aggregate_aligned_only_keeps_non_conflicting() {
+        let g1 = TaskGradient::new("a", grad(&[1.0, 0.0]), 0.5).unwrap();
+        let g2 = TaskGradient::new("b", grad(&[2.0, 0.0]), 0.25).unwrap();
+
+        let aligned_only = aggregate_gradients(
+            &[g1.clone(), g2.clone()],
+            AggregationStrategy::AlignedOnly,
+            0,
+        )
+        .unwrap();
+        let weighted_sum =
+            aggregate_gradients(&[g1, g2], AggregationStrategy::WeightedSum, 0).unwrap();
+        for (a, w) in aligned_only.iter().zip(weighted_sum.iter()) {
+            assert!((a - w).abs() < 1e-5, "expected {w}, got {a}");
+        }
+    }
+
+    // 25. aggregate_gradients WeightedSum length mismatch → error, not silent truncation.
+    #[test]
+    fn test_aggregate_weighted_sum_length_mismatch() {
+        let g1 = TaskGradient::new("a", grad(&[1.0, 2.0]), 1.0).unwrap();
+        let g2 = TaskGradient::new("b", grad(&[1.0]), 1.0).unwrap();
+        let result = aggregate_gradients(&[g1, g2], AggregationStrategy::WeightedSum, 0);
+        assert!(
+            matches!(result, Err(GradientSurgeryError::LengthMismatch { .. })),
+            "expected LengthMismatch, got {result:?}"
+        );
+    }
+
+    // 26. aggregate_gradients GradNormalized length mismatch → error, not silent truncation.
+    #[test]
+    fn test_aggregate_grad_normalized_length_mismatch() {
+        let g1 = TaskGradient::new("a", grad(&[1.0, 2.0]), 1.0).unwrap();
+        let g2 = TaskGradient::new("b", grad(&[1.0]), 1.0).unwrap();
+        let result = aggregate_gradients(&[g1, g2], AggregationStrategy::GradNormalized, 0);
+        assert!(
+            matches!(result, Err(GradientSurgeryError::LengthMismatch { .. })),
+            "expected LengthMismatch, got {result:?}"
+        );
     }
 }

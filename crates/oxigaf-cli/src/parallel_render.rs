@@ -41,7 +41,18 @@ pub struct ParallelRenderConfig {
     /// Number of threads to use. 0 = auto (use rayon default = all cores).
     pub num_threads: usize,
 
-    /// Chunk size: how many frames to render per thread per batch.
+    /// Chunk size: how many consecutive frames one rayon work item renders
+    /// before the scheduler may hand out another.
+    ///
+    /// [`ParallelRenderer::execute`] hands rayon
+    /// `tasks.par_chunks(chunk_size)`, so this is the real scheduling
+    /// granularity, not a hint: `1` (the finest split) lets work-stealing
+    /// rebalance after every frame and is right when frames are expensive or
+    /// unevenly sized, while a larger value amortises the per-task
+    /// bookkeeping when frames are cheap and uniform. It never changes which
+    /// frames are rendered or what they contain.
+    ///
+    /// Must be greater than zero — see [`ParallelRenderConfig::validate`].
     pub chunk_size: usize,
 
     /// Output directory for rendered frames.
@@ -52,9 +63,17 @@ pub struct ParallelRenderConfig {
     pub filename_pattern: String,
 
     /// Image width in pixels.
+    ///
+    /// This is the job's declared output resolution. [`ParallelRenderer`] is
+    /// deliberately renderer-agnostic — it schedules opaque closures and never
+    /// rasterises anything itself — so `execute` does not consume this field;
+    /// it is checked by [`ParallelRenderConfig::validate`] and read back by
+    /// callers through [`ParallelRenderer::config`], which is how a render
+    /// closure learns the resolution it was configured for.
     pub width: u32,
 
-    /// Image height in pixels.
+    /// Image height in pixels. See [`ParallelRenderConfig::width`] for how
+    /// this field is consumed.
     pub height: u32,
 }
 
@@ -310,8 +329,16 @@ impl ParallelRenderer {
     /// `render_fn` is called concurrently for each task. It must be both
     /// `Send` and `Sync` so that it can be shared across rayon threads.
     ///
+    /// Tasks are handed to rayon as `par_chunks(config.chunk_size)`: each
+    /// work item renders that many consecutive frames sequentially, so
+    /// `chunk_size` is the scheduling granularity. `1` gives the finest
+    /// possible work-stealing split (one frame per work item); a larger value
+    /// amortises per-task overhead across cheap, uniform frames. The set of
+    /// rendered frames and their contents are identical either way.
+    ///
     /// Progress is reported through the optional [`BatchProgress`] handle;
-    /// it is incremented once per completed task (success or failure).
+    /// it is incremented once per completed task (success or failure),
+    /// regardless of how tasks are grouped into chunks.
     ///
     /// # Arguments
     ///
@@ -338,20 +365,27 @@ impl ParallelRenderer {
 
         let start = Instant::now();
 
+        // `validate()` already rejects zero at construction time; `max(1)`
+        // keeps `par_chunks`' own zero-length panic unreachable even if a
+        // caller mutates the config field afterwards.
+        let chunk_size = self.config.chunk_size.max(1);
+
         let execute_inner = |tasks: &[FrameTask]| {
-            tasks.par_iter().for_each(|task| {
-                match render_fn(task) {
-                    Ok(()) => {
-                        successful.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    }
-                    Err(msg) => {
-                        if let Ok(mut guard) = errors.lock() {
-                            guard.push((task.frame_index, msg));
+            tasks.par_chunks(chunk_size).for_each(|chunk| {
+                for task in chunk {
+                    match render_fn(task) {
+                        Ok(()) => {
+                            successful.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        Err(msg) => {
+                            if let Ok(mut guard) = errors.lock() {
+                                guard.push((task.frame_index, msg));
+                            }
                         }
                     }
-                }
-                if let Some(pb) = progress {
-                    pb.increment();
+                    if let Some(pb) = progress {
+                        pb.increment();
+                    }
                 }
             });
         };
@@ -778,6 +812,168 @@ mod tests {
                 observed_threads >= 2,
                 "expected at least 2 threads to be used, but observed only {}",
                 observed_threads
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // chunk_size is honoured by execute() (regression: it used to be
+    // validated and then ignored, with execute() always using par_iter)
+    // -----------------------------------------------------------------------
+
+    /// Run `n_tasks` through `execute` with the given pool/chunk settings and
+    /// return `(distinct thread ids observed, per-task execution counts)`.
+    fn run_and_observe(
+        num_threads: usize,
+        chunk_size: usize,
+        n_tasks: usize,
+    ) -> (usize, Vec<usize>) {
+        let config = ParallelRenderConfig {
+            num_threads,
+            chunk_size,
+            ..Default::default()
+        };
+        let renderer = ParallelRenderer::new(config).expect("renderer creation should succeed");
+        let tasks = ParallelRenderer::turntable_tasks(renderer.config(), n_tasks, 0.0);
+
+        let thread_ids: Arc<Mutex<HashSet<thread::ThreadId>>> =
+            Arc::new(Mutex::new(HashSet::new()));
+        let counts: Arc<Vec<std::sync::atomic::AtomicUsize>> = Arc::new(
+            (0..n_tasks)
+                .map(|_| std::sync::atomic::AtomicUsize::new(0))
+                .collect(),
+        );
+        let thread_ids_clone = Arc::clone(&thread_ids);
+        let counts_clone = Arc::clone(&counts);
+
+        let result = renderer.execute(
+            &tasks,
+            move |task| {
+                if let Ok(mut set) = thread_ids_clone.lock() {
+                    set.insert(thread::current().id());
+                }
+                if let Some(slot) = counts_clone.get(task.frame_index) {
+                    slot.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                // Enough CPU work that rayon has a reason to steal when the
+                // chunking actually permits it.
+                let mut acc: u64 = 0;
+                for i in 0..50_000u64 {
+                    acc = acc.wrapping_add(i.wrapping_mul(i));
+                }
+                std::hint::black_box(acc);
+                Ok(())
+            },
+            None,
+        );
+        assert_eq!(result.successful, n_tasks, "every task must succeed");
+
+        let observed = thread_ids.lock().map(|g| g.len()).unwrap_or(0);
+        let per_task = counts
+            .iter()
+            .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+            .collect();
+        (observed, per_task)
+    }
+
+    #[test]
+    fn execute_chunk_size_covering_all_tasks_uses_exactly_one_thread() {
+        // A chunk that spans the whole task list is a single rayon work item,
+        // so it cannot be split across threads no matter how many the pool
+        // has. This is what discriminates "chunk_size is honoured" from
+        // "chunk_size is ignored" — a count-based assertion passes either way.
+        let n_tasks = 16;
+        let (observed_threads, per_task) = run_and_observe(4, n_tasks, n_tasks);
+        assert_eq!(
+            observed_threads, 1,
+            "chunk_size >= task count must produce a single rayon work item, \
+             but work ran on {observed_threads} threads"
+        );
+        assert!(
+            per_task.iter().all(|&c| c == 1),
+            "each task must still run exactly once, got {per_task:?}"
+        );
+    }
+
+    #[test]
+    fn execute_chunk_size_one_still_splits_across_threads() {
+        // The complement of the test above: the finest chunking must remain
+        // free to work-steal across the pool.
+        let available_cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        // Whether a second worker actually wakes before 32 short tasks drain
+        // is a scheduler race under machine load, so observing it once is
+        // enough: a structural regression (chunking that serializes the
+        // pool) fails every attempt, while a saturated test box just needs
+        // another try.
+        let mut observed_threads = 0;
+        for _ in 0..20 {
+            let (threads, per_task) = run_and_observe(4, 1, 32);
+            assert!(
+                per_task.iter().all(|&c| c == 1),
+                "each task must run exactly once, got {per_task:?}"
+            );
+            observed_threads = observed_threads.max(threads);
+            if observed_threads >= 2 {
+                break;
+            }
+        }
+        if available_cores >= 2 {
+            assert!(
+                observed_threads >= 2,
+                "chunk_size=1 should allow multi-threaded execution, observed {observed_threads}"
+            );
+        }
+    }
+
+    #[test]
+    fn execute_with_large_chunk_size_preserves_error_frame_indices() {
+        // Chunked execution must still attribute each failure to its own
+        // frame index rather than to the chunk it happened to land in.
+        let config = ParallelRenderConfig {
+            num_threads: 2,
+            chunk_size: 5,
+            ..Default::default()
+        };
+        let renderer = ParallelRenderer::new(config).expect("renderer creation should succeed");
+        let tasks = ParallelRenderer::turntable_tasks(renderer.config(), 12, 0.0);
+        let result = renderer.execute(
+            &tasks,
+            |task| {
+                if task.frame_index.is_multiple_of(4) {
+                    Err(format!("boom {}", task.frame_index))
+                } else {
+                    Ok(())
+                }
+            },
+            None,
+        );
+        assert_eq!(result.total_frames, 12);
+        assert_eq!(result.failed, 3, "frames 0, 4 and 8 must fail");
+        assert_eq!(result.successful, 9);
+        let mut failed_indices: Vec<usize> = result.errors.iter().map(|(i, _)| *i).collect();
+        failed_indices.sort_unstable();
+        assert_eq!(failed_indices, vec![0, 4, 8]);
+        for (index, message) in &result.errors {
+            assert!(
+                message.contains(&format!("boom {index}")),
+                "error message must belong to its own frame, got {message} for frame {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn execute_chunk_size_does_not_change_which_frames_run() {
+        // Behavioural equivalence across chunkings: only the scheduling
+        // granularity changes, never the work performed.
+        let n_tasks = 20;
+        for &chunk_size in &[1usize, 3, 7, 20, 64] {
+            let (_, per_task) = run_and_observe(2, chunk_size, n_tasks);
+            assert_eq!(
+                per_task,
+                vec![1usize; n_tasks],
+                "chunk_size {chunk_size} must run every frame exactly once"
             );
         }
     }

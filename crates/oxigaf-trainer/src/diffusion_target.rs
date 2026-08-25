@@ -15,16 +15,22 @@
 //! - [`SdsLoss`] — Score Distillation Sampling loss computation
 //! - [`ViewConsistencyLoss`] — ensures consistency across generated views
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use candle_core::{DType, Device, Tensor};
-use candle_nn::VarBuilder;
-use nalgebra as na;
 
-use oxigaf_diffusion::{DiffusionConfig, DiffusionError, MultiViewDiffusionPipeline, Vae};
+use oxigaf_diffusion::{DiffusionConfig, DiffusionError, MultiViewDiffusionPipeline};
 use oxigaf_flame::Camera;
 
 use crate::TrainerError;
+
+mod tensor_ops;
+
+pub use tensor_ops::sds_timestep_weight;
+use tensor_ops::{
+    cameras_to_tensor, images_to_tensor, normal_maps_to_tensor, prepare_reference_image,
+    tensor_to_hwc_image, warp_view,
+};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -37,7 +43,12 @@ use crate::TrainerError;
 /// or the SDS weighting would disagree with the model it distils from.  This
 /// is *not* [`DiffusionTargetConfig::timestep_start`], which only says where
 /// the training-time timestep annealing begins.
-const DDPM_TRAIN_TIMESTEPS: u32 = 1000;
+///
+/// Public so callers of [`sds_timestep_weight`] and
+/// [`DiffusionTargetGenerator::compute_sds_gradient_with_horizon`] have a
+/// canonical value to pass for "the standard training horizon" instead of
+/// re-hardcoding `1000` themselves.
+pub const DDPM_TRAIN_TIMESTEPS: u32 = 1000;
 
 /// Input resolution of the CLIP ViT image encoder used for IP-Adapter tokens.
 const CLIP_INPUT_SIZE: usize = 224;
@@ -46,7 +57,7 @@ const CLIP_INPUT_SIZE: usize = 224;
 const CLIP_MEAN: [f32; 3] = [0.481_454_66, 0.457_827_5, 0.408_210_73];
 
 /// Per-channel standard deviation of the OpenAI CLIP image normalisation.
-const CLIP_STD: [f32; 3] = [0.268_629_54, 0.261_302_58, 0.275_777_1];
+const CLIP_STD: [f32; 3] = [0.268_629_54, 0.261_302_6, 0.275_777_1];
 
 // ---------------------------------------------------------------------------
 // DiffusionTargetConfig
@@ -178,11 +189,16 @@ impl DiffusionTargetConfig {
 /// # Not (yet) an img2img loop
 ///
 /// The denoising run still starts from seeded Gaussian noise rather than from
-/// the *noised latents of the current render*: `MultiViewDiffusionPipeline`
-/// exposes no entry point that accepts initial latents, so an SDEdit-style
-/// `z_t = √ᾱ_t·z₀ + √(1−ᾱ_t)·ε` start is not reachable from here.  The annealed
-/// timestep from [`DiffusionTargetConfig::current_timestep`] therefore weights
-/// the distillation loss ([`DiffusionTargetGenerator::compute_sds_gradient`],
+/// the *noised latents of the current render*: this generator does not yet
+/// call `MultiViewDiffusionPipeline::begin_session_from_latents`, so an
+/// SDEdit-style `z_t = √ᾱ_t·z₀ + √(1−ᾱ_t)·ε` start is not wired up here. The
+/// pipeline itself now exposes what such a start would need
+/// (`encode_images`, `begin_session_from_latents`, `session_start_timestep`)
+/// — the normal-map conditioning path already routes through
+/// `encode_images` — but nothing in this generator calls the other two yet.
+/// The annealed timestep from
+/// [`DiffusionTargetConfig::current_timestep`] therefore weights the
+/// distillation loss ([`DiffusionTargetGenerator::compute_sds_gradient`],
 /// [`SdsLoss`]) but does **not** set a denoising start point.  Identity and
 /// geometry conditioning are what tie the generated targets to the current
 /// model state.
@@ -197,16 +213,6 @@ pub struct DiffusionTargetGenerator {
     device: Device,
     /// Whether the pipeline is fully loaded.
     is_loaded: bool,
-    /// Directory the pipeline weights were loaded from.
-    ///
-    /// Kept so the normal-map encoder can be built from the same VAE weights.
-    weights_dir: Option<PathBuf>,
-    /// VAE used to encode normal-map conditioning, built on first use.
-    ///
-    /// This is a *second* copy of the pipeline's VAE: `MultiViewDiffusionPipeline`
-    /// keeps its own encoder private and exposes decoding only.  It is built
-    /// lazily so runs that never supply normal maps never pay for it.
-    normal_encoder: Option<Vae>,
     /// Whether the "no normal maps supplied" warning has already been emitted.
     warned_missing_normals: bool,
 }
@@ -225,8 +231,6 @@ impl DiffusionTargetGenerator {
             target_config,
             device,
             is_loaded: false,
-            weights_dir: None,
-            normal_encoder: None,
             warned_missing_normals: false,
         }
     }
@@ -236,9 +240,6 @@ impl DiffusionTargetGenerator {
         let pipeline =
             MultiViewDiffusionPipeline::load(self.diff_config.clone(), weights_dir, &self.device)?;
         self.pipeline = Some(pipeline);
-        self.weights_dir = Some(weights_dir.to_path_buf());
-        // A previously built encoder belongs to the old weights directory.
-        self.normal_encoder = None;
         self.is_loaded = true;
         tracing::info!("Diffusion pipeline loaded from {:?}", weights_dir);
         Ok(())
@@ -481,11 +482,18 @@ impl DiffusionTargetGenerator {
             &self.device,
         )?;
 
-        let latents = {
-            let vae = self.normal_encoder()?;
-            vae.encode(&pixels)
-                .map_err(|e| DiffusionError::Inference(format!("normal VAE encode: {e}")))?
-        };
+        // Route through the pipeline's own encoder rather than building a
+        // second `Vae` from the same weights directory: `encode_images` is
+        // `MultiViewDiffusionPipeline`'s dedicated entry point for exactly
+        // this (see its doc — it exists precisely so callers do not have to
+        // duplicate the VAE load), and it additionally participates in the
+        // pipeline's component lazy-loading/offload lifecycle, which a
+        // hand-built second `Vae` never did.
+        let latents = self
+            .pipeline
+            .as_mut()
+            .ok_or(TrainerError::DiffusionNotLoaded)?
+            .encode_images(&pixels)?;
 
         // The latents are concatenated channel-wise onto the noise latents, so a
         // spatial mismatch would only surface as an opaque `Tensor::cat` error.
@@ -502,46 +510,6 @@ impl DiffusionTargetGenerator {
         Ok(latents)
     }
 
-    /// The VAE used to encode normal maps, built from the pipeline weights on
-    /// first use.
-    fn normal_encoder(&mut self) -> Result<&Vae, TrainerError> {
-        if self.normal_encoder.is_none() {
-            let path = self
-                .weights_dir
-                .as_ref()
-                .ok_or(TrainerError::DiffusionNotLoaded)?
-                .join("vae/diffusion_pytorch_model.safetensors");
-
-            // SAFETY: `from_mmaped_safetensors` inherits the `memmap2` contract
-            // — the mapping is undefined behaviour if the backing file is
-            // modified by *anything* while it stays mapped.  These are
-            // read-only pipeline weights that the training run never writes,
-            // the same assumption `MultiViewDiffusionPipeline` and
-            // `lpips::VggFeatureExtractor::from_safetensors` already make.
-            let vb = unsafe {
-                VarBuilder::from_mmaped_safetensors(&[&path], DType::F32, &self.device).map_err(
-                    |e| {
-                        TrainerError::Init(format!(
-                            "normal-map VAE weights ({}): {e}",
-                            path.display()
-                        ))
-                    },
-                )?
-            };
-            let vae = Vae::new(
-                vb,
-                self.diff_config.latent_channels,
-                self.diff_config.vae_scale_factor,
-            )
-            .map_err(|e| TrainerError::Init(format!("normal-map VAE build: {e}")))?;
-            self.normal_encoder = Some(vae);
-        }
-
-        self.normal_encoder
-            .as_ref()
-            .ok_or(TrainerError::DiffusionNotLoaded)
-    }
-
     /// Compute the per-pixel gradient of the pixel-space distillation loss.
     ///
     /// This generator distils in **pixel space**: `target` is the pseudo-GT
@@ -555,21 +523,53 @@ impl DiffusionTargetGenerator {
     ///
     /// with the constant factor 2 folded into the weights.  `w(t)` is the
     /// variance-preserving weighting [`sds_timestep_weight`] at the timestep
-    /// [`DiffusionTargetConfig::current_timestep`] anneals to.
+    /// [`DiffusionTargetConfig::current_timestep`] anneals to — the **same**
+    /// function [`SdsLoss`] evaluates for [`SdsWeighting::SigmaBased`], so the
+    /// reported loss and the applied gradient cannot disagree.
     ///
     /// - `rendered`: flattened HWC pixels of the current render.
     /// - `target`: flattened HWC pixels of the pseudo ground truth.
     /// - `iteration`: current training iteration.
     ///
+    /// # Normalisation
+    ///
+    /// The result is an **un-normalised** residual: it carries no `1/pixels`
+    /// and no `1/views` factor, while [`SdsLoss::compute`] reports a mean over
+    /// both.  Callers adding this to an image-space gradient must apply
+    /// `2 / (num_views · pixels_per_view)` themselves — that is what
+    /// `Trainer::compute_gradients` does.  It is left out here because the
+    /// per-view pixel count is not knowable from a flat slice whose length may
+    /// legitimately differ between views.
+    ///
     /// The returned vector is as long as the shorter of the two inputs.
+    ///
+    /// This form assumes the standard [`DDPM_TRAIN_TIMESTEPS`] horizon; use
+    /// [`Self::compute_sds_gradient_with_horizon`] when distilling from a
+    /// schedule of a different length (and pass the same horizon to
+    /// [`SdsLoss`], or the two weightings drift apart).
     pub fn compute_sds_gradient(
         &self,
         rendered: &[f32],
         target: &[f32],
         iteration: u32,
     ) -> Vec<f32> {
+        self.compute_sds_gradient_with_horizon(rendered, target, iteration, DDPM_TRAIN_TIMESTEPS)
+    }
+
+    /// [`Self::compute_sds_gradient`] against an explicit DDPM schedule length.
+    ///
+    /// Pass the [`SdsLoss::max_timestep`] of the loss whose value is being
+    /// reported alongside; anything else makes the logged SDS loss and the
+    /// descent direction two different objectives.
+    pub fn compute_sds_gradient_with_horizon(
+        &self,
+        rendered: &[f32],
+        target: &[f32],
+        iteration: u32,
+        max_timestep: u32,
+    ) -> Vec<f32> {
         let timestep = self.target_config.current_timestep(iteration);
-        let weight = sds_timestep_weight(timestep, DDPM_TRAIN_TIMESTEPS);
+        let weight = sds_timestep_weight(timestep, max_timestep);
         let sds_w = self.sds_weight(iteration);
 
         rendered
@@ -727,11 +727,12 @@ impl SdsLoss {
             SdsWeighting::Uniform => 1.0,
             SdsWeighting::Linear => t_norm,
             SdsWeighting::Quadratic => t_norm * t_norm,
-            SdsWeighting::SigmaBased => {
-                // Approximate sigma^2 weighting based on DDPM schedule
-                let alpha_t = ddpm_alpha_cumprod(timestep, max_timestep);
-                1.0 - alpha_t
-            }
+            // Delegates to the *same* helper the applied SDS gradient uses
+            // (`DiffusionTargetGenerator::compute_sds_gradient`), floor
+            // included.  They previously both computed `1 − ᾱ(t)` but only the
+            // gradient floored it, so at low timesteps the reported loss and
+            // the descent direction were scaled differently.
+            SdsWeighting::SigmaBased => sds_timestep_weight(timestep, max_timestep),
         }
     }
 }
@@ -969,416 +970,12 @@ impl TemporalConsistency {
 }
 
 // ---------------------------------------------------------------------------
-// Helper Functions
-// ---------------------------------------------------------------------------
-
-/// Convert HWC images to a batched tensor [N, C, H, W].
-fn images_to_tensor(
-    images: &[Vec<f32>],
-    width: u32,
-    height: u32,
-    device: &Device,
-) -> Result<Tensor, DiffusionError> {
-    let n = images.len();
-    let h = height as usize;
-    let w = width as usize;
-
-    // Create NCHW tensor
-    let mut data = vec![0.0_f32; n * 3 * h * w];
-
-    for (idx, img) in images.iter().enumerate() {
-        for y in 0..h {
-            for x in 0..w {
-                let hwc_idx = (y * w + x) * 3;
-                let r = img.get(hwc_idx).copied().unwrap_or(0.0);
-                let g = img.get(hwc_idx + 1).copied().unwrap_or(0.0);
-                let b = img.get(hwc_idx + 2).copied().unwrap_or(0.0);
-
-                let base = idx * 3 * h * w;
-                let channel_stride = h * w;
-                data[base + y * w + x] = r;
-                data[base + channel_stride + y * w + x] = g;
-                data[base + 2 * channel_stride + y * w + x] = b;
-            }
-        }
-    }
-
-    Tensor::from_vec(data, (n, 3, h, w), device)
-        .map_err(|e| DiffusionError::Inference(format!("images_to_tensor: {e}")))
-}
-
-/// Convert a tensor [C, H, W] to HWC Vec<f32>.
-fn tensor_to_hwc_image(
-    tensor: &Tensor,
-    width: u32,
-    height: u32,
-) -> Result<Vec<f32>, DiffusionError> {
-    let h = height as usize;
-    let w = width as usize;
-
-    // Flatten and convert to Vec<f32>
-    let data: Vec<f32> = tensor
-        .flatten_all()
-        .and_then(|t| t.to_vec1())
-        .map_err(|e| DiffusionError::Inference(format!("tensor_to_hwc: {e}")))?;
-
-    if data.len() < 3 * h * w {
-        return Err(DiffusionError::Inference(format!(
-            "tensor_to_hwc: data length {} < expected {}",
-            data.len(),
-            3 * h * w
-        )));
-    }
-
-    // CHW to HWC
-    let mut hwc = vec![0.0_f32; h * w * 3];
-    for y in 0..h {
-        for x in 0..w {
-            let hwc_idx = (y * w + x) * 3;
-            let channel_stride = h * w;
-            let pixel_offset = y * w + x;
-            hwc[hwc_idx] = data.get(pixel_offset).copied().unwrap_or(0.0);
-            hwc[hwc_idx + 1] = data
-                .get(channel_stride + pixel_offset)
-                .copied()
-                .unwrap_or(0.0);
-            hwc[hwc_idx + 2] = data
-                .get(2 * channel_stride + pixel_offset)
-                .copied()
-                .unwrap_or(0.0);
-        }
-    }
-
-    Ok(hwc)
-}
-
-/// Convert cameras to a batched pose tensor `[num_views, 12]` (flattened 4x3
-/// extrinsics).
-///
-/// Cameras are tiled cyclically when fewer than `num_views` are supplied and
-/// dropped when more are, for the same reason the normal latents are (see
-/// [`normal_maps_to_tensor`]): the pipeline denoises exactly
-/// `DiffusionConfig::num_views` latents and every per-view conditioning tensor
-/// has to line up with that batch dimension.
-fn cameras_to_tensor(
-    cameras: &[Camera],
-    num_views: usize,
-    device: &Device,
-) -> Result<Tensor, DiffusionError> {
-    if cameras.is_empty() || num_views == 0 {
-        return Err(DiffusionError::Inference(format!(
-            "cameras_to_tensor: {} camera(s), {num_views} view(s)",
-            cameras.len()
-        )));
-    }
-
-    let mut data = vec![0.0_f32; num_views * 12];
-
-    for i in 0..num_views {
-        let cam = &cameras[i % cameras.len()];
-        // Flatten rotation (3x3) and translation (3)
-        // Row-major: r00, r01, r02, r10, r11, r12, r20, r21, r22, tx, ty, tz
-        for r in 0..3 {
-            for c in 0..3 {
-                data[i * 12 + r * 3 + c] = cam.rotation[(r, c)];
-            }
-        }
-        data[i * 12 + 9] = cam.translation.x;
-        data[i * 12 + 10] = cam.translation.y;
-        data[i * 12 + 11] = cam.translation.z;
-    }
-
-    Tensor::from_vec(data, (num_views, 12), device)
-        .map_err(|e| DiffusionError::Inference(format!("cameras_to_tensor: {e}")))
-}
-
-/// Half-pixel-centred bilinear sampling weights along one axis.
-///
-/// Maps destination index `dst` of a `dst_len`-long axis onto the source axis
-/// with `src = (dst + 0.5) · src_len / dst_len − 0.5`, which covers the *whole*
-/// source extent for both up- and down-scaling.  Returns `(lo, hi, frac)` so
-/// the resampled value is `v[lo] + (v[hi] − v[lo]) · frac`.
-fn bilinear_axis(dst: usize, dst_len: usize, src_len: usize) -> (usize, usize, f32) {
-    if src_len == 0 || dst_len == 0 {
-        return (0, 0, 0.0);
-    }
-    let scale = src_len as f32 / dst_len as f32;
-    let pos = ((dst as f32 + 0.5) * scale - 0.5).clamp(0.0, (src_len - 1) as f32);
-    let lo = pos.floor() as usize;
-    let hi = (lo + 1).min(src_len - 1);
-    (lo, hi, pos - lo as f32)
-}
-
-/// Bilinearly resample an interleaved HWC RGB image.
-fn resample_hwc(src: &[f32], src_w: usize, src_h: usize, dst_w: usize, dst_h: usize) -> Vec<f32> {
-    let mut out = vec![0.0_f32; dst_w * dst_h * 3];
-    if src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
-        return out;
-    }
-
-    for y in 0..dst_h {
-        let (y0, y1, wy) = bilinear_axis(y, dst_h, src_h);
-        for x in 0..dst_w {
-            let (x0, x1, wx) = bilinear_axis(x, dst_w, src_w);
-            for c in 0..3 {
-                let p00 = src.get((y0 * src_w + x0) * 3 + c).copied().unwrap_or(0.0);
-                let p01 = src.get((y0 * src_w + x1) * 3 + c).copied().unwrap_or(0.0);
-                let p10 = src.get((y1 * src_w + x0) * 3 + c).copied().unwrap_or(0.0);
-                let p11 = src.get((y1 * src_w + x1) * 3 + c).copied().unwrap_or(0.0);
-                let top = p00 + (p01 - p00) * wx;
-                let bottom = p10 + (p11 - p10) * wx;
-                if let Some(slot) = out.get_mut((y * dst_w + x) * 3 + c) {
-                    *slot = top + (bottom - top) * wy;
-                }
-            }
-        }
-    }
-
-    out
-}
-
-/// Prepare the CLIP reference image from the first rendered view.
-///
-/// `images` is the `(V, 3, H, W)` render batch in `[0, 1]`.  The first view is
-/// bilinearly resampled to 224×224 — covering the *whole* frame; the previous
-/// integer-ratio box filter cropped the right/bottom edges and, for inputs
-/// smaller than twice the target, degenerated into a plain top-left crop — and
-/// then normalised with CLIP's own channel mean/std, which is what the ViT
-/// image encoder behind the IP-Adapter tokens was trained on.
-fn prepare_reference_image(images: &Tensor) -> Result<Tensor, DiffusionError> {
-    let first = images
-        .narrow(0, 0, 1)
-        .map_err(|e| DiffusionError::Inference(format!("narrow: {e}")))?;
-
-    let (_b, c, h, w) = first
-        .dims4()
-        .map_err(|e| DiffusionError::Inference(format!("dims4: {e}")))?;
-    if c == 0 || h == 0 || w == 0 {
-        return Err(DiffusionError::Inference(format!(
-            "reference image has an empty dimension: ({c}, {h}, {w})"
-        )));
-    }
-
-    let data: Vec<f32> = first
-        .flatten_all()
-        .and_then(|t| t.to_vec1())
-        .map_err(|e| DiffusionError::Inference(format!("flatten: {e}")))?;
-
-    let size = CLIP_INPUT_SIZE;
-    // The axis weights are shared by every channel, so compute them once.
-    let rows: Vec<(usize, usize, f32)> = (0..size).map(|y| bilinear_axis(y, size, h)).collect();
-    let cols: Vec<(usize, usize, f32)> = (0..size).map(|x| bilinear_axis(x, size, w)).collect();
-
-    let mut resized = vec![0.0_f32; c * size * size];
-    for ch in 0..c {
-        let src_plane = ch * h * w;
-        let dst_plane = ch * size * size;
-        let mean = CLIP_MEAN.get(ch).copied().unwrap_or(0.0);
-        let std_dev = CLIP_STD.get(ch).copied().unwrap_or(1.0);
-        for (y, &(y0, y1, wy)) in rows.iter().enumerate() {
-            for (x, &(x0, x1, wx)) in cols.iter().enumerate() {
-                let p00 = data.get(src_plane + y0 * w + x0).copied().unwrap_or(0.0);
-                let p01 = data.get(src_plane + y0 * w + x1).copied().unwrap_or(0.0);
-                let p10 = data.get(src_plane + y1 * w + x0).copied().unwrap_or(0.0);
-                let p11 = data.get(src_plane + y1 * w + x1).copied().unwrap_or(0.0);
-                let top = p00 + (p01 - p00) * wx;
-                let bottom = p10 + (p11 - p10) * wx;
-                let value = top + (bottom - top) * wy;
-                if let Some(slot) = resized.get_mut(dst_plane + y * size + x) {
-                    *slot = (value - mean) / std_dev;
-                }
-            }
-        }
-    }
-
-    Tensor::from_vec(resized, (1, c, size, size), first.device())
-        .map_err(|e| DiffusionError::Inference(format!("reference image: {e}")))
-}
-
-/// Build the `(num_views, 3, size, size)` pixel tensor the VAE encoder expects
-/// from per-view HWC normal maps in `[0, 1]`.
-///
-/// Each map is bilinearly resampled to `size × size` and rescaled to the
-/// `[-1, 1]` range the encoder was trained on.  Views are tiled cyclically when
-/// fewer maps than views are supplied and dropped when more are: the pipeline
-/// always denoises exactly `num_views` latents and concatenates these onto them
-/// channel-wise, so the batch dimensions have to agree.
-fn normal_maps_to_tensor(
-    maps: &[Vec<f32>],
-    num_views: usize,
-    src_width: usize,
-    src_height: usize,
-    size: usize,
-    device: &Device,
-) -> Result<Tensor, DiffusionError> {
-    if maps.is_empty() || num_views == 0 || size == 0 || src_width == 0 || src_height == 0 {
-        return Err(DiffusionError::Inference(format!(
-            "normal maps: {} map(s), {num_views} view(s), source {src_width}x{src_height}, \
-             target {size}x{size}",
-            maps.len()
-        )));
-    }
-
-    let plane = size * size;
-    let mut data = vec![0.0_f32; num_views * 3 * plane];
-
-    for view in 0..num_views {
-        let map = &maps[view % maps.len()];
-        let resized = resample_hwc(map, src_width, src_height, size, size);
-        let base = view * 3 * plane;
-        for pixel in 0..plane {
-            for c in 0..3 {
-                let value = resized.get(pixel * 3 + c).copied().unwrap_or(0.0);
-                if let Some(slot) = data.get_mut(base + c * plane + pixel) {
-                    // [0, 1] → [-1, 1]
-                    *slot = value.mul_add(2.0, -1.0);
-                }
-            }
-        }
-    }
-
-    Tensor::from_vec(data, (num_views, 3, size, size), device)
-        .map_err(|e| DiffusionError::Inference(format!("normal_maps_to_tensor: {e}")))
-}
-
-/// A source view forward-warped into a target view.
-struct WarpedView {
-    /// Warped RGB pixels in HWC order; entries whose `mask` is `false` are unset.
-    pixels: Vec<f32>,
-    /// `true` where at least one source pixel projected onto the target pixel.
-    mask: Vec<bool>,
-}
-
-/// Warp a source view to a target view using depth.
-///
-/// This is a forward scatter, so it leaves holes wherever no source pixel lands;
-/// `WarpedView::mask` records which target pixels were actually written so the
-/// caller can skip the rest.  Competing sources are resolved with a per-target
-/// depth buffer — nearest wins — instead of last-write-wins.
-fn warp_view(
-    src_view: &[f32],
-    src_cam: &Camera,
-    tgt_cam: &Camera,
-    src_depth: &[f32],
-    width: usize,
-    height: usize,
-) -> WarpedView {
-    let mut warped = WarpedView {
-        pixels: vec![0.0_f32; width * height * 3],
-        mask: vec![false; width * height],
-    };
-    let mut depth_buffer = vec![f32::INFINITY; width * height];
-
-    // For each pixel in source view
-    for y in 0..height {
-        for x in 0..width {
-            let idx = y * width + x;
-            let depth = src_depth.get(idx).copied().unwrap_or(0.0);
-
-            if depth <= 0.0 || !depth.is_finite() {
-                continue;
-            }
-
-            // Unproject to 3D
-            let px = (x as f32 - src_cam.cx) / src_cam.focal_x;
-            let py = (y as f32 - src_cam.cy) / src_cam.focal_y;
-            let point_cam = na::Vector3::new(px * depth, py * depth, depth);
-
-            // Transform to world space
-            let r_inv = src_cam.rotation.transpose();
-            let point_world = r_inv * (point_cam - src_cam.translation);
-
-            // Project to target camera
-            let point_tgt_cam = tgt_cam.rotation * point_world + tgt_cam.translation;
-
-            if point_tgt_cam.z <= 0.0 || !point_tgt_cam.z.is_finite() {
-                continue;
-            }
-
-            let tx = (point_tgt_cam.x / point_tgt_cam.z) * tgt_cam.focal_x + tgt_cam.cx;
-            let ty = (point_tgt_cam.y / point_tgt_cam.z) * tgt_cam.focal_y + tgt_cam.cy;
-            if !tx.is_finite() || !ty.is_finite() {
-                continue;
-            }
-
-            let tx_i = tx.round() as i32;
-            let ty_i = ty.round() as i32;
-
-            if tx_i >= 0 && tx_i < width as i32 && ty_i >= 0 && ty_i < height as i32 {
-                let tgt_idx = (ty_i as usize) * width + (tx_i as usize);
-
-                // Z-buffer: keep the nearest source sample for this target pixel.
-                let Some(slot) = depth_buffer.get_mut(tgt_idx) else {
-                    continue;
-                };
-                if point_tgt_cam.z >= *slot {
-                    continue;
-                }
-                *slot = point_tgt_cam.z;
-
-                let src_hwc = idx * 3;
-                let tgt_hwc = tgt_idx * 3;
-                if let Some(dst) = warped.pixels.get_mut(tgt_hwc..tgt_hwc + 3) {
-                    dst[0] = src_view.get(src_hwc).copied().unwrap_or(0.0);
-                    dst[1] = src_view.get(src_hwc + 1).copied().unwrap_or(0.0);
-                    dst[2] = src_view.get(src_hwc + 2).copied().unwrap_or(0.0);
-                }
-                if let Some(valid) = warped.mask.get_mut(tgt_idx) {
-                    *valid = true;
-                }
-            }
-        }
-    }
-
-    warped
-}
-
-/// SDS timestep weighting factor.
-///
-/// Higher timesteps (more noise) get higher weights.  `max_timestep` is the
-/// length of the DDPM *training* schedule — pass [`DDPM_TRAIN_TIMESTEPS`] unless
-/// the caller deliberately distils from a different schedule.
-fn sds_timestep_weight(timestep: u32, max_timestep: u32) -> f32 {
-    let alpha = ddpm_alpha_cumprod(timestep, max_timestep);
-    let sigma_sq = 1.0 - alpha;
-
-    // w(t) = sigma(t)^2 for variance-preserving weighting
-    sigma_sq.max(0.001)
-}
-
-/// Approximate DDPM `alpha_cumprod` for a given timestep.
-///
-/// `max_timestep` is the length of the training schedule.  It is clamped to at
-/// least 2 because the beta interpolation divides by `max_timestep - 1`, which
-/// would otherwise yield `inf`/`NaN` and propagate straight into the SDS
-/// weighting.  `timestep` is likewise clamped to the last schedule entry, so a
-/// caller passing `t == max_timestep` stops at `beta_end` instead of
-/// extrapolating past it.
-fn ddpm_alpha_cumprod(timestep: u32, max_timestep: u32) -> f32 {
-    // Scaled linear beta schedule (SD 2.1 style)
-    let beta_start = 0.00085_f32.sqrt();
-    let beta_end = 0.012_f32.sqrt();
-
-    let last = max_timestep.max(2) - 1;
-    let denom = last as f32;
-
-    let mut alpha_cumprod = 1.0_f32;
-    for t in 0..=timestep.min(last) {
-        let beta = beta_start + (beta_end - beta_start) * (t as f32) / denom;
-        let beta = beta * beta;
-        let alpha = 1.0 - beta;
-        alpha_cumprod *= alpha;
-    }
-
-    alpha_cumprod
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
+    use super::tensor_ops::{ddpm_alpha_cumprod, resample_hwc};
     use super::*;
 
     #[test]
@@ -1651,6 +1248,29 @@ mod tests {
         assert!(normal_maps_to_tensor(&[], 4, 1, 1, 2, &device).is_err());
     }
 
+    // Regression: `encode_normal_latents` used to build its own *second*
+    // `Vae` (the `normal_encoder` field/method, loaded via a raw
+    // `VarBuilder::from_mmaped_safetensors` on `weights_dir`) instead of
+    // routing through `MultiViewDiffusionPipeline::encode_images`. That
+    // second copy is gone; the encoder path now goes exclusively through
+    // `self.pipeline`, so with no pipeline loaded the call must fail with
+    // `DiffusionNotLoaded` — not silently fall back to a stale/duplicate VAE,
+    // and not panic reaching for a `weights_dir` that no longer exists as a
+    // field.
+    #[test]
+    fn encode_normal_latents_without_a_loaded_pipeline_reports_not_loaded() {
+        let mut gen = DiffusionTargetGenerator::new(DiffusionTargetConfig::default());
+        assert!(!gen.is_loaded());
+
+        let map = vec![0.5_f32; 3]; // one 1x1 RGB pixel
+        let result = gen.encode_normal_latents(Some(&[map]), 1, 1);
+
+        assert!(
+            matches!(result, Err(TrainerError::DiffusionNotLoaded)),
+            "expected DiffusionNotLoaded with no pipeline loaded, got {result:?}"
+        );
+    }
+
     #[test]
     fn camera_poses_match_the_pipeline_view_count() {
         let device = Device::Cpu;
@@ -1903,5 +1523,63 @@ mod tests {
         let ok = SdsLoss::new(SdsWeighting::Linear, 2).expect("2 is the minimum schedule");
         assert_eq!(ok.max_timestep, 2);
         assert_eq!(SdsLoss::default().max_timestep, DDPM_TRAIN_TIMESTEPS);
+    }
+
+    // ---- SDS weighting agreement (F143) -----------------------------------
+
+    #[test]
+    fn reported_sds_loss_and_applied_gradient_share_one_weighting() {
+        // Regression: `SdsLoss::weight` computed an unfloored `1 − ᾱ(t)` while
+        // `sds_timestep_weight` (which weights the APPLIED gradient) floored it
+        // at 0.001, so at the low timesteps annealing ends on the logged loss
+        // and the descent direction were scaled differently.
+        let loss = SdsLoss::new(SdsWeighting::SigmaBased, DDPM_TRAIN_TIMESTEPS)
+            .expect("1000 is a valid horizon");
+        for timestep in [0_u32, 1, 10, 50, 250, 999] {
+            let reported = loss.weight(timestep);
+            let applied = sds_timestep_weight(timestep, DDPM_TRAIN_TIMESTEPS);
+            assert_eq!(
+                reported, applied,
+                "weighting diverged at timestep {timestep}: {reported} vs {applied}"
+            );
+        }
+        // The floor is what makes the low end non-zero at all.
+        assert!(sds_timestep_weight(0, DDPM_TRAIN_TIMESTEPS) >= 0.001);
+    }
+
+    #[test]
+    fn sds_gradient_uses_the_horizon_it_is_given() {
+        // The gradient used to hardcode `DDPM_TRAIN_TIMESTEPS` while the loss
+        // read `SdsLoss::max_timestep`; a caller distilling from a shorter
+        // schedule silently optimised a differently-weighted objective.
+        let config = DiffusionTargetConfig {
+            warmup_iterations: 0,
+            ..Default::default()
+        };
+        let generator = DiffusionTargetGenerator::new(config);
+        let rendered = vec![1.0_f32, 0.5, 0.25];
+        let target = vec![0.0_f32, 0.0, 0.0];
+
+        let default_horizon = generator.compute_sds_gradient(&rendered, &target, 1_000);
+        let explicit = generator.compute_sds_gradient_with_horizon(
+            &rendered,
+            &target,
+            1_000,
+            DDPM_TRAIN_TIMESTEPS,
+        );
+        assert_eq!(default_horizon, explicit);
+
+        let shorter = generator.compute_sds_gradient_with_horizon(&rendered, &target, 1_000, 100);
+        assert_eq!(shorter.len(), explicit.len());
+        assert!(
+            shorter
+                .iter()
+                .zip(explicit.iter())
+                .any(|(a, b)| (a - b).abs() > 1e-9),
+            "a different horizon must change the weighting"
+        );
+
+        // The residual keeps the sign of (rendered − target) in both forms.
+        assert!(explicit.iter().all(|g| *g >= 0.0));
     }
 }

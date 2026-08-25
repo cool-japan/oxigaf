@@ -133,6 +133,7 @@ fn bench_combined_loss(c: &mut Criterion) {
         w_normal: 0.0,
         w_gradient_penalty: 0.0,
         gradient_penalty_threshold: 1.0,
+        w_scale_reg_max_scale: oxigaf_trainer::loss::MAX_REASONABLE_WORLD_SCALE,
     };
 
     let _loss_computer = LossComputer::new(config);

@@ -36,7 +36,10 @@ use super::{
 ///   `J · (v_template + Σₖ βₖ Sₖ) = J·v_template + Σₖ βₖ (J·Sₖ)`, the products
 ///   `J·Sₖ` are precomputed once and each forward pass reduces to a
 ///   `n_joints × 3` accumulation instead of an `n_joints × N × 3` matrix
-///   product.
+///   product. Note the identity involves the **shape** directions only:
+///   [`FlameModel::forward`] regresses the joint pivots from the shape-only
+///   rest mesh and adds expression afterwards, so no expression term belongs
+///   here.
 /// - Mesh assembly and normal recomputation are skipped entirely.
 ///
 /// The arithmetic is otherwise identical to the model's own forward pass: same
@@ -78,9 +81,11 @@ pub struct FlameLandmarkFitter<'a> {
     /// `j_regressor · v_template` (`[joint]`).
     joints_template: Vec<[f32; 3]>,
     /// `j_regressor · shapedirs[:, :, k]` (`[shape_component][joint]`).
+    ///
+    /// There is deliberately no expression counterpart: FLAME regresses the
+    /// joint pivots from the shape-only rest mesh, so the expression
+    /// coefficients never move the joints.
     joints_shape: Vec<Vec<[f32; 3]>>,
-    /// `j_regressor · expressiondirs[:, :, k]` (`[expr_component][joint]`).
-    joints_expr: Vec<Vec<[f32; 3]>>,
     /// Number of skeleton joints.
     n_joints: usize,
     /// Number of vertices in the underlying model.
@@ -123,6 +128,106 @@ fn regress_columns(
         .collect()
 }
 
+/// Validate that `model`'s joint chain is well-formed for `n_joints`: a
+/// nonzero count, a `parents` array long enough to cover it, and a
+/// topological order (`parent < child`) throughout.
+fn validate_joint_chain(model: &FlameModel, n_joints: usize) -> Result<(), FittingError> {
+    if n_joints == 0 {
+        return Err(FittingError::ForwardPassFailed(
+            "model has zero joints".to_owned(),
+        ));
+    }
+    if model.parents.len() < n_joints {
+        return Err(FittingError::ForwardPassFailed(format!(
+            "parents has {} entries but the model has {n_joints} joints",
+            model.parents.len()
+        )));
+    }
+    for (j, &parent) in model.parents.iter().enumerate().take(n_joints) {
+        if parent >= 0 {
+            let p = parent as usize;
+            if p >= j {
+                return Err(FittingError::ForwardPassFailed(format!(
+                    "joint {j} has parent {p}, which is not earlier in the chain"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate that the joint regressor, skinning weights and vertex template
+/// are all shaped for `n_joints` joints and `num_vertices` vertices.
+fn validate_regressor_shapes(
+    model: &FlameModel,
+    n_joints: usize,
+    num_vertices: usize,
+) -> Result<(), FittingError> {
+    if model.j_regressor.nrows() < n_joints || model.j_regressor.ncols() < num_vertices {
+        return Err(FittingError::ForwardPassFailed(format!(
+            "j_regressor is {}×{} but {n_joints}×{num_vertices} is required",
+            model.j_regressor.nrows(),
+            model.j_regressor.ncols()
+        )));
+    }
+    if model.lbs_weights.nrows() < num_vertices || model.lbs_weights.ncols() < n_joints {
+        return Err(FittingError::ForwardPassFailed(format!(
+            "lbs_weights is {}×{} but {num_vertices}×{n_joints} is required",
+            model.lbs_weights.nrows(),
+            model.lbs_weights.ncols()
+        )));
+    }
+    if model.v_template.ncols() < 3 {
+        return Err(FittingError::ForwardPassFailed(format!(
+            "v_template has {} columns, expected 3",
+            model.v_template.ncols()
+        )));
+    }
+    Ok(())
+}
+
+/// Validate that every entry of `landmark_indices` is a valid vertex index.
+fn validate_landmark_indices(
+    landmark_indices: &[usize],
+    num_vertices: usize,
+) -> Result<(), FittingError> {
+    for &idx in landmark_indices {
+        if idx >= num_vertices {
+            return Err(FittingError::InvalidVertexIndex { idx, num_vertices });
+        }
+    }
+    Ok(())
+}
+
+/// The `(shapedirs, expressiondirs, posedirs)` array shapes, each as
+/// returned by `ndarray::Array3::shape`.
+type BlendShapeDims<'a> = (&'a [usize], &'a [usize], &'a [usize]);
+
+/// Validate that the blend-shape direction arrays (`shapedirs`,
+/// `expressiondirs`, `posedirs`) are all at least `num_vertices × 3 × K`,
+/// returning their shapes for the caller to read `K` from.
+fn validate_blend_shape_dims(
+    model: &FlameModel,
+    num_vertices: usize,
+) -> Result<BlendShapeDims<'_>, FittingError> {
+    let shape_dims = model.shapedirs.shape();
+    let expr_dims = model.expressiondirs.shape();
+    let pose_dims = model.posedirs.shape();
+    for (name, dims) in [
+        ("shapedirs", shape_dims),
+        ("expressiondirs", expr_dims),
+        ("posedirs", pose_dims),
+    ] {
+        if dims[0] < num_vertices || dims[1] < 3 {
+            return Err(FittingError::ForwardPassFailed(format!(
+                "{name} is {}×{}×{} but {num_vertices}×3×K is required",
+                dims[0], dims[1], dims[2]
+            )));
+        }
+    }
+    Ok((shape_dims, expr_dims, pose_dims))
+}
+
 impl<'a> FlameLandmarkFitter<'a> {
     /// Build a fitter specialised for `landmark_indices`, caching the first
     /// `n_shape` shape and `n_expr` expression components.
@@ -146,68 +251,10 @@ impl<'a> FlameLandmarkFitter<'a> {
         let num_vertices = model.num_vertices();
         let n_joints = model.n_joints;
 
-        if n_joints == 0 {
-            return Err(FittingError::ForwardPassFailed(
-                "model has zero joints".to_owned(),
-            ));
-        }
-        if model.parents.len() < n_joints {
-            return Err(FittingError::ForwardPassFailed(format!(
-                "parents has {} entries but the model has {n_joints} joints",
-                model.parents.len()
-            )));
-        }
-        for (j, &parent) in model.parents.iter().enumerate().take(n_joints) {
-            if parent >= 0 {
-                let p = parent as usize;
-                if p >= j {
-                    return Err(FittingError::ForwardPassFailed(format!(
-                        "joint {j} has parent {p}, which is not earlier in the chain"
-                    )));
-                }
-            }
-        }
-        if model.j_regressor.nrows() < n_joints || model.j_regressor.ncols() < num_vertices {
-            return Err(FittingError::ForwardPassFailed(format!(
-                "j_regressor is {}×{} but {n_joints}×{num_vertices} is required",
-                model.j_regressor.nrows(),
-                model.j_regressor.ncols()
-            )));
-        }
-        if model.lbs_weights.nrows() < num_vertices || model.lbs_weights.ncols() < n_joints {
-            return Err(FittingError::ForwardPassFailed(format!(
-                "lbs_weights is {}×{} but {num_vertices}×{n_joints} is required",
-                model.lbs_weights.nrows(),
-                model.lbs_weights.ncols()
-            )));
-        }
-        if model.v_template.ncols() < 3 {
-            return Err(FittingError::ForwardPassFailed(format!(
-                "v_template has {} columns, expected 3",
-                model.v_template.ncols()
-            )));
-        }
-        for &idx in landmark_indices {
-            if idx >= num_vertices {
-                return Err(FittingError::InvalidVertexIndex { idx, num_vertices });
-            }
-        }
-
-        let shape_dims = model.shapedirs.shape();
-        let expr_dims = model.expressiondirs.shape();
-        let pose_dims = model.posedirs.shape();
-        for (name, dims) in [
-            ("shapedirs", shape_dims),
-            ("expressiondirs", expr_dims),
-            ("posedirs", pose_dims),
-        ] {
-            if dims[0] < num_vertices || dims[1] < 3 {
-                return Err(FittingError::ForwardPassFailed(format!(
-                    "{name} is {}×{}×{} but {num_vertices}×3×K is required",
-                    dims[0], dims[1], dims[2]
-                )));
-            }
-        }
+        validate_joint_chain(model, n_joints)?;
+        validate_regressor_shapes(model, n_joints, num_vertices)?;
+        validate_landmark_indices(landmark_indices, num_vertices)?;
+        let (shape_dims, expr_dims, pose_dims) = validate_blend_shape_dims(model, num_vertices)?;
 
         let n_shape = n_shape.min(shape_dims[2]);
         let n_expr = n_expr.min(expr_dims[2]);
@@ -241,7 +288,14 @@ impl<'a> FlameLandmarkFitter<'a> {
             .collect();
 
         // --- Precompute the joint-regression products -----------------------
-        // joints(β, ψ) = J·v_template + Σₖ βₖ (J·Sₖ) + Σₖ ψₖ (J·Eₖ)
+        // joints(β) = J·v_template + Σₖ βₖ (J·Sₖ)
+        //
+        // Expression is absent on purpose. `FlameModel::forward` regresses the
+        // joints from the SHAPE-ONLY rest mesh (`apply_shape_only`) and only
+        // then adds expression on top for the posing/skinning stage, so the
+        // expression coefficients must not move the joint pivots. Adding a
+        // `Σₖ ψₖ (J·Eₖ)` term here silently shifts every skinning transform
+        // and makes this fast path disagree with the full forward pass.
         let joints_template =
             regress_columns(&model.j_regressor, n_joints, num_vertices, |v, c| {
                 model.v_template[[v, c]]
@@ -250,13 +304,6 @@ impl<'a> FlameLandmarkFitter<'a> {
             .map(|k| {
                 regress_columns(&model.j_regressor, n_joints, num_vertices, |v, c| {
                     model.shapedirs[[v, c, k]]
-                })
-            })
-            .collect();
-        let joints_expr: Vec<Vec<[f32; 3]>> = (0..n_expr)
-            .map(|k| {
-                regress_columns(&model.j_regressor, n_joints, num_vertices, |v, c| {
-                    model.expressiondirs[[v, c, k]]
                 })
             })
             .collect();
@@ -271,7 +318,6 @@ impl<'a> FlameLandmarkFitter<'a> {
             lbs_subset,
             joints_template,
             joints_shape,
-            joints_expr,
             n_joints,
             num_vertices,
         })
@@ -324,9 +370,10 @@ impl<'a> FlameLandmarkFitter<'a> {
         accumulate_dirs(&mut verts, &self.expr_subset, &params.expression);
 
         // 2. Joint positions, via the precomputed regressor products.
+        //    Shape only — `FlameModel::forward` regresses the pivots from the
+        //    shape-only rest mesh, before expression is added.
         let mut joints = self.joints_template.clone();
         accumulate_dirs(&mut joints, &self.joints_shape, &params.shape);
-        accumulate_dirs(&mut joints, &self.joints_expr, &params.expression);
 
         // 3. Per-joint rotation matrices (Rodrigues).  `to_flame_params` lays
         //    the pose out as [root(3), neck(3), jaw(3), l_eye(3), r_eye(3)],

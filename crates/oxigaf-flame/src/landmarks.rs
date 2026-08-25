@@ -181,7 +181,7 @@ pub struct BarycentricLandmark {
 }
 
 /// Emits a one-time [`tracing::warn!`] the first time an extractor backed by
-/// the unverified [`FLAME_68_VERTEX_INDICES`] table is constructed. Gated by
+/// the unverified `FLAME_68_VERTEX_INDICES` table is constructed. Gated by
 /// [`Once`] rather than firing unconditionally, since
 /// `LandmarkExtractor::new()` is reachable from per-frame paths (e.g.
 /// `Mesh::extract_landmarks`) and an unconditional warning would spam logs.
@@ -196,7 +196,7 @@ static UNVERIFIED_TABLE_WARNING: Once = Once::new();
 ///
 /// By default ([`LandmarkExtractor::new`]) the extractor uses the built-in
 /// 68-point vertex-index table, which is an **unverified approximation**
-/// (see [`FLAME_68_VERTEX_INDICES`]) -- not ground truth from the official
+/// (see `FLAME_68_VERTEX_INDICES`) -- not ground truth from the official
 /// FLAME landmark embedding. Verified vertex indices can be supplied via
 /// [`LandmarkExtractor::with_indices`], and a genuine barycentric embedding
 /// (the format the official asset actually uses) via
@@ -205,7 +205,7 @@ pub struct LandmarkExtractor {
     /// Vertex indices corresponding to each landmark point. Used when
     /// `barycentric` is `None`.
     vertex_indices: Vec<u32>,
-    /// Real (face_index, barycentric weights) embedding, used instead of
+    /// Real `(face_index, barycentric weights)` embedding, used instead of
     /// `vertex_indices` when present. See
     /// [`LandmarkExtractor::with_barycentric_embedding`].
     barycentric: Option<Vec<BarycentricLandmark>>,
@@ -215,7 +215,7 @@ impl LandmarkExtractor {
     /// Create an extractor using the canonical FLAME 68-point landmark indices.
     ///
     /// The built-in table is an **unverified approximation** (see
-    /// [`FLAME_68_VERTEX_INDICES`]); this logs a one-time warning the first
+    /// `FLAME_68_VERTEX_INDICES`); this logs a one-time warning the first
     /// time any extractor is constructed this way.
     #[must_use]
     pub fn new() -> Self {
@@ -982,12 +982,14 @@ mod tests {
                 + mesh.vertices[face[2] as usize].z)
                 / 3.0,
         ];
-        for k in 0..3 {
+        for (k, (&exp, &got)) in expected
+            .iter()
+            .zip(landmarks[0].position.iter())
+            .enumerate()
+        {
             assert!(
-                (landmarks[0].position[k] - expected[k]).abs() < 1e-5,
-                "component {k}: expected {}, got {}",
-                expected[k],
-                landmarks[0].position[k]
+                (got - exp).abs() < 1e-5,
+                "component {k}: expected {exp}, got {got}"
             );
         }
     }

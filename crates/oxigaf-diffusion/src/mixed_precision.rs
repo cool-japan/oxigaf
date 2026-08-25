@@ -1047,8 +1047,10 @@ mod tests {
 
     #[test]
     fn test_apply_precision_fp32_is_exact_copy() {
-        let mut cfg = MixedPrecisionConfig::default();
-        cfg.mode = PrecisionMode::Float32;
+        let cfg = MixedPrecisionConfig {
+            mode: PrecisionMode::Float32,
+            ..MixedPrecisionConfig::default()
+        };
         let data = vec![1.0_f32, 2.0, 3.0, -1.5];
         let out = apply_precision(&data, &cfg);
         assert_eq!(out, data, "FP32 mode should produce exact copy");

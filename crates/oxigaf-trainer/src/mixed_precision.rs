@@ -18,6 +18,8 @@ use std::fmt::Write as FmtWrite;
 
 use serde::{Deserialize, Serialize};
 
+use crate::optimizer::Gradients;
+
 // ---------------------------------------------------------------------------
 // TrainingPrecision
 // ---------------------------------------------------------------------------
@@ -263,8 +265,6 @@ pub struct MixedPrecisionTrainer {
     pub precision: TrainingPrecision,
     /// Dynamic loss scaler.
     pub scaler: LossScaler,
-    /// Layer name patterns that must remain in FP32 (e.g. layer norm, softmax).
-    pub fp32_layers: Vec<String>,
 }
 
 impl MixedPrecisionTrainer {
@@ -283,7 +283,6 @@ impl MixedPrecisionTrainer {
         Self {
             precision,
             scaler: LossScaler::new(initial_scale),
-            fp32_layers: Vec::new(),
         }
     }
 
@@ -319,19 +318,53 @@ impl MixedPrecisionTrainer {
         !overflow
     }
 
-    /// Add a layer name pattern to the FP32-pinned list.
-    pub fn pin_fp32_layer(&mut self, layer: impl Into<String>) {
-        self.fp32_layers.push(layer.into());
+    /// Perform a mixed-precision gradient-processing step over all six
+    /// Gaussian parameter groups (position, rotation, scale, opacity, SH,
+    /// offset) in one call.
+    ///
+    /// This is [`step`](Self::step) generalized from a single flat gradient
+    /// slice to a full [`Gradients`] bundle: it unscales every group
+    /// (divides by the current loss scale), checks all six for NaN/Inf,
+    /// makes one combined overflow decision, and updates the internal
+    /// scaler accordingly. Returns `true` if the optimizer step should
+    /// proceed (no overflow in any group).
+    pub fn step_gradients(&mut self, grads: &mut Gradients) -> bool {
+        let inv_scale = 1.0 / self.scaler.scale();
+        grads.scale(inv_scale);
+        let overflow = LossScaler::has_overflow(&grads.position)
+            || LossScaler::has_overflow(&grads.rotation)
+            || LossScaler::has_overflow(&grads.scale)
+            || LossScaler::has_overflow(&grads.opacity)
+            || LossScaler::has_overflow(&grads.sh)
+            || LossScaler::has_overflow(&grads.offset);
+        self.scaler.update(overflow);
+        !overflow
     }
 
-    /// Return `true` if the given layer name matches any pinned FP32 pattern.
+    /// Full per-iteration gradient handling for the configured precision.
     ///
-    /// Matching is substring-based: if any entry in `fp32_layers` is contained
-    /// in `layer_name` the layer is considered pinned.
-    pub fn is_fp32_pinned(&self, layer_name: &str) -> bool {
-        self.fp32_layers
-            .iter()
-            .any(|pattern| layer_name.contains(pattern.as_str()))
+    /// This is the form the training loop wants: one call that
+    ///
+    /// 1. returns `true` immediately when the precision needs no scaling
+    ///    ([`TrainingPrecision::requires_scaling`]) — `Float32` never touches
+    ///    the gradients;
+    /// 2. otherwise **scales** every group by the current loss scale, which is
+    ///    what makes an FP16/BF16-range overflow observable at all (a value
+    ///    that overflows only after scaling stays `inf` through the unscale);
+    /// 3. **unscales** and makes ONE overflow decision across all six groups;
+    /// 4. updates the dynamic loss scale accordingly.
+    ///
+    /// Returns `true` when the optimizer step should proceed.  Prefer this over
+    /// open-coding `Gradients::scale` plus six [`LossScaler::has_overflow`]
+    /// calls: split across a call site those four steps drift apart, and a
+    /// per-group decision would skip only *some* groups, silently biasing the
+    /// update towards whichever groups did not overflow.
+    pub fn process(&mut self, grads: &mut Gradients) -> bool {
+        if !self.precision.requires_scaling() {
+            return true;
+        }
+        grads.scale(self.scaler.scale());
+        self.step_gradients(grads)
     }
 
     /// Format a one-line statistics summary.
@@ -595,13 +628,40 @@ mod tests {
     }
 
     #[test]
-    fn test_fp32_pinned_layers() {
+    fn test_step_gradients_clean_returns_true_and_unscales() {
+        let mut t = MixedPrecisionTrainer::float16(); // scale = 65536.0
+        let mut grads = Gradients::zeros(2, 3);
+        grads.position.fill(65536.0 * 0.5);
+        grads.rotation.fill(65536.0 * 0.25);
+        grads.scale.fill(65536.0 * 0.1);
+        grads.opacity.fill(65536.0 * 0.2);
+        grads.sh.fill(65536.0 * 0.05);
+        grads.offset.fill(65536.0 * 0.3);
+
+        let should_step = t.step_gradients(&mut grads);
+        assert!(should_step, "clean gradients must not report overflow");
+        for &v in &grads.position {
+            assert!((v - 0.5).abs() < 1e-3, "position should be unscaled: {v}");
+        }
+        for &v in &grads.sh {
+            assert!((v - 0.05).abs() < 1e-3, "sh should be unscaled: {v}");
+        }
+        assert_eq!(t.scaler.stats().overflow_count, 0);
+    }
+
+    #[test]
+    fn test_step_gradients_overflow_in_any_group_returns_false() {
         let mut t = MixedPrecisionTrainer::float16();
-        t.pin_fp32_layer("layer_norm");
-        t.pin_fp32_layer("softmax");
-        assert!(t.is_fp32_pinned("model.encoder.layer_norm.weight"));
-        assert!(t.is_fp32_pinned("output.softmax.bias"));
-        assert!(!t.is_fp32_pinned("model.attention.query.weight"));
+        let mut grads = Gradients::zeros(1, 3);
+        // Overflow confined to a single group (sh) must still be detected
+        // as a combined overflow across all six groups.
+        grads.sh[0] = f32::NAN;
+        let should_step = t.step_gradients(&mut grads);
+        assert!(
+            !should_step,
+            "NaN in any single group must block the optimizer step"
+        );
+        assert_eq!(t.scaler.stats().overflow_count, 1);
     }
 
     #[test]
@@ -640,5 +700,75 @@ mod tests {
             512.0,
             "scale must remain at post-overflow value after fewer successes than window"
         );
+    }
+
+    // ---- process(): the whole per-iteration decision in one call ----------
+
+    fn filled_gradients(value: f32) -> Gradients {
+        let mut grads = Gradients::zeros(2, 3);
+        grads.position.iter_mut().for_each(|g| *g = value);
+        grads.rotation.iter_mut().for_each(|g| *g = value);
+        grads.scale.iter_mut().for_each(|g| *g = value);
+        grads.opacity.iter_mut().for_each(|g| *g = value);
+        grads.sh.iter_mut().for_each(|g| *g = value);
+        grads.offset.iter_mut().for_each(|g| *g = value);
+        grads
+    }
+
+    #[test]
+    fn process_is_a_no_op_in_full_precision() {
+        let mut trainer = MixedPrecisionTrainer::float32();
+        let mut grads = filled_gradients(0.25);
+        assert!(trainer.process(&mut grads));
+        // Float32 needs no scaling, so nothing may be touched.
+        assert!(grads.position.iter().all(|g| *g == 0.25));
+        assert!(grads.offset.iter().all(|g| *g == 0.25));
+    }
+
+    #[test]
+    fn process_round_trips_the_scale_and_reports_one_decision() {
+        let mut trainer = MixedPrecisionTrainer::bfloat16();
+        let mut grads = filled_gradients(0.5);
+        assert!(trainer.process(&mut grads));
+        // scale then unscale must leave the value intact...
+        for g in grads.position.iter() {
+            assert!((g - 0.5).abs() < 1e-6, "value drifted to {g}");
+        }
+        // ...and every group must have been visited, offset included.
+        for g in grads.offset.iter() {
+            assert!((g - 0.5).abs() < 1e-6, "offset drifted to {g}");
+        }
+    }
+
+    #[test]
+    fn process_makes_one_overflow_decision_across_all_six_groups() {
+        let mut trainer = MixedPrecisionTrainer::float16();
+        let before = trainer.scaler.scale();
+
+        // A NaN in the LAST group (offset) must still veto the step: a
+        // per-group decision would have stepped the other five.
+        let mut grads = filled_gradients(0.1);
+        grads.offset[0] = f32::NAN;
+        assert!(!trainer.process(&mut grads));
+        assert!(
+            trainer.scaler.scale() < before,
+            "the loss scale must back off after an overflow"
+        );
+
+        // A clean batch proceeds.
+        let mut clean = filled_gradients(0.1);
+        assert!(trainer.process(&mut clean));
+    }
+
+    #[test]
+    fn process_detects_an_overflow_only_scaling_makes_visible() {
+        // The scale step is not decorative: a value that is finite before
+        // scaling but overflows FP16 range after it is exactly what dynamic
+        // loss scaling exists to catch.
+        let mut trainer = MixedPrecisionTrainer::float16();
+        let huge = f32::MAX / 2.0;
+        let mut grads = filled_gradients(huge);
+        assert!(huge.is_finite());
+        assert!(!trainer.process(&mut grads));
     }
 }

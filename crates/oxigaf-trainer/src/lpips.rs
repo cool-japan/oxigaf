@@ -87,7 +87,27 @@ pub struct VggFeatureExtractor {
 
 impl VggFeatureExtractor {
     /// Create a new VGG feature extractor with weights loaded from safetensors.
+    ///
+    /// # Safety
+    ///
+    /// This memory-maps `weights_path` for the lifetime of the returned
+    /// extractor's internal tensors. The caller must ensure the file is not
+    /// truncated, modified, or removed for as long as this extractor (or any
+    /// tensor derived from it) is alive — a racing write to a memory-mapped
+    /// file is undefined behaviour (it can surface as `SIGBUS` or silently
+    /// torn/garbage reads), not a catchable `Err`. For weight files of
+    /// unknown provenance or files that may be concurrently written, prefer
+    /// loading via [`from_varbuilder`](Self::from_varbuilder) with a
+    /// `VarBuilder` built from `candle_core::safetensors::load` (which reads
+    /// the file fully into memory) instead of this mmap-based path.
     pub fn from_safetensors(weights_path: &Path, device: &Device) -> Result<Self, TrainerError> {
+        // SAFETY: `VarBuilder::from_mmaped_safetensors` memory-maps
+        // `weights_path`. Per this function's `# Safety` contract (above),
+        // the caller guarantees the file is not mutated or truncated for the
+        // lifetime of the resulting `VarBuilder`/`VggFeatureExtractor`; under
+        // that invariant the mapped bytes stay a stable, valid safetensors
+        // image for the duration of this call and of subsequent tensor
+        // reads through it.
         let vb = unsafe {
             VarBuilder::from_mmaped_safetensors(&[weights_path], DType::F32, device)
                 .map_err(|e| TrainerError::Loss(format!("Failed to load VGG weights: {e}")))?
@@ -317,13 +337,24 @@ impl LpipsWeights {
     }
 
     /// Create with uniform weights (equal contribution from each layer).
+    ///
+    /// This is a non-standard fallback for when no learned LPIPS linear
+    /// weights are available (see [`Self::from_safetensors`] for the
+    /// reference-accurate path). Each channel is weighted by `1/channels`,
+    /// so — combined with [`LpipsDistance::compute`]'s spatial-only
+    /// normalization — this variant computes a *mean* squared feature
+    /// difference across channels for each layer, rather than the learned
+    /// weighted *sum* the reference LPIPS formula uses. That keeps layers
+    /// with very different channel counts (64 vs. 512) from dominating the
+    /// total distance purely due to their width.
     pub fn uniform(device: &Device) -> Result<Self, TrainerError> {
         let mut weights = Vec::with_capacity(5);
         for &channels in &Self::CHANNELS {
             // 1x1 conv: [1, C, 1, 1]
             let w = Tensor::ones((1, channels, 1, 1), DType::F32, device)
                 .map_err(|e| TrainerError::Loss(format!("Failed to create uniform weight: {e}")))?;
-            // Scale by 1/channels for normalization
+            // Scale by 1/channels so the per-layer contribution is a mean
+            // (not a sum) over channels — see the doc comment above.
             let w = (w / channels as f64)
                 .map_err(|e| TrainerError::Loss(format!("Failed to scale weight: {e}")))?;
             weights.push(w);
@@ -434,10 +465,23 @@ impl LpipsDistance {
                 .to_scalar::<f32>()
                 .map_err(|e| TrainerError::Loss(format!("To scalar failed: {e}")))?;
 
-            // Normalize by spatial dimensions
+            // Normalize by batch × spatial dimensions only (B×H×W), matching
+            // the reference LPIPS formula: the weighted squared difference is
+            // *summed* over channels (that sum already happened via the
+            // `broadcast_mul` + `sum_all` above, folding in the per-channel
+            // weight) and only *averaged* over the spatial extent. Dividing
+            // by the channel count too (i.e. by the full B×C×H×W element
+            // count) would silently rescale every layer by 1/C, and C
+            // differs per VGG layer (64, 128, 256, 512, 512), so the
+            // relative weighting between layers would be wrong.
             let dims = diff_sq.dims();
-            let n_elements = dims.iter().product::<usize>().max(1);
-            total_dist += layer_dist / n_elements as f32;
+            let denom = if dims.len() == 4 {
+                // NCHW: batch × height × width, excluding the channel axis.
+                (dims[0] * dims[2] * dims[3]).max(1)
+            } else {
+                dims.iter().product::<usize>().max(1)
+            };
+            total_dist += layer_dist / denom as f32;
         }
 
         Ok(total_dist)
@@ -558,13 +602,25 @@ fn load_safetensors(
     for (name, view) in tensors.tensors() {
         let shape: Vec<usize> = view.shape().to_vec();
 
-        // Only support F32 for now
-        if view.dtype() != safetensors::Dtype::F32 {
-            continue;
-        }
-
-        let data: &[f32] = bytemuck::cast_slice(view.data());
-        let tensor = Tensor::from_slice(data, &shape[..], device)
+        // Build the tensor via candle's own raw-buffer loader instead of
+        // `bytemuck::cast_slice`: `view.data()`'s alignment depends on the
+        // file-controlled header length, so a malformed or merely
+        // differently-laid-out `.safetensors` file can hand back a slice
+        // that is not 4-byte aligned (or not a multiple-of-4 length), which
+        // `bytemuck::cast_slice` turns into a process panic instead of an
+        // `Err`. `Tensor::from_raw_buffer` checks alignment itself and falls
+        // back to a safe copy when needed, and (unlike the old "F32 only"
+        // path) natively understands every dtype safetensors can carry
+        // (F16/BF16 included), so a half-precision checkpoint loads
+        // correctly instead of silently vanishing from the weight map.
+        let dtype = DType::try_from(view.dtype()).map_err(|e| {
+            TrainerError::Loss(format!(
+                "Tensor {name}: unsupported safetensors dtype {:?}: {e}",
+                view.dtype()
+            ))
+        })?;
+        let tensor = Tensor::from_raw_buffer(view.data(), dtype, &shape, device)
+            .and_then(|t| t.to_dtype(DType::F32))
             .map_err(|e| TrainerError::Loss(format!("Failed to create tensor {name}: {e}")))?;
 
         result.insert(name.to_string(), tensor);
@@ -576,6 +632,67 @@ fn load_safetensors(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn test_load_safetensors_f32_roundtrip() {
+        let device = Device::Cpu;
+        let tensor = Tensor::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], (2, 2), &device)
+            .expect("failed to build tensor");
+        let path = std::env::temp_dir().join(format!(
+            "oxigaf_lpips_test_f32_{}_{}.safetensors",
+            std::process::id(),
+            "roundtrip"
+        ));
+        tensor
+            .save_safetensors("w", &path)
+            .expect("failed to save safetensors");
+
+        let loaded = load_safetensors(&path, &device)
+            .expect("load_safetensors must not panic or error on a valid F32 file");
+        let t = loaded.get("w").expect("missing tensor 'w'");
+        assert_eq!(t.dims(), &[2, 2]);
+        let data = t.to_vec2::<f32>().expect("to_vec2 failed");
+        assert_eq!(data, vec![vec![1.0, 2.0], vec![3.0, 4.0]]);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn test_load_safetensors_f16_converts_to_f32() {
+        // Regression test: `load_safetensors` used to silently `continue`
+        // past any non-F32 tensor (see the "Only support F32 for now"
+        // comment this replaced), so an F16 checkpoint would load as a
+        // silently incomplete weight map. It should now convert instead.
+        let device = Device::Cpu;
+        let values = [0.5_f32, -1.25, 2.0, 4.0];
+        let tensor = Tensor::from_slice(&values, (4,), &device)
+            .expect("failed to build tensor")
+            .to_dtype(DType::F16)
+            .expect("failed to cast to f16");
+        let path = std::env::temp_dir().join(format!(
+            "oxigaf_lpips_test_f16_{}_{}.safetensors",
+            std::process::id(),
+            "convert"
+        ));
+        tensor
+            .save_safetensors("w", &path)
+            .expect("failed to save safetensors");
+
+        let loaded = load_safetensors(&path, &device)
+            .expect("load_safetensors must convert F16 tensors instead of silently dropping them");
+        let t = loaded
+            .get("w")
+            .expect("F16 tensor should not have been silently skipped");
+        assert_eq!(t.dtype(), DType::F32, "loaded tensor should be F32");
+        let data = t.to_vec1::<f32>().expect("to_vec1 failed");
+        for (a, b) in data.iter().zip(values.iter()) {
+            assert!((a - b).abs() < 1e-2, "got {a}, expected {b}");
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
 
     #[test]
     fn test_hwc_to_nchw_conversion() {

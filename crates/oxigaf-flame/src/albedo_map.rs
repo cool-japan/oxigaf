@@ -1393,7 +1393,7 @@ mod tests {
         // the historical bug where a single constant was shared between the
         // m=-2 and m=+2 basis functions, which must differ (they are not
         // related by a sign flip like the m=-1/+1 and m=-3/+3 pairs are).
-        const REF_M3_P3: f32 = 0.590_043_59; // m = -3, +3
+        const REF_M3_P3: f32 = 0.590_043_6; // m = -3, +3
         const REF_M2: f32 = 2.890_611_4; // m = -2
         const REF_M1_P1: f32 = 0.457_045_8; // m = -1, +1
         const REF_0: f32 = 0.373_176_33; // m = 0

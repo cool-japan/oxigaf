@@ -10,6 +10,8 @@
 use std::fmt;
 use thiserror::Error;
 
+use oxigaf_render::gaussian::GaussianModel;
+
 // ---------------------------------------------------------------------------
 // xorshift64 PRNG (inline, matching session_recorder.rs pattern)
 // ---------------------------------------------------------------------------
@@ -192,9 +194,22 @@ impl DataSplit {
                 val_indices.sort_unstable();
                 val_indices.dedup();
 
-                let train_indices: Vec<usize> = (0..total_frames)
-                    .filter(|i| !val_indices.contains(i))
-                    .collect();
+                // `val_indices` is sorted, so the training set (every index
+                // in `0..total_frames` not in `val_indices`) is built with a
+                // single O(total_frames) linear merge instead of an O(len)
+                // `contains` scan per frame (previously O(total_frames *
+                // val_indices.len()) — ~1e9 comparisons for a 100k-frame
+                // sequence with a 10k-frame validation set).
+                let mut train_indices =
+                    Vec::with_capacity(total_frames.saturating_sub(val_indices.len()));
+                let mut val_pos = 0usize;
+                for i in 0..total_frames {
+                    if val_pos < val_indices.len() && val_indices[val_pos] == i {
+                        val_pos += 1;
+                    } else {
+                        train_indices.push(i);
+                    }
+                }
 
                 if train_indices.is_empty() && total_frames > 0 {
                     return Err(SplitError::EmptyTrainSet);
@@ -224,8 +239,16 @@ impl DataSplit {
         self.val_indices.len() as f32 / self.total_frames as f32
     }
 
+    /// Whether `idx` is a validation frame.
+    ///
+    /// `O(log val_count)`: every [`SplitStrategy`] arm leaves `val_indices`
+    /// sorted ascending (`LastN`/`EveryNth` build it in order;
+    /// `RandomFraction`/`Manual` sort explicitly before returning), so a
+    /// binary search is always valid here — this is the natural per-frame
+    /// hot-path query during training, previously an `O(val_count)` linear
+    /// `contains` scan per call.
     pub fn is_val_frame(&self, idx: usize) -> bool {
-        self.val_indices.contains(&idx)
+        self.val_indices.binary_search(&idx).is_ok()
     }
 
     pub fn format_summary(&self) -> String {
@@ -397,7 +420,10 @@ pub struct EarlyStopperConfig {
     pub patience: usize,
     /// Minimum improvement to count as progress.
     pub min_delta: f32,
-    /// Conceptually restore best parameters (tracked only, no actual weight copy).
+    /// Whether [`EarlyStopper::record_val_with_model`] should snapshot the
+    /// model whenever it sees a new best, so [`EarlyStopper::restore_best_into`]
+    /// can later restore it. Has no effect on [`EarlyStopper::record_val`],
+    /// which never sees a model to snapshot.
     pub restore_best: bool,
     /// Which metric to monitor.
     pub monitor_metric: MonitorMetric,
@@ -425,6 +451,12 @@ pub struct EarlyStopper {
     steps_without_improvement: usize,
     best_step: usize,
     pub stopped: bool,
+    /// Snapshot of the model captured at `best_step`, when
+    /// [`Self::record_val_with_model`] was used and `config.restore_best`
+    /// was set at that improving step. `None` if no such snapshot has been
+    /// captured yet (including: only plain [`Self::record_val`] has been
+    /// called so far, or `restore_best` was `false`).
+    best_weights: Option<GaussianModel>,
 }
 
 impl fmt::Debug for EarlyStopper {
@@ -435,6 +467,7 @@ impl fmt::Debug for EarlyStopper {
             .field("steps_without_improvement", &self.steps_without_improvement)
             .field("best_step", &self.best_step)
             .field("stopped", &self.stopped)
+            .field("has_best_weights", &self.best_weights.is_some())
             .finish()
     }
 }
@@ -451,11 +484,16 @@ impl EarlyStopper {
             steps_without_improvement: 0,
             best_step: 0,
             stopped: false,
+            best_weights: None,
         }
     }
 
-    /// Record a validation result. Returns true if training should stop.
-    pub fn record_val(&mut self, step: usize, val_psnr: f32, val_loss: f32) -> bool {
+    /// Core bookkeeping shared by [`Self::record_val`] and
+    /// [`Self::record_val_with_model`]. Returns whether this call was a new
+    /// best (i.e. whether a caller wanting to snapshot weights should do so
+    /// now) — `self.stopped` carries the "should training stop" signal, as
+    /// it did before this was split out.
+    fn record_val_core(&mut self, step: usize, val_psnr: f32, val_loss: f32) -> bool {
         let current = match self.config.monitor_metric {
             MonitorMetric::ValPsnr => val_psnr,
             MonitorMetric::ValLoss => val_loss,
@@ -478,7 +516,63 @@ impl EarlyStopper {
             self.stopped = true;
         }
 
+        is_better
+    }
+
+    /// Record a validation result. Returns true if training should stop.
+    ///
+    /// Does **not** capture a weight snapshot even when
+    /// `config.restore_best` is set — [`Self::restore_best_into`] will have
+    /// nothing to restore unless [`Self::record_val_with_model`] is used
+    /// instead (this variant exists because `EarlyStopper` cannot see the
+    /// model on its own; see [`Self::record_val_with_model`] for the
+    /// implementation of what `restore_best` actually promises).
+    pub fn record_val(&mut self, step: usize, val_psnr: f32, val_loss: f32) -> bool {
+        self.record_val_core(step, val_psnr, val_loss);
         self.stopped
+    }
+
+    /// Record a validation result exactly like [`Self::record_val`], and —
+    /// when `config.restore_best` is set and this step is a new best —
+    /// additionally clone `model` into an internal snapshot that
+    /// [`Self::restore_best_into`] can later restore.
+    ///
+    /// The snapshot is a full clone of `model`, so this is only as cheap as
+    /// cloning a [`GaussianModel`]; call it at your validation cadence, not
+    /// every training step.
+    pub fn record_val_with_model(
+        &mut self,
+        step: usize,
+        val_psnr: f32,
+        val_loss: f32,
+        model: &GaussianModel,
+    ) -> bool {
+        let improved = self.record_val_core(step, val_psnr, val_loss);
+        if improved && self.config.restore_best {
+            self.best_weights = Some(model.clone());
+        }
+        self.stopped
+    }
+
+    /// Whether a weight snapshot is available for [`Self::restore_best_into`]
+    /// to restore.
+    pub fn has_best_weights(&self) -> bool {
+        self.best_weights.is_some()
+    }
+
+    /// Overwrite `model` with the snapshot captured at [`Self::best_step`],
+    /// if one exists. Returns `true` if a snapshot was restored, `false`
+    /// (leaving `model` untouched) if none is available — e.g. only
+    /// [`Self::record_val`] has been called so far, or `config.restore_best`
+    /// was `false` at every improving step.
+    pub fn restore_best_into(&self, model: &mut GaussianModel) -> bool {
+        match &self.best_weights {
+            Some(snapshot) => {
+                *model = snapshot.clone();
+                true
+            }
+            None => false,
+        }
     }
 
     pub fn should_stop(&self) -> bool {
@@ -711,6 +805,32 @@ mod tests {
     }
 
     #[test]
+    fn test_is_val_frame_out_of_range_idx_does_not_panic() -> Result<(), SplitError> {
+        let split = DataSplit::from_strategy(&SplitStrategy::LastN(3), 10)?;
+        assert!(!split.is_val_frame(1_000));
+        Ok(())
+    }
+
+    #[test]
+    fn test_split_manual_empty_val_indices() -> Result<(), SplitError> {
+        let split = DataSplit::from_strategy(&SplitStrategy::Manual(vec![]), 5)?;
+        assert!(split.val_indices.is_empty());
+        assert_eq!(split.train_indices, vec![0, 1, 2, 3, 4]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_split_manual_first_and_last_frame_val() -> Result<(), SplitError> {
+        // Exercises the O(n) merge's boundary conditions: val index 0
+        // (consumed on the very first loop iteration) and val index ==
+        // total_frames - 1 (consumed on the very last).
+        let split = DataSplit::from_strategy(&SplitStrategy::Manual(vec![0, 9]), 10)?;
+        assert_eq!(split.val_indices, vec![0, 9]);
+        assert_eq!(split.train_indices, (1..9).collect::<Vec<_>>());
+        Ok(())
+    }
+
+    #[test]
     fn test_split_fraction() -> Result<(), SplitError> {
         let split = DataSplit::from_strategy(&SplitStrategy::LastN(2), 10)?;
         let frac = split.val_fraction();
@@ -873,6 +993,87 @@ mod tests {
         stopper.record_val(10, 28.0, 0.6);
         assert_eq!(stopper.best_step(), 5);
         assert!((stopper.best_value() - 30.0).abs() < 1e-6);
+    }
+
+    fn make_test_model(marker: f32) -> GaussianModel {
+        GaussianModel {
+            gaussians: vec![oxigaf_render::gaussian::GaussianAttributes {
+                position: [marker, 0.0, 0.0],
+                _pad0: 0.0,
+                rotation: [0.0, 0.0, 0.0, 1.0],
+                scale: [0.0; 3],
+                opacity: 0.0,
+            }],
+            sh_coeffs: vec![0.0; 3],
+            sh_degree: 0,
+            face_indices: vec![0],
+            barycentric: vec![[1.0 / 3.0; 3]],
+            local_offsets: vec![[0.0; 3]],
+            is_rigid: vec![true],
+        }
+    }
+
+    #[test]
+    fn test_early_stopper_restore_best_into_false_without_snapshot() {
+        // Regression: `restore_best` was documented as "tracked only, no
+        // actual weight copy" — a caller enabling it got the final (worse)
+        // weights instead of the best ones. Plain `record_val` still takes
+        // no model, so there is genuinely nothing to restore.
+        let config = EarlyStopperConfig::default(); // restore_best: true
+        let mut stopper = EarlyStopper::new(config);
+        stopper.record_val(0, 25.0, 0.5);
+        assert!(!stopper.has_best_weights());
+        let mut model = make_test_model(0.0);
+        assert!(!stopper.restore_best_into(&mut model));
+        assert_eq!(
+            model.gaussians[0].position[0], 0.0,
+            "untouched when nothing to restore"
+        );
+    }
+
+    #[test]
+    fn test_early_stopper_record_val_with_model_captures_and_restores_best() {
+        let config = EarlyStopperConfig {
+            patience: 10,
+            min_delta: 0.0,
+            restore_best: true,
+            monitor_metric: MonitorMetric::ValPsnr,
+        };
+        let mut stopper = EarlyStopper::new(config);
+
+        // Step 0: first result, always an improvement over -inf.
+        stopper.record_val_with_model(0, 20.0, 0.9, &make_test_model(1.0));
+        assert!(stopper.has_best_weights());
+
+        // Step 1: worse — must NOT overwrite the step-0 snapshot.
+        stopper.record_val_with_model(1, 15.0, 1.0, &make_test_model(2.0));
+
+        // Step 2: new best — snapshot should now be step 2's model.
+        stopper.record_val_with_model(2, 30.0, 0.5, &make_test_model(3.0));
+        assert_eq!(stopper.best_step(), 2);
+
+        let mut model = make_test_model(0.0);
+        assert!(stopper.restore_best_into(&mut model));
+        assert_eq!(
+            model.gaussians[0].position[0], 3.0,
+            "restored snapshot must be the one taken at the actual best step"
+        );
+    }
+
+    #[test]
+    fn test_early_stopper_record_val_with_model_respects_restore_best_flag() {
+        let config = EarlyStopperConfig {
+            patience: 10,
+            min_delta: 0.0,
+            restore_best: false, // explicitly disabled
+            monitor_metric: MonitorMetric::ValPsnr,
+        };
+        let mut stopper = EarlyStopper::new(config);
+        stopper.record_val_with_model(0, 20.0, 0.9, &make_test_model(1.0));
+        assert!(
+            !stopper.has_best_weights(),
+            "restore_best: false must never capture a snapshot"
+        );
     }
 
     #[test]

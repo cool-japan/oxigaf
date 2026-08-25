@@ -42,7 +42,12 @@ use candle_core::{DType, Device, Result, Tensor, D};
 use candle_nn as nn;
 use candle_nn::Module;
 
+use std::sync::Arc;
+
 use crate::attention_masking::AttentionMask;
+use crate::config::{AttentionBackend, DiffusionConfig};
+use crate::kv_cache::{CacheKeyBuilder, KVCache};
+use crate::sliced_attention::{SlicedAttention, SlicedAttentionConfig};
 
 #[cfg(feature = "flash_attention")]
 use crate::flash_attention::{FlashAttention, FlashAttentionConfig};
@@ -144,6 +149,89 @@ pub struct CrossAttention {
     flash_attention: Option<FlashAttention>,
     /// Whether to use flash attention for this module
     use_flash_attention: bool,
+    /// Kernel this layer dispatches to; see [`AttentionBackend`].
+    backend: AttentionBackend,
+    /// Chunked-query kernel, built when `backend == AttentionBackend::Sliced`.
+    sliced: SlicedHandle,
+}
+
+/// An optional [`SlicedAttention`] that can live inside a `#[derive(Debug)]`
+/// model type.
+///
+/// [`SlicedAttention`] does not implement `Debug`, so storing it directly would
+/// force a hand-written `Debug` on [`CrossAttention`] and every model type that
+/// contains one. This newtype absorbs that, printing only whether the kernel is
+/// selected.
+#[derive(Default)]
+struct SlicedHandle(Option<SlicedAttention>);
+
+impl SlicedHandle {
+    /// The kernel, when this layer selected it.
+    fn get(&self) -> Option<&SlicedAttention> {
+        self.0.as_ref()
+    }
+}
+
+impl std::fmt::Debug for SlicedHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(_) => f.write_str("SlicedHandle(enabled)"),
+            None => f.write_str("SlicedHandle(none)"),
+        }
+    }
+}
+
+/// How one attention layer should be built.
+///
+/// Bundles the head geometry with the kernel selection so the constructors
+/// that thread it from [`crate::config::DiffusionConfig`] down to
+/// [`CrossAttention`] stay within a readable argument count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttentionSpec {
+    /// Number of attention heads.
+    pub heads: usize,
+    /// Width of each head.
+    pub dim_head: usize,
+    /// Kernel to run.
+    pub backend: AttentionBackend,
+    /// Tile width for [`AttentionBackend::Flash`].
+    pub flash_block_size: usize,
+    /// Queries per slice for [`AttentionBackend::Sliced`]; `None` = one slice.
+    pub slice_size: Option<usize>,
+}
+
+impl AttentionSpec {
+    /// A spec for `heads × dim_head` running the standard kernel.
+    pub fn standard(heads: usize, dim_head: usize) -> Self {
+        Self {
+            heads,
+            dim_head,
+            backend: AttentionBackend::Standard,
+            flash_block_size: 64,
+            slice_size: Some(64),
+        }
+    }
+
+    /// Derive the head geometry and kernel selection from a model config.
+    ///
+    /// Uses [`crate::config::DiffusionConfig::resolved_attention_backend`], so
+    /// both the legacy `use_flash_attention` flag and the newer
+    /// `attention_backend` selector are honoured.
+    pub fn from_config(config: &DiffusionConfig, heads: usize, dim_head: usize) -> Self {
+        Self {
+            heads,
+            dim_head,
+            backend: config.resolved_attention_backend(),
+            flash_block_size: config.flash_attention_block_size,
+            slice_size: config.attention_slice_size,
+        }
+    }
+
+    /// The same spec with a different kernel.
+    pub fn with_backend(mut self, backend: AttentionBackend) -> Self {
+        self.backend = backend;
+        self
+    }
 }
 
 impl CrossAttention {
@@ -160,6 +248,9 @@ impl CrossAttention {
 
     /// Create a new cross-attention module with optional flash attention.
     ///
+    /// Equivalent to [`Self::with_spec`] with a spec whose backend is
+    /// [`AttentionBackend::Flash`] or [`AttentionBackend::Standard`].
+    ///
     /// # Arguments
     ///
     /// * `vs` - Variable builder for weight initialization
@@ -169,7 +260,6 @@ impl CrossAttention {
     /// * `dim_head` - Dimension per head
     /// * `use_flash_attention` - Whether to use flash attention
     /// * `flash_block_size` - Block size for flash attention tiling
-    #[allow(unused_variables)]
     pub fn new_with_flash(
         vs: nn::VarBuilder,
         query_dim: usize,
@@ -179,6 +269,45 @@ impl CrossAttention {
         use_flash_attention: bool,
         flash_block_size: usize,
     ) -> Result<Self> {
+        let backend = if use_flash_attention {
+            AttentionBackend::Flash
+        } else {
+            AttentionBackend::Standard
+        };
+        Self::with_spec(
+            vs,
+            query_dim,
+            context_dim,
+            &AttentionSpec {
+                heads,
+                dim_head,
+                backend,
+                flash_block_size,
+                slice_size: None,
+            },
+        )
+    }
+
+    /// Create a cross-attention module for an explicit [`AttentionSpec`].
+    ///
+    /// This is the constructor the U-Net uses, and the only one that can select
+    /// [`AttentionBackend::Sliced`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates weight-loading failures, and reports a
+    /// [`SlicedAttentionConfig`] that [`SlicedAttention::new`] rejects (a zero
+    /// head count, head width or slice size) as
+    /// [`candle_core::Error::Msg`].
+    pub fn with_spec(
+        vs: nn::VarBuilder,
+        query_dim: usize,
+        context_dim: Option<usize>,
+        spec: &AttentionSpec,
+    ) -> Result<Self> {
+        let heads = spec.heads;
+        let dim_head = spec.dim_head;
+        let use_flash_attention = spec.backend == AttentionBackend::Flash;
         let inner_dim = dim_head * heads;
         let context_dim = context_dim.unwrap_or(query_dim);
         let scale = 1.0 / (dim_head as f64).sqrt();
@@ -190,10 +319,19 @@ impl CrossAttention {
         // Initialize flash attention if feature is enabled and requested
         #[cfg(feature = "flash_attention")]
         let flash_attention = if use_flash_attention {
-            let config = FlashAttentionConfig::with_block_size(flash_block_size);
+            let config = FlashAttentionConfig::with_block_size(spec.flash_block_size);
             Some(FlashAttention::new(dim_head, config))
         } else {
             None
+        };
+
+        let sliced = if spec.backend == AttentionBackend::Sliced {
+            let config = SlicedAttentionConfig::new(spec.slice_size, heads, dim_head);
+            SlicedHandle(Some(SlicedAttention::new(config).map_err(|e| {
+                candle_core::Error::Msg(format!("sliced attention: {e}"))
+            })?))
+        } else {
+            SlicedHandle::default()
         };
 
         Ok(Self {
@@ -207,7 +345,14 @@ impl CrossAttention {
             #[cfg(feature = "flash_attention")]
             flash_attention,
             use_flash_attention,
+            backend: spec.backend,
+            sliced,
         })
+    }
+
+    /// The kernel this layer dispatches to.
+    pub fn backend(&self) -> AttentionBackend {
+        self.backend
     }
 
     /// Scaled-dot-product attention (standard or flash based on configuration).
@@ -255,22 +400,46 @@ impl CrossAttention {
             .transpose(1, 2)?
             .contiguous()?;
 
-        // Dispatch to flash attention or standard attention. A mask always
-        // routes through standard_attention, since flash attention has no
-        // additive-bias support here.
-        #[cfg(feature = "flash_attention")]
-        let out = if attn_mask.is_none() {
-            if let Some(flash) = &self.flash_attention {
-                flash.forward(&q, &k, &v)?
-            } else {
-                self.standard_attention(&q, &k, &v, attn_mask)?
-            }
-        } else {
-            self.standard_attention(&q, &k, &v, attn_mask)?
-        };
+        self.attend(&q, &k, &v, attn_mask, b, seq_len)
+    }
 
-        #[cfg(not(feature = "flash_attention"))]
-        let out = self.standard_attention(&q, &k, &v, attn_mask)?;
+    /// Run the attention kernel over already-projected `(B, heads, seq, dim)`
+    /// tensors and apply the output projection.
+    ///
+    /// Shared by [`Self::forward_masked`] and [`Self::forward_cached`] so both
+    /// take the identical flash/standard dispatch.
+    fn attend(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        attn_mask: Option<&Tensor>,
+        b: usize,
+        seq_len: usize,
+    ) -> Result<Tensor> {
+        // A mask always routes through standard_attention: neither the flash
+        // nor the sliced kernel supports an additive bias.
+        let out = match self.sliced.get() {
+            Some(sliced) if attn_mask.is_none() => self.sliced_attention(sliced, q, k, v)?,
+            _ => {
+                #[cfg(feature = "flash_attention")]
+                {
+                    if attn_mask.is_none() {
+                        if let Some(flash) = &self.flash_attention {
+                            flash.forward(q, k, v)?
+                        } else {
+                            self.standard_attention(q, k, v, attn_mask)?
+                        }
+                    } else {
+                        self.standard_attention(q, k, v, attn_mask)?
+                    }
+                }
+                #[cfg(not(feature = "flash_attention"))]
+                {
+                    self.standard_attention(q, k, v, attn_mask)?
+                }
+            }
+        };
 
         // Reshape back to (B, seq, inner_dim)
         let out = out
@@ -278,6 +447,125 @@ impl CrossAttention {
             .contiguous()?
             .reshape((b, seq_len, ()))?;
         self.to_out.forward(&out)
+    }
+
+    /// Chunked-query attention via [`crate::sliced_attention`].
+    ///
+    /// That kernel works on flat `f32` buffers, so `q`/`k`/`v` are read back to
+    /// the host and the result is rebuilt as a tensor. The round trip is the
+    /// price of bounding peak score-matrix memory at
+    /// `slice_size × ctx_len` instead of `seq_len × ctx_len`; a non-`f32` input
+    /// takes the standard path instead of being silently downcast.
+    fn sliced_attention(
+        &self,
+        sliced: &SlicedAttention,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+    ) -> Result<Tensor> {
+        if q.dtype() != DType::F32 {
+            return self.standard_attention(q, k, v, None);
+        }
+        let (batch, _, seq_len_q, _) = q.dims4()?;
+        let seq_len_k = k.dim(2)?;
+
+        let read = |t: &Tensor| -> Result<Vec<f32>> { t.flatten_all()?.to_vec1::<f32>() };
+        let out = sliced
+            .forward(&read(q)?, &read(k)?, &read(v)?, batch, seq_len_q, seq_len_k)
+            .map_err(|e| candle_core::Error::Msg(format!("sliced attention: {e}")))?;
+
+        Tensor::from_vec(
+            out,
+            (batch, self.heads, seq_len_q, self.dim_head),
+            q.device(),
+        )
+    }
+
+    /// Cross-attention whose key/value projections of `context` are served
+    /// from `cache`.
+    ///
+    /// In a diffusion loop the cross-attention context (IP-Adapter CLIP tokens
+    /// here) is *constant* across every denoising timestep, so `to_k(context)`
+    /// and `to_v(context)` recompute the same two matmuls at every step. This
+    /// method computes them once per `key` and replays the stored tensors on
+    /// subsequent steps; the query projection still runs every call because the
+    /// latents change.
+    ///
+    /// `key` must identify both the layer and the conditioning — see
+    /// [`crate::kv_cache::CacheKeyBuilder`]. Reusing a key across different
+    /// conditioning would replay the wrong K/V.
+    ///
+    /// # Falls back to the uncached path
+    ///
+    /// - When `xs` or `context` is not `f32`:
+    ///   [`KVEntry`][crate::kv_cache::KVEntry] stores `f32`, so a cached round
+    ///   trip would silently change the dtype of a mixed-precision run.
+    /// - When a cached entry's declared shape does not match this call's
+    ///   `(batch, heads, ctx_len, dim_head)` — a stale entry is ignored rather
+    ///   than reinterpreted.
+    ///
+    /// Both fallbacks produce exactly the same result as
+    /// [`Self::forward`]; only the cache hit-rate changes.
+    ///
+    /// # Errors
+    ///
+    /// Propagates tensor-operation failures, and surfaces a cache failure as
+    /// [`candle_core::Error::Msg`].
+    pub fn forward_cached(
+        &self,
+        xs: &Tensor,
+        context: &Tensor,
+        cache: &KVCache,
+        key: &str,
+    ) -> Result<Tensor> {
+        if xs.dtype() != DType::F32 || context.dtype() != DType::F32 {
+            return self.forward(xs, Some(context));
+        }
+
+        let (b, seq_len, _) = xs.dims3()?;
+        let ctx_len = context.dim(1)?;
+        let q = self
+            .to_q
+            .forward(xs)?
+            .reshape((b, seq_len, self.heads, self.dim_head))?
+            .transpose(1, 2)?
+            .contiguous()?;
+
+        let project = |linear: &nn::Linear| -> Result<Tensor> {
+            linear
+                .forward(context)?
+                .reshape((b, ctx_len, self.heads, self.dim_head))?
+                .transpose(1, 2)?
+                .contiguous()
+        };
+
+        let entry = cache
+            .get_or_compute(key.to_string(), || {
+                let k = project(&self.to_k)?;
+                let v = project(&self.to_v)?;
+                Ok((
+                    k.flatten_all()?.to_vec1::<f32>()?,
+                    v.flatten_all()?.to_vec1::<f32>()?,
+                    b,
+                    self.heads,
+                    ctx_len,
+                    self.dim_head,
+                ))
+            })
+            .map_err(|e| candle_core::Error::Msg(format!("KV cache: {e}")))?;
+
+        let shape = (b, self.heads, ctx_len, self.dim_head);
+        if (entry.batch, entry.num_heads, entry.seq_k, entry.head_dim) != shape {
+            // A stale entry for this key: recompute without touching it.
+            let k = project(&self.to_k)?;
+            let v = project(&self.to_v)?;
+            return self.attend(&q, &k, &v, None, b, seq_len);
+        }
+
+        let device = xs.device();
+        let k = Tensor::from_slice(&entry.keys, shape, device)?;
+        let v = Tensor::from_slice(&entry.values, shape, device)?;
+        self.attend(&q, &k, &v, None, b, seq_len)
     }
 
     /// Standard O(N^2) scaled-dot-product attention.
@@ -326,6 +614,42 @@ impl CrossAttention {
 }
 
 // ---------------------------------------------------------------------------
+// KV-cache handle
+// ---------------------------------------------------------------------------
+
+/// An optional shared [`KVCache`] that can live inside a `#[derive(Debug)]`
+/// model type.
+///
+/// [`KVCache`] holds a `Mutex<HashMap<..>>` and does not implement `Debug`, so
+/// storing it directly would force a hand-written `Debug` on every enclosing
+/// model struct. This newtype absorbs that: it prints whether a cache is
+/// attached and nothing about its contents (which are large, and behind a lock
+/// that a `Debug` impl must not block on).
+#[derive(Default, Clone)]
+struct KvCacheHandle(Option<Arc<KVCache>>);
+
+impl KvCacheHandle {
+    /// The cache, when one is attached.
+    fn get(&self) -> Option<&KVCache> {
+        self.0.as_deref()
+    }
+
+    /// `true` when a cache is attached.
+    fn is_attached(&self) -> bool {
+        self.0.is_some()
+    }
+}
+
+impl std::fmt::Debug for KvCacheHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(_) => f.write_str("KvCacheHandle(attached)"),
+            None => f.write_str("KvCacheHandle(none)"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Multi-view transformer block
 // ---------------------------------------------------------------------------
 
@@ -361,33 +685,24 @@ pub struct MultiViewTransformerBlock {
     ff: FeedForward,
     /// Number of views
     num_views: usize,
+    /// Shared cross-attention KV cache, when one has been attached.
+    ///
+    /// Only `attn_ip` consults it: the IP-Adapter CLIP tokens are the one
+    /// context that is genuinely constant across every denoising step of a
+    /// run. `attn1`/`attn_cv` derive their K/V from the latents (which change
+    /// every step), and `attn2`'s null context is cheap and stage-shaped.
+    kv_cache: KvCacheHandle,
+    /// Cache key for this block's `attn_ip` K/V projection; identifies both the
+    /// layer and the conditioning it was computed from.
+    ip_cache_key: String,
 }
 
 impl MultiViewTransformerBlock {
     /// Create a new multi-view transformer block with standard attention.
-    pub fn new(
-        vs: nn::VarBuilder,
-        dim: usize,
-        n_heads: usize,
-        d_head: usize,
-        context_dim: usize,
-        ip_dim: usize,
-        num_views: usize,
-    ) -> Result<Self> {
-        Self::new_with_flash(
-            vs,
-            dim,
-            n_heads,
-            d_head,
-            context_dim,
-            ip_dim,
-            num_views,
-            false,
-            64,
-        )
-    }
-
-    /// Create a new multi-view transformer block with optional flash attention.
+    ///
+    /// Convenience wrapper over [`Self::with_spec`] for the standard kernel;
+    /// use `with_spec` directly to select [`AttentionBackend::Flash`] or
+    /// [`AttentionBackend::Sliced`].
     ///
     /// # Arguments
     ///
@@ -398,10 +713,7 @@ impl MultiViewTransformerBlock {
     /// * `context_dim` - Text cross-attention context dimension
     /// * `ip_dim` - IP-adapter context dimension
     /// * `num_views` - Number of views for cross-view attention
-    /// * `use_flash_attention` - Whether to use flash attention
-    /// * `flash_block_size` - Block size for flash attention tiling
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_with_flash(
+    pub fn new(
         vs: nn::VarBuilder,
         dim: usize,
         n_heads: usize,
@@ -409,46 +721,50 @@ impl MultiViewTransformerBlock {
         context_dim: usize,
         ip_dim: usize,
         num_views: usize,
-        use_flash_attention: bool,
-        flash_block_size: usize,
+    ) -> Result<Self> {
+        Self::with_spec(
+            vs,
+            dim,
+            &AttentionSpec::standard(n_heads, d_head),
+            context_dim,
+            ip_dim,
+            num_views,
+        )
+    }
+
+    /// Create a block whose attention layers follow an explicit
+    /// [`AttentionSpec`].
+    ///
+    /// The cross-view layer (`attn_cv`) always uses the standard kernel: its
+    /// sequence length is `num_views` (typically 4), far below the point where
+    /// a tiled or chunked kernel pays for its overhead.
+    ///
+    /// # Errors
+    ///
+    /// Propagates weight-loading failures and an invalid sliced-attention
+    /// configuration; see [`CrossAttention::with_spec`].
+    pub fn with_spec(
+        vs: nn::VarBuilder,
+        dim: usize,
+        spec: &AttentionSpec,
+        context_dim: usize,
+        ip_dim: usize,
+        num_views: usize,
     ) -> Result<Self> {
         let norm1 = nn::layer_norm(dim, 1e-5, vs.pp("norm1"))?;
-        let attn1 = CrossAttention::new_with_flash(
-            vs.pp("attn1"),
-            dim,
-            None,
-            n_heads,
-            d_head,
-            use_flash_attention,
-            flash_block_size,
-        )?;
+        let attn1 = CrossAttention::with_spec(vs.pp("attn1"), dim, None, spec)?;
 
         let norm_cv = nn::layer_norm(dim, 1e-5, vs.pp("norm_cv"))?;
-        // Cross-view attention typically has small sequence length (num_views),
-        // so flash attention may not be beneficial here
-        let attn_cv = CrossAttention::new(vs.pp("attn_cv"), dim, None, n_heads, d_head)?;
+        // Cross-view attention has a sequence length of `num_views`, so a
+        // memory-optimising kernel would only add overhead here.
+        let cv_spec = spec.with_backend(AttentionBackend::Standard);
+        let attn_cv = CrossAttention::with_spec(vs.pp("attn_cv"), dim, None, &cv_spec)?;
 
         let norm2 = nn::layer_norm(dim, 1e-5, vs.pp("norm2"))?;
-        let attn2 = CrossAttention::new_with_flash(
-            vs.pp("attn2"),
-            dim,
-            Some(context_dim),
-            n_heads,
-            d_head,
-            use_flash_attention,
-            flash_block_size,
-        )?;
+        let attn2 = CrossAttention::with_spec(vs.pp("attn2"), dim, Some(context_dim), spec)?;
 
         let norm_ip = nn::layer_norm(dim, 1e-5, vs.pp("norm_ip"))?;
-        let attn_ip = CrossAttention::new_with_flash(
-            vs.pp("attn_ip"),
-            dim,
-            Some(ip_dim),
-            n_heads,
-            d_head,
-            use_flash_attention,
-            flash_block_size,
-        )?;
+        let attn_ip = CrossAttention::with_spec(vs.pp("attn_ip"), dim, Some(ip_dim), spec)?;
 
         let norm3 = nn::layer_norm(dim, 1e-5, vs.pp("norm3"))?;
         let ff = FeedForward::new(vs.pp("ff"), dim, 4)?;
@@ -465,13 +781,50 @@ impl MultiViewTransformerBlock {
             norm3,
             ff,
             num_views,
+            kv_cache: KvCacheHandle::default(),
+            ip_cache_key: String::new(),
         })
+    }
+
+    /// Attach (or, with `None`, detach) the shared cross-attention KV cache.
+    ///
+    /// `layer_idx` and `block_idx` identify this block within the model and
+    /// `conditioning_tag` identifies the IP-Adapter tokens the cached
+    /// projections were computed from — changing the reference image must
+    /// change the tag, or the block would replay another image's K/V.
+    ///
+    /// Detaching leaves any entries in the cache; they simply stop being
+    /// consulted.
+    pub fn set_kv_cache(
+        &mut self,
+        cache: Option<Arc<KVCache>>,
+        layer_idx: usize,
+        block_idx: usize,
+        conditioning_tag: u64,
+    ) {
+        self.ip_cache_key = CacheKeyBuilder::new()
+            .layer(layer_idx)
+            .head_group(block_idx)
+            .conditioning_hash(conditioning_tag)
+            .build();
+        self.kv_cache = KvCacheHandle(cache);
+    }
+
+    /// The cache key this block's `attn_ip` layer uses, when a cache is
+    /// attached.
+    pub fn ip_cache_key(&self) -> Option<&str> {
+        self.kv_cache
+            .is_attached()
+            .then_some(self.ip_cache_key.as_str())
     }
 
     /// Forward pass.
     ///
     /// - `xs`: `(B*num_views, seq_len, dim)` — spatial tokens for all views (batched)
-    /// - `context`: `(B*num_views, ctx_len, context_dim)` — text encoder hidden states
+    /// - `context`: `(B*num_views, ctx_len, context_dim)` — text encoder hidden
+    ///   states. `None` skips the text cross-attention layer entirely (the
+    ///   block then contributes nothing from `attn2`), exactly as `None`
+    ///   `ip_tokens` skips `attn_ip` for the CFG unconditional pass.
     /// - `ip_tokens`: `(B*num_views, ip_len, ip_dim)` — CLIP image embedding tokens
     pub fn forward(
         &self,
@@ -531,17 +884,36 @@ impl MultiViewTransformerBlock {
             .reshape((bv, seq_len, dim))?;
         let xs = (cv_out + residual)?;
 
-        // 3. Text cross-attention
-        let residual = &xs;
-        let xs = (self.attn2.forward(&self.norm2.forward(&xs)?, context)? + residual)?;
+        // 3. Text cross-attention.
+        //
+        // Skipped entirely when no context is supplied, mirroring the IP
+        // branch below. `CrossAttention::forward` substitutes `xs` for a
+        // missing context, and `attn2`'s `to_k`/`to_v` are built for
+        // `context_dim` — so feeding it `xs` (width `dim`) was a hard matmul
+        // shape error whenever `dim != context_dim`, which is every real SD
+        // 2.1 stage (320/640/1280 channels vs a 1024-wide context).
+        let xs = if let Some(ctx) = context {
+            let residual = &xs;
+            (self.attn2.forward(&self.norm2.forward(&xs)?, Some(ctx))? + residual)?
+        } else {
+            xs
+        };
 
-        // 4. IP cross-attention (reference image conditioning)
+        // 4. IP cross-attention (reference image conditioning).
+        //
+        // The IP tokens are fixed for a whole denoising run, so `to_k`/`to_v`
+        // over them are served from the shared KV cache when one is attached.
         let xs = if let Some(ip) = ip_tokens {
             let residual = &xs;
-            (self
-                .attn_ip
-                .forward(&self.norm_ip.forward(&xs)?, Some(ip))?
-                + residual)?
+            let normed = self.norm_ip.forward(&xs)?;
+            let attended = match self.kv_cache.get() {
+                Some(cache) => {
+                    self.attn_ip
+                        .forward_cached(&normed, ip, cache, &self.ip_cache_key)?
+                }
+                None => self.attn_ip.forward(&normed, Some(ip))?,
+            };
+            (attended + residual)?
         } else {
             xs
         };
@@ -566,6 +938,32 @@ enum Projection {
     Conv(nn::Conv2d),
 }
 
+/// Everything one [`MultiViewSpatialTransformer`] stage needs to be built.
+///
+/// Groups the layer geometry with its [`AttentionSpec`] so
+/// [`crate::unet::MultiViewUNet`] can pass a single value down through the
+/// encoder/decoder block constructors instead of eight positional arguments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpatialTransformerSpec {
+    /// Input/output feature-map channel count.
+    pub in_channels: usize,
+    /// Number of transformer blocks in this stage.
+    pub depth: usize,
+    /// Text cross-attention context dimension.
+    pub context_dim: usize,
+    /// IP-adapter context dimension.
+    pub ip_dim: usize,
+    /// Number of views attended across.
+    pub num_views: usize,
+    /// Group count for the input group-norm.
+    pub num_groups: usize,
+    /// `true` for the SD 2.x `Linear` projection, `false` for the SD 1.5 /
+    /// Zero123 1×1-`Conv2d` projection.
+    pub use_linear_projection: bool,
+    /// How each attention layer in this stage is built.
+    pub attention: AttentionSpec,
+}
+
 /// A spatial transformer that includes multi-view attention in every block.
 /// Replaces the standard `SpatialTransformer` from SD 2.1.
 #[derive(Debug)]
@@ -581,67 +979,35 @@ pub struct MultiViewSpatialTransformer {
 }
 
 impl MultiViewSpatialTransformer {
-    /// Create a new multi-view spatial transformer with standard attention.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        vs: nn::VarBuilder,
-        in_channels: usize,
-        n_heads: usize,
-        d_head: usize,
-        depth: usize,
-        context_dim: usize,
-        ip_dim: usize,
-        num_views: usize,
-        num_groups: usize,
-        use_linear_projection: bool,
-    ) -> Result<Self> {
-        Self::new_with_flash(
-            vs,
+    /// Create a spatial transformer from a full [`SpatialTransformerSpec`].
+    ///
+    /// This is the **only** constructor, and the one
+    /// [`crate::unet::MultiViewUNet`] uses; it is the path through which a
+    /// [`crate::config::DiffusionConfig`]'s attention backend reaches the
+    /// attention layers. Two positional constructors (`new`, taking ten
+    /// arguments, and `new_with_flash`, taking twelve) used to shadow it; both
+    /// did nothing but assemble a `SpatialTransformerSpec` from a run of
+    /// same-typed `usize`s in which `context_dim`, `ip_dim`, `num_views` and
+    /// `num_groups` were adjacent and silently interchangeable at every call
+    /// site. Build the spec with named fields instead.
+    ///
+    /// # Errors
+    ///
+    /// Propagates weight-loading failures and an invalid sliced-attention
+    /// configuration; see [`CrossAttention::with_spec`].
+    pub fn with_spec(vs: nn::VarBuilder, spec: &SpatialTransformerSpec) -> Result<Self> {
+        let SpatialTransformerSpec {
             in_channels,
-            n_heads,
-            d_head,
             depth,
             context_dim,
             ip_dim,
             num_views,
             num_groups,
             use_linear_projection,
-            false,
-            64,
-        )
-    }
-
-    /// Create a new multi-view spatial transformer with optional flash attention.
-    ///
-    /// # Arguments
-    ///
-    /// * `vs` - Variable builder for weight initialization
-    /// * `in_channels` - Number of input channels
-    /// * `n_heads` - Number of attention heads
-    /// * `d_head` - Dimension per head
-    /// * `depth` - Number of transformer blocks
-    /// * `context_dim` - Text cross-attention context dimension
-    /// * `ip_dim` - IP-adapter context dimension
-    /// * `num_views` - Number of views for cross-view attention
-    /// * `num_groups` - Number of groups for group normalization
-    /// * `use_linear_projection` - Whether to use linear projection
-    /// * `use_flash_attention` - Whether to use flash attention
-    /// * `flash_block_size` - Block size for flash attention tiling
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_with_flash(
-        vs: nn::VarBuilder,
-        in_channels: usize,
-        n_heads: usize,
-        d_head: usize,
-        depth: usize,
-        context_dim: usize,
-        ip_dim: usize,
-        num_views: usize,
-        num_groups: usize,
-        use_linear_projection: bool,
-        use_flash_attention: bool,
-        flash_block_size: usize,
-    ) -> Result<Self> {
+            attention,
+        } = *spec;
+        let n_heads = attention.heads;
+        let d_head = attention.dim_head;
         let inner_dim = n_heads * d_head;
         let norm = nn::group_norm(num_groups, in_channels, 1e-6, vs.pp("norm"))?;
 
@@ -677,16 +1043,13 @@ impl MultiViewSpatialTransformer {
         let vs_tb = vs.pp("transformer_blocks");
         let mut transformer_blocks = Vec::with_capacity(depth);
         for i in 0..depth {
-            transformer_blocks.push(MultiViewTransformerBlock::new_with_flash(
+            transformer_blocks.push(MultiViewTransformerBlock::with_spec(
                 vs_tb.pp(i.to_string()),
                 inner_dim,
-                n_heads,
-                d_head,
+                &attention,
                 context_dim,
                 ip_dim,
                 num_views,
-                use_flash_attention,
-                flash_block_size,
             )?);
         }
 
@@ -700,10 +1063,56 @@ impl MultiViewSpatialTransformer {
         })
     }
 
+    /// Attach (or, with `None`, detach) the shared cross-attention KV cache on
+    /// every transformer block of this layer.
+    ///
+    /// `layer_idx` must be unique across the model — see
+    /// [`crate::unet::MultiViewUNet::set_kv_cache`], which assigns the indices.
+    /// Each block is keyed by its own position within this layer, so a
+    /// `depth > 1` transformer keeps its blocks' projections apart.
+    pub fn set_kv_cache(
+        &mut self,
+        cache: Option<Arc<KVCache>>,
+        layer_idx: usize,
+        conditioning_tag: u64,
+    ) {
+        for (block_idx, block) in self.transformer_blocks.iter_mut().enumerate() {
+            block.set_kv_cache(cache.clone(), layer_idx, block_idx, conditioning_tag);
+        }
+    }
+
+    /// Number of transformer blocks in this layer.
+    pub fn depth(&self) -> usize {
+        self.transformer_blocks.len()
+    }
+
+    /// The attention backend this layer's blocks were built with.
+    ///
+    /// Returns `None` for a zero-depth layer. Exposed so callers can confirm
+    /// that a [`crate::config::DiffusionConfig`]'s selection reached the
+    /// attention layers.
+    pub fn attention_backend(&self) -> Option<AttentionBackend> {
+        self.transformer_blocks
+            .first()
+            .map(|block| block.attn1.backend())
+    }
+
+    /// The `attn_ip` cache keys of this layer's blocks, in block order.
+    ///
+    /// Empty when no cache is attached. Exposed so callers (and tests) can
+    /// verify that [`crate::unet::MultiViewUNet::set_kv_cache`] assigned a
+    /// distinct key to every attention site.
+    pub fn ip_cache_keys(&self) -> impl Iterator<Item = &str> {
+        self.transformer_blocks
+            .iter()
+            .filter_map(|block| block.ip_cache_key())
+    }
+
     /// Forward pass.
     ///
     /// - `xs`: `(B*V, C, H, W)` feature map
-    /// - `context`: optional text cross-attention context
+    /// - `context`: optional text cross-attention context (`None` skips the
+    ///   text cross-attention layer entirely)
     /// - `ip_tokens`: optional IP-adapter tokens
     pub fn forward(
         &self,
@@ -802,21 +1211,35 @@ mod tests {
         nn::VarBuilder::from_varmap(&varmap, DType::F32, &Device::Cpu)
     }
 
+    /// A standard-kernel [`SpatialTransformerSpec`] over the shared test
+    /// geometry: 2 heads of width 4 across 2 views, group-normed in 4 groups.
+    fn test_spec(
+        in_channels: usize,
+        depth: usize,
+        context_dim: usize,
+        ip_dim: usize,
+        use_linear_projection: bool,
+    ) -> SpatialTransformerSpec {
+        SpatialTransformerSpec {
+            in_channels,
+            depth,
+            context_dim,
+            ip_dim,
+            num_views: 2,
+            num_groups: 4,
+            use_linear_projection,
+            attention: AttentionSpec::standard(2, 4),
+        }
+    }
+
     #[test]
     fn test_multi_view_spatial_transformer_conv_projection_shape() -> Result<()> {
         let vs = test_varbuilder();
         let in_channels = 8;
-        let transformer = MultiViewSpatialTransformer::new(
+        // `use_linear_projection: false` exercises the Conv2d branch.
+        let transformer = MultiViewSpatialTransformer::with_spec(
             vs.pp("t"),
-            in_channels,
-            2, // n_heads
-            4, // d_head
-            1, // depth
-            16,
-            16,    // context_dim, ip_dim
-            2,     // num_views
-            4,     // num_groups
-            false, // use_linear_projection -> exercises the Conv2d branch
+            &test_spec(in_channels, 1, 16, 16, false),
         )?;
         let batch_views = 2; // B=1 * V=2
         let (h, w) = (4, 4);
@@ -830,23 +1253,377 @@ mod tests {
     fn test_multi_view_spatial_transformer_linear_projection_shape() -> Result<()> {
         let vs = test_varbuilder();
         let in_channels = 8;
-        let transformer = MultiViewSpatialTransformer::new(
+        let transformer = MultiViewSpatialTransformer::with_spec(
             vs.pp("t"),
-            in_channels,
-            2,
-            4,
-            1,
-            16,
-            16,
-            2,
-            4,
-            true, // use_linear_projection
+            &test_spec(in_channels, 1, 16, 16, true),
         )?;
         let batch_views = 2;
         let (h, w) = (4, 4);
         let xs = Tensor::randn(0f32, 1f32, (batch_views, in_channels, h, w), &Device::Cpu)?;
         let out = transformer.forward(&xs, None, None)?;
         assert_eq!(out.dims4()?, (batch_views, in_channels, h, w));
+        Ok(())
+    }
+
+    /// Regression: `forward(.., context: None, ..)` fed `xs` to `attn2`, whose
+    /// `to_k`/`to_v` are built for `context_dim`. Whenever the two widths
+    /// differ — which is every real SD 2.1 stage — that was a hard
+    /// "shape mismatch in matmul" error, so `MultiViewUNet::forward` could
+    /// never actually pass the `None` its signature advertises.
+    #[test]
+    fn test_transformer_block_without_context_skips_text_attention() -> Result<()> {
+        let vs = test_varbuilder();
+        let dim = 8;
+        let context_dim = 16; // deliberately != dim
+        let block = MultiViewTransformerBlock::new(vs.pp("b"), dim, 2, 4, context_dim, 16, 2)?;
+
+        let xs = Tensor::randn(0f32, 1f32, (2usize, 4usize, dim), &Device::Cpu)?;
+        let without = block.forward(&xs, None, None)?;
+        assert_eq!(without.dims3()?, (2, 4, dim));
+
+        // With a context of the declared width the layer runs and changes the
+        // result, proving the `None` path really skipped a live layer rather
+        // than one that happens to be a no-op.
+        let context = Tensor::randn(0f32, 1f32, (2usize, 3usize, context_dim), &Device::Cpu)?;
+        let with = block.forward(&xs, Some(&context), None)?;
+        let diff = (&with - &without)?.abs()?.sum_all()?.to_scalar::<f32>()?;
+        assert!(
+            diff > 1e-5,
+            "supplying a context must change the block output, got diff {diff}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_spatial_transformer_without_context_when_widths_differ() -> Result<()> {
+        // The same regression seen through the wrapper both failing inline
+        // tests exercised.
+        for use_linear in [false, true] {
+            let vs = test_varbuilder();
+            let in_channels = 8;
+            // context_dim (16) != inner_dim (2 heads × 4 = 8).
+            let transformer = MultiViewSpatialTransformer::with_spec(
+                vs.pp("t"),
+                &test_spec(in_channels, 1, 16, 16, use_linear),
+            )?;
+            let xs = Tensor::randn(
+                0f32,
+                1f32,
+                (2usize, in_channels, 4usize, 4usize),
+                &Device::Cpu,
+            )?;
+            let out = transformer.forward(&xs, None, None)?;
+            assert_eq!(out.dims4()?, (2, in_channels, 4, 4));
+        }
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Cross-attention KV cache
+    //
+    // Regression: `KVCache` was never handed to any attention layer, so
+    // `BatchStats::{cache_hits, cache_misses}` and
+    // `GenerationResult::num_cached_kv` could only ever be 0.
+    // ------------------------------------------------------------------
+
+    fn test_cache() -> KVCache {
+        KVCache::new(crate::kv_cache::KVCacheConfig::default())
+    }
+
+    #[test]
+    fn test_forward_cached_matches_uncached_output() -> Result<()> {
+        let vs = test_varbuilder();
+        let (query_dim, context_dim) = (8usize, 16usize);
+        let attn = CrossAttention::new(vs.pp("attn"), query_dim, Some(context_dim), 2, 4)?;
+
+        let xs = Tensor::randn(0f32, 1f32, (2usize, 4usize, query_dim), &Device::Cpu)?;
+        let context = Tensor::randn(0f32, 1f32, (2usize, 3usize, context_dim), &Device::Cpu)?;
+
+        let uncached = attn.forward(&xs, Some(&context))?;
+        let cache = test_cache();
+
+        // First call misses and populates; the second must hit and still agree.
+        for round in 0..2 {
+            let cached = attn.forward_cached(&xs, &context, &cache, "layer=0:cond=1")?;
+            let diff = (&cached - &uncached)?
+                .abs()?
+                .sum_all()?
+                .to_scalar::<f32>()?;
+            assert!(
+                diff < 1e-5,
+                "round {round}: cached output must match uncached, diff {diff}"
+            );
+        }
+
+        let stats = cache.stats();
+        assert_eq!(stats.misses, 1, "the first lookup must miss");
+        assert!(stats.hits >= 1, "the second lookup must hit");
+        Ok(())
+    }
+
+    #[test]
+    fn test_forward_cached_changes_with_a_different_key() -> Result<()> {
+        // Two different contexts under distinct keys must not cross-serve.
+        let vs = test_varbuilder();
+        let (query_dim, context_dim) = (8usize, 16usize);
+        let attn = CrossAttention::new(vs.pp("attn"), query_dim, Some(context_dim), 2, 4)?;
+        let cache = test_cache();
+
+        let xs = Tensor::randn(0f32, 1f32, (1usize, 4usize, query_dim), &Device::Cpu)?;
+        let ctx_a = Tensor::ones((1usize, 3usize, context_dim), DType::F32, &Device::Cpu)?;
+        let ctx_b = Tensor::full(-2f32, (1usize, 3usize, context_dim), &Device::Cpu)?;
+
+        let out_a = attn.forward_cached(&xs, &ctx_a, &cache, "layer=0:cond=aaa")?;
+        let out_b = attn.forward_cached(&xs, &ctx_b, &cache, "layer=0:cond=bbb")?;
+        let plain_b = attn.forward(&xs, Some(&ctx_b))?;
+
+        let diff = (&out_b - &plain_b)?.abs()?.sum_all()?.to_scalar::<f32>()?;
+        assert!(diff < 1e-5, "distinct keys must not cross-serve: {diff}");
+        let separation = (&out_a - &out_b)?.abs()?.sum_all()?.to_scalar::<f32>()?;
+        assert!(separation > 1e-5, "the two contexts must differ");
+        Ok(())
+    }
+
+    #[test]
+    fn test_forward_cached_ignores_a_shape_stale_entry() -> Result<()> {
+        // A cached entry recorded at batch 1 must not be replayed for batch 2.
+        let vs = test_varbuilder();
+        let (query_dim, context_dim) = (8usize, 16usize);
+        let attn = CrossAttention::new(vs.pp("attn"), query_dim, Some(context_dim), 2, 4)?;
+        let cache = test_cache();
+        let key = "layer=0:cond=stale";
+
+        let xs1 = Tensor::randn(0f32, 1f32, (1usize, 4usize, query_dim), &Device::Cpu)?;
+        let ctx1 = Tensor::randn(0f32, 1f32, (1usize, 3usize, context_dim), &Device::Cpu)?;
+        let _ = attn.forward_cached(&xs1, &ctx1, &cache, key)?;
+
+        let xs2 = Tensor::randn(0f32, 1f32, (2usize, 4usize, query_dim), &Device::Cpu)?;
+        let ctx2 = Tensor::randn(0f32, 1f32, (2usize, 3usize, context_dim), &Device::Cpu)?;
+        let cached = attn.forward_cached(&xs2, &ctx2, &cache, key)?;
+        let plain = attn.forward(&xs2, Some(&ctx2))?;
+        let diff = (&cached - &plain)?.abs()?.sum_all()?.to_scalar::<f32>()?;
+        assert!(diff < 1e-5, "a shape-stale entry must be ignored: {diff}");
+        Ok(())
+    }
+
+    #[test]
+    fn test_transformer_block_cache_matches_uncached_and_records_hits() -> Result<()> {
+        let vs = test_varbuilder();
+        let dim = 8;
+        let (context_dim, ip_dim) = (16usize, 12usize);
+        let mut block =
+            MultiViewTransformerBlock::new(vs.pp("b"), dim, 2, 4, context_dim, ip_dim, 2)?;
+
+        let xs = Tensor::randn(0f32, 1f32, (2usize, 4usize, dim), &Device::Cpu)?;
+        let context = Tensor::randn(0f32, 1f32, (2usize, 3usize, context_dim), &Device::Cpu)?;
+        let ip = Tensor::randn(0f32, 1f32, (2usize, 5usize, ip_dim), &Device::Cpu)?;
+
+        assert!(block.ip_cache_key().is_none(), "no cache attached yet");
+        let uncached = block.forward(&xs, Some(&context), Some(&ip))?;
+
+        let cache = Arc::new(test_cache());
+        block.set_kv_cache(Some(Arc::clone(&cache)), 3, 0, 0xabc);
+        assert_eq!(block.ip_cache_key(), Some("layer=3:hg=0:cond=2748"));
+
+        for step in 0..3 {
+            let cached = block.forward(&xs, Some(&context), Some(&ip))?;
+            let diff = (&cached - &uncached)?
+                .abs()?
+                .sum_all()?
+                .to_scalar::<f32>()?;
+            assert!(
+                diff < 1e-5,
+                "step {step}: cached block output drifted: {diff}"
+            );
+        }
+        let stats = cache.stats();
+        assert_eq!(stats.misses, 1);
+        assert_eq!(stats.hits, 2, "steps 2 and 3 must hit");
+
+        // Detaching restores the uncached path.
+        block.set_kv_cache(None, 3, 0, 0xabc);
+        assert!(block.ip_cache_key().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn test_transformer_block_cache_is_untouched_without_ip_tokens() -> Result<()> {
+        // The CFG unconditional pass skips attn_ip entirely, so it must not
+        // populate or consult the cache.
+        let vs = test_varbuilder();
+        let dim = 8;
+        let mut block = MultiViewTransformerBlock::new(vs.pp("b"), dim, 2, 4, 16, 12, 2)?;
+        let cache = Arc::new(test_cache());
+        block.set_kv_cache(Some(Arc::clone(&cache)), 0, 0, 1);
+
+        let xs = Tensor::randn(0f32, 1f32, (2usize, 4usize, dim), &Device::Cpu)?;
+        let context = Tensor::randn(0f32, 1f32, (2usize, 3usize, 16usize), &Device::Cpu)?;
+        let _ = block.forward(&xs, Some(&context), None)?;
+
+        let stats = cache.stats();
+        assert_eq!(stats.hits, 0);
+        assert_eq!(stats.misses, 0);
+        assert!(cache.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_spatial_transformer_keys_each_block_separately() -> Result<()> {
+        let vs = test_varbuilder();
+        let mut transformer =
+            MultiViewSpatialTransformer::with_spec(vs.pp("t"), &test_spec(8, 3, 16, 12, true))?;
+        assert_eq!(transformer.depth(), 3);
+
+        let cache = Arc::new(test_cache());
+        transformer.set_kv_cache(Some(Arc::clone(&cache)), 7, 99);
+        let keys: Vec<String> = transformer
+            .transformer_blocks
+            .iter()
+            .filter_map(|b| b.ip_cache_key().map(str::to_string))
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                "layer=7:hg=0:cond=99".to_string(),
+                "layer=7:hg=1:cond=99".to_string(),
+                "layer=7:hg=2:cond=99".to_string(),
+            ]
+        );
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Attention backend selection
+    //
+    // Regression: SlicedAttention was reachable only from its own module's
+    // tests, because nothing built a CrossAttention that used it.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_sliced_backend_matches_standard_numerically() -> Result<()> {
+        // Same weights, two kernels: the results must agree.
+        let varmap = VarMap::new();
+        let (query_dim, context_dim) = (8usize, 16usize);
+        let spec = AttentionSpec {
+            heads: 2,
+            dim_head: 4,
+            backend: AttentionBackend::Standard,
+            flash_block_size: 64,
+            slice_size: Some(3),
+        };
+
+        let build = |backend: AttentionBackend| -> Result<CrossAttention> {
+            let vs = nn::VarBuilder::from_varmap(&varmap, DType::F32, &Device::Cpu);
+            CrossAttention::with_spec(
+                vs.pp("attn"),
+                query_dim,
+                Some(context_dim),
+                &spec.with_backend(backend),
+            )
+        };
+
+        let standard = build(AttentionBackend::Standard)?;
+        let sliced = build(AttentionBackend::Sliced)?;
+        assert_eq!(standard.backend(), AttentionBackend::Standard);
+        assert_eq!(sliced.backend(), AttentionBackend::Sliced);
+
+        // seq_len 8 with slice_size 3 exercises a ragged final slice.
+        let xs = Tensor::randn(0f32, 1f32, (2usize, 8usize, query_dim), &Device::Cpu)?;
+        let context = Tensor::randn(0f32, 1f32, (2usize, 5usize, context_dim), &Device::Cpu)?;
+
+        let a = standard.forward(&xs, Some(&context))?;
+        let b = sliced.forward(&xs, Some(&context))?;
+        assert_eq!(a.dims3()?, b.dims3()?);
+        let diff = (&a - &b)?.abs()?.max_all()?.to_scalar::<f32>()?;
+        assert!(diff < 1e-4, "sliced kernel diverged from standard: {diff}");
+        Ok(())
+    }
+
+    #[test]
+    fn test_sliced_backend_falls_back_for_a_masked_call() -> Result<()> {
+        // The sliced kernel has no additive-bias support, so a masked call must
+        // route through standard_attention and still honour the mask.
+        let vs = test_varbuilder();
+        let query_dim = 8usize;
+        let attn = CrossAttention::with_spec(
+            vs.pp("attn"),
+            query_dim,
+            None,
+            &AttentionSpec {
+                heads: 2,
+                dim_head: 4,
+                backend: AttentionBackend::Sliced,
+                flash_block_size: 64,
+                slice_size: Some(2),
+            },
+        )?;
+
+        let seq_len = 4;
+        let xs = Tensor::randn(0f32, 1f32, (1usize, seq_len, query_dim), &Device::Cpu)?;
+        let unmasked = attn.forward_masked(&xs, None, None)?;
+
+        let mut mask = AttentionMask::new(seq_len, true);
+        for k in 1..seq_len {
+            mask.set(0, k, false);
+        }
+        let bias = mask_to_bias_tensor(&mask, &Device::Cpu)?;
+        let masked = attn.forward_masked(&xs, None, Some(&bias))?;
+
+        let diff = (&masked - &unmasked)?
+            .abs()?
+            .sum_all()?
+            .to_scalar::<f32>()?;
+        assert!(diff > 1e-5, "the mask must still take effect: {diff}");
+        Ok(())
+    }
+
+    #[test]
+    fn test_spec_from_config_carries_the_resolved_backend() {
+        let sliced = DiffusionConfig {
+            attention_backend: AttentionBackend::Sliced,
+            attention_slice_size: Some(16),
+            ..DiffusionConfig::default()
+        };
+        let spec = AttentionSpec::from_config(&sliced, 5, 64);
+        assert_eq!(spec.backend, AttentionBackend::Sliced);
+        assert_eq!(spec.slice_size, Some(16));
+        assert_eq!(spec.heads, 5);
+        assert_eq!(spec.dim_head, 64);
+
+        // The legacy flag still routes to Flash through resolved_*().
+        let legacy = DiffusionConfig {
+            use_flash_attention: true,
+            ..DiffusionConfig::default()
+        };
+        assert_eq!(
+            AttentionSpec::from_config(&legacy, 5, 64).backend,
+            AttentionBackend::Flash
+        );
+    }
+
+    #[test]
+    fn test_block_keeps_cross_view_attention_standard() -> Result<()> {
+        // attn_cv's sequence length is num_views; a memory-optimising kernel
+        // there is pure overhead, so the spec must be downgraded for it.
+        let vs = test_varbuilder();
+        let block = MultiViewTransformerBlock::with_spec(
+            vs.pp("b"),
+            8,
+            &AttentionSpec {
+                heads: 2,
+                dim_head: 4,
+                backend: AttentionBackend::Sliced,
+                flash_block_size: 64,
+                slice_size: Some(2),
+            },
+            16,
+            12,
+            2,
+        )?;
+        assert_eq!(block.attn1.backend(), AttentionBackend::Sliced);
+        assert_eq!(block.attn2.backend(), AttentionBackend::Sliced);
+        assert_eq!(block.attn_ip.backend(), AttentionBackend::Sliced);
+        assert_eq!(block.attn_cv.backend(), AttentionBackend::Standard);
         Ok(())
     }
 

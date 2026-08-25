@@ -90,9 +90,32 @@ fn quat_to_mat(q: vec4<f32>) -> mat3x3<f32> {
     );
 }
 
-fn quat_to_normal(q: vec4<f32>) -> vec3<f32> {
+// Extract the principal normal of a Gaussian.
+//
+// The normal is the direction of *minimum* scale - the axis the ellipsoid is
+// flattest along, i.e. the disc's surface normal. That is usually, but not
+// always, the local Z axis: whichever of `s.x`, `s.y`, `s.z` is smallest picks
+// the corresponding column of the rotation matrix. Unconditionally returning
+// `R[2]` emits a vector tangent to the disc whenever the Gaussian is flat in X
+// or Y.
+//
+// `s` holds *log*-scales (see `compute_cov3d`, which exponentiates them).
+// `exp` is strictly increasing, so the argmin of the log-scales is the argmin
+// of the scales and no `exp` call is needed here.
+//
+// Kept byte-identical to the copy in preprocess.wgsl (the non-variant
+// fallback): pipeline.rs selects one of these variants whenever
+// `sh_optimization && use_sh_variants` (both default to true) and
+// `sh_degree <= 3`, so the two paths must not drift apart.
+fn quat_to_normal(q: vec4<f32>, s: vec3<f32>) -> vec3<f32> {
     let R = quat_to_mat(q);
-    return normalize(R[2]);
+    var axis = R[2];
+    if s.x <= s.y && s.x <= s.z {
+        axis = R[0];
+    } else if s.y <= s.z {
+        axis = R[1];
+    }
+    return normalize(axis);
 }
 
 fn compute_cov3d(q: vec4<f32>, s: vec3<f32>) -> mat3x3<f32> {
@@ -270,6 +293,6 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>) {
     colors[idx] = vec4<f32>(eval_sh_degree3(dir, sh_offset), 0.0);
 
     if (uniforms.output_flags & 2u) != 0u {
-        normals[idx] = vec4<f32>(quat_to_normal(rot), 0.0);
+        normals[idx] = vec4<f32>(quat_to_normal(rot, scale), 0.0);
     }
 }

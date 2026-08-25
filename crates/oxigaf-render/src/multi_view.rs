@@ -6,12 +6,19 @@
 //!
 //! # Design Rationale
 //!
-//! The single-view [`Rasterizer`]'s `forward()` method lazily uploads
-//! Gaussian data to the GPU on the first call and caches it for subsequent
-//! calls. This means that iterating over N cameras with the same model
-//! naturally achieves "shared GPU preprocessing" — the upload, allocation, and
-//! SH coefficient staging happen only once, and only the per-frame uniform
-//! update (camera matrices) plus the rasterization dispatches repeat.
+//! Within a single [`MultiViewRenderer::render_views`] /
+//! [`MultiViewRenderer::render_views_stacked`] call, the Gaussian data is
+//! uploaded once and every camera in the slice reuses it — only the
+//! per-frame uniform update (camera matrices) plus the rasterization
+//! dispatch repeat per camera.
+//!
+//! Across *separate* calls, `MultiViewRenderer` also keeps a snapshot of
+//! the most recently uploaded model and skips the re-upload (and the GPU
+//! buffer set it reallocates) when the incoming model compares equal to
+//! it, so re-rendering the same static scene from a new batch of cameras
+//! does not repeatedly reallocate `GaussianBuffers`, `IntermediateBuffers`,
+//! `OutputBuffers` and `GradientBuffers`. Passing a genuinely different
+//! model (by content) always triggers a fresh upload.
 //!
 //! Future work: true parallel multi-view could issue all N rasterization
 //! dispatches into a single command encoder, but sequential dispatch is
@@ -39,7 +46,7 @@
 use std::f32::consts::TAU;
 
 use crate::config::RasterConfig;
-use crate::gaussian::GaussianModel;
+use crate::gaussian::{GaussianAttributes, GaussianModel};
 use crate::rasterizer::{Rasterizer, RenderCamera};
 use crate::RenderError;
 
@@ -128,6 +135,15 @@ impl MultiViewConfig {
 pub struct MultiViewRenderer {
     rasterizer: Rasterizer,
     config: MultiViewConfig,
+    /// Snapshot of the most recently uploaded model, used to skip a
+    /// redundant `upload_gaussians` GPU re-allocation when the same model
+    /// (by full data equality) is rendered again — see the module docs.
+    /// This trades memory (one extra full `GaussianModel` clone, held for
+    /// the renderer's lifetime) for avoiding repeated GPU buffer
+    /// reallocation; a model containing NaN coefficients always compares
+    /// unequal to itself (`f32` `PartialEq`), which is the safe direction —
+    /// it just means such a model always re-uploads.
+    uploaded_model: Option<GaussianModel>,
 }
 
 impl MultiViewRenderer {
@@ -138,7 +154,11 @@ impl MultiViewRenderer {
         config.validate()?;
         let raster_config = config.to_raster_config();
         let rasterizer = Rasterizer::new(raster_config).await?;
-        Ok(Self { rasterizer, config })
+        Ok(Self {
+            rasterizer,
+            config,
+            uploaded_model: None,
+        })
     }
 
     /// Create a `MultiViewRenderer` from an already-initialised [`Rasterizer`].
@@ -150,7 +170,25 @@ impl MultiViewRenderer {
         config: MultiViewConfig,
     ) -> Result<Self, RenderError> {
         config.validate()?;
-        Ok(Self { rasterizer, config })
+        Ok(Self {
+            rasterizer,
+            config,
+            uploaded_model: None,
+        })
+    }
+
+    /// Upload `model` to the GPU unless it is identical (by full data
+    /// equality) to the model already resident from a previous call.
+    fn ensure_uploaded(&mut self, model: &GaussianModel) {
+        let already_current = match &self.uploaded_model {
+            Some(cached) => gaussian_model_data_eq(cached, model),
+            None => false,
+        };
+        if already_current {
+            return;
+        }
+        self.rasterizer.upload_gaussians(model);
+        self.uploaded_model = Some(model.clone());
     }
 
     /// Render the model from each camera in `cameras`.
@@ -158,10 +196,9 @@ impl MultiViewRenderer {
     /// Returns a `Vec` of RGBA images, one per camera, each as `Vec<u8>`
     /// with length `width * height * 4` in row-major order.
     ///
-    /// The Gaussian model is uploaded to the GPU lazily (once per unique model
-    /// identity — specifically, once per `render_views` call if buffers are
-    /// already allocated for the same `n_gaussians`). All cameras in the slice
-    /// share that single GPU upload.
+    /// The Gaussian model is uploaded to the GPU lazily (once per unique
+    /// model, by full data equality — see the module docs). All cameras in
+    /// the slice share that single GPU upload.
     ///
     /// # Errors
     ///
@@ -176,10 +213,7 @@ impl MultiViewRenderer {
             return Ok(Vec::new());
         }
 
-        // Upload Gaussians once for the whole batch. The rasterizer caches them
-        // between calls; force a fresh upload so callers can pass different models
-        // across separate render_views invocations.
-        self.rasterizer.upload_gaussians(model);
+        self.ensure_uploaded(model);
 
         let mut results = Vec::with_capacity(cameras.len());
         for camera in cameras {
@@ -209,9 +243,10 @@ impl MultiViewRenderer {
 
         let mut out = Vec::with_capacity(total_bytes);
 
-        // Upload once before iterating.
+        // Upload once before iterating (skipped if `model` is unchanged
+        // from a previous call — see `ensure_uploaded`).
         if !cameras.is_empty() {
-            self.rasterizer.upload_gaussians(model);
+            self.ensure_uploaded(model);
         }
 
         for camera in cameras {
@@ -290,6 +325,21 @@ impl MultiViewRenderer {
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
+
+/// Returns `true` when `a` and `b` contain identical Gaussian data — the
+/// full set of fields that influence what gets uploaded to the GPU by
+/// [`Rasterizer::upload_gaussians`]. Used to decide whether a re-upload can
+/// be skipped (see [`MultiViewRenderer::ensure_uploaded`]).
+fn gaussian_model_data_eq(a: &GaussianModel, b: &GaussianModel) -> bool {
+    a.sh_degree == b.sh_degree
+        && a.face_indices == b.face_indices
+        && a.barycentric == b.barycentric
+        && a.local_offsets == b.local_offsets
+        && a.is_rigid == b.is_rigid
+        && a.sh_coeffs == b.sh_coeffs
+        && bytemuck::cast_slice::<GaussianAttributes, u8>(&a.gaussians)
+            == bytemuck::cast_slice::<GaussianAttributes, u8>(&b.gaussians)
+}
 
 /// Convert a slice of linear-f32 RGBA values to `u8` RGBA (clamped, gamma-encoded as sRGB).
 ///
@@ -715,6 +765,46 @@ mod tests {
         // Zero cameras → 0 bytes.
         let stacked: Vec<u8> = Vec::new();
         assert_eq!(stacked.len(), 0);
+    }
+
+    // ------------------------------------------------------------------
+    // gaussian_model_data_eq (pure function, no GPU required)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_gaussian_model_data_eq_identical_models() {
+        let a = minimal_gaussian_model();
+        let b = minimal_gaussian_model();
+        assert!(gaussian_model_data_eq(&a, &b));
+    }
+
+    #[test]
+    fn test_gaussian_model_data_eq_detects_position_change() {
+        let a = minimal_gaussian_model();
+        let mut b = minimal_gaussian_model();
+        b.gaussians[0].position[0] += 0.001;
+        assert!(!gaussian_model_data_eq(&a, &b));
+    }
+
+    #[test]
+    fn test_gaussian_model_data_eq_detects_sh_coeffs_change() {
+        let a = minimal_gaussian_model();
+        let mut b = minimal_gaussian_model();
+        b.sh_coeffs[0] += 0.001;
+        assert!(!gaussian_model_data_eq(&a, &b));
+    }
+
+    #[test]
+    fn test_gaussian_model_data_eq_detects_gaussian_count_change() {
+        let a = minimal_gaussian_model();
+        let mut b = minimal_gaussian_model();
+        b.gaussians.push(b.gaussians[0]);
+        b.face_indices.push(0);
+        b.barycentric.push([1.0 / 3.0; 3]);
+        b.local_offsets.push([0.0; 3]);
+        b.is_rigid.push(true);
+        b.sh_coeffs.extend_from_slice(&[0.0; 3]);
+        assert!(!gaussian_model_data_eq(&a, &b));
     }
 
     // ------------------------------------------------------------------

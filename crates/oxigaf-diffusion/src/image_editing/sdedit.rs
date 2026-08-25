@@ -16,40 +16,11 @@
 //! ## Layout convention
 //! Latents are flat `Vec<f32>` in row-major order. Mask data is `[H × W]`.
 
-use super::EditMask;
-use thiserror::Error;
-
-// ---------------------------------------------------------------------------
-// Error type
-// ---------------------------------------------------------------------------
-
-/// Errors produced by SDEdit-style image editing operations.
-#[derive(Debug, Error)]
-pub enum ImageEditError {
-    /// Dimension mismatch between operands.
-    #[error("Dimension mismatch: expected {expected}, got {got}")]
-    DimensionMismatch { expected: usize, got: usize },
-
-    /// Strength value is outside the valid `(0, 1]` range.
-    #[error("Strength {0} must be in (0, 1]")]
-    InvalidStrength(f32),
-
-    /// Timestep is outside the valid `[0, max]` range.
-    #[error("Timestep {t} out of range [0, {max}]")]
-    TimestepOutOfRange { t: usize, max: usize },
-
-    /// Mask is structurally invalid.
-    #[error("Invalid mask: {0}")]
-    InvalidMask(String),
-
-    /// Empty input was provided where at least one element is required.
-    #[error("Empty input")]
-    EmptyInput,
-
-    /// Invalid parameter value.
-    #[error("Invalid parameter: {0}")]
-    InvalidParam(String),
-}
+// This module used to declare its own `ImageEditError`. It has been folded
+// into the parent module's `ImageEditingError` so the slice-based SDEdit API
+// here and the `EditLatent`-based API in `image_editing` share one error
+// enum instead of requiring a `From` conversion at every API boundary.
+use super::{EditMask, ImageEditingError};
 
 // ---------------------------------------------------------------------------
 // Edit configuration
@@ -95,9 +66,9 @@ impl EditConfig {
     /// module checks. `strength` is validated separately by
     /// [`edit_start_timestep`] (reachable with a descriptive error even for
     /// callers that bypass `EditConfig`).
-    pub fn validate(&self) -> Result<(), ImageEditError> {
+    pub fn validate(&self) -> Result<(), ImageEditingError> {
         if !self.guidance_scale.is_finite() || self.guidance_scale < 0.0 {
-            return Err(ImageEditError::InvalidParam(format!(
+            return Err(ImageEditingError::InvalidConfig(format!(
                 "guidance_scale must be a finite value >= 0, got {}",
                 self.guidance_scale
             )));
@@ -150,10 +121,12 @@ fn edit_box_muller(u1: f32, u2: f32) -> (f32, f32) {
 /// `strength = 1.0` would compute exactly `n_timesteps`, one past the last
 /// valid index for an `alpha_bars` array of that length.
 ///
-/// Returns `InvalidStrength` if `strength` is not in `(0, 1]`.
-pub fn edit_start_timestep(strength: f32, n_timesteps: usize) -> Result<usize, ImageEditError> {
+/// Returns `InvalidConfig` if `strength` is not in `(0, 1]`.
+pub fn edit_start_timestep(strength: f32, n_timesteps: usize) -> Result<usize, ImageEditingError> {
     if strength <= 0.0 || strength > 1.0 {
-        return Err(ImageEditError::InvalidStrength(strength));
+        return Err(ImageEditingError::InvalidConfig(format!(
+            "strength {strength} must be in (0, 1]"
+        )));
     }
     let raw = (n_timesteps as f32 * strength).floor() as usize;
     Ok(raw.min(n_timesteps.saturating_sub(1)))
@@ -224,26 +197,26 @@ pub fn edit_linear_alpha_bars(n_timesteps: usize, beta_start: f32, beta_end: f32
 /// `x_noisy = sqrt(alpha_bar[t]) * x + sqrt(1 - alpha_bar[t]) * noise`
 ///
 /// Returns `DimensionMismatch` if `latent` and `noise` have different lengths.
-/// Returns `TimestepOutOfRange` if `timestep >= alpha_bars.len()`.
+/// Returns `NoiseLevelOutOfRange` if `timestep >= alpha_bars.len()`.
 pub fn edit_add_noise(
     latent: &[f32],
     noise: &[f32],
     timestep: usize,
     alpha_bars: &[f32],
-) -> Result<Vec<f32>, ImageEditError> {
+) -> Result<Vec<f32>, ImageEditingError> {
     if latent.is_empty() {
-        return Err(ImageEditError::EmptyInput);
+        return Err(ImageEditingError::EmptyInput);
     }
     if noise.len() != latent.len() {
-        return Err(ImageEditError::DimensionMismatch {
+        return Err(ImageEditingError::DimensionMismatch {
             expected: latent.len(),
-            got: noise.len(),
+            actual: noise.len(),
         });
     }
     if alpha_bars.is_empty() || timestep >= alpha_bars.len() {
-        return Err(ImageEditError::TimestepOutOfRange {
-            t: timestep,
-            max: alpha_bars.len().saturating_sub(1),
+        return Err(ImageEditingError::NoiseLevelOutOfRange {
+            t: timestep as f32,
+            max_t: alpha_bars.len().saturating_sub(1) as f32,
         });
     }
 
@@ -302,9 +275,9 @@ pub fn sdedit_perturb(
     config: &EditConfig,
     alpha_bars: &[f32],
     state: &mut u64,
-) -> Result<(Vec<f32>, usize), ImageEditError> {
+) -> Result<(Vec<f32>, usize), ImageEditingError> {
     if latent.is_empty() {
-        return Err(ImageEditError::EmptyInput);
+        return Err(ImageEditingError::EmptyInput);
     }
     config.validate()?;
     let t_start = edit_start_timestep(config.strength, config.n_timesteps)?;
@@ -327,14 +300,14 @@ pub fn sdedit_perturb_with_mask(
     alpha_bars: &[f32],
     state: &mut u64,
     mask: Option<&EditMask>,
-) -> Result<(Vec<f32>, usize), ImageEditError> {
+) -> Result<(Vec<f32>, usize), ImageEditingError> {
     let (noisy, t_start) = sdedit_perturb(latent, config, alpha_bars, state)?;
     if !config.use_mask {
         return Ok((noisy, t_start));
     }
     let m = mask.ok_or_else(|| {
-        ImageEditError::InvalidMask(
-            "EditConfig::use_mask is set but no mask was provided".to_string(),
+        ImageEditingError::InvalidImage(
+            "invalid mask: EditConfig::use_mask is set but no mask was provided".to_string(),
         )
     })?;
     let blended = edit_blend_with_mask(latent, &noisy, m)?;
@@ -356,27 +329,27 @@ pub fn edit_blend_with_mask(
     original: &[f32],
     edited: &[f32],
     mask: &EditMask,
-) -> Result<Vec<f32>, ImageEditError> {
+) -> Result<Vec<f32>, ImageEditingError> {
     if original.is_empty() {
-        return Err(ImageEditError::EmptyInput);
+        return Err(ImageEditingError::EmptyInput);
     }
     if original.len() != edited.len() {
-        return Err(ImageEditError::DimensionMismatch {
+        return Err(ImageEditingError::DimensionMismatch {
             expected: original.len(),
-            got: edited.len(),
+            actual: edited.len(),
         });
     }
 
     let hw = mask.height * mask.width;
     if hw == 0 {
-        return Err(ImageEditError::InvalidMask(
-            "mask has zero spatial extent".to_string(),
+        return Err(ImageEditingError::InvalidImage(
+            "invalid mask: mask has zero spatial extent".to_string(),
         ));
     }
     if !original.len().is_multiple_of(hw) {
-        return Err(ImageEditError::DimensionMismatch {
+        return Err(ImageEditingError::DimensionMismatch {
             expected: original.len(),
-            got: hw,
+            actual: hw,
         });
     }
 
@@ -417,14 +390,14 @@ pub fn edit_expand_mask_to_channels(mask: &EditMask, channels: usize) -> Vec<f32
 /// `result = alpha * a + (1 - alpha) * b`
 ///
 /// `alpha = 1.0` returns `a`; `alpha = 0.0` returns `b`.
-pub fn edit_lerp_latents(a: &[f32], b: &[f32], alpha: f32) -> Result<Vec<f32>, ImageEditError> {
+pub fn edit_lerp_latents(a: &[f32], b: &[f32], alpha: f32) -> Result<Vec<f32>, ImageEditingError> {
     if a.is_empty() {
-        return Err(ImageEditError::EmptyInput);
+        return Err(ImageEditingError::EmptyInput);
     }
     if a.len() != b.len() {
-        return Err(ImageEditError::DimensionMismatch {
+        return Err(ImageEditingError::DimensionMismatch {
             expected: a.len(),
-            got: b.len(),
+            actual: b.len(),
         });
     }
     let result: Vec<f32> = a
@@ -444,14 +417,14 @@ pub fn edit_lerp_latents(a: &[f32], b: &[f32], alpha: f32) -> Result<Vec<f32>, I
 /// `image_variations::spherical_interpolate_latents` elsewhere in this crate.
 /// Falls back to linear interpolation when the vectors are nearly parallel
 /// (`dot > 0.9999` after normalization).
-pub fn edit_slerp_latents(a: &[f32], b: &[f32], alpha: f32) -> Result<Vec<f32>, ImageEditError> {
+pub fn edit_slerp_latents(a: &[f32], b: &[f32], alpha: f32) -> Result<Vec<f32>, ImageEditingError> {
     if a.is_empty() {
-        return Err(ImageEditError::EmptyInput);
+        return Err(ImageEditingError::EmptyInput);
     }
     if a.len() != b.len() {
-        return Err(ImageEditError::DimensionMismatch {
+        return Err(ImageEditingError::DimensionMismatch {
             expected: a.len(),
-            got: b.len(),
+            actual: b.len(),
         });
     }
 
@@ -493,14 +466,14 @@ pub fn edit_slerp_latents(a: &[f32], b: &[f32], alpha: f32) -> Result<Vec<f32>, 
 }
 
 /// Compute the L2 (Euclidean) distance between two latents.
-pub fn edit_latent_distance(a: &[f32], b: &[f32]) -> Result<f32, ImageEditError> {
+pub fn edit_latent_distance(a: &[f32], b: &[f32]) -> Result<f32, ImageEditingError> {
     if a.is_empty() {
-        return Err(ImageEditError::EmptyInput);
+        return Err(ImageEditingError::EmptyInput);
     }
     if a.len() != b.len() {
-        return Err(ImageEditError::DimensionMismatch {
+        return Err(ImageEditingError::DimensionMismatch {
             expected: a.len(),
-            got: b.len(),
+            actual: b.len(),
         });
     }
     let sq_sum: f32 = a
@@ -517,14 +490,14 @@ pub fn edit_latent_distance(a: &[f32], b: &[f32]) -> Result<f32, ImageEditError>
 /// Compute the cosine similarity between two latents.
 ///
 /// Returns `0.0` when either input is zero-norm.
-pub fn edit_cosine_similarity(a: &[f32], b: &[f32]) -> Result<f32, ImageEditError> {
+pub fn edit_cosine_similarity(a: &[f32], b: &[f32]) -> Result<f32, ImageEditingError> {
     if a.is_empty() {
-        return Err(ImageEditError::EmptyInput);
+        return Err(ImageEditingError::EmptyInput);
     }
     if a.len() != b.len() {
-        return Err(ImageEditError::DimensionMismatch {
+        return Err(ImageEditingError::DimensionMismatch {
             expected: a.len(),
-            got: b.len(),
+            actual: b.len(),
         });
     }
 
@@ -541,14 +514,14 @@ pub fn edit_cosine_similarity(a: &[f32], b: &[f32]) -> Result<f32, ImageEditErro
 
 /// Normalize a latent to unit L2 norm.
 ///
-/// Returns `InvalidParam` when the latent is zero-norm.
-pub fn edit_normalize_latent(latent: &[f32]) -> Result<Vec<f32>, ImageEditError> {
+/// Returns `InvalidConfig` when the latent is zero-norm.
+pub fn edit_normalize_latent(latent: &[f32]) -> Result<Vec<f32>, ImageEditingError> {
     if latent.is_empty() {
-        return Err(ImageEditError::EmptyInput);
+        return Err(ImageEditingError::EmptyInput);
     }
     let norm: f32 = latent.iter().map(|&x| x * x).sum::<f32>().sqrt();
     if norm < 1e-12 {
-        return Err(ImageEditError::InvalidParam(
+        return Err(ImageEditingError::InvalidConfig(
             "cannot normalize a zero-norm latent".to_string(),
         ));
     }
@@ -562,14 +535,14 @@ pub fn edit_normalize_latent(latent: &[f32]) -> Result<Vec<f32>, ImageEditError>
 ///
 /// `direction` must be a unit vector; if not, results are mathematically
 /// valid but not strictly an orthogonal projection.
-pub fn edit_project_out(x: &[f32], direction: &[f32]) -> Result<Vec<f32>, ImageEditError> {
+pub fn edit_project_out(x: &[f32], direction: &[f32]) -> Result<Vec<f32>, ImageEditingError> {
     if x.is_empty() {
-        return Err(ImageEditError::EmptyInput);
+        return Err(ImageEditingError::EmptyInput);
     }
     if x.len() != direction.len() {
-        return Err(ImageEditError::DimensionMismatch {
+        return Err(ImageEditingError::DimensionMismatch {
             expected: x.len(),
-            got: direction.len(),
+            actual: direction.len(),
         });
     }
     let proj: f32 = x
@@ -589,19 +562,19 @@ pub fn edit_project_out(x: &[f32], direction: &[f32]) -> Result<Vec<f32>, ImageE
 ///
 /// All latents must have the same length. Returns `EmptyInput` for an
 /// empty collection or zero-length latents.
-pub fn edit_mean_latent(latents: &[Vec<f32>]) -> Result<Vec<f32>, ImageEditError> {
+pub fn edit_mean_latent(latents: &[Vec<f32>]) -> Result<Vec<f32>, ImageEditingError> {
     if latents.is_empty() {
-        return Err(ImageEditError::EmptyInput);
+        return Err(ImageEditingError::EmptyInput);
     }
     let n = latents[0].len();
     if n == 0 {
-        return Err(ImageEditError::EmptyInput);
+        return Err(ImageEditingError::EmptyInput);
     }
     for lat in latents {
         if lat.len() != n {
-            return Err(ImageEditError::DimensionMismatch {
+            return Err(ImageEditingError::DimensionMismatch {
                 expected: n,
-                got: lat.len(),
+                actual: lat.len(),
             });
         }
     }
@@ -623,19 +596,19 @@ pub fn edit_mean_latent(latents: &[Vec<f32>]) -> Result<Vec<f32>, ImageEditError
 ///
 /// Uses the two-pass algorithm: first compute the mean, then accumulate
 /// squared deviations. All latents must have the same length.
-pub fn edit_variance_map(latents: &[Vec<f32>]) -> Result<Vec<f32>, ImageEditError> {
+pub fn edit_variance_map(latents: &[Vec<f32>]) -> Result<Vec<f32>, ImageEditingError> {
     if latents.is_empty() {
-        return Err(ImageEditError::EmptyInput);
+        return Err(ImageEditingError::EmptyInput);
     }
     let n = latents[0].len();
     if n == 0 {
-        return Err(ImageEditError::EmptyInput);
+        return Err(ImageEditingError::EmptyInput);
     }
     for lat in latents {
         if lat.len() != n {
-            return Err(ImageEditError::DimensionMismatch {
+            return Err(ImageEditingError::DimensionMismatch {
                 expected: n,
-                got: lat.len(),
+                actual: lat.len(),
             });
         }
     }
@@ -685,14 +658,14 @@ pub fn compute_sdedit_stats(
     noisy: &[f32],
     mask: Option<&EditMask>,
     edit_strength: f32,
-) -> Result<SdeditStats, ImageEditError> {
+) -> Result<SdeditStats, ImageEditingError> {
     if original.is_empty() {
-        return Err(ImageEditError::EmptyInput);
+        return Err(ImageEditingError::EmptyInput);
     }
     if original.len() != noisy.len() {
-        return Err(ImageEditError::DimensionMismatch {
+        return Err(ImageEditingError::DimensionMismatch {
             expected: original.len(),
-            got: noisy.len(),
+            actual: noisy.len(),
         });
     }
 
@@ -784,19 +757,19 @@ mod tests {
     #[test]
     fn start_timestep_invalid_zero() {
         let err = edit_start_timestep(0.0, 1000).unwrap_err();
-        assert!(matches!(err, ImageEditError::InvalidStrength(_)));
+        assert!(matches!(err, ImageEditingError::InvalidConfig(_)));
     }
 
     #[test]
     fn start_timestep_invalid_above_one() {
         let err = edit_start_timestep(1.5, 1000).unwrap_err();
-        assert!(matches!(err, ImageEditError::InvalidStrength(_)));
+        assert!(matches!(err, ImageEditingError::InvalidConfig(_)));
     }
 
     #[test]
     fn start_timestep_invalid_negative() {
         let err = edit_start_timestep(-0.1, 1000).unwrap_err();
-        assert!(matches!(err, ImageEditError::InvalidStrength(_)));
+        assert!(matches!(err, ImageEditingError::InvalidConfig(_)));
     }
 
     // -----------------------------------------------------------------------
@@ -936,7 +909,7 @@ mod tests {
         let latent = make_latent_val(16, 0.0);
         let noise = make_latent_val(8, 0.0);
         let err = edit_add_noise(&latent, &noise, 0, &ab).unwrap_err();
-        assert!(matches!(err, ImageEditError::DimensionMismatch { .. }));
+        assert!(matches!(err, ImageEditingError::DimensionMismatch { .. }));
     }
 
     #[test]
@@ -945,14 +918,17 @@ mod tests {
         let latent = make_latent_val(8, 1.0);
         let noise = make_latent_val(8, 0.0);
         let err = edit_add_noise(&latent, &noise, 20, &ab).unwrap_err();
-        assert!(matches!(err, ImageEditError::TimestepOutOfRange { .. }));
+        assert!(matches!(
+            err,
+            ImageEditingError::NoiseLevelOutOfRange { .. }
+        ));
     }
 
     #[test]
     fn add_noise_empty_input() {
         let ab = edit_cosine_alpha_bars(100);
         let err = edit_add_noise(&[], &[], 0, &ab).unwrap_err();
-        assert!(matches!(err, ImageEditError::EmptyInput));
+        assert!(matches!(err, ImageEditingError::EmptyInput));
     }
 
     // -----------------------------------------------------------------------
@@ -1177,7 +1153,7 @@ mod tests {
         };
         let mut state = 7u64;
         let err = sdedit_perturb_with_mask(&latent, &config, &ab, &mut state, None).unwrap_err();
-        assert!(matches!(err, ImageEditError::InvalidMask(_)));
+        assert!(matches!(err, ImageEditingError::InvalidImage(_)));
     }
 
     // -----------------------------------------------------------------------
@@ -1740,7 +1716,7 @@ mod tests {
     #[test]
     fn compute_stats_empty_error() {
         let err = compute_sdedit_stats(&[], &[], None, 0.5).unwrap_err();
-        assert!(matches!(err, ImageEditError::EmptyInput));
+        assert!(matches!(err, ImageEditingError::EmptyInput));
     }
 
     #[test]

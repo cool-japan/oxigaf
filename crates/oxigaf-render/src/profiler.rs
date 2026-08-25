@@ -33,6 +33,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use crate::RenderError;
+
 /// A single timing record for one pass invocation.
 #[derive(Debug, Clone)]
 pub struct PassRecord {
@@ -322,6 +324,307 @@ impl<'a> Drop for ProfileScope<'a> {
         let elapsed = self.start.elapsed();
         self.profiler.record(self.pass_name, elapsed);
     }
+}
+
+// ---------------------------------------------------------------------------
+// GpuTimestampProfiler
+// ---------------------------------------------------------------------------
+
+/// Bytes per resolved timestamp query (`u64` ticks).
+const TIMESTAMP_BYTES: u64 = 8;
+
+/// Alignment `CommandEncoder::resolve_query_set` requires of its destination
+/// buffer offset, and therefore of the resolve buffer's size.
+const QUERY_RESOLVE_ALIGNMENT: u64 = wgpu::QUERY_RESOLVE_BUFFER_ALIGNMENT;
+
+/// GPU-side pass profiler backed by `wgpu` timestamp queries.
+///
+/// [`PassProfiler`] measures *wall-clock host* time, which for a compute
+/// dispatch is the cost of **recording** the pass, not of executing it — the
+/// GPU runs asynchronously. This type measures the real thing: two timestamps
+/// per compute pass, written by the GPU itself at the pass boundaries.
+///
+/// # Requirements
+///
+/// The device must have been created with
+/// [`REQUIRED_FEATURES`](Self::REQUIRED_FEATURES) (i.e.
+/// `wgpu::Features::TIMESTAMP_QUERY`), which is only available when the
+/// adapter advertises it. [`Rasterizer::new`](crate::Rasterizer::new) requests
+/// the feature whenever the adapter offers it, so
+/// [`Rasterizer::enable_gpu_timestamps`](crate::Rasterizer::enable_gpu_timestamps)
+/// succeeds on such devices and reports a clear error otherwise.
+///
+/// # Frame protocol
+///
+/// 1. [`pass_writes`](Self::pass_writes) once per compute pass, passing the
+///    result as `ComputePassDescriptor::timestamp_writes`. Each call reserves
+///    two query slots and remembers the pass name.
+/// 2. [`resolve`](Self::resolve) into the same encoder, after the last pass.
+/// 3. Submit, then [`collect`](Self::collect) once the device has been polled:
+///    it maps the readback, converts ticks to durations with the queue's
+///    timestamp period, folds them into [`stats`](Self::stats) and clears the
+///    reservation list for the next frame.
+///
+/// A frame that never reaches `collect` must call [`discard`](Self::discard),
+/// otherwise the next frame keeps reserving slots after the stale ones and
+/// eventually overflows the query set.
+pub struct GpuTimestampProfiler {
+    query_set: wgpu::QuerySet,
+    /// `QUERY_RESOLVE | COPY_SRC` destination of `resolve_query_set`.
+    resolve_buf: wgpu::Buffer,
+    /// `MAP_READ | COPY_DST` host-visible copy of `resolve_buf`.
+    staging: wgpu::Buffer,
+    /// Nanoseconds per timestamp tick, from `Queue::get_timestamp_period`.
+    period_ns: f32,
+    /// Number of passes (query pairs) this profiler can record per frame.
+    max_passes: u32,
+    /// Names of the passes reserved so far this frame, in slot order.
+    pending: Mutex<Vec<String>>,
+    /// Accumulated per-pass GPU statistics.
+    stats: PassProfiler,
+}
+
+impl GpuTimestampProfiler {
+    /// Device features a GPU timestamp profiler needs.
+    pub const REQUIRED_FEATURES: wgpu::Features = wgpu::Features::TIMESTAMP_QUERY;
+
+    /// Passes [`Rasterizer`](crate::Rasterizer) records in one forward plus one
+    /// backward pass, with headroom: preprocess, three scan levels, two
+    /// add-backs, tile_assign, tile_ranges, rasterize_fwd, rasterize_bwd, three
+    /// atomic conversions, preprocess_bwd and flame_binding_bwd.
+    pub const DEFAULT_MAX_PASSES: u32 = 32;
+
+    /// Create a timestamp profiler on `device` with room for `max_passes`
+    /// timed passes per frame.
+    ///
+    /// # Errors
+    ///
+    /// [`RenderError::GpuInit`] when the device was not created with
+    /// [`REQUIRED_FEATURES`](Self::REQUIRED_FEATURES), or when `max_passes` is
+    /// zero or needs more queries than `wgpu::QUERY_SET_MAX_QUERIES`.
+    pub fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        max_passes: u32,
+    ) -> Result<Self, RenderError> {
+        if !device.features().contains(Self::REQUIRED_FEATURES) {
+            return Err(RenderError::GpuInit(
+                "GPU timestamps need wgpu::Features::TIMESTAMP_QUERY, which this device was not \
+                 created with (the adapter may not support it)"
+                    .to_string(),
+            ));
+        }
+        if max_passes == 0 {
+            return Err(RenderError::GpuInit(
+                "GpuTimestampProfiler::new: max_passes must be > 0".to_string(),
+            ));
+        }
+        let query_count = max_passes.checked_mul(2).ok_or_else(|| {
+            RenderError::GpuInit(format!(
+                "GpuTimestampProfiler: {max_passes} passes overflow u32"
+            ))
+        })?;
+        if query_count > wgpu::QUERY_SET_MAX_QUERIES {
+            return Err(RenderError::GpuInit(format!(
+                "GpuTimestampProfiler: {max_passes} passes need {query_count} queries, above the \
+                 {} a query set can hold",
+                wgpu::QUERY_SET_MAX_QUERIES
+            )));
+        }
+
+        let query_set = device.create_query_set(&wgpu::QuerySetDescriptor {
+            label: Some("gpu_timestamps"),
+            ty: wgpu::QueryType::Timestamp,
+            count: query_count,
+        });
+
+        // `resolve_query_set` writes at 256-byte-aligned offsets, so the
+        // buffer is rounded up to that alignment as well.
+        let byte_size = (u64::from(query_count) * TIMESTAMP_BYTES)
+            .next_multiple_of(QUERY_RESOLVE_ALIGNMENT)
+            .max(QUERY_RESOLVE_ALIGNMENT);
+        let resolve_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gpu_timestamps_resolve"),
+            size: byte_size,
+            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gpu_timestamps_staging"),
+            size: byte_size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        Ok(Self {
+            query_set,
+            resolve_buf,
+            staging,
+            period_ns: queue.get_timestamp_period(),
+            max_passes,
+            pending: Mutex::new(Vec::new()),
+            stats: PassProfiler::new(),
+        })
+    }
+
+    /// Accumulated GPU-side statistics, in the same shape as the CPU profiler.
+    pub fn stats(&self) -> &PassProfiler {
+        &self.stats
+    }
+
+    /// Nanoseconds per timestamp tick on this queue.
+    pub fn period_ns(&self) -> f32 {
+        self.period_ns
+    }
+
+    /// Number of passes reserved for the frame currently being recorded.
+    pub fn reserved_passes(&self) -> usize {
+        self.pending.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    /// Reserve two query slots for `pass_name` and build the descriptor to
+    /// hand to `ComputePassDescriptor::timestamp_writes`.
+    ///
+    /// Returns `None` once the frame has already reserved `max_passes` passes;
+    /// the caller then simply records an untimed pass rather than failing the
+    /// frame.
+    pub fn pass_writes(&self, pass_name: &str) -> Option<wgpu::ComputePassTimestampWrites<'_>> {
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        let index = u32::try_from(pending.len()).unwrap_or(u32::MAX);
+        if index >= self.max_passes {
+            tracing::warn!(
+                pass = pass_name,
+                max_passes = self.max_passes,
+                "GPU timestamp query set is full for this frame; pass recorded untimed"
+            );
+            return None;
+        }
+        pending.push(pass_name.to_owned());
+        let slot = index * 2;
+        Some(wgpu::ComputePassTimestampWrites {
+            query_set: &self.query_set,
+            beginning_of_pass_write_index: Some(slot),
+            end_of_pass_write_index: Some(slot + 1),
+        })
+    }
+
+    /// Record the query resolve and the host readback copy into `encoder`.
+    ///
+    /// Returns the number of passes that will be reported by the following
+    /// [`collect`](Self::collect); zero means nothing was timed and `collect`
+    /// can be skipped.
+    pub fn resolve(&self, encoder: &mut wgpu::CommandEncoder) -> usize {
+        let passes = self.reserved_passes();
+        if passes == 0 {
+            return 0;
+        }
+        let queries = u32::try_from(passes * 2).unwrap_or(u32::MAX);
+        encoder.resolve_query_set(&self.query_set, 0..queries, &self.resolve_buf, 0);
+        let bytes = (u64::from(queries) * TIMESTAMP_BYTES).min(self.staging.size());
+        encoder.copy_buffer_to_buffer(&self.resolve_buf, 0, &self.staging, 0, bytes);
+        passes
+    }
+
+    /// Map the resolved timestamps, fold them into [`stats`](Self::stats) and
+    /// start a new frame.
+    ///
+    /// Call this only after the submission containing [`resolve`](Self::resolve)
+    /// has completed. Returns the per-pass GPU durations of the frame, in the
+    /// order the passes were reserved.
+    ///
+    /// # Errors
+    ///
+    /// [`RenderError::BufferMapFailed`] when the readback cannot be mapped. The
+    /// frame's reservations are cleared either way, so one failed readback does
+    /// not poison every later frame.
+    pub fn collect(&self, device: &wgpu::Device) -> Result<Vec<(String, Duration)>, RenderError> {
+        let names: Vec<String> = {
+            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut *pending)
+        };
+        if names.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let slice = self.staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            tx.send(result).ok();
+        });
+        let _ = device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        });
+        rx.recv()
+            .map_err(|e| RenderError::BufferMapFailed {
+                buffer_name: "gpu_timestamps_staging".to_string(),
+                error: format!("Channel recv failed: {e}"),
+            })?
+            .map_err(|e| RenderError::BufferMapFailed {
+                buffer_name: "gpu_timestamps_staging".to_string(),
+                error: e.to_string(),
+            })?;
+
+        let data = slice
+            .get_mapped_range()
+            .map_err(|e| RenderError::BufferMapFailed {
+                buffer_name: "gpu_timestamps_staging".to_string(),
+                error: format!("Mapped range failed: {e}"),
+            })?;
+        let ticks: Vec<u64> = data
+            .chunks_exact(TIMESTAMP_BYTES as usize)
+            .map(|c| {
+                let mut raw = [0u8; 8];
+                raw.copy_from_slice(c);
+                u64::from_le_bytes(raw)
+            })
+            .collect();
+        drop(data);
+        self.staging.unmap();
+
+        let out = timestamps_to_durations(&names, &ticks, self.period_ns);
+        for (name, duration) in &out {
+            self.stats.record(name, *duration);
+        }
+        self.stats.next_frame();
+        Ok(out)
+    }
+
+    /// Drop this frame's reservations without reading them back.
+    ///
+    /// Use this when a frame is abandoned (an error before submission, or a
+    /// submission whose completion is never awaited): otherwise the stale
+    /// reservations stay counted and the query set fills up.
+    pub fn discard(&self) {
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+}
+
+/// Convert resolved timestamp ticks into one duration per named pass.
+///
+/// `ticks` holds `[begin_0, end_0, begin_1, end_1, ...]`. A pair whose end
+/// precedes its begin (an unwritten or wrapped query) yields a zero duration
+/// rather than an underflow, and names without a full pair are dropped.
+fn timestamps_to_durations(
+    names: &[String],
+    ticks: &[u64],
+    period_ns: f32,
+) -> Vec<(String, Duration)> {
+    let period = f64::from(period_ns.max(0.0));
+    names
+        .iter()
+        .enumerate()
+        .filter_map(|(i, name)| {
+            let begin = *ticks.get(i * 2)?;
+            let end = *ticks.get(i * 2 + 1)?;
+            let elapsed_ticks = end.saturating_sub(begin);
+            let nanos = (elapsed_ticks as f64) * period;
+            Some((name.clone(), Duration::from_nanos(nanos as u64)))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -700,5 +1003,66 @@ mod tests {
             .unwrap_or_else(|| panic!("expected stats for 'pass_b'"));
         assert_eq!(a.invocation_count, 2);
         assert_eq!(b.invocation_count, 1);
+    }
+
+    // -------------------------------------------------------------------------
+    // GPU timestamp conversion (no GPU required)
+    // -------------------------------------------------------------------------
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn test_timestamps_to_durations_uses_the_queue_period() {
+        // 1 tick = 2.5 ns; pass 0 spans 1000 ticks, pass 1 spans 40 ticks.
+        let out = timestamps_to_durations(
+            &names(&["preprocess", "rasterize_fwd"]),
+            &[100, 1_100, 5_000, 5_040],
+            2.5,
+        );
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].0, "preprocess");
+        assert_eq!(out[0].1, Duration::from_nanos(2_500));
+        assert_eq!(out[1].0, "rasterize_fwd");
+        assert_eq!(out[1].1, Duration::from_nanos(100));
+    }
+
+    /// Regression: an unwritten or wrapped query pair must not underflow into
+    /// a multi-century duration.
+    #[test]
+    fn test_timestamps_to_durations_clamps_reversed_pairs() {
+        let out = timestamps_to_durations(&names(&["odd"]), &[900, 100], 1.0);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].1, Duration::ZERO);
+    }
+
+    /// A truncated readback drops the incomplete tail instead of indexing
+    /// past the resolved data.
+    #[test]
+    fn test_timestamps_to_durations_drops_incomplete_tail() {
+        let out = timestamps_to_durations(&names(&["a", "b"]), &[0, 10, 20], 1.0);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, "a");
+        assert_eq!(out[0].1, Duration::from_nanos(10));
+    }
+
+    #[test]
+    fn test_timestamps_to_durations_empty_is_empty() {
+        assert!(timestamps_to_durations(&[], &[1, 2], 1.0).is_empty());
+        assert!(timestamps_to_durations(&names(&["a"]), &[], 1.0).is_empty());
+    }
+
+    /// The two timestamps a pass reserves must land in adjacent, non-
+    /// overlapping slots — the invariant `pass_writes` encodes and
+    /// `timestamps_to_durations` decodes.
+    #[test]
+    fn test_timestamp_slot_layout_is_two_per_pass() {
+        for pass_index in 0u32..8 {
+            let begin = pass_index * 2;
+            let end = begin + 1;
+            assert_eq!(end - begin, 1);
+            assert!(begin.is_multiple_of(2));
+        }
     }
 }

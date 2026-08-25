@@ -26,6 +26,8 @@
 //! println!("total_l2_norm = {:.4e}", snapshot.total_l2_norm);
 //! ```
 
+use std::collections::VecDeque;
+
 use thiserror::Error;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -91,7 +93,12 @@ pub struct FlowSnapshot {
 }
 
 /// Classification of gradient flow health for one group.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Declaration order below (least to most severe) doubles as the derived
+/// [`Ord`] ranking: `Healthy < Vanishing < Exploding < Dead < NanOrInf`.
+/// [`worst_health`] and [`classify_flow_health`]'s documented priority both
+/// derive from this single ordering, so they cannot drift apart again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum FlowHealth {
     /// Gradient norms are in a reasonable range.
     Healthy,
@@ -188,7 +195,7 @@ pub struct GradientFlowTracker {
     /// Configuration parameters.
     pub config: GradientFlowConfig,
     /// Chronological history of flow snapshots.
-    history: Vec<FlowSnapshot>,
+    history: VecDeque<FlowSnapshot>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -310,22 +317,11 @@ pub fn classify_flow_health(
 
 /// Return the worse of two [`FlowHealth`] values.
 ///
-/// Ordering (worst first): NanOrInf > Exploding > Vanishing > Dead > Healthy.
+/// Ordering (worst first): NanOrInf > Dead > Exploding > Vanishing > Healthy,
+/// matching the priority documented on [`classify_flow_health`] — both are
+/// derived from [`FlowHealth`]'s single [`Ord`] impl (see its doc).
 pub fn worst_health(a: FlowHealth, b: FlowHealth) -> FlowHealth {
-    let rank = |h: FlowHealth| -> u8 {
-        match h {
-            FlowHealth::NanOrInf => 4,
-            FlowHealth::Exploding => 3,
-            FlowHealth::Vanishing => 2,
-            FlowHealth::Dead => 1,
-            FlowHealth::Healthy => 0,
-        }
-    };
-    if rank(a) >= rank(b) {
-        a
-    } else {
-        b
-    }
+    a.max(b)
 }
 
 /// Compute the linear regression slope for a sequence of values.
@@ -357,9 +353,18 @@ pub fn flow_linear_regression(values: &[f32]) -> f32 {
 ///
 /// - Empty or single-element input → `Stable`
 /// - coefficient of variation (std/mean) < `config.stable_cv` → `Stable`
-/// - slope > 0 and cv ≥ stable_cv → `Increasing`
-/// - slope < 0 and cv ≥ stable_cv → `Decreasing`
-/// - otherwise → `Oscillating`
+/// - Otherwise, normalise the linear-regression slope into a window-relative
+///   fractional change (`rel_slope`, see below); if its magnitude is still
+///   below `config.stable_cv` → `Oscillating` (the variance is high but not
+///   explained by a monotone trend — i.e. noise, not drift)
+/// - `rel_slope > 0` → `Increasing`
+/// - `rel_slope <= 0` → `Decreasing`
+///
+/// `rel_slope = slope * n / mean.abs()` estimates the total fractional
+/// change predicted by the fitted line across the whole window, so it is on
+/// the same (dimensionless) scale as `stable_cv` and does not require the
+/// slope to be bit-exactly `0.0` to detect a genuinely trendless, noisy
+/// sequence.
 pub fn compute_grad_trend(norms: &[f32], config: &GradientFlowConfig) -> GradTrend {
     if norms.len() < 2 {
         return GradTrend::Stable;
@@ -383,13 +388,18 @@ pub fn compute_grad_trend(norms: &[f32], config: &GradientFlowConfig) -> GradTre
     }
 
     let slope = flow_linear_regression(norms);
-
-    if slope > 0.0 {
-        GradTrend::Increasing
-    } else if slope < 0.0 {
-        GradTrend::Decreasing
+    let rel_slope = if mean.abs() < f32::EPSILON {
+        0.0
     } else {
+        slope * n / mean.abs()
+    };
+
+    if rel_slope.abs() < config.stable_cv {
         GradTrend::Oscillating
+    } else if rel_slope > 0.0 {
+        GradTrend::Increasing
+    } else {
+        GradTrend::Decreasing
     }
 }
 
@@ -402,7 +412,7 @@ impl GradientFlowTracker {
     pub fn new(config: GradientFlowConfig) -> Self {
         Self {
             config,
-            history: Vec::new(),
+            history: VecDeque::new(),
         }
     }
 
@@ -436,11 +446,13 @@ impl GradientFlowTracker {
             total_l2_norm,
         };
 
-        // Evict oldest entry if at capacity.
+        // Evict oldest entry if at capacity. `VecDeque::pop_front` is O(1),
+        // unlike `Vec::remove(0)` which shifts the entire backing buffer on
+        // every eviction.
         if self.history.len() >= self.config.history_capacity {
-            self.history.remove(0);
+            self.history.pop_front();
         }
-        self.history.push(snapshot.clone());
+        self.history.push_back(snapshot.clone());
 
         Ok(snapshot)
     }
@@ -452,7 +464,10 @@ impl GradientFlowTracker {
 
     /// Return the most recently recorded snapshot, or `None` if history is empty.
     pub fn latest_snapshot(&self) -> Option<&FlowSnapshot> {
-        self.history.last()
+        // `VecDeque` has no inherent `last()` (it does not `Deref<Target =
+        // [T]>` the way `Vec` does) — `back()` is the O(1) equivalent for
+        // the most-recently-`push_back`-ed element.
+        self.history.back()
     }
 
     /// Analyze the gradient flow for one named parameter group over the last
@@ -478,14 +493,17 @@ impl GradientFlowTracker {
         }
 
         let start = self.history.len() - window;
-        let window_snaps = &self.history[start..];
+        // `VecDeque` does not implement `Index<Range<usize>>`, so collect
+        // the window into a `Vec` of references via `range()` instead of
+        // slicing directly.
+        let window_snaps: Vec<&FlowSnapshot> = self.history.range(start..).collect();
 
         // Collect L2 norms for this group across the window.
         let mut norms: Vec<f32> = Vec::new();
         let mut any_nan = false;
         let mut any_inf = false;
 
-        for snap in window_snaps {
+        for snap in &window_snaps {
             for g in &snap.groups {
                 if g.group_name == group_name {
                     norms.push(g.l2_norm);
@@ -515,7 +533,7 @@ impl GradientFlowTracker {
 
         // Compute relative_signal as this group's mean_norm vs the sum of all
         // group mean_norms.  We compute the latter from the same window.
-        let total_mean: f32 = self.group_total_mean_norm_in_window(window_snaps);
+        let total_mean: f32 = self.group_total_mean_norm_in_window(&window_snaps);
         let relative_signal = if total_mean > 0.0 {
             mean_norm / total_mean
         } else {
@@ -549,7 +567,8 @@ impl GradientFlowTracker {
         }
 
         // Use group names from the latest snapshot as the canonical list.
-        let latest = self.history.last().ok_or(GradientFlowError::EmptyHistory)?;
+        // `VecDeque` has no inherent `last()`; `back()` is the equivalent.
+        let latest = self.history.back().ok_or(GradientFlowError::EmptyHistory)?;
         let group_names: Vec<String> = latest.groups.iter().map(|g| g.group_name.clone()).collect();
 
         let mut reports: Vec<GroupFlowReport> = Vec::with_capacity(group_names.len());
@@ -593,10 +612,29 @@ impl GradientFlowTracker {
         })
     }
 
+    /// Like [`analyze_group`](Self::analyze_group), but uses
+    /// `config.trend_window` (clamped to the available history) as the
+    /// window size instead of requiring the caller to pass one explicitly.
+    pub fn analyze_group_default_window(
+        &self,
+        group_name: &str,
+    ) -> Result<GroupFlowReport, GradientFlowError> {
+        let window = self.config.trend_window.min(self.history.len());
+        self.analyze_group(group_name, window)
+    }
+
+    /// Like [`analyze_all`](Self::analyze_all), but uses
+    /// `config.trend_window` (clamped to the available history) as the
+    /// window size instead of requiring the caller to pass one explicitly.
+    pub fn analyze_all_default_window(&self) -> Result<GradientFlowReport, GradientFlowError> {
+        let window = self.config.trend_window.min(self.history.len());
+        self.analyze_all(window)
+    }
+
     // ── Internal helpers ──────────────────────────────────────────────────────
 
     /// Compute the sum of per-group mean L2 norms across the given window of snapshots.
-    fn group_total_mean_norm_in_window(&self, window_snaps: &[FlowSnapshot]) -> f32 {
+    fn group_total_mean_norm_in_window(&self, window_snaps: &[&FlowSnapshot]) -> f32 {
         // Collect all unique group names from window.
         let mut group_names: Vec<String> = Vec::new();
         for snap in window_snaps {
@@ -945,10 +983,27 @@ mod tests {
     }
 
     #[test]
-    fn test_worst_health_vanishing_beats_dead() {
+    fn test_worst_health_dead_beats_vanishing() {
+        // Regression test: Dead (exactly-zero gradient, no learning signal
+        // at all) must outrank Vanishing (merely small but nonzero), per
+        // classify_flow_health's documented priority. worst_health's rank
+        // previously disagreed and ranked Vanishing above Dead.
+        assert_eq!(
+            worst_health(FlowHealth::Dead, FlowHealth::Vanishing),
+            FlowHealth::Dead
+        );
         assert_eq!(
             worst_health(FlowHealth::Vanishing, FlowHealth::Dead),
-            FlowHealth::Vanishing
+            FlowHealth::Dead
+        );
+    }
+
+    #[test]
+    fn test_worst_health_dead_beats_exploding() {
+        // Full documented ordering check: Dead also outranks Exploding.
+        assert_eq!(
+            worst_health(FlowHealth::Dead, FlowHealth::Exploding),
+            FlowHealth::Dead
         );
     }
 
@@ -1456,12 +1511,29 @@ mod tests {
             stable_cv: 0.01, // tight threshold
             ..test_config()
         };
-        // Alternating values → high cv, slope ~0 → Oscillating.
+        // Alternating values → high cv, slope exactly 0 (symmetric) → Oscillating.
         let v = [1.0_f32, 10.0, 1.0, 10.0, 1.0];
         let trend = compute_grad_trend(&v, &cfg);
-        // With alternating values, slope could be near zero or slightly off.
-        // It should not be Stable (cv is huge).
-        assert_ne!(trend, GradTrend::Stable);
+        assert_eq!(trend, GradTrend::Oscillating, "trend={trend:?}");
+    }
+
+    #[test]
+    fn test_grad_trend_oscillating_with_nonzero_slope() {
+        // Regression test: Oscillating must not require a bit-exact 0.0
+        // slope. This sequence is nearly (but not exactly) symmetric, so
+        // `flow_linear_regression` returns a small NONZERO slope — with
+        // real float data, an exactly-zero slope essentially never
+        // happens, so the old `slope == 0.0` check made this variant
+        // unreachable in practice.
+        let cfg = GradientFlowConfig {
+            stable_cv: 0.01, // tight threshold: high cv still triggers here
+            ..test_config()
+        };
+        let v = [1.0_f32, 10.0, 1.0, 10.0, 1.01];
+        let slope = flow_linear_regression(&v);
+        assert_ne!(slope, 0.0, "sanity: slope should be nonzero for this input");
+        let trend = compute_grad_trend(&v, &cfg);
+        assert_eq!(trend, GradTrend::Oscillating, "trend={trend:?}");
     }
 
     #[test]
@@ -1519,5 +1591,68 @@ mod tests {
         assert_eq!(report.groups.len(), 2);
         // positions should dominate because its norms are much larger.
         assert_eq!(report.dominant_group, "positions");
+    }
+
+    // ─── trend_window wiring (analyze_*_default_window) ─────────────────────
+
+    #[test]
+    fn test_analyze_group_default_window_uses_config_trend_window() {
+        let cfg = GradientFlowConfig {
+            history_capacity: 100,
+            trend_window: 3,
+            ..GradientFlowConfig::default()
+        };
+        let mut tracker = GradientFlowTracker::new(cfg);
+        for step in 0..10usize {
+            let grads = vec![(step as f32 + 1.0) * 0.5];
+            tracker
+                .record(step, vec![("positions".to_string(), grads.as_slice())])
+                .unwrap();
+        }
+        let default_report = tracker
+            .analyze_group_default_window("positions")
+            .expect("trend_window=3 should be usable directly");
+        let explicit_report = tracker.analyze_group("positions", 3).unwrap();
+        assert!((default_report.mean_norm - explicit_report.mean_norm).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_analyze_group_default_window_clamps_to_history_len() {
+        // trend_window (50, the default) exceeds the 2 recorded steps —
+        // the default-window helper must clamp instead of erroring.
+        let mut tracker = GradientFlowTracker::new(GradientFlowConfig::default());
+        let grads = vec![1.0_f32];
+        tracker
+            .record(0, vec![("g".to_string(), grads.as_slice())])
+            .unwrap();
+        tracker
+            .record(1, vec![("g".to_string(), grads.as_slice())])
+            .unwrap();
+        let report = tracker
+            .analyze_group_default_window("g")
+            .expect("should clamp window to history_len instead of erroring");
+        assert!((report.mean_norm - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_analyze_all_default_window_matches_explicit_window() {
+        let cfg = GradientFlowConfig {
+            history_capacity: 100,
+            trend_window: 4,
+            ..GradientFlowConfig::default()
+        };
+        let mut tracker = GradientFlowTracker::new(cfg);
+        for step in 0..10usize {
+            let pos = vec![(step as f32 + 1.0) * 2.0];
+            tracker
+                .record(step, vec![("positions".to_string(), pos.as_slice())])
+                .unwrap();
+        }
+        let default_report = tracker.analyze_all_default_window().unwrap();
+        let explicit_report = tracker.analyze_all(4).unwrap();
+        assert_eq!(default_report.step, explicit_report.step);
+        assert!(
+            (default_report.groups[0].mean_norm - explicit_report.groups[0].mean_norm).abs() < 1e-6
+        );
     }
 }

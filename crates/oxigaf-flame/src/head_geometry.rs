@@ -99,13 +99,22 @@ pub struct HeadMeasurements {
     pub head_width: f32,
     /// Inferior-to-superior extent (max height along Y axis).
     pub head_height: f32,
-    /// Approximate zygomatic width (cheekbone to cheekbone).
+    /// Zygomatic width (cheekbone to cheekbone). Real distance between
+    /// [`HeadLandmarks::left_zygomatic_idx`]/`right_zygomatic_idx` when both
+    /// are supplied, else the documented fallback `head_width * 0.8`.
     pub face_width: f32,
-    /// Approximate chin-to-brow distance.
+    /// Chin-to-brow distance. Real distance from
+    /// [`HeadLandmarks::chin_idx`] to `brow_idx` (or the mesh's max-Y bound
+    /// when `brow_idx` is absent) when `chin_idx` is supplied, else the
+    /// documented fallback `head_height * 0.7`.
     pub face_height: f32,
-    /// Approximate nose tip to root length.
+    /// Nose tip-to-root length. Real distance between
+    /// [`HeadLandmarks::nose_tip_idx`]/`nose_root_idx` when both are
+    /// supplied, else the documented fallback `head_height * 0.15`.
     pub nose_length: f32,
-    /// Approximate mandible width at jaw angles.
+    /// Mandible width at the jaw angles. Real distance between
+    /// [`HeadLandmarks::left_gonion_idx`]/`right_gonion_idx` when both are
+    /// supplied, else the documented fallback `head_width * 0.6`.
     pub jaw_width: f32,
     /// Cephalic index: `head_width / head_length * 100`.
     pub cephalic_index: f32,
@@ -113,9 +122,56 @@ pub struct HeadMeasurements {
     pub facial_index: f32,
 }
 
+/// Optional anatomical landmark vertex indices that let [`measure_head`]
+/// replace its bounding-box-ratio fallbacks with real, mesh-derived
+/// measurements. Every field is independently optional; a measurement
+/// falls back to its documented ratio unless the specific landmark(s) it
+/// needs are supplied (see the [`HeadMeasurements`] field docs).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HeadLandmarks {
+    /// Tip of the nose.
+    pub nose_tip_idx: Option<usize>,
+    /// Nose root / nasion (bridge of the nose, between the eyes).
+    pub nose_root_idx: Option<usize>,
+    /// Point of the chin (menton).
+    pub chin_idx: Option<usize>,
+    /// Brow ridge landmark, used as the upper reference for `face_height`.
+    pub brow_idx: Option<usize>,
+    /// Left zygomatic (cheekbone) point.
+    pub left_zygomatic_idx: Option<usize>,
+    /// Right zygomatic (cheekbone) point.
+    pub right_zygomatic_idx: Option<usize>,
+    /// Left gonion (mandible angle) point.
+    pub left_gonion_idx: Option<usize>,
+    /// Right gonion (mandible angle) point.
+    pub right_gonion_idx: Option<usize>,
+}
+
+impl HeadLandmarks {
+    /// Every supplied (`Some`) index, for bounds validation.
+    fn indices(&self) -> impl Iterator<Item = usize> {
+        [
+            self.nose_tip_idx,
+            self.nose_root_idx,
+            self.chin_idx,
+            self.brow_idx,
+            self.left_zygomatic_idx,
+            self.right_zygomatic_idx,
+            self.left_gonion_idx,
+            self.right_gonion_idx,
+        ]
+        .into_iter()
+        .flatten()
+    }
+}
+
 /// Compute standard anthropometric measurements from vertex positions.
 ///
-/// Optional landmark indices refine the `face_height` calculation.
+/// `landmarks` optionally refines `face_width`, `face_height`,
+/// `nose_length`, and `jaw_width` from real mesh distances instead of
+/// bounding-box-ratio heuristics — see the [`HeadMeasurements`] field docs
+/// for exactly which landmark(s) each measurement needs. Pass
+/// `HeadLandmarks::default()` to always use the heuristic fallbacks.
 ///
 /// # Errors
 ///
@@ -123,8 +179,7 @@ pub struct HeadMeasurements {
 /// [`HeadGeometryError::InvalidLandmark`] when a provided index is out of range.
 pub fn measure_head(
     vertices: &[[f32; 3]],
-    nose_tip_idx: Option<usize>,
-    chin_idx: Option<usize>,
+    landmarks: HeadLandmarks,
 ) -> Result<HeadMeasurements, HeadGeometryError> {
     if vertices.is_empty() {
         return Err(HeadGeometryError::EmptyMesh(
@@ -132,16 +187,7 @@ pub fn measure_head(
         ));
     }
 
-    // Validate optional landmark indices.
-    if let Some(idx) = nose_tip_idx {
-        if idx >= vertices.len() {
-            return Err(HeadGeometryError::InvalidLandmark {
-                idx,
-                n_verts: vertices.len(),
-            });
-        }
-    }
-    if let Some(idx) = chin_idx {
+    for idx in landmarks.indices() {
         if idx >= vertices.len() {
             return Err(HeadGeometryError::InvalidLandmark {
                 idx,
@@ -182,19 +228,31 @@ pub fn measure_head(
     let head_width = (max_x - min_x).max(0.0);
     let head_height = (max_y - min_y).max(0.0);
 
-    let face_width = head_width * 0.8;
+    let face_width = match (landmarks.left_zygomatic_idx, landmarks.right_zygomatic_idx) {
+        (Some(l), Some(r)) => head_dist3(&vertices[l], &vertices[r]),
+        _ => head_width * 0.8,
+    };
 
-    // Optionally use chin + brow region to sharpen face_height.
-    let face_height = if let (Some(c_idx), Some(_n_idx)) = (chin_idx, nose_tip_idx) {
+    // Use the chin landmark (independently of nose_tip_idx — the two are
+    // unrelated) to sharpen face_height; brow_idx refines the upper
+    // reference beyond the mesh's max-Y bound when available.
+    let face_height = if let Some(c_idx) = landmarks.chin_idx {
         let chin_y = vertices[c_idx][1];
-        let brow_y = max_y;
-        (brow_y - chin_y).abs() * 0.7_f32.max(0.0)
+        let brow_y = landmarks.brow_idx.map_or(max_y, |b| vertices[b][1]);
+        (brow_y - chin_y).abs()
     } else {
         head_height * 0.7
     };
 
-    let nose_length = 0.15 * head_height;
-    let jaw_width = head_width * 0.6;
+    let nose_length = match (landmarks.nose_tip_idx, landmarks.nose_root_idx) {
+        (Some(tip), Some(root)) => head_dist3(&vertices[tip], &vertices[root]),
+        _ => 0.15 * head_height,
+    };
+
+    let jaw_width = match (landmarks.left_gonion_idx, landmarks.right_gonion_idx) {
+        (Some(l), Some(r)) => head_dist3(&vertices[l], &vertices[r]),
+        _ => head_width * 0.6,
+    };
 
     let cephalic_index = head_width / head_length.max(1e-6) * 100.0;
     let facial_index = face_height / face_width.max(1e-6) * 100.0;
@@ -706,23 +764,40 @@ fn shoelace_area(poly: &[[f32; 2]]) -> f32 {
 /// between the left vertex and the YZ-plane reflection of the right vertex
 /// (i.e., the right vertex mirrored at x = 0).
 ///
-/// Returns a `Vec<f32>` with one score per input pair.
-#[must_use]
+/// Returns a `Vec<f32>` with one score per input pair, in the same order.
+///
+/// # Errors
+///
+/// Returns [`HeadGeometryError::InvalidLandmark`] when either index of a
+/// pair is out of range for `vertices` — matching [`region_centroid`]'s
+/// contract, rather than silently returning `f32::NAN` for that entry
+/// (which previously produced undocumented, easy-to-miss `NaN`s in any
+/// caller aggregating the scores via mean/max/sorting).
 pub fn vertex_asymmetry_scores(
     vertices: &[[f32; 3]],
     symmetry_pairs: &[(usize, usize)],
-) -> Vec<f32> {
+) -> Result<Vec<f32>, HeadGeometryError> {
+    let n = vertices.len();
     symmetry_pairs
         .iter()
         .map(|&(li, ri)| {
-            if li >= vertices.len() || ri >= vertices.len() {
-                return f32::NAN;
+            if li >= n {
+                return Err(HeadGeometryError::InvalidLandmark {
+                    idx: li,
+                    n_verts: n,
+                });
+            }
+            if ri >= n {
+                return Err(HeadGeometryError::InvalidLandmark {
+                    idx: ri,
+                    n_verts: n,
+                });
             }
             let l = vertices[li];
             let r = vertices[ri];
             // Mirror r across the YZ plane (negate x).
             let r_reflected = [-r[0], r[1], r[2]];
-            head_dist3(&l, &r_reflected)
+            Ok(head_dist3(&l, &r_reflected))
         })
         .collect()
 }
@@ -878,7 +953,9 @@ pub fn project_to_plane(
 }
 
 /// Compute the principal axis (largest PCA eigenvector) of a vertex cloud
-/// via power iteration (100 iterations).
+/// via power iteration, stopping as soon as the estimate changes by less
+/// than `1e-7` between iterations (capped at 200 iterations as a safety
+/// bound if it never quite settles).
 ///
 /// # Errors
 ///
@@ -945,7 +1022,12 @@ pub fn principal_axis(vertices: &[[f32; 3]]) -> Result<[f32; 3], HeadGeometryErr
             // Degenerate covariance (all vertices identical) — return default axis.
             return Ok([1.0, 0.0, 0.0]);
         }
-        ev = [new_ev[0] / len, new_ev[1] / len, new_ev[2] / len];
+        let next_ev = [new_ev[0] / len, new_ev[1] / len, new_ev[2] / len];
+        let delta = norm3(&sub3(&next_ev, &ev));
+        ev = next_ev;
+        if delta < 1e-7 {
+            break;
+        }
     }
     Ok(ev)
 }
@@ -979,12 +1061,11 @@ pub struct HeadGeometryStats {
 pub fn compute_head_geometry_stats(
     vertices: &[[f32; 3]],
     faces: &[[u32; 3]],
-    nose_tip_idx: Option<usize>,
-    chin_idx: Option<usize>,
+    landmarks: HeadLandmarks,
 ) -> Result<HeadGeometryStats, HeadGeometryError> {
     let surface_area = head_surface_area(vertices, faces)?;
     let volume = head_volume(vertices, faces)?;
-    let measurements = measure_head(vertices, nose_tip_idx, chin_idx)?;
+    let measurements = measure_head(vertices, landmarks)?;
 
     let compactness = if surface_area > 1e-30 {
         36.0 * std::f32::consts::PI * volume * volume / (surface_area * surface_area * surface_area)
@@ -1188,7 +1269,7 @@ mod tests {
     #[test]
     fn test_measure_head_unit_cube() {
         let verts = unit_cube_vertices();
-        let m = measure_head(&verts, None, None).expect("measurements");
+        let m = measure_head(&verts, HeadLandmarks::default()).expect("measurements");
         assert!((m.head_length - 1.0).abs() < 1e-5);
         assert!((m.head_width - 1.0).abs() < 1e-5);
         assert!((m.head_height - 1.0).abs() < 1e-5);
@@ -1199,22 +1280,86 @@ mod tests {
 
     #[test]
     fn test_measure_head_empty() {
-        let err = measure_head(&[], None, None).expect_err("should fail");
+        let err = measure_head(&[], HeadLandmarks::default()).expect_err("should fail");
         assert!(matches!(err, HeadGeometryError::EmptyMesh(_)));
     }
 
     #[test]
     fn test_measure_head_invalid_nose_idx() {
         let verts = unit_cube_vertices();
-        let err = measure_head(&verts, Some(999), None).expect_err("should fail");
+        let landmarks = HeadLandmarks {
+            nose_tip_idx: Some(999),
+            ..Default::default()
+        };
+        let err = measure_head(&verts, landmarks).expect_err("should fail");
         assert!(matches!(err, HeadGeometryError::InvalidLandmark { .. }));
     }
 
     #[test]
     fn test_measure_head_invalid_chin_idx() {
         let verts = unit_cube_vertices();
-        let err = measure_head(&verts, None, Some(999)).expect_err("should fail");
+        let landmarks = HeadLandmarks {
+            chin_idx: Some(999),
+            ..Default::default()
+        };
+        let err = measure_head(&verts, landmarks).expect_err("should fail");
         assert!(matches!(err, HeadGeometryError::InvalidLandmark { .. }));
+    }
+
+    // Regression test: `nose_tip_idx` was read nowhere (bound as `_n_idx`),
+    // so `nose_length` was always the fixed `head_height * 0.15` heuristic
+    // even when a real nose tip + root were supplied.
+    #[test]
+    fn test_measure_head_nose_length_uses_landmarks_when_supplied() {
+        let mut verts = unit_cube_vertices();
+        let root_idx = verts.len();
+        verts.push([0.0, 0.0, 0.0]); // nose root
+        let tip_idx = verts.len();
+        verts.push([0.0, 0.0, 5.0]); // nose tip, 5 units from root
+        let landmarks = HeadLandmarks {
+            nose_tip_idx: Some(tip_idx),
+            nose_root_idx: Some(root_idx),
+            ..Default::default()
+        };
+        let m = measure_head(&verts, landmarks).expect("measurements");
+        assert!(
+            (m.nose_length - 5.0).abs() < 1e-4,
+            "nose_length should be the real tip-root distance (5.0), got {}",
+            m.nose_length
+        );
+    }
+
+    // Regression test: face_width/jaw_width ignored zygomatic/gonion
+    // landmarks entirely, always using the bounding-box ratio.
+    #[test]
+    fn test_measure_head_face_and_jaw_width_use_landmarks_when_supplied() {
+        let mut verts = unit_cube_vertices();
+        let lz = verts.len();
+        verts.push([-3.0, 0.0, 0.0]);
+        let rz = verts.len();
+        verts.push([3.0, 0.0, 0.0]); // zygomatic pair, 6 units apart
+        let lg = verts.len();
+        verts.push([-2.0, -1.0, 0.0]);
+        let rg = verts.len();
+        verts.push([2.0, -1.0, 0.0]); // gonion pair, 4 units apart
+        let landmarks = HeadLandmarks {
+            left_zygomatic_idx: Some(lz),
+            right_zygomatic_idx: Some(rz),
+            left_gonion_idx: Some(lg),
+            right_gonion_idx: Some(rg),
+            ..Default::default()
+        };
+        let m = measure_head(&verts, landmarks).expect("measurements");
+        assert!(
+            (m.face_width - 6.0).abs() < 1e-4,
+            "face_width should be the real zygomatic distance (6.0), got {}",
+            m.face_width
+        );
+        assert!(
+            (m.jaw_width - 4.0).abs() < 1e-4,
+            "jaw_width should be the real gonion distance (4.0), got {}",
+            m.jaw_width
+        );
     }
 
     #[test]
@@ -1226,7 +1371,7 @@ mod tests {
             [0.0, 0.0, 4.0],
             [2.0, 0.0, 4.0],
         ];
-        let m = measure_head(&verts, None, None).expect("measurements");
+        let m = measure_head(&verts, HeadLandmarks::default()).expect("measurements");
         assert!(
             (m.cephalic_index - 50.0).abs() < 1e-3,
             "ci={}",
@@ -1338,6 +1483,26 @@ mod tests {
         assert!(ax[1].abs() > 0.99, "expected Y axis, got {ax:?}");
     }
 
+    // Regression test for the early-exit convergence rewrite: a cloud
+    // elongated along a diagonal (not already axis-aligned with the power
+    // iteration's starting guess) must still converge to the true
+    // dominant direction, not stop early on a stale estimate.
+    #[test]
+    fn test_principal_axis_along_diagonal() {
+        let dir = normalize3(&[3.0_f32, 4.0, 0.0]); // 0.6, 0.8, 0.0
+        let verts: Vec<[f32; 3]> = (-50..=50)
+            .map(|i| {
+                let t = i as f32 * 0.1;
+                [dir[0] * t, dir[1] * t, dir[2] * t]
+            })
+            .collect();
+        let ax = principal_axis(&verts).expect("principal axis");
+        assert!(
+            dot3(&ax, &dir).abs() > 0.99,
+            "expected axis aligned with {dir:?}, got {ax:?}"
+        );
+    }
+
     // ---- height_histogram --------------------------------------------------
 
     #[test]
@@ -1403,7 +1568,7 @@ mod tests {
     fn test_label_vertices_correct_length() {
         let verts = unit_cube_vertices();
         let centroid = head_centroid(&verts).expect("centroid");
-        let m = measure_head(&verts, None, None).expect("measurements");
+        let m = measure_head(&verts, HeadLandmarks::default()).expect("measurements");
         let labels = label_vertices_by_region(&verts, &centroid, &m);
         assert_eq!(labels.len(), verts.len());
     }
@@ -1414,7 +1579,7 @@ mod tests {
     fn test_vertices_in_region_subset() {
         let verts = unit_cube_vertices();
         let centroid = head_centroid(&verts).expect("centroid");
-        let m = measure_head(&verts, None, None).expect("measurements");
+        let m = measure_head(&verts, HeadLandmarks::default()).expect("measurements");
         // The crown region should have at least 0 and at most all vertices.
         let crown = vertices_in_region(&verts, &HeadRegion::Crown, &centroid, &m);
         assert!(crown.len() <= verts.len());
@@ -1469,7 +1634,7 @@ mod tests {
     fn test_asymmetry_symmetric_pair() {
         // Left and right are perfect reflections → score = 0.
         let verts = vec![[1.0_f32, 0.0, 0.0], [-1.0, 0.0, 0.0]];
-        let scores = vertex_asymmetry_scores(&verts, &[(0, 1)]);
+        let scores = vertex_asymmetry_scores(&verts, &[(0, 1)]).expect("valid pair");
         assert!((scores[0] - 0.0).abs() < 1e-5, "score={}", scores[0]);
     }
 
@@ -1477,15 +1642,24 @@ mod tests {
     fn test_asymmetry_asymmetric_pair() {
         // Left vertex NOT a mirror of the right → positive score.
         let verts = vec![[1.0_f32, 0.0, 0.0], [2.0, 0.0, 0.0]];
-        let scores = vertex_asymmetry_scores(&verts, &[(0, 1)]);
+        let scores = vertex_asymmetry_scores(&verts, &[(0, 1)]).expect("valid pair");
         assert!(scores[0] > 0.0, "score={}", scores[0]);
     }
 
     #[test]
     fn test_asymmetry_empty_pairs() {
         let verts = vec![[0.0_f32, 0.0, 0.0]];
-        let scores = vertex_asymmetry_scores(&verts, &[]);
+        let scores = vertex_asymmetry_scores(&verts, &[]).expect("empty pairs is valid");
         assert!(scores.is_empty());
+    }
+
+    // Regression test: an out-of-range pair index used to silently produce
+    // an undocumented `f32::NAN` instead of a reportable error.
+    #[test]
+    fn test_asymmetry_out_of_range_pair_errors() {
+        let verts = vec![[1.0_f32, 0.0, 0.0], [-1.0, 0.0, 0.0]];
+        let err = vertex_asymmetry_scores(&verts, &[(0, 99)]).expect_err("should fail");
+        assert!(matches!(err, HeadGeometryError::InvalidLandmark { .. }));
     }
 
     // ---- find_nearest_vertex -----------------------------------------------
@@ -1609,8 +1783,8 @@ mod tests {
     #[test]
     fn test_compute_head_geometry_stats() {
         let (verts, faces) = unit_tetrahedron();
-        let stats =
-            compute_head_geometry_stats(&verts, &faces, None, None).expect("head geometry stats");
+        let stats = compute_head_geometry_stats(&verts, &faces, HeadLandmarks::default())
+            .expect("head geometry stats");
         assert_eq!(stats.n_vertices, verts.len());
         assert_eq!(stats.n_faces, faces.len());
         assert!(stats.surface_area > 0.0);
@@ -1620,7 +1794,8 @@ mod tests {
     #[test]
     fn test_compute_head_geometry_stats_volume_correct() {
         let (verts, faces) = unit_tetrahedron();
-        let stats = compute_head_geometry_stats(&verts, &faces, None, None).expect("stats");
+        let stats =
+            compute_head_geometry_stats(&verts, &faces, HeadLandmarks::default()).expect("stats");
         assert!(
             (stats.volume - 1.0 / 6.0).abs() < 1e-5,
             "vol={}",
@@ -1633,7 +1808,7 @@ mod tests {
     #[test]
     fn test_format_head_measurements_non_empty() {
         let verts = unit_cube_vertices();
-        let m = measure_head(&verts, None, None).expect("measurements");
+        let m = measure_head(&verts, HeadLandmarks::default()).expect("measurements");
         let s = format_head_measurements(&m);
         assert!(!s.is_empty());
         assert!(s.contains("head_length"), "missing head_length");
@@ -1644,7 +1819,8 @@ mod tests {
     #[test]
     fn test_format_head_geometry_stats_non_empty() {
         let (verts, faces) = unit_tetrahedron();
-        let stats = compute_head_geometry_stats(&verts, &faces, None, None).expect("stats");
+        let stats =
+            compute_head_geometry_stats(&verts, &faces, HeadLandmarks::default()).expect("stats");
         let s = format_head_geometry_stats(&stats);
         assert!(!s.is_empty());
         assert!(s.contains("n_vertices"), "missing n_vertices");
@@ -1656,7 +1832,12 @@ mod tests {
     fn test_measure_head_with_nose_and_chin() {
         let verts = unit_cube_vertices();
         // nose at index 7 (top-right-back), chin at index 0 (bottom-left-front).
-        let m = measure_head(&verts, Some(7), Some(0)).expect("measurements");
+        let landmarks = HeadLandmarks {
+            nose_tip_idx: Some(7),
+            chin_idx: Some(0),
+            ..Default::default()
+        };
+        let m = measure_head(&verts, landmarks).expect("measurements");
         assert!(m.face_height >= 0.0);
         assert!(m.nose_length >= 0.0);
     }

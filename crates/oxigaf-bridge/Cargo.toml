@@ -31,6 +31,11 @@ half = { workspace = true }
 # Logging
 tracing = { workspace = true }
 
+# ZIP container for PyTorch `.pt` checkpoints (src/pickle/torch.rs). A
+# `torch.save` file is a ZIP holding one pickle plus one member per tensor
+# storage; oxiarc-archive is the COOLJAPAN Pure Rust ZIP reader.
+oxiarc-archive = { workspace = true }
+
 # ToRSh integration (Pure Rust, feature-gated). torsh-core is intentionally
 # not a direct dependency: nothing in src/ references `torsh_core::` paths
 # directly, only torsh_nn::serialization and torsh_tensor::Tensor, so it is
@@ -40,10 +45,23 @@ torsh-nn = { workspace = true, optional = true, features = ["safetensors"] }
 bytemuck = { workspace = true, optional = true }
 
 [dev-dependencies]
+# Self dev-dependency: turns on `test-fixtures` for test/example/bench
+# targets only, so `validation::create_synthetic_gaf_checkpoint` stays out
+# of the stable public surface for ordinary consumers while
+# `tests/diffusion_integration.rs` can still reach it. Path-only, so
+# `cargo publish` strips it.
+oxigaf-bridge = { path = ".", features = ["test-fixtures"] }
+
 tempfile = { workspace = true }
 approx = { workspace = true }
+proptest = { workspace = true }
 candle-core = { workspace = true }
 candle-nn = { workspace = true }
+
+# Used by src/pickle/flame.rs's tests to prove the .npy files this crate
+# writes are readable by the exact reader `oxigaf-flame` uses.
+ndarray = { workspace = true }
+ndarray-npy = { workspace = true }
 
 # Example dependencies (anyhow is used only by examples/, not by src/)
 anyhow = { workspace = true }
@@ -56,6 +74,10 @@ tracing-subscriber = { workspace = true }
 [features]
 default = []
 torsh = ["dep:torsh-tensor", "dep:torsh-nn", "dep:bytemuck"]
+# Exposes `validation::create_synthetic_gaf_checkpoint`, a test-fixture
+# generator. Deliberately opt-in so it is not part of the stable public
+# surface; `tests/diffusion_integration.rs` requires it.
+test-fixtures = ["torsh"]
 
 [[example]]
 name = "convert_gaf_checkpoint"

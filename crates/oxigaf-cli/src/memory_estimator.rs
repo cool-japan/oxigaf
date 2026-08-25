@@ -897,7 +897,7 @@ mod tests {
     fn test_layout_sh_degree_0() {
         let layout = estimate_gaussian_layout(1000, 0).expect("sh0 layout failed");
         assert_eq!(layout.sh_coefficients, 1);
-        assert_eq!(layout.sh_bytes, 1000 * 1 * 3 * 4);
+        assert_eq!(layout.sh_bytes, 1000 * 3 * 4); // 1000 gaussians × 1 coeff × 3 channels × 4 bytes
     }
 
     #[test]
@@ -1000,9 +1000,10 @@ mod tests {
         // than oxigaf-render's actual default `RasterConfig::tile_size` of
         // 16px, understating `tile_buffer_bytes` by up to 16x. At 512×512
         // with 16px tiles: 32×32 = 1024 tiles.
-        let rb = estimate_render_buffers(512, 512, 2000).expect("512x512 buffers failed");
+        let n_gaussians = 2000usize;
+        let rb = estimate_render_buffers(512, 512, n_gaussians).expect("512x512 buffers failed");
         let expected_tiles = 32 * 32;
-        let expected_per_tile_entries = 2000usize.min(1024);
+        let expected_per_tile_entries = n_gaussians.min(1024);
         let expected_tile_bytes =
             (expected_tiles * expected_per_tile_entries * 8).min(MAX_TILE_BUFFER_BYTES);
         assert_eq!(rb.tile_buffer_bytes, expected_tile_bytes);

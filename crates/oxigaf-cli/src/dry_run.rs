@@ -50,12 +50,9 @@ pub struct ResourceEstimates {
 /// stays `None`, which `DryRunReport::print_report` renders honestly as
 /// "(not estimated)" instead of a made-up number.
 ///
-/// Not yet called by any command: main.rs's `cmd_train` dry-run path
-/// (which owns `total_iterations`/`sh_degree`/`image_size` from the loaded
-/// [`crate::config::ProjectConfig`]) needs to be updated to call this
-/// instead of assigning fixed literals -- tracked as a followup, since
-/// `main.rs` is outside this fix's file ownership.
-#[allow(dead_code)]
+/// Called by `main.rs`'s `train_dry_run`, which passes the
+/// `total_iterations`/`sh_degree`/`image_size` of the resolved
+/// [`crate::config::ProjectConfig`].
 pub fn estimate_training_resources(
     num_gaussians: usize,
     sh_degree: u32,
@@ -96,11 +93,10 @@ pub fn estimate_training_resources(
 /// per-Gaussian float payload; format-specific framing overhead is
 /// negligible at any real Gaussian count this runs on).
 ///
-/// Not yet called by any command -- see [`estimate_training_resources`]'s
-/// doc for why, and the corresponding followup for `cmd_export`'s dry-run
-/// path in main.rs (which currently hardcodes `estimated_disk_mb = Some(100)`
-/// regardless of how many Gaussians are being exported).
-#[allow(dead_code)]
+/// Called both by [`estimate_training_resources`] and directly by `main.rs`'s
+/// `export --dry-run` path, which used to hardcode
+/// `estimated_disk_mb = Some(100)` regardless of how many Gaussians were
+/// being exported.
 pub fn estimate_export_disk_mb(num_gaussians: usize, sh_degree: u32) -> Option<u64> {
     let degree = u64::from(sh_degree.min(3));
     let sh_coeffs = (degree + 1) * (degree + 1);
@@ -126,7 +122,6 @@ impl DryRunReport {
     }
 
     /// Add a file or directory that would be deleted.
-    #[allow(dead_code)]
     pub fn add_delete(&mut self, path: impl Into<String>) {
         self.would_delete.push(path.into());
     }
@@ -248,43 +243,94 @@ fn probe_write_in_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Check GPU availability via wgpu.
+/// Check that *some* GPU adapter exists, ignoring `--device` and `[device]`.
 ///
-/// This function verifies that a GPU adapter can be requested,
-/// which is necessary for training and rendering operations.
+/// Prefer [`check_gpu_selection`] on any path that knows which device the
+/// real run would use: this variant reports "GPU available" from whatever
+/// adapter wgpu happens to prefer, which is not necessarily the adapter the
+/// subsequent run would fail on.
+///
+/// # Errors
+///
+/// Returns an error when no adapter can be requested at all.
 pub fn check_gpu() -> Result<()> {
+    check_gpu_selection(0, &crate::config::DeviceSection::default())
+}
+
+/// Verify that the GPU the real run would select actually exists.
+///
+/// A dry run exists to predict the real run, so it has to resolve the *same*
+/// adapter: the configured `[device] backend` restricts the instance, and the
+/// `--device` index selects among the enumerated adapters exactly as
+/// [`crate::pipeline`] does — including the out-of-range diagnostic, which is
+/// the single most likely way a `--device N` run fails. Checking a
+/// `Backends::all()` high-performance pick instead (as this used to) reports
+/// success for `--device 7` on a one-GPU machine.
+///
+/// # Errors
+///
+/// Returns an error when `[device] backend` names something unrecognised,
+/// when no adapter is available on the selected backend, or when the
+/// requested device index is out of range.
+pub fn check_gpu_selection(
+    device_index: usize,
+    device_section: &crate::config::DeviceSection,
+) -> Result<()> {
     output::info("Would verify GPU availability");
 
-    // In dry-run mode, we perform a lightweight check
+    let configured = device_section
+        .resolve_backends()
+        .context("Invalid [device] backend")?;
+    let backends = configured.unwrap_or_else(wgpu::Backends::all);
+
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::all(),
+        backends,
         ..wgpu::InstanceDescriptor::new_without_display_handle()
     });
 
-    let adapter_result =
-        pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+    // Index 0 means "let wgpu pick the best adapter" — matching
+    // `pipeline::request_gpu_device`, where enumerating and taking
+    // `adapters[0]` would instead choose a laptop's integrated GPU.
+    if device_index == 0 {
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: None,
             force_fallback_adapter: false,
             apply_limit_buckets: false,
-        }));
-
-    match adapter_result {
-        Ok(adapter) => {
-            let info = adapter.get_info();
-            output::success(&format!(
-                "GPU available: {} ({:?})",
-                info.name, info.backend
-            ));
-            Ok(())
-        }
-        Err(e) => {
-            anyhow::bail!(
-                "No GPU adapter found: {}. A GPU is required for training and rendering.",
-                e
+        }))
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "No GPU adapter found: {e}. A GPU is required for training and rendering."
             )
-        }
+        })?;
+        let info = adapter.get_info();
+        output::success(&format!(
+            "GPU available: {} ({:?})",
+            info.name, info.backend
+        ));
+        return Ok(());
     }
+
+    let adapters = pollster::block_on(instance.enumerate_adapters(backends));
+    let listing: Vec<String> = adapters
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            let info = a.get_info();
+            format!("[{i}] {} ({:?})", info.name, info.backend)
+        })
+        .collect();
+    let index = crate::pipeline::select_adapter_index(adapters.len(), device_index)
+        .with_context(|| format!("Enumerated GPU adapters: {}", listing.join(", ")))?;
+    let info = adapters
+        .get(index)
+        .ok_or_else(|| anyhow::anyhow!("GPU adapter {index} vanished during selection"))?
+        .get_info();
+    output::success(&format!(
+        "GPU available: {} ({:?}) at --device {device_index}",
+        info.name, info.backend
+    ));
+    Ok(())
 }
 
 #[cfg(test)]
@@ -383,6 +429,46 @@ mod tests {
         assert!(
             high > low,
             "higher SH degree must report more disk usage (low={low}, high={high})"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // check_gpu_selection
+    //
+    // Regression coverage for: the dry-run GPU check ignored `--device` and
+    // `[device]` entirely, so `train --device 7 --dry-run` reported "GPU
+    // available" on a one-GPU machine and the real run then failed.
+    //
+    // These assertions are GPU-independent on purpose: the outcome of an
+    // *available* adapter varies per machine (and is absent in CI), but the
+    // rejections below are decided before any adapter is touched.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_check_gpu_selection_rejects_an_unknown_backend() {
+        let mut device = crate::config::DeviceSection::default();
+        device.backend = "vulcan".to_string();
+        let err = check_gpu_selection(0, &device)
+            .expect_err("a misspelled backend must not silently auto-detect");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("backend"),
+            "the error must name the offending setting: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_check_gpu_selection_reports_an_out_of_range_device() {
+        // An index no machine has: either there are no adapters on this
+        // backend, or the index is past the end. Both are failures, and
+        // neither may be reported as "GPU available".
+        let device = crate::config::DeviceSection::default();
+        let result = check_gpu_selection(usize::MAX, &device);
+        let err = result.expect_err("--device usize::MAX cannot be valid anywhere");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("out of range") || msg.contains("No GPU adapters"),
+            "unexpected message: {msg}"
         );
     }
 

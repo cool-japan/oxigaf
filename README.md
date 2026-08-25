@@ -39,8 +39,8 @@ Implements the methods from [GAF: Gaussian Avatar Reconstruction from Monocular 
 
 ### Quality & Performance
 - **100% Pure Rust**: Zero C/Fortran dependencies (COOLJAPAN compliant)
-- **12537 Tests Passing**: Comprehensive validation across all crates
-- **Production Ready**: Zero unwrap(), feature-gated dependencies, files kept under a 2000-line limit (one outlier, `oxigaf-cli/src/diff_tool.rs`, is pending a `splitrs` split)
+- **Comprehensive test suite**: validation across all crates — see `CHANGELOG.md` / CI for current counts (a specific number here would only go stale)
+- **Production Ready**: Zero unwrap(), feature-gated dependencies, `splitrs`-based file-size policy (target: under 2000 lines per file)
 
 ## Workspace Structure
 
@@ -127,19 +127,27 @@ OxiGAF supports both legacy NPY and modern Safetensors formats for FLAME models.
 Safetensors format is supported for runtime loading/saving.
 
 1. Download the FLAME 2023 model from <https://flame.is.tue.mpg.de/>
-2. Convert the PyTorch checkpoint to safetensors (casts to fp16, partitions
-   into `unet`/`vae`/`clip`/`other`):
+2. Convert the PyTorch checkpoint to safetensors — pure Rust, no Python,
+   PyTorch, or `torch.load` needed (partitions into `unet`/`vae`/`clip`/
+   `other`; `--precision fp16` matches the old Python script's behaviour,
+   which always forced FP16 — omit it to keep each tensor's original dtype):
    ```bash
-   python scripts/convert_weights.py path/to/checkpoint.pt output_dir/
+   cargo run -p oxigaf-bridge --example convert_pytorch -- \
+     --checkpoint path/to/checkpoint.pt --output-dir output_dir/ --precision fp16
    ```
+   A Python fallback is still available if you prefer it:
+   `python scripts/convert_weights.py path/to/checkpoint.pt output_dir/`
 
 ### Option 2: NPY (Legacy)
 
 1. Download the FLAME 2023 model from <https://flame.is.tue.mpg.de/>
-2. Convert to `.npy` format:
+2. Convert to `.npy` format — pure Rust:
    ```bash
-   python scripts/convert_flame.py path/to/FLAME2023.pkl output_dir/
+   cargo run -p oxigaf-bridge --example convert_flame_pkl -- \
+     --model path/to/FLAME2023.pkl --output-dir output_dir/
    ```
+   A Python fallback is still available if you prefer it:
+   `python scripts/convert_flame.py path/to/FLAME2023.pkl output_dir/`
 
 ## Usage Examples
 
@@ -219,7 +227,8 @@ mapping.add_custom_mapping(
 
 // Convert PyTorch layer names to OxiGAF format
 let oxigaf_name = mapping.pytorch_to_oxigaf("unet.down_blocks.0.conv.weight")?;
-// Result: "down_blocks_0_conv_weight"
+// Result: "down_blocks.0.conv.weight" (dot-separated — VarBuilder-loadable;
+// see crates/oxigaf-bridge/README.md for the 0.1.2 naming migration note)
 ```
 
 ## Documentation

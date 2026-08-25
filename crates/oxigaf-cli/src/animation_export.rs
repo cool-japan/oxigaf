@@ -186,7 +186,17 @@ pub struct AnimationMeta {
 /// Configuration for animation export.
 #[derive(Debug, Clone)]
 pub struct AnimExportConfig {
-    /// Frames per second (default: 30.0).
+    /// Playback rate written into the exported `meta`, or `0.0` to keep the
+    /// sequence's own rate (default: `0.0`).
+    ///
+    /// Any value `> 0.0` *relabels* the exported animation: the frames are
+    /// written unchanged but `meta.fps`/`meta.duration_ms` describe the
+    /// requested rate. Defaulting that to a fixed number would silently
+    /// retime every sequence that was not already at it — a 24 fps sequence
+    /// exported with `Default::default()` would come back claiming 30 fps —
+    /// so the default is the neutral "inherit" sentinel and re-timing is
+    /// opt-in. Actually resampling the frames is
+    /// [`resample_animation`]'s job, not the exporter's.
     pub fps: f32,
     /// Include SH coefficients (default: true).
     pub include_sh: bool,
@@ -197,7 +207,7 @@ pub struct AnimExportConfig {
 impl Default for AnimExportConfig {
     fn default() -> Self {
         Self {
-            fps: 30.0,
+            fps: 0.0,
             include_sh: true,
             precision: 6,
         }
@@ -843,14 +853,15 @@ pub fn compute_animation_stats(sequence: &AnimationSequence) -> AnimationStats {
 /// - `include_sh`: when `false`, `sh_coefficients` are cleared from every
 ///   exported frame (the source `sequence` is not modified).
 /// - `precision`: every `f32` value is rounded to this many decimal places
-///   before serialisation (see [`round_to_precision`] for the exact,
+///   before serialisation (see `round_to_precision` for the exact,
 ///   overflow-safe semantics).
 /// - `fps`: when `> 0.0`, `meta` is rebuilt using this FPS (via
 ///   [`build_animation_meta`]) so `meta.fps`/`meta.duration_ms` reflect the
-///   requested export rate; otherwise the sequence's own `meta.fps` is kept.
-///   Either way, `meta` is rebuilt from the (possibly SH-cleared) frames
-///   actually being written, so `has_sh`/`sh_degree` stay consistent with
-///   `include_sh`.
+///   requested export rate; otherwise — including for
+///   [`AnimExportConfig::default`] — the sequence's own `meta.fps` is kept,
+///   so a default export round-trips the rate it was given. Either way,
+///   `meta` is rebuilt from the (possibly SH-cleared) frames actually being
+///   written, so `has_sh`/`sh_degree` stay consistent with `include_sh`.
 pub fn export_animation_json<P: AsRef<Path>>(
     sequence: &AnimationSequence,
     path: P,
@@ -1462,7 +1473,9 @@ mod tests {
     fn test_interpolate_rotations_antipodal_short_path() {
         // `a` and `-a` represent the same rotation; slerp between them
         // (dot < 0) must take the short way and stay unit-norm.
-        let a = [0.0f32, 0.0, 0.707_106_8, 0.707_106_8]; // 90 degrees about Z
+        // 90 degrees about Z: (0, 0, sin(45°), cos(45°)).
+        const SQRT_HALF: f32 = std::f32::consts::FRAC_1_SQRT_2;
+        let a = [0.0f32, 0.0, SQRT_HALF, SQRT_HALF];
         let frame_a = AnimationFrame {
             step: 0,
             timestamp_ms: 0.0,
@@ -1643,6 +1656,38 @@ mod tests {
         assert!((loaded.meta.fps - seq.meta.fps).abs() < 1e-6);
 
         // Clean up
+        let _ = fs::remove_file(&tmp);
+    }
+
+    /// Regression: [`AnimExportConfig::default`] must not carry a playback
+    /// rate of its own. It used to default to 30 fps, which — because any
+    /// `fps > 0.0` relabels the exported `meta` — silently rewrote every
+    /// sequence exported with the default config to claim 30 fps, and made
+    /// `meta.duration_ms` disagree with the frames actually written.
+    #[test]
+    fn test_default_export_config_does_not_retime_the_sequence() {
+        assert_eq!(
+            AnimExportConfig::default().fps,
+            0.0,
+            "the default config must inherit the sequence's rate"
+        );
+
+        let mut tmp = std::env::temp_dir();
+        tmp.push("oxigaf_animation_test_default_fps_inherit.json");
+
+        let seq = make_sequence(6, 4, 24.0);
+        export_animation_json(&seq, &tmp, &AnimExportConfig::default()).expect("export ok");
+        let loaded = load_animation_json(&tmp).expect("load ok");
+
+        assert!((loaded.meta.fps - 24.0).abs() < 1e-6, "fps was retimed");
+        // 6 frames at 24 fps is 250 ms; at the old 30 fps default it would
+        // have been written as 200 ms.
+        assert!(
+            (loaded.meta.duration_ms - 250.0).abs() < 1e-6,
+            "duration was retimed: {}",
+            loaded.meta.duration_ms
+        );
+
         let _ = fs::remove_file(&tmp);
     }
 

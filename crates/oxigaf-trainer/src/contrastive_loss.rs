@@ -125,18 +125,33 @@ pub fn pairwise_distance_matrix(embeddings: &[Vec<f32>]) -> Result<Vec<f32>, Con
     let d = embeddings[0].len();
     let n = embeddings.len();
     let mut matrix = vec![0.0f32; n * n];
-    for i in 0..n {
-        if embeddings[i].len() != d {
+    // Validate every embedding's dimension up front. The original version
+    // of this loop checked `embeddings[i].len()` inline as part of the
+    // outer `i in 0..n` loop before its inner `j in 0..n` pass, so every
+    // index got checked regardless of `i`/`j` pairing. Switching the inner
+    // loop to `j in (i+1)..n` below (to halve the work, per this fix) means
+    // `i` never reaches `n-1` as the outer index, so `embeddings[n-1]`
+    // would no longer be visited by an inline check placed the same way —
+    // hence validating every embedding explicitly here first, independent
+    // of the pairwise loop shape.
+    for e in embeddings.iter() {
+        if e.len() != d {
             return Err(ContrastiveLossError::DimensionMismatch {
                 expected: d,
-                got: embeddings[i].len(),
+                got: e.len(),
             });
         }
-        for j in 0..n {
-            if i == j {
-                continue; // remains 0.0
-            }
-            matrix[i * n + j] = squared_l2_distance(&embeddings[i], &embeddings[j])?;
+    }
+    // The matrix is symmetric (squared L2 distance is symmetric) and the
+    // diagonal is always 0.0, so only the `i < j` triangle needs computing;
+    // mirror each result into `[j*n+i]` instead of recomputing it. This
+    // halves the distance evaluations on what `mine_triplets` calls once
+    // per training batch.
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let d_ij = squared_l2_distance(&embeddings[i], &embeddings[j])?;
+            matrix[i * n + j] = d_ij;
+            matrix[j * n + i] = d_ij;
         }
     }
     Ok(matrix)
@@ -287,6 +302,31 @@ impl TripletConfig {
     }
 }
 
+/// Core triplet-margin formula given precomputed `d_pos`/`d_neg` distances
+/// (already resolved to L2 or squared per `config.squared`) and
+/// `config.margin`/`config.soft_margin`.
+///
+/// Shared by [`triplet_loss`] (which computes `d_pos`/`d_neg` from raw
+/// embedding vectors) and [`mined_triplet_loss`] (which reads them from an
+/// already-computed pairwise distance matrix), so the two never risk
+/// diverging on the actual margin formula.
+///
+/// - Standard: `max(0, d_pos - d_neg + margin)`
+/// - Soft-margin: `log(1 + exp(d_pos - d_neg + margin))`
+fn triplet_loss_from_distances(d_pos: f32, d_neg: f32, config: &TripletConfig) -> f32 {
+    let diff = d_pos - d_neg + config.margin;
+    if config.soft_margin {
+        // numerically stable: log(1 + exp(x)) = x + log(1 + exp(-x)) for x > 0
+        if diff > 0.0 {
+            diff + (1.0 + (-diff).exp()).ln()
+        } else {
+            (1.0 + diff.exp()).ln()
+        }
+    } else {
+        diff.max(0.0)
+    }
+}
+
 /// Triplet loss for a single (anchor, positive, negative) triple.
 ///
 /// - Standard: `max(0, d(anchor, positive) - d(anchor, negative) + margin)`
@@ -303,18 +343,7 @@ pub fn triplet_loss(
     config.validate()?;
     let d_pos = config.distance(anchor, positive)?;
     let d_neg = config.distance(anchor, negative)?;
-    let diff = d_pos - d_neg + config.margin;
-    if config.soft_margin {
-        // numerically stable: log(1 + exp(x)) = x + log(1 + exp(-x)) for x > 0
-        let loss = if diff > 0.0 {
-            diff + (1.0 + (-diff).exp()).ln()
-        } else {
-            (1.0 + diff.exp()).ln()
-        };
-        Ok(loss)
-    } else {
-        Ok(diff.max(0.0))
-    }
+    Ok(triplet_loss_from_distances(d_pos, d_neg, config))
 }
 
 /// Triplet loss averaged over a batch of `(anchor, positive, negative)` triples.
@@ -339,11 +368,14 @@ pub fn triplet_loss_batch(
     Ok(total / triplets.len() as f32)
 }
 
-/// Fraction of triplets that violate the margin constraint (i.e., have loss > 0).
+/// Fraction of triplets that violate the margin constraint.
 ///
 /// A triplet violates the constraint when `d_pos >= d_neg - margin`, which is
-/// equivalent to `d_pos - d_neg + margin >= 0` (the standard triplet loss term
-/// is non-zero).
+/// equivalent to `d_pos - d_neg + margin >= 0`: the boundary case (exactly on
+/// the margin) counts as a violation, matching the definition above (`>=`,
+/// not the stricter `>`). This mirrors the standard triplet-loss convention
+/// that a triplet only counts as *satisfied* when it clears the margin with
+/// room to spare, not merely meets it exactly.
 ///
 /// # Errors
 /// - [`ContrastiveLossError::EmptyBatch`] if `triplets` is empty.
@@ -360,7 +392,7 @@ pub fn triplet_violation_rate(
     for (a, p, n) in triplets {
         let d_pos = config.distance(a, p)?;
         let d_neg = config.distance(a, n)?;
-        if d_pos - d_neg + config.margin > 0.0 {
+        if d_pos - d_neg + config.margin >= 0.0 {
             violations += 1;
         }
     }
@@ -419,6 +451,26 @@ pub fn mine_triplets(
     strategy: MiningStrategy,
     config: &TripletConfig,
 ) -> Result<Vec<TripletIndex>, ContrastiveLossError> {
+    Ok(mine_triplets_with_matrix(embeddings, labels, strategy, config)?.0)
+}
+
+/// Shared implementation behind [`mine_triplets`] and [`mined_triplet_loss`].
+///
+/// Returns the mined triplets together with the `n×n` squared-distance
+/// matrix (`dist[i*n+j] = squared_l2_distance(embeddings[i], embeddings[j])`,
+/// from [`pairwise_distance_matrix`]) and `n` that were already computed to
+/// do the mining, so [`mined_triplet_loss`] can reuse them instead of
+/// recomputing every distance from raw embeddings a second time via
+/// [`triplet_loss`] per mined triplet — for [`MiningStrategy::AllTriplets`]
+/// the triplet count is `O(n³)` (e.g. ~2M triplets for a 256-sample batch
+/// with 2 identities), so a second `O(d)` distance computation per triplet
+/// costs `O(n³·d)` on top of the `O(n²·d)` the matrix already paid for.
+fn mine_triplets_with_matrix(
+    embeddings: &[Vec<f32>],
+    labels: &[u32],
+    strategy: MiningStrategy,
+    config: &TripletConfig,
+) -> Result<(Vec<TripletIndex>, Vec<f32>, usize), ContrastiveLossError> {
     if embeddings.is_empty() {
         return Err(ContrastiveLossError::EmptyBatch);
     }
@@ -564,12 +616,23 @@ pub fn mine_triplets(
         }
     }
 
-    Ok(triplets)
+    Ok((triplets, dist, n))
 }
 
 /// Apply mined triplet loss over a labelled embedding batch.
 ///
 /// Returns `(loss, num_triplets_used)`.
+///
+/// Reuses the `n×n` squared-distance matrix computed once during mining
+/// (via `mine_triplets_with_matrix`) to evaluate every mined triplet's
+/// loss, instead of recomputing `d(anchor, positive)` / `d(anchor,
+/// negative)` from raw embedding vectors per triplet the way calling
+/// [`triplet_loss`] in a loop would. `mine_triplets` itself already builds
+/// this matrix ([`pairwise_distance_matrix`], `O(n²·d)`) and then discarded
+/// it; for [`MiningStrategy::AllTriplets`] the triplet count is `O(n³)`
+/// (e.g. ~2M triplets for a 256-sample, 2-identity batch), so recomputing a
+/// fresh `O(d)` distance pair per triplet on top of that previously cost an
+/// extra `O(n³·d)` for work the matrix already covers in `O(n²·d)`.
 ///
 /// # Errors
 /// - [`ContrastiveLossError::EmptyBatch`] when no valid triplets can be found.
@@ -580,22 +643,30 @@ pub fn mined_triplet_loss(
     strategy: MiningStrategy,
     config: &TripletConfig,
 ) -> Result<(f32, usize), ContrastiveLossError> {
-    let triplet_indices = mine_triplets(embeddings, labels, strategy, config)?;
+    let (triplet_indices, dist, n) =
+        mine_triplets_with_matrix(embeddings, labels, strategy, config)?;
     if triplet_indices.is_empty() {
         return Err(ContrastiveLossError::EmptyBatch);
     }
+    // Matches `TripletConfig::distance`: the cached matrix always holds
+    // squared L2 distances; take the sqrt unless the config wants squared
+    // distances directly.
+    let dist_fn = |i: usize, j: usize| -> f32 {
+        let sq = dist[i * n + j];
+        if config.squared {
+            sq
+        } else {
+            sq.sqrt()
+        }
+    };
     let mut total_loss = 0.0f32;
     for idx in &triplet_indices {
-        let loss = triplet_loss(
-            &embeddings[idx.anchor],
-            &embeddings[idx.positive],
-            &embeddings[idx.negative],
-            config,
-        )?;
-        total_loss += loss;
+        let d_pos = dist_fn(idx.anchor, idx.positive);
+        let d_neg = dist_fn(idx.anchor, idx.negative);
+        total_loss += triplet_loss_from_distances(d_pos, d_neg, config);
     }
-    let n = triplet_indices.len();
-    Ok((total_loss / n as f32, n))
+    let count = triplet_indices.len();
+    Ok((total_loss / count as f32, count))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -882,6 +953,62 @@ mod tests {
         assert!(matches!(err, ContrastiveLossError::EmptyBatch));
     }
 
+    #[test]
+    fn test_pairwise_distance_matrix_dim_mismatch_on_last_element() {
+        // Regression guard for the symmetric-matrix optimization: with the
+        // `i < j` loop shape, the LAST embedding (index n-1) never appears
+        // as the outer `i`. Dimension validation must still catch a
+        // mismatch there instead of silently skipping it.
+        let embs = vec![
+            vec![1.0f32, 0.0],
+            vec![1.0f32, 0.0],
+            vec![1.0f32], // wrong dimension, and it's the last entry
+        ];
+        let err = pairwise_distance_matrix(&embs).unwrap_err();
+        assert!(matches!(
+            err,
+            ContrastiveLossError::DimensionMismatch {
+                expected: 2,
+                got: 1
+            }
+        ));
+    }
+
+    #[test]
+    fn test_pairwise_distance_matrix_matches_naive_reference() {
+        // Regression guard for the mirror-instead-of-recompute
+        // optimization: every entry must match a straightforward
+        // brute-force computation, not just the diagonal/symmetry checks
+        // the pre-existing test covers.
+        let embs = vec![
+            vec![0.0f32, 0.0],
+            vec![3.0f32, 4.0],
+            vec![1.0f32, 1.0],
+            vec![-2.0f32, 5.0],
+        ];
+        let n = embs.len();
+        let mat = pairwise_distance_matrix(&embs).expect("valid batch");
+        for i in 0..n {
+            for j in 0..n {
+                let expected: f32 = if i == j {
+                    0.0
+                } else {
+                    embs[i]
+                        .iter()
+                        .zip(embs[j].iter())
+                        .map(|(x, y)| (x - y) * (x - y))
+                        .sum()
+                };
+                assert!(
+                    (mat[i * n + j] - expected).abs() < 1e-5,
+                    "mismatch at ({i},{j}): got {} expected {}",
+                    mat[i * n + j],
+                    expected
+                );
+            }
+        }
+    }
+
     // ── ContrastiveConfig::validate ───────────────────────────────────────────
 
     #[test]
@@ -1057,6 +1184,41 @@ mod tests {
         let triplets = vec![(anchor, positive, negative)];
         let rate = triplet_violation_rate(&triplets, &TripletConfig::default()).expect("valid");
         assert!((rate - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_triplet_violation_rate_boundary_counts_as_violation() {
+        // Regression: the doc defines a violation as
+        // `d_pos - d_neg + margin >= 0` (boundary INCLUDED), but the
+        // implementation used a strict `> 0.0`, silently excluding
+        // triplets sitting exactly on the margin. Construct a triplet
+        // where `d_pos - d_neg + margin == 0.0` exactly and confirm it now
+        // counts.
+        let margin = 0.5_f32;
+        // d_pos = 2.0, d_neg = 2.5 → d_pos - d_neg + margin = 2.0 - 2.5 + 0.5 = 0.0
+        let anchor = vec![0.0f32];
+        let positive = vec![2.0f32];
+        let negative = vec![2.5f32];
+        let cfg = TripletConfig {
+            margin,
+            ..Default::default()
+        };
+        // Sanity: confirm this triplet is really exactly on the boundary
+        // using the same distance function the implementation uses.
+        let d_pos = cfg.distance(&anchor, &positive).expect("distance");
+        let d_neg = cfg.distance(&anchor, &negative).expect("distance");
+        assert!(
+            (d_pos - d_neg + margin).abs() < 1e-6,
+            "test setup must be exactly on the boundary, got {}",
+            d_pos - d_neg + margin
+        );
+
+        let triplets = vec![(anchor, positive, negative)];
+        let rate = triplet_violation_rate(&triplets, &cfg).expect("valid");
+        assert!(
+            (rate - 1.0).abs() < 1e-6,
+            "a triplet exactly on the margin boundary must count as a violation, got rate={rate}"
+        );
     }
 
     // ── mine_triplets ─────────────────────────────────────────────────────────
@@ -1246,6 +1408,67 @@ mod tests {
         let err =
             mined_triplet_loss(&embs, &labels, MiningStrategy::AllTriplets, &cfg).unwrap_err();
         assert!(matches!(err, ContrastiveLossError::EmptyBatch));
+    }
+
+    #[test]
+    fn test_mined_triplet_loss_matches_manual_per_triplet_computation() {
+        // Regression guard for the distance-matrix-reuse optimization:
+        // `mined_triplet_loss` must produce the exact same value as mining
+        // indices with `mine_triplets` and then computing each triplet's
+        // loss independently via the raw-embedding `triplet_loss` function
+        // -- i.e. reusing the cached matrix must not change the numeric
+        // result, only how it's computed.
+        let embs = vec![
+            vec![0.0f32, 0.0],
+            vec![5.0f32, 0.0], // far positive -> some triplets should violate
+            vec![0.5f32, 0.0], // close negative
+            vec![0.6f32, 0.3],
+            vec![4.8f32, 0.1],
+        ];
+        let labels = vec![0u32, 0u32, 1u32, 1u32, 0u32];
+
+        for cfg in [
+            TripletConfig {
+                margin: 0.3,
+                soft_margin: false,
+                squared: false,
+            },
+            TripletConfig {
+                margin: 0.3,
+                soft_margin: false,
+                squared: true,
+            },
+            TripletConfig {
+                margin: 0.3,
+                soft_margin: true,
+                squared: false,
+            },
+        ] {
+            let (matrix_loss, matrix_n) =
+                mined_triplet_loss(&embs, &labels, MiningStrategy::AllTriplets, &cfg)
+                    .expect("valid triplets");
+
+            let manual_indices = mine_triplets(&embs, &labels, MiningStrategy::AllTriplets, &cfg)
+                .expect("valid mining");
+            let mut manual_total = 0.0f32;
+            for idx in &manual_indices {
+                manual_total += triplet_loss(
+                    &embs[idx.anchor],
+                    &embs[idx.positive],
+                    &embs[idx.negative],
+                    &cfg,
+                )
+                .expect("valid loss");
+            }
+            let manual_loss = manual_total / manual_indices.len() as f32;
+
+            assert_eq!(matrix_n, manual_indices.len());
+            assert!(
+                (matrix_loss - manual_loss).abs() < 1e-4,
+                "config {cfg:?}: matrix-based loss {matrix_loss} should match \
+                 manual per-triplet loss {manual_loss}"
+            );
+        }
     }
 
     #[test]

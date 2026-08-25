@@ -305,13 +305,16 @@ impl ViewScheduler {
             self.select_priority(batch_size, rng_seed)
         };
 
-        // Record visits.
-        for &idx in &selected {
-            let s = &mut self.stats[idx];
-            s.visit_count += 1;
-            s.last_visit_step = self.current_step;
-        }
-
+        // `visit_count` / `last_visit_step` are recorded once a view is
+        // actually *observed* — see `record_observation` — not merely
+        // selected. Previously both were incremented here too, so in the
+        // documented "select → render → record_observation" workflow every
+        // real visit counted twice: `min_visits_for_priority` was reached
+        // in half the intended visits, and `record_observation`'s
+        // `visit_count == 0` cold-start EMA-init branch could never fire
+        // (this call had already bumped the count to >= 1), so the EMA
+        // always took the smoothing branch from an initial value of 0.0
+        // instead of initialising directly from the first real loss.
         Ok(selected)
     }
 
@@ -398,11 +401,37 @@ impl ViewScheduler {
             selected.push(idx);
         }
 
-        // If still short (shouldn't happen normally), pad from round-robin.
+        // If still short (shouldn't happen normally — `select_batch`
+        // already rejects `batch_size > total`, so an unused slot always
+        // exists while `selected.len() < batch_size`), pad from
+        // round-robin — mirroring the `!used[..]` search from the deficit
+        // fill above, rather than pushing blindly, since an index already
+        // in `selected` would otherwise be double-counted in one training
+        // step's batch (rendered and back-propagated twice).
         while selected.len() < batch_size {
             let rr_idx = self.round_robin_cursor % total;
             self.round_robin_cursor = (self.round_robin_cursor + 1) % total;
-            selected.push(rr_idx);
+            if !used[rr_idx] {
+                used[rr_idx] = true;
+                selected.push(rr_idx);
+            } else {
+                let mut found = false;
+                for offset in 1..total {
+                    let candidate = (rr_idx + offset) % total;
+                    if !used[candidate] {
+                        used[candidate] = true;
+                        selected.push(candidate);
+                        found = true;
+                        break;
+                    }
+                }
+                if !found {
+                    // Every view already selected — provably unreachable
+                    // given `batch_size <= total`, but break rather than
+                    // loop forever or push a duplicate.
+                    break;
+                }
+            }
         }
 
         selected
@@ -433,14 +462,27 @@ impl ViewScheduler {
 
             // Build cumsum and find index via scan.
             let mut cumsum = 0.0f32;
-            let mut chosen = candidates.len() - 1; // fallback
+            let mut chosen = None;
             for (i, &w) in weights.iter().enumerate() {
                 cumsum += w;
                 if r < cumsum {
-                    chosen = i;
+                    chosen = Some(i);
                     break;
                 }
             }
+
+            // Floating-point rounding can leave `r >= cumsum` for every
+            // entry, in which case fall back to the *last remaining*
+            // candidate with positive weight — not an unconditional
+            // `candidates.len() - 1`, which may already have been drawn
+            // (its weight zeroed by a previous iteration) and would
+            // produce a duplicate despite this function's "without
+            // replacement" contract. `total_w > 0.0` (checked above)
+            // guarantees at least one such candidate exists.
+            let Some(chosen) = chosen.or_else(|| weights.iter().rposition(|&w| w > 0.0)) else {
+                break;
+            };
+
             result.push(candidates[chosen]);
             weights[chosen] = 0.0; // remove from future draws
         }
@@ -1011,6 +1053,173 @@ mod tests {
         let sched = ViewScheduler::with_count(5, ViewSchedulerConfig::default())?;
         let s = sched.format_summary();
         assert!(!s.is_empty());
+        Ok(())
+    }
+
+    // 21. select_batch alone must not bump visit_count (regression)
+    #[test]
+    fn test_select_batch_does_not_increment_visit_count() -> Result<(), ViewSchedulerError> {
+        // Regression: select_batch used to increment visit_count itself,
+        // double-counting every real visit in the documented
+        // select -> render -> record_observation workflow.
+        let mut sched = ViewScheduler::with_count(5, ViewSchedulerConfig::default())?;
+        let batch = sched.select_batch(3, 42)?;
+        for &idx in &batch {
+            let s = sched
+                .view_stats(idx)
+                .ok_or(ViewSchedulerError::ViewIndexOutOfRange(idx))?;
+            assert_eq!(
+                s.visit_count, 0,
+                "select_batch alone must not bump visit_count"
+            );
+        }
+        for &idx in &batch {
+            sched.record_observation(idx, 0.5, 20.0)?;
+        }
+        for &idx in &batch {
+            let s = sched
+                .view_stats(idx)
+                .ok_or(ViewSchedulerError::ViewIndexOutOfRange(idx))?;
+            assert_eq!(
+                s.visit_count, 1,
+                "one real observation == exactly one visit"
+            );
+        }
+        Ok(())
+    }
+
+    // 22. record_observation's cold-start EMA path fires after select_batch (regression)
+    #[test]
+    fn test_record_observation_cold_start_ema_after_select_batch() -> Result<(), ViewSchedulerError>
+    {
+        // Regression: the `visit_count == 0` cold-start branch in
+        // record_observation could never fire because select_batch had
+        // already bumped the count — the EMA started smoothing from an
+        // initial value of 0.0 instead of initialising from the first
+        // real loss directly.
+        let mut sched = ViewScheduler::with_count(3, ViewSchedulerConfig::default())?;
+        let batch = sched.select_batch(1, 7)?;
+        let idx = batch[0];
+        sched.record_observation(idx, 4.0, 10.0)?;
+        let s = sched
+            .view_stats(idx)
+            .ok_or(ViewSchedulerError::ViewIndexOutOfRange(idx))?;
+        assert!(
+            (s.loss_ema - 4.0).abs() < 1e-6,
+            "expected cold-start EMA == first loss (4.0), got {}",
+            s.loss_ema
+        );
+        Ok(())
+    }
+
+    // 23. weighted_sample_without_replacement never repeats a candidate (regression)
+    #[test]
+    fn test_weighted_sample_without_replacement_no_duplicates() -> Result<(), ViewSchedulerError> {
+        let mut sched = ViewScheduler::with_count(10, ViewSchedulerConfig::default())?;
+        for i in 0..10 {
+            sched.record_observation(i, (i as f32 + 1.0) * 0.37, 20.0)?;
+        }
+        let candidates: Vec<usize> = (0..10).collect();
+        for seed in 0..200u64 {
+            let mut rng = seed;
+            let drawn = sched.weighted_sample_without_replacement(&candidates, 10, &mut rng);
+            let mut seen = std::collections::HashSet::new();
+            for &idx in &drawn {
+                assert!(
+                    seen.insert(idx),
+                    "duplicate {idx} for seed {seed}: {drawn:?}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    // 24. select_batch never repeats an index within one batch (regression)
+    #[test]
+    fn test_select_batch_no_duplicate_indices() -> Result<(), ViewSchedulerError> {
+        // Regression: both the weighted-sampling fallback and
+        // select_priority's final padding loop could emit an index
+        // already present in the batch, double-weighting that view's
+        // gradient for the step.
+        let config = ViewSchedulerConfig {
+            coverage_period: 1_000_000, // avoid round-robin coverage steps
+            min_visits_for_priority: 0, // every view eligible immediately
+            ..ViewSchedulerConfig::default()
+        };
+        let n = 20;
+        let mut sched = ViewScheduler::with_count(n, config)?;
+        for i in 0..n {
+            sched.record_observation(i, (i as f32 + 1.0) * 0.1, 20.0)?;
+        }
+        // `current_step` starts at 0, and 0 is a multiple of every
+        // `coverage_period`, which would force every `select_batch` call
+        // below onto the round-robin (not priority) path and defeat the
+        // point of this test — advance past that once.
+        sched.step();
+        assert_eq!(sched.current_step(), 1);
+
+        for seed in 0..50u64 {
+            let batch = sched.select_batch(n, seed)?; // request the full view set
+            let mut seen = std::collections::HashSet::new();
+            for &idx in &batch {
+                assert!(
+                    seen.insert(idx),
+                    "duplicate index {idx} in batch for seed {seed}: {batch:?}"
+                );
+            }
+            assert_eq!(batch.len(), n);
+        }
+        Ok(())
+    }
+
+    // 25. select_priority's final pad loop breaks rather than duplicating
+    // once every view is already used. Regression, and coverage gap: via
+    // the public `select_batch`, `batch_size > total` is always rejected
+    // before `select_priority` runs, and whenever `batch_size <= total`
+    // holds, the priority-draw + random-fill phases above the pad loop
+    // always exactly fill `selected` to `batch_size` on their own — so the
+    // pad loop can never actually execute through the public API, and
+    // `test_select_batch_no_duplicate_indices` cannot exercise it either.
+    // This test calls the private `select_priority` directly with a
+    // deliberately out-of-contract `batch_size > total` to force the pad
+    // loop to run, with `priority_fraction` kept low enough that the
+    // earlier priority-draw phase fills cleanly (`deficit == 0`) and never
+    // touches the separate round-robin deficit-fill loop above it.
+    #[test]
+    fn test_select_priority_pad_loop_forced_no_duplicates() -> Result<(), ViewSchedulerError> {
+        let config = ViewSchedulerConfig {
+            coverage_period: 1_000_000,
+            min_visits_for_priority: 0,
+            priority_fraction: 0.5,
+            ..ViewSchedulerConfig::default()
+        };
+        let n = 6;
+        let mut sched = ViewScheduler::with_count(n, config)?;
+        for i in 0..n {
+            // Distinct positive losses -> distinct positive priorities, so
+            // the weighted priority draw below fills cleanly without
+            // needing its own fallback.
+            sched.record_observation(i, (i as f32 + 1.0) * 0.1, 20.0)?;
+        }
+
+        for seed in 0..20u64 {
+            // total = 6, batch_size = 10: strictly more than every view
+            // that exists, guaranteeing the pad loop is reached with every
+            // index already used.
+            let batch = sched.select_priority(10, seed);
+            let mut seen = std::collections::HashSet::new();
+            for &idx in &batch {
+                assert!(
+                    seen.insert(idx),
+                    "duplicate index {idx} for seed {seed}: {batch:?}"
+                );
+                assert!(idx < n, "index {idx} out of range for {n} views");
+            }
+            assert!(
+                batch.len() <= n,
+                "batch {batch:?} exceeds the {n} distinct views that exist, for seed {seed}"
+            );
+        }
         Ok(())
     }
 }

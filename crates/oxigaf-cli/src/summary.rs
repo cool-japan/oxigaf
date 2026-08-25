@@ -307,10 +307,24 @@ impl RenderSummary {
 // Export Summary
 // ---------------------------------------------------------------------------
 
+/// Width the label of a `Label       : value` detail row is padded to.
+///
+/// Every summary block in this module hand-wrote its labels as literals
+/// (`"  Format       : "`, `"  Peak Memory  : "`, …) that all place the colon
+/// at column 15 — two leading spaces plus a 13-wide label. [`ExportSummary`]
+/// builds its rows from data instead, so the padding has to be explicit to
+/// keep its colons in the same column as the blocks around it.
+const DETAIL_LABEL_WIDTH: usize = 13;
+
+/// Render one uncolored `  Label       : value` detail row.
+fn detail_line(label: &str, value: &str) -> String {
+    format!("  {label:<DETAIL_LABEL_WIDTH$}: {value}")
+}
+
 /// Summary information displayed after export completion.
 pub struct ExportSummary {
     pub format: String,
-    #[allow(dead_code)]
+    /// Model the export read from; shown as the `Source` detail line.
     pub input_file: String,
     pub output_file: String,
     pub file_size_mb: f64,
@@ -319,9 +333,34 @@ pub struct ExportSummary {
 }
 
 impl ExportSummary {
+    /// The `Export Details` rows, as `(label, value)` pairs.
+    ///
+    /// Both the colored and the plain branch of [`Self::print`] render this
+    /// one list, so a detail can never again appear in one and be missing
+    /// from the other — which is exactly how `input_file` came to be
+    /// collected by the export command, stored here, and then printed
+    /// nowhere at all (it was carrying an `#[allow(dead_code)]`).
+    ///
+    /// `Source` is listed first: an export summary that names only the file
+    /// it wrote leaves the reader unable to tell *which* model produced it,
+    /// which matters as soon as more than one checkpoint is in play.
+    fn detail_rows(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("Source", self.input_file.clone()),
+            ("Format", self.format.to_uppercase()),
+            ("Gaussians", self.num_gaussians.to_string()),
+            (
+                "File Size",
+                format!("{} MB", format_file_size_mb(self.file_size_mb)),
+            ),
+            ("Duration", format_duration(self.elapsed)),
+        ]
+    }
+
     /// Print formatted summary to stdout.
     pub fn print(&self) {
         let separator = "═".repeat(65);
+        let rows = self.detail_rows();
 
         if output::colors_enabled() {
             println!("\n{}", separator.bright_cyan());
@@ -329,22 +368,14 @@ impl ExportSummary {
             println!("{}\n", separator.bright_cyan());
 
             println!("{}", "Export Details:".bright_yellow().bold());
-            println!(
-                "  Format       : {}",
-                self.format.to_uppercase().bright_white()
-            );
-            println!(
-                "  Gaussians    : {}",
-                format!("{}", self.num_gaussians).bright_white()
-            );
-            println!(
-                "  File Size    : {} MB",
-                format_file_size_mb(self.file_size_mb).bright_white()
-            );
-            println!(
-                "  Duration     : {}",
-                format_duration(self.elapsed).bright_white()
-            );
+            for (label, value) in &rows {
+                println!(
+                    "  {:<width$}: {}",
+                    label,
+                    value.bright_white(),
+                    width = DETAIL_LABEL_WIDTH
+                );
+            }
 
             println!("\n{}", "Output:".bright_yellow().bold());
             println!(
@@ -367,13 +398,9 @@ impl ExportSummary {
             println!("{}\n", separator);
 
             println!("Export Details:");
-            println!("  Format       : {}", self.format.to_uppercase());
-            println!("  Gaussians    : {}", self.num_gaussians);
-            println!(
-                "  File Size    : {} MB",
-                format_file_size_mb(self.file_size_mb)
-            );
-            println!("  Duration     : {}", format_duration(self.elapsed));
+            for (label, value) in &rows {
+                println!("{}", detail_line(label, value));
+            }
 
             println!("\nOutput:");
             println!("  [FILE] {}", self.output_file);
@@ -580,6 +607,103 @@ mod tests {
         summary.print();
     }
 
+    // -----------------------------------------------------------------------
+    // ExportSummary detail rows
+    //
+    // Regression: `input_file` was populated by the export command and then
+    // printed by neither branch of `print`, so an "Export Complete" block
+    // never said which model it had read. The field was suppressed with
+    // `#[allow(dead_code)]` instead of being wired up.
+    // -----------------------------------------------------------------------
+
+    fn sample_export_summary() -> ExportSummary {
+        ExportSummary {
+            format: "gltf".to_string(),
+            input_file: "/models/subject_042.ply".to_string(),
+            output_file: "/exports/subject_042.glb".to_string(),
+            file_size_mb: 42.5,
+            num_gaussians: 100_000,
+            elapsed: Duration::from_secs(75),
+        }
+    }
+
+    #[test]
+    fn test_export_summary_shows_source_file() {
+        let summary = sample_export_summary();
+        let rows = summary.detail_rows();
+        let source = rows
+            .iter()
+            .find(|(label, _)| *label == "Source")
+            .map(|(_, value)| value.clone());
+        assert_eq!(
+            source,
+            Some("/models/subject_042.ply".to_string()),
+            "the export summary must name the model it read: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn test_export_summary_rows_cover_every_field() {
+        let summary = sample_export_summary();
+        let rows = summary.detail_rows();
+        let rendered: Vec<String> = rows
+            .iter()
+            .map(|(label, value)| format!("{label}: {value}"))
+            .collect();
+        let joined = rendered.join("\n");
+
+        assert!(joined.contains("Source: /models/subject_042.ply"));
+        assert!(joined.contains("Format: GLTF"));
+        assert!(joined.contains("Gaussians: 100000"));
+        assert!(joined.contains("File Size: 42.5 MB"));
+        assert!(joined.contains("Duration: 1m 15s"));
+    }
+
+    #[test]
+    fn test_export_summary_labels_fit_the_column() {
+        // `print` pads labels to `DETAIL_LABEL_WIDTH` so the colons line up;
+        // a longer label would push its colon out of the column.
+        for (label, _) in sample_export_summary().detail_rows() {
+            assert!(
+                label.len() <= DETAIL_LABEL_WIDTH,
+                "detail label {label:?} does not fit the {DETAIL_LABEL_WIDTH}-char label column"
+            );
+        }
+    }
+
+    /// The data-driven detail rows must land their colon in exactly the
+    /// column the hand-written literals elsewhere in this module use
+    /// (`"  Peak Memory  : "` and friends: two spaces + a 13-wide label, so
+    /// the colon sits at index 15). Asserting on `detail_rows` alone would
+    /// not catch a padding width that shifts every export detail line
+    /// relative to the `Output:` and `Usage:` blocks below it.
+    #[test]
+    fn test_export_detail_line_colon_column_matches_other_summaries() {
+        // Reference literal taken verbatim from `TrainingSummary::print`.
+        let reference = "  Peak Memory  : ";
+        let colon_column = reference
+            .find(':')
+            .expect("test: the reference literal contains a colon");
+        assert_eq!(colon_column, 15, "reference literal changed shape");
+
+        for (label, value) in sample_export_summary().detail_rows() {
+            let line = detail_line(label, &value);
+            assert_eq!(
+                line.find(':'),
+                Some(colon_column),
+                "detail line {line:?} puts its colon out of column {colon_column}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_export_detail_line_renders_label_and_value() {
+        assert_eq!(
+            detail_line("Source", "/models/subject_042.ply"),
+            "  Source       : /models/subject_042.ply"
+        );
+    }
+
     #[test]
     fn test_count_files_in_nonexistent_dir() {
         let result = count_files_in_dir("/nonexistent/directory/path");
@@ -669,10 +793,10 @@ mod tests {
 
     #[test]
     fn test_suggested_export_command_parses() {
-        // Note: this crate's binary target (`main.rs`, which is where this
-        // `summary` module lives) sets `#![deny(clippy::expect_used)]`
-        // crate-wide with no `clippy.toml` exemption for tests, so this
-        // uses `assert!` rather than `.expect()`/`.unwrap()`.
+        // Note: this module is declared once, in `lib.rs`, which denies
+        // `clippy::expect_used` under `cfg_attr(not(test), ..)`. Test code is
+        // therefore exempt, but asserting on the `Result` states the actual
+        // claim ("this command line parses") better than unwrapping it would.
         use crate::cli::Cli;
         use clap::Parser;
 

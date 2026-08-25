@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.1.2] - Unreleased
 
+> **Migration notes.** Most of what follows is additive or affects only
+> advanced/internal APIs. Two changes are worth reading before you upgrade:
+>
+> - **PLY files with `sh_degree >= 1` written by `GaussianModel::save_ply`
+>   (`oxigaf-render`) before this release load with permuted higher-order SH
+>   coefficients.** The `f_rest_*` property order changed to
+>   channel-major (matches the reference 3DGS Python convention,
+>   `features_rest.transpose(1, 2).flatten()`) — see *Fixed → oxigaf-render*
+>   below. Re-export any `.ply` written this way that you care about. (Scoped
+>   to this one writer/reader pair — `oxigaf-cli` has its own separate PLY
+>   toolchain in `export_ply`/`export.rs`, not covered by this note.)
+> - **macOS: the default asset cache directory moved** from `~/.cache/oxigaf`
+>   to `~/Library/Caches/oxigaf` (`dirs::cache_dir()`), because `setup`,
+>   `doctor`, and `cache` used to each compute it a different way — see
+>   *Fixed → oxigaf-cli* below. Move any existing `~/.cache/oxigaf` state, or
+>   set `OXIGAF_CACHE_DIR` to keep the old location.
+
 ### Changed
 
 - **candle-core / candle-nn** updated 0.10 → 0.11, and switched from
@@ -24,6 +41,135 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   actually be turned off; it is now a real opt-in (`--features
   flash_attention`, or the `full_performance` / `all_features` bundles).
 
+#### oxigaf-diffusion — signature and semantics changes
+
+- `compute_distillation_loss` and `DistillationStep::aggregate_losses`
+  (`distillation_loss.rs`) now return `Result` instead of an infallible
+  value; `DistillationLossResult` gained a `mode: DistillationMode` field,
+  `DistillationConfig` gained `latent_dims: Option<LatentDims>` (required
+  when `lpips_proxy_weight > 0`), and `TeacherStudentPair` gained
+  `teacher_mid: Option<NoisePrediction>` (set via
+  `TeacherStudentPair::with_teacher_mid`) for true two-step teacher
+  evaluation.
+- `dpm_plus_plus_2m_step` now takes `prev_x0`/`h_prev` instead of a single
+  `prev_noise_pred` (6 → 7 arguments) — the DPM-Solver++ 2M multistep
+  formula needs the previous denoised sample and step size, not just the
+  previous noise prediction.
+- `InversionTrajectory::x_0()` / `x_t()` (`inversion.rs`) now return
+  `Option<&[f32]>` instead of `&[f32]`, and `reconstruction_error` can
+  return `Err` — both were previously infallible against trajectories that
+  hadn't reached the requested step.
+- `DdimInversionConfig::refinement_threshold` is now compared against the
+  RMS (root-mean-square) reconstruction error instead of the raw L2 norm, so
+  the same threshold value now means something different (scale-independent
+  of the trajectory length) — re-tune any pinned threshold.
+- `pad_to_square`, `flip_horizontal`, `flip_vertical` (`image_preprocessing.rs`)
+  now return `Result<_, PreprocessError>` instead of an infallible value — an
+  empty image or a source buffer that disagrees with its `ImageDims` is
+  reported as an error instead of panicking or producing garbage output.
+- `FlowStats::divergence_estimate` (`flow_matching.rs`) renamed to
+  `mean_squared_norm` — the old name overclaimed what the field measures: it
+  is `mean(sum(v_i^2))` over the batch, not an estimate of the velocity
+  field's divergence (`div v = sum_i dv_i/dx_i`).
+- `EditMask::all_ones` (`image_editing/mod.rs`) takes `(height, width)`, the
+  same argument order as `EditMask::new` / `EditMask::from_data`.
+- `fm_interpolate` / `fm_target_velocity` (`flow_matching.rs`): the `Linear`
+  path now honors `FlowMatchingConfig::sigma_min` (default `0.001`) instead
+  of assuming `sigma_min == 0`; at `t = 1` it returns `sigma_min * x_0 +
+  x_1` rather than exactly `x_1` whenever `sigma_min > 0`.
+- `softmax_over_dim` (`fused_attention.rs`) now returns `Result<(),
+  DiffusionError>` instead of an infallible value.
+- `sdedit::ImageEditError` removed — `sdedit` now uses the parent
+  `image_editing::ImageEditingError` directly instead of a separate enum
+  bridged in via `From`. Old variants map onto it as `InvalidStrength` /
+  `InvalidParam` → `InvalidConfig`, `InvalidMask` → `InvalidImage`,
+  `TimestepOutOfRange` → `NoiseLevelOutOfRange`, and `DimensionMismatch`'s
+  `got` field renamed to `actual`.
+- `MultiViewDiffusionPipeline::begin_session_from_latents` (`pipeline.rs`)
+  now takes a single `SessionRequest<'_>` instead of seven positional
+  arguments (four of them `&Tensor`, and therefore trivially transposable at
+  a call site) — it bundles `reference_image`, `normal_map_latents`,
+  `camera_poses`, `latents`, `seed`, `start_step`, and
+  `num_inference_steps`.
+
+#### oxigaf-flame — signature and semantics changes
+
+- `shade_mesh_directional` / `shade_mesh_multi_light` (`lighting_model.rs`)
+  now return `Err` when a light colour component is outside `[0, 1]`,
+  instead of silently clamping it into range.
+- `LightingError` gained an `InvalidFaceIndex` variant; the enum is not
+  `#[non_exhaustive]`, so an exhaustive `match` on `LightingError` needs a
+  new arm.
+- `DecimationConfig::default().target_vertex_count` changed from `0` to
+  `usize::MAX` (`multiresolution.rs`). `0` was always rejected by validation
+  (`"target_vertex_count must be > 0"`), so the old default was an
+  always-reject footgun; `usize::MAX` is a documented no-op default
+  (decimation only runs while `live_vertex_count > target_vertex_count`).
+- `estimate_pitch_from_vertical` (re-exported at `oxigaf_flame::lib.rs:351`)
+  now takes a third `&PitchReference` argument and returns
+  `Result<[f32; 2], _>` instead of `Result<f32, _>`. The arity change means
+  old call sites fail to compile rather than silently compiling against a
+  changed meaning.
+
+#### oxigaf-render — signature and semantics changes
+
+- `RadixSorter::sort` no longer takes `device`/`keys`/`values` — that setup
+  moved to a new `prepare()` step (`sort.rs`); `capacity()` now reports the
+  sorter's live, growable buffer capacity rather than a fixed construction-
+  time value.
+- `Rasterizer::from_device` now errors when `tile_size != 16` instead of
+  silently accepting it, and `WorkgroupConfig::from_profile`'s tile
+  dimensions changed from 4×4 to 16×16 to match `RASTERIZE_TILE_SIZE` (see
+  *Added* below).
+- `MbStats.mean_samples_used` renamed to `estimated_sample_utilization`
+  (motion-blur pipeline) — the old name implied an exact sample count; the
+  field is a ratio.
+- `hdr_tone_mapping::lottes_approx` renamed to `generalized_reinhard`, next
+  to the new, more accurate `hdr_tone_mapping::lottes` (see *Added* below) —
+  "approx" was misleading once a non-approximating Lottes implementation
+  existed.
+
+#### oxigaf-trainer — signature and semantics changes
+
+- `ViewConsistencyLoss` (`diffusion_target.rs`) gained a `pub enable_warping:
+  bool` field, which breaks external `ViewConsistencyLoss { .. }`
+  struct-literal construction that doesn't list it. `DiffusionTargetGenerator`
+  gained `generate_targets_with_normals`, `view_consistency_loss()`, and
+  `target_config()`; the private `cameras_to_tensor` helper it calls now
+  takes a `num_views` parameter and tiles cameras cyclically (or truncates)
+  to match it, since the pipeline always denoises exactly
+  `DiffusionConfig::num_views` latents.
+- `detect_convergence_phase` gained a `loss_scale` parameter (4 → 5 args);
+  `ConvergenceConfig` gained `oscillation_threshold` and `max_history`
+  (`convergence_analysis.rs`).
+- `mr_upsample`, `mr_gaussian_blur_3x3`, `mr_sobel_magnitude`
+  (`multi_resolution_loss.rs`) and `GaussianOptimizer::step` /
+  `step_accumulated` (`optimizer.rs`) now return `Result` instead of an
+  infallible value, per the no-`unwrap()` policy.
+- `SyncReport` gained `buckets` and `gradient_compression` fields
+  (`data_parallel.rs`); `estimated_bandwidth_mb` changed meaning — see
+  *Added* below for the new fields' semantics.
+
+#### oxigaf-cli — signature and semantics changes
+
+- `extract_subset`, `select_spatial_grid_indices`, and
+  `find_optimal_reduction_ratios` now return `Result` instead of an
+  infallible value. `merge_lod_levels`'s 3rd parameter was renamed
+  `weight_a` → `weight_b` (the parameter's actual meaning — it is the weight
+  applied to the *second* level being merged — was mislabeled, not just
+  renamed for style).
+- `InspectableModel::activated_scale` now returns `Result` and the type is
+  `#[non_exhaustive]`. `compute_ssim` now returns `Result<Option<f32>>` and
+  `ImageQualityMetrics::ssim` is now `Option<f32>` (previously both were
+  infallible and could silently report a meaningless SSIM for degenerate
+  inputs).
+- `ss_chunk_scene` gained an `sh_channels` parameter (`scene_streaming.rs`,
+  3 → 4 args) — chunk boundaries must respect per-Gaussian SH layout, which
+  varies with `sh_degree`.
+- `RenderArgs::width` / `height` are now `Option<u32>` instead of `u32` (the
+  render command now derives a default from the source model/camera instead
+  of hardcoding one).
+
 ### Fixed
 
 - **C Oniguruma removed from the default build** — `candle-core` → `tokenizers`
@@ -31,12 +177,88 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   via `cc`/`pkg-config` on every default build. Fixed by the `oxicandle-core`
   switch above (verified: `Cargo.lock` now has zero `onig`/`onig_sys`
   entries). This was a COOLJAPAN Pure-Rust policy violation.
-- **C OpenSSL removed from `oxigaf-cli`** — `hf-hub`'s default features
-  pulled in `native-tls` → `openssl`/`openssl-sys`, even though
-  `oxigaf-cli` only uses the sync `ureq` API
-  (`hf_hub::api::sync::ApiBuilder`). Fixed by declaring `hf-hub` with
-  `default-features = false, features = ["ureq"]` (verified:
-  `Cargo.lock` no longer lists `openssl-sys`).
+- **C OpenSSL, and later `ring`, removed from `oxigaf-cli`'s HTTP stack** —
+  superseded the entry this replaces (`hf-hub` reconfigured with
+  `default-features = false, features = ["ureq"]`, which only removed
+  `native-tls`/`openssl-sys`). `hf-hub` has since been dropped entirely: its
+  sole consumer, `oxigaf-cli/src/assets.rs`, now talks to the Hugging Face
+  Hub `resolve` endpoint directly over `ureq 3.4`
+  (`default-features = false`, `rustls-no-provider` +
+  `rustls-webpki-roots`) with `rustls 0.23`
+  (`default-features = false`: `std`, `tls12`, `logging`) and the process
+  `CryptoProvider` installed once from `oxitls-rustcrypto-provider 0.3`
+  (COOLJAPAN's pure-RustCrypto fork of `rustls-rustcrypto`,
+  RUSTSEC-2026-0104 fixed). This eliminates `ring` (C + hand-written asm) as
+  well as `openssl`/`native-tls`, and — as a side effect of no longer
+  shelling out to `curl`/`wget` — `download_file` now streams with native,
+  byte-accurate progress. Verified: `cargo tree -i ring` and
+  `cargo tree -i hf-hub` are both empty; `cargo deny check bans` passes with
+  `ring` fully banned (no wrapper exception needed).
+
+### Deprecated
+
+- **`ExpressionLibrary::default_expressions()`** (`oxigaf-flame`) is now
+  `#[deprecated]` in favour of `placeholder_expressions()`, which states in
+  its name that the returned expressions are placeholders rather than a
+  recommended default. A workspace that denies deprecation warnings
+  (`-D deprecated`) will fail to build against any future caller that still
+  uses the old name.
+
+#### oxigaf-flame — bug fixes
+
+- **`FittingError::CameraProjectionFailed` is now actually reachable** —
+  `fit_landmarks` previously declared the variant but never constructed it
+  (dead code); it is now returned when not one landmark projects in front of
+  the camera, instead of the fit silently proceeding on a degenerate
+  projection. `FittingResult` gained a public `n_visible_landmarks: usize`
+  field so callers can distinguish "good fit" from "fit against very few
+  visible landmarks" without re-deriving the count themselves.
+
+#### oxigaf-render — bug fixes
+
+- **`GaussianModel::save_ply` / `load_ply` (`gaussian.rs`) `f_rest_*`
+  property order changed to channel-major** — matches the reference 3D
+  Gaussian Splatting Python convention; this crate's own in-memory
+  `sh_coeffs` layout is coefficient-major RGB-interleaved, so the two orders
+  are now explicitly permuted on write and un-permuted on read instead of
+  being written through unchanged. See the migration note at the top of
+  this section: files written by this code path before the fix contain
+  correctly-valued but permuted higher-order SH coefficients (`sh_degree >=
+  1`); re-export them. Covered by a new regression test,
+  `test_ply_save_writes_f_rest_channel_major`.
+
+#### oxigaf-trainer — bug fixes
+
+- **`decompose_uncertainty` no longer fabricates an aleatoric/epistemic
+  split for a single point sample** (`uncertainty_estimation.rs`) — it
+  previously rescaled a single variance estimate into an arbitrary ~0.64 /
+  0.36 aleatoric/epistemic split with no statistical basis. It now reports
+  `aleatoric == 0.0` and `epistemic == total` for point samples (there is no
+  data-noise signal to separate without repeated observations); callers
+  that need a real data-noise term must call
+  `decompose_uncertainty_with_variances` instead, which takes the repeated
+  samples the decomposition actually requires.
+- **`CurriculumSchedule::validate` now rejects invalid stage ordering** —
+  previously accepted schedules where a stage's `step_start > step_end`, or
+  where consecutive stages left an uncovered gap between them; both now
+  return a validation error instead of producing a schedule that silently
+  skips or inverts a training stage at runtime.
+
+#### oxigaf-cli — bug fixes
+
+- **`setup` / `doctor` / `cache` agree on the asset cache directory** — they
+  previously computed it three different ways (`~/.cache/oxigaf`,
+  `$HOME/.cache/oxigaf`, `dirs::cache_dir()`), so on macOS `oxigaf setup`
+  populated `~/.cache/oxigaf` while `oxigaf cache list` looked in
+  `~/Library/Caches/oxigaf` and reported an empty cache. All three now go
+  through one `commands::runtime::default_cache_dir()`, which uses
+  `dirs::cache_dir()` (macOS: `~/Library/Caches/oxigaf`) unless
+  `OXIGAF_CACHE_DIR` is set. `SetupArgs::cache_dir` is now `Option<PathBuf>`
+  to let it fall through to the shared default instead of hardcoding
+  `~/.cache/oxigaf` as a `clap` default value — see the migration note at
+  the top of this section.
+- **CLI `convert`'s `.pkl` path now actually works** — see the annotation on
+  the `[0.1.0]` `convert` entry below.
 
 ### Removed
 
@@ -56,6 +278,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   COOLJAPAN banned-crate list (compression, BLAS/LAPACK, TLS, tokenizer C
   backends, etc.), with documented `wrappers`/skip exceptions for crates not
   yet migrated off their C dependency.
+
+#### oxigaf-cli
+
+- `RegistrationError::NoCorrespondences` (`cloud_registration/types.rs`) —
+  returned by point-cloud correspondence search when not one pair could be
+  matched, instead of proceeding with an empty correspondence set.
+- `stages::GaussianModel` is now `pub use oxigaf::render::gaussian::
+  GaussianModel` instead of a local placeholder struct, so pipeline stages
+  operate on the real Gaussian model type. New `TrainingSetup` struct, plus
+  `DiffusionStage::with_*` / `TrainingStage::with_*` builder methods for
+  constructing pipeline stages without a full-struct literal.
+- `QualityThresholds` gained a `background_color` field, letting quality
+  checks account for a non-default render background instead of assuming
+  black.
+
+#### oxigaf-render
+
+- `GaussianStats` gained `opacity_above_099_count` / `degenerate_scale_count`
+  and a new `compute_stats_and_histograms()` entry point that computes both
+  in one pass over the model.
+- `hdr_tone_mapping::LottesParams` and `hdr_tone_mapping::lottes()` — a real
+  (non-approximating) implementation of the Lottes tone-mapping operator,
+  alongside the renamed `generalized_reinhard` (see *Changed* above).
+- `LensDistortionError::BufferSizeMismatch` — returned instead of an
+  out-of-bounds panic/silent truncation when a caller-supplied buffer
+  doesn't match the expected pixel count.
+- `CullingResult::behind_camera_culled` — a separate counter from the
+  existing frustum-cull counts, so callers can distinguish "behind the
+  camera" from "outside the side/top/bottom/far planes" when diagnosing an
+  unexpectedly empty render.
+- `Rasterizer::invalidate_gaussians` / `Rasterizer::workgroups` and a new
+  `pub const RASTERIZE_TILE_SIZE: u32 = 16` — the tile size the forward/
+  backward shaders are compiled against, now named instead of a bare
+  literal repeated at each call site (see the `Rasterizer::from_device` /
+  `WorkgroupConfig::from_profile` entries under *Changed* above, which both
+  now key off this constant).
+
+#### oxigaf-trainer
+
+- `SyncReport` gained `buckets` and `gradient_compression` fields
+  (`data_parallel.rs`), reporting per-bucket gradient-sync detail instead of
+  only an aggregate. `estimated_bandwidth_mb` now reflects the
+  post-compression transfer size when `gradient_compression` is active,
+  rather than always reporting the uncompressed size.
 
 ## [0.1.1] - 2026-06-19
 
@@ -206,7 +472,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - CLI examples: `convert_gaf_checkpoint`, `batch_convert`, `validate_conversion`
 
 - **oxigaf-cli** — Command-line interface
-  - `convert` — Convert between 3D formats and weight formats
+  - `convert` — Convert between 3D formats and weight formats. **Historical
+    note (added retroactively):** at 0.1.0 the `.pkl` input path
+    (`convert_pkl` in `oxigaf-cli/src/convert.rs`) was structurally unable to
+    succeed against real FLAME `.pkl` files — only the `.npz` half of this
+    command actually worked, despite `convert` being listed as shipped
+    above. `convert_pkl` now decodes the pickle stream with a pure-Rust
+    virtual machine (`pickle::load_arrays`, understanding protocols 0–5 and
+    reconstructing `numpy.ndarray` / `numpy.dtype` / `chumpy.ch.Ch` /
+    `scipy.sparse` payloads) instead of the earlier approach; see `[0.1.2]`
+    above.
   - `train` — Train Gaussian Avatar models
   - `render` — Render images from trained models
   - `export` — Export to standard formats

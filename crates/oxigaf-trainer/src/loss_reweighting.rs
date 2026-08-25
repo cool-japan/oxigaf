@@ -23,6 +23,8 @@
 //! println!("{}", oxigaf_trainer::loss_reweighting::format_weight_summary(&sw));
 //! ```
 
+use std::collections::VecDeque;
+
 use thiserror::Error;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -211,8 +213,11 @@ pub struct SampleWeights {
 /// Rolling history of per-step weight statistics for post-hoc analysis.
 #[derive(Debug, Clone)]
 pub struct WeightTracker {
-    /// Circular history: `(step, mean_weight, max_weight)`.
-    pub history: Vec<(usize, f32, f32)>,
+    /// Circular history: `(step, mean_weight, max_weight)`. Backed by a
+    /// `VecDeque` so eviction at capacity is O(1) via `pop_front()` instead
+    /// of the O(n) memmove that `Vec::remove(0)` would incur on every
+    /// recorded step.
+    pub history: VecDeque<(usize, f32, f32)>,
     /// Maximum number of entries retained.
     pub capacity: usize,
 }
@@ -221,7 +226,7 @@ impl WeightTracker {
     /// Create a new tracker with the given capacity.
     pub fn new(capacity: usize) -> Self {
         Self {
-            history: Vec::with_capacity(capacity),
+            history: VecDeque::with_capacity(capacity),
             capacity,
         }
     }
@@ -234,9 +239,9 @@ impl WeightTracker {
             return;
         }
         if self.history.len() >= self.capacity {
-            self.history.remove(0);
+            self.history.pop_front();
         }
-        self.history.push((step, mean_weight, max_weight));
+        self.history.push_back((step, mean_weight, max_weight));
     }
 
     /// Estimate the linear trend of `max_weight` over the last `window` entries.
@@ -249,26 +254,30 @@ impl WeightTracker {
             return None;
         }
         let start = n.saturating_sub(window);
-        let slice = &self.history[start..];
-        if slice.len() < 2 {
+        let count = n - start;
+        if count < 2 {
             return None;
         }
         // Simple linear regression slope on (step, max_weight) pairs.
-        let len = slice.len() as f32;
-        let sum_x: f32 = slice.iter().map(|&(s, _, _)| s as f32).sum();
-        let sum_y: f32 = slice.iter().map(|&(_, _, m)| m).sum();
+        // `VecDeque` has no `Index<Range<usize>>`, so use `.range()` instead
+        // of slicing directly (as in `GradientFlowTracker::analyze_group`).
+        let len = count as f32;
+        let sum_x: f32 = self.history.range(start..).map(|&(s, _, _)| s as f32).sum();
+        let sum_y: f32 = self.history.range(start..).map(|&(_, _, m)| m).sum();
         let mean_x = sum_x / len;
         let mean_y = sum_y / len;
 
-        let ss_xx: f32 = slice
-            .iter()
+        let ss_xx: f32 = self
+            .history
+            .range(start..)
             .map(|&(s, _, _)| {
                 let dx = s as f32 - mean_x;
                 dx * dx
             })
             .sum();
-        let ss_xy: f32 = slice
-            .iter()
+        let ss_xy: f32 = self
+            .history
+            .range(start..)
             .map(|&(s, _, m)| (s as f32 - mean_x) * (m - mean_y))
             .sum();
 
@@ -285,11 +294,24 @@ impl WeightTracker {
 
 /// Compute focal-loss per-sample weights.
 ///
-/// `w_i = alpha * (1 - predictions[i])^gamma`, then normalised so
-/// `mean(w) == 1.0`.
+/// `w_i = alpha_i * (1 - predictions[i])^gamma`, then normalised so
+/// `mean(w) == 1.0`, where `alpha_i = alpha` when `predictions[i] >= 0.5`
+/// (treated as the "positive"/in-class prediction) and `alpha_i = 1 -
+/// alpha` otherwise — the standard Lin et al. 2017 class-balance split,
+/// applied per-sample from the prediction itself since this function has
+/// no separate ground-truth label input to split on.
 ///
-/// A perfect prediction (`p_i = 1.0`) yields weight zero; a completely wrong
-/// prediction (`p_i = 0.0`) yields weight `alpha`.
+/// A UNIFORM (non-per-class) `alpha` — the previous implementation — has
+/// NO effect on the returned weights: scaling every raw weight by the
+/// same constant before mean-normalisation cancels out exactly. Splitting
+/// `alpha` by predicted class is what gives it an actual, testable
+/// effect; `alpha = 0.5` puts BOTH branches at the same 0.5 multiplier,
+/// so it remains the alpha-independent midpoint (matching the previous
+/// behaviour at that one value).
+///
+/// Before normalisation: a perfect "positive" prediction (`p_i = 1.0`)
+/// yields raw weight `alpha * 0 = 0`; a completely wrong "negative"
+/// prediction (`p_i = 0.0`) yields raw weight `(1 - alpha) * 1`.
 ///
 /// # Errors
 /// - [`ReweightingError::EmptyLosses`] if `predictions` is empty.
@@ -305,12 +327,14 @@ pub fn compute_focal_weights(
     if gamma < 0.0 {
         return Err(ReweightingError::InvalidGamma { gamma });
     }
+    let alpha = alpha.clamp(0.0, 1.0);
 
     let raw: Vec<f32> = predictions
         .iter()
         .map(|&p| {
             let p_clamped = p.clamp(0.0, 1.0);
-            alpha * (1.0 - p_clamped).powf(gamma)
+            let alpha_i = if p_clamped >= 0.5 { alpha } else { 1.0 - alpha };
+            alpha_i * (1.0 - p_clamped).powf(gamma)
         })
         .collect();
 
@@ -323,9 +347,19 @@ pub fn compute_focal_weights(
 /// `w_i ∝ exp((losses[i] - max_loss) / temperature)`.
 ///
 /// After computing softmax probabilities the result is scaled so that
-/// `mean(w) == 1.0` and any weight exceeding
-/// `config.max_weight_ratio * mean_weight` is clipped; the distribution is
-/// then re-normalised.
+/// `mean(w) == 1.0` and any weight exceeding `config.max_weight_ratio *
+/// mean_weight` is clipped; ONLY the un-clipped mass is then redistributed
+/// among the un-clipped weights (never rescaling an already-capped weight
+/// back above the cap), iterating a few passes since redistributing mass
+/// can itself push a previously-safe weight over the cap. The result
+/// always satisfies both `sum(weights) == n` (mean stays 1.0) and
+/// `weights[i] <= config.max_weight_ratio` for every `i` — unless even the
+/// full un-capped mass cannot be absorbed without exceeding the cap
+/// itself, e.g. `max_weight_ratio < 1.0`, in which case the mean
+/// invariant is preserved and the cap is honoured for whichever weights
+/// were clipped, but the deficit cannot be fully redistributed onto
+/// unclipped weights that are already at (or would need to exceed) the
+/// same cap.
 ///
 /// Higher loss → higher weight.
 ///
@@ -355,26 +389,53 @@ pub fn compute_hardness_weights(
     // Scale from probabilities (sum = 1) to weights (mean = 1).
     let mut weights: Vec<f32> = exps.iter().map(|&e| e / sum_exp * n).collect();
 
-    // Clip at max_weight_ratio * mean (mean is 1.0 by construction above).
     let cap = config.max_weight_ratio;
-    let clipped: bool = weights.iter_mut().fold(false, |acc, w| {
-        if *w > cap {
-            *w = cap;
-            true
-        } else {
-            acc
-        }
-    });
 
-    if clipped {
-        // Re-normalise after clipping.
-        let clip_sum: f32 = weights.iter().sum();
-        let target_sum = n; // mean == 1 ⟹ sum == n
-        if clip_sum > 0.0 {
-            let scale = target_sum / clip_sum;
-            for w in &mut weights {
-                *w *= scale;
+    // Clip weights above the cap, then redistribute ONLY the un-clipped
+    // mass among the un-clipped weights — never touching an
+    // already-clipped weight again. The previous implementation rescaled
+    // ALL weights (including the just-clipped ones) by `n / clip_sum`;
+    // since clipping only ever reduces the sum, that scale factor was
+    // always > 1, which pushed the clipped weights right back above the
+    // cap it had just enforced. Iterate a few passes since redistributing
+    // the deficit can itself push a previously-uncapped weight over the
+    // cap.
+    let mut clipped = vec![false; weights.len()];
+    for _pass in 0..8 {
+        let mut any_new_clip = false;
+        for (w, c) in weights.iter_mut().zip(clipped.iter_mut()) {
+            if !*c && *w > cap {
+                *w = cap;
+                *c = true;
+                any_new_clip = true;
             }
+        }
+
+        let clipped_total: f32 = weights
+            .iter()
+            .zip(clipped.iter())
+            .filter(|&(_, &c)| c)
+            .map(|(&w, _)| w)
+            .sum();
+        let uncapped_sum: f32 = weights
+            .iter()
+            .zip(clipped.iter())
+            .filter(|&(_, &c)| !c)
+            .map(|(&w, _)| w)
+            .sum();
+        let deficit = n - clipped_total;
+
+        if uncapped_sum > 1e-12 && deficit > 0.0 {
+            let scale = deficit / uncapped_sum;
+            for (w, &c) in weights.iter_mut().zip(clipped.iter()) {
+                if !c {
+                    *w *= scale;
+                }
+            }
+        }
+
+        if !any_new_clip {
+            break;
         }
     }
 
@@ -1017,6 +1078,28 @@ mod tests {
         assert_mean_one(&weights);
     }
 
+    // 11b. Regression: alpha must have a genuine (non-cancelling) effect
+    //      on the normalised weight distribution when it differs from
+    //      0.5 — this was previously a no-op because a uniform scalar
+    //      multiplier cancels under mean-normalisation.
+    #[test]
+    fn test_focal_alpha_has_real_effect() {
+        let preds = vec![0.9_f32, 0.1, 0.5];
+        let gamma = 2.0;
+        let w_alpha_02 = compute_focal_weights(&preds, gamma, 0.2).unwrap();
+        let w_alpha_08 = compute_focal_weights(&preds, gamma, 0.8).unwrap();
+        let max_diff = w_alpha_02
+            .iter()
+            .zip(w_alpha_08.iter())
+            .map(|(&a, &b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            max_diff > 1e-2,
+            "alpha=0.2 vs alpha=0.8 should give visibly different weights, \
+             got alpha_0.2={w_alpha_02:?} alpha_0.8={w_alpha_08:?} (max_diff={max_diff})"
+        );
+    }
+
     // ── compute_hardness_weights ──────────────────────────────────────────────
 
     // 12. Higher loss → higher weight.
@@ -1061,6 +1144,29 @@ mod tests {
         let cfg = HardnessConfig::default();
         let weights = compute_hardness_weights(&losses, &cfg).unwrap();
         assert_mean_one(&weights);
+    }
+
+    // 15b. Regression: a clipped weight must never be rescaled back above
+    //      the cap. The previous implementation rescaled ALL weights
+    //      (including already-clipped ones) by `n / clip_sum`, and since
+    //      clipping only reduces the sum, that factor was always > 1.
+    #[test]
+    fn test_hardness_weights_never_exceed_cap() {
+        let losses = vec![0.0_f32, 0.0, 0.0, 0.0, 5.0];
+        let cfg = HardnessConfig {
+            temperature: 1.0,
+            max_weight_ratio: 2.0,
+        };
+        let weights = compute_hardness_weights(&losses, &cfg).unwrap();
+        let cap = cfg.max_weight_ratio;
+        for (i, &w) in weights.iter().enumerate() {
+            assert!(w <= cap + 1e-3, "weight[{i}]={w} exceeds cap={cap}");
+        }
+        // Mean should still be preserved at 1.0 (sum == n) — clipping
+        // alone must not silently change the overall weight budget.
+        let n = losses.len() as f32;
+        let sum: f32 = weights.iter().sum();
+        assert!((sum - n).abs() < 1e-2, "sum should stay ≈ n={n}, got {sum}");
     }
 
     // ── compute_inverse_hardness_weights ──────────────────────────────────────
@@ -1439,6 +1545,21 @@ mod tests {
         assert_eq!(tracker.history.len(), 3);
         // The first entry (step=0) should be gone.
         assert_eq!(tracker.history[0].0, 1);
+    }
+
+    // 48b. Regression test: eviction at capacity must use O(1) `pop_front`
+    // (via `VecDeque`) rather than `Vec::remove(0)`, while preserving FIFO
+    // order across many evictions.
+    #[test]
+    fn test_weight_tracker_record_evict_preserves_fifo_order() {
+        let mut tracker = WeightTracker::new(5);
+        for step in 0..100usize {
+            tracker.record(step, 1.0, step as f32);
+        }
+        assert_eq!(tracker.history.len(), 5);
+        // Oldest surviving step should be 95, newest 99, in order.
+        let steps: Vec<usize> = tracker.history.iter().map(|&(s, _, _)| s).collect();
+        assert_eq!(steps, vec![95, 96, 97, 98, 99]);
     }
 
     // 49. recent_max_weight_trend positive when weights are growing.

@@ -8,6 +8,22 @@
 //! 5. AO application to RGB image with configurable strength
 //!
 //! All random numbers use a deterministic xorshift64 PRNG — no external rand crate.
+//!
+//! # Relationship to [`crate::ssao`]
+//!
+//! Two CPU ambient-occlusion modules coexist in this crate:
+//!
+//! | Module | Normal input | Projection | Denoise |
+//! |---|---|---|---|
+//! | [`crate::ambient_occlusion`] (this one) | flat `[f32]` triples | caller-supplied [`AoProjParams`] | depth-aware bilateral blur |
+//! | [`crate::ssao`] | `Vec<[f32; 3]>` normal map | fixed pinhole unprojection | separable box blur |
+//!
+//! Prefer this module when you need a custom projection or an
+//! edge-preserving denoise. [`ao_dot`] / [`ao_cross`] here are the crate's
+//! single implementation of AO vector maths; [`crate::ssao`] aliases them.
+//! The two modules' PRNGs are deliberately *not* shared — they differ in
+//! zero-state handling and in the `u64 → f32` mapping, so their sample
+//! patterns are not interchangeable.
 
 use thiserror::Error;
 
@@ -143,22 +159,42 @@ pub struct SsaoResult {
 
 /// Projection-derived scale factors used to reconstruct view-space positions.
 ///
-/// These are typically derived from the camera projection matrix:
-/// `proj_scale_x = tan(fov_x / 2)` and `proj_scale_y = tan(fov_y / 2)`.
+/// These are the camera's **focal length expressed in pixels**, i.e.
+/// `focal_px_x = width / (2 * tan(fov_x / 2))` and
+/// `focal_px_y = height / (2 * tan(fov_y / 2))`. [`ao_compute`] uses them to
+/// convert a view-space offset at a given depth into a pixel-space offset:
+/// `pixel_offset = view_offset * focal_px / depth`. Passing `tan(fov/2)`
+/// directly (as opposed to the focal length in pixels) under-scales the
+/// sample offsets by roughly the image size and degenerates SSAO into
+/// sampling the centre pixel.
 #[derive(Debug, Clone, Copy)]
 pub struct AoProjParams {
-    /// Horizontal field-of-view tangent scale.
-    pub proj_scale_x: f32,
-    /// Vertical field-of-view tangent scale.
-    pub proj_scale_y: f32,
+    /// Horizontal focal length in pixels.
+    pub focal_px_x: f32,
+    /// Vertical focal length in pixels.
+    pub focal_px_y: f32,
 }
 
 impl AoProjParams {
-    /// Construct from explicit scale values.
-    pub fn new(proj_scale_x: f32, proj_scale_y: f32) -> Self {
+    /// Construct from explicit focal-length-in-pixels values.
+    pub fn new(focal_px_x: f32, focal_px_y: f32) -> Self {
         Self {
-            proj_scale_x,
-            proj_scale_y,
+            focal_px_x,
+            focal_px_y,
+        }
+    }
+
+    /// Construct from horizontal/vertical field-of-view (radians) and image
+    /// dimensions in pixels: `focal_px = dimension / (2 * tan(fov / 2))`.
+    ///
+    /// `width` and `height` are taken as `f32` so callers can pass either
+    /// pixel counts or, if needed, sub-pixel-accurate render targets.
+    pub fn from_fov(fov_x: f32, fov_y: f32, width: f32, height: f32) -> Self {
+        let focal_px_x = width / (2.0 * (fov_x * 0.5).tan());
+        let focal_px_y = height / (2.0 * (fov_y * 0.5).tan());
+        Self {
+            focal_px_x,
+            focal_px_y,
         }
     }
 }
@@ -266,16 +302,25 @@ pub fn ao_sample_kernel(n_samples: usize) -> Result<Vec<f32>, AoError> {
 
     let mut kernel = Vec::with_capacity(n_samples * 3);
     let two_pi = 2.0 * core::f32::consts::PI;
-    let half_pi = core::f32::consts::FRAC_PI_2;
 
     for i in 0..n_samples {
-        // Random hemisphere direction (z >= 0)
+        // Cosine-weighted hemisphere direction (z >= 0): azimuth uniform in
+        // [0, 2*PI), polar angle drawn so the *solid-angle* density is
+        // proportional to cos(phi) rather than phi itself uniform. With
+        // u ~ Uniform(0, 1), z = sqrt(1 - u) gives a cosine-weighted z and
+        // sin(phi) = sqrt(u) is the matching planar radius — this
+        // concentrates fewer samples at the pole (the normal direction) and
+        // more toward grazing angles than a naive uniform-in-phi draw,
+        // which is what SSAO needs since most occlusion happens at grazing
+        // angles near the tangent plane.
         let theta = xorshift_f32(&mut state) * two_pi;
-        let phi = xorshift_f32(&mut state) * half_pi;
+        let u = xorshift_f32(&mut state);
+        let sin_phi = u.max(0.0).sqrt();
+        let cos_phi = (1.0 - u).max(0.0).sqrt();
 
-        let x = phi.sin() * theta.cos();
-        let y = phi.sin() * theta.sin();
-        let z = phi.cos();
+        let x = sin_phi * theta.cos();
+        let y = sin_phi * theta.sin();
+        let z = cos_phi;
 
         // Lerp-accelerated scale: closer samples weighted higher
         let t = i as f32 / n_samples.max(1) as f32;
@@ -316,14 +361,28 @@ pub fn ao_noise_texture() -> Vec<f32> {
 
 /// Compute SSAO factor for each pixel using a TBN-matrix-based hemisphere sampling.
 ///
+/// # Depth and normal convention
+/// Depth is **positive-linear and increases away from the camera** (the
+/// camera sits at depth 0, background/no-hit is encoded as depth `0.0` or
+/// non-finite). Normals are in the same view space, so a surface facing the
+/// camera has a **negative** z component (it points back toward smaller
+/// depth); `(0, 0, -1)` is "facing the camera" and `(0, 0, 1)` is "facing
+/// away from the camera". The hemisphere kernel (z ≥ 0 in tangent space,
+/// see [`ao_sample_kernel`]) is oriented along the normal, so
+/// under this convention samples land at depths ≤ the surface depth, i.e.
+/// toward the camera / free space, as intended for AO sampling.
+///
 /// # Parameters
 /// - `depth_buf`: per-pixel linear depth (view-space z), length = `width * height`.
 ///   Pixels with depth == 0 or infinite are treated as background (AO = 1.0).
 /// - `normal_buf`: per-pixel view-space normals (flat), length = `width * height * 3`.
 /// - `width`, `height`: image dimensions.
-/// - `kernel`: sample kernel from [`ao_sample_kernel`], length = `n_samples * 3`.
-/// - `noise`: noise texture from [`ao_noise_texture`], length = 32.
-/// - `proj_scale_x`, `proj_scale_y`: projection scale factors (focal / image_size).
+/// - `kernel`: sample kernel from [`ao_sample_kernel`], length = `n_samples * 3`
+///   (must be non-empty and a multiple of 3).
+/// - `noise`: noise texture from [`ao_noise_texture`], length = 32 (must have
+///   an even length ≥ 32).
+/// - `proj`: [`AoProjParams`] — focal length in pixels, used to project
+///   view-space sample offsets into screen space.
 /// - `config`: AO configuration.
 ///
 /// # Returns
@@ -334,6 +393,8 @@ pub fn ao_noise_texture() -> Vec<f32> {
 /// - [`AoError::EmptyInput`] if `depth_buf` is empty.
 /// - [`AoError::DimensionMismatch`] if buffer lengths don't match expected sizes.
 /// - [`AoError::InvalidRadius`] if `config.radius <= 0`.
+/// - [`AoError::InvalidConfig`] if `kernel` is empty / not a multiple of 3,
+///   or `noise` has fewer than 32 values or an odd length.
 pub fn ao_compute(
     depth_buf: &[f32],
     normal_buf: &[f32],
@@ -350,6 +411,18 @@ pub fn ao_compute(
     }
     if config.radius <= 0.0 {
         return Err(AoError::InvalidRadius(config.radius));
+    }
+    if kernel.is_empty() || !kernel.len().is_multiple_of(3) {
+        return Err(AoError::InvalidConfig(format!(
+            "kernel must be a non-empty multiple of 3 (x, y, z triplets), got {}",
+            kernel.len()
+        )));
+    }
+    if noise.len() < 32 || !noise.len().is_multiple_of(2) {
+        return Err(AoError::InvalidConfig(format!(
+            "noise texture must have an even length >= 32, got {}",
+            noise.len()
+        )));
     }
 
     let num_pixels = width * height;
@@ -430,8 +503,8 @@ pub fn ao_compute(
 
                 // Project to screen space
                 let denom = (depth + oz).max(1e-6);
-                let sx = px as f32 + ox * proj.proj_scale_x / denom;
-                let sy = py as f32 + oy * proj.proj_scale_y / denom;
+                let sx = px as f32 + ox * proj.focal_px_x / denom;
+                let sy = py as f32 + oy * proj.focal_px_y / denom;
 
                 // Clamp to image bounds
                 let sx_clamped = sx.clamp(0.0, (width as f32) - 1.0);
@@ -450,8 +523,10 @@ pub fn ao_compute(
                 let depth_diff = (depth - sampled_depth).abs();
                 let range_check = ao_smoothstep(0.0, 1.0, radius / (depth_diff + 1e-6));
 
-                // Occlusion test: sample is behind the current fragment + bias
-                let occluded = if sampled_depth >= (depth + oz + bias) {
+                // Occlusion test: real geometry exists in front of (closer
+                // to the camera than) the hemisphere sample point, i.e. the
+                // sample point is embedded in solid matter.
+                let occluded = if sampled_depth <= (depth + oz - bias) {
                     1.0_f32
                 } else {
                     0.0_f32
@@ -461,7 +536,7 @@ pub fn ao_compute(
             }
 
             let n_samples_f = n_samples.max(1) as f32;
-            let ao = 1.0 - (occlusion_sum / n_samples_f).powf(power);
+            let ao = (1.0 - occlusion_sum / n_samples_f).powf(power);
             ao_buf.push(ao.clamp(0.0, 1.0));
         }
     }
@@ -795,1097 +870,4 @@ pub fn apply_ssao(
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn approx_eq(a: f32, b: f32, eps: f32) -> bool {
-        (a - b).abs() < eps
-    }
-
-    fn make_flat_scene(w: usize, h: usize, depth: f32) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
-        let n = w * h;
-        let depth_buf = vec![depth; n];
-        let mut normal_buf = Vec::with_capacity(n * 3);
-        for _ in 0..n {
-            normal_buf.push(0.0_f32);
-            normal_buf.push(0.0_f32);
-            normal_buf.push(1.0_f32);
-        }
-        let image = vec![0.5_f32; n * 3];
-        (depth_buf, normal_buf, image)
-    }
-
-    // ── AoConfig tests ────────────────────────────────────────────────────────
-
-    #[test]
-    fn test_aoconfig_default_values() {
-        let cfg = AoConfig::default();
-        assert_eq!(cfg.n_samples, 16);
-        assert!(approx_eq(cfg.radius, 0.5, 1e-6));
-        assert!(approx_eq(cfg.bias, 0.025, 1e-6));
-        assert!(approx_eq(cfg.power, 1.0, 1e-6));
-        assert_eq!(cfg.blur_radius, 2);
-        assert!(approx_eq(cfg.blur_sigma_space, 2.0, 1e-6));
-        assert!(approx_eq(cfg.blur_sigma_depth, 0.1, 1e-6));
-        assert!(approx_eq(cfg.strength, 1.0, 1e-6));
-    }
-
-    // ── ao_sample_kernel tests ─────────────────────────────────────────────────
-
-    #[test]
-    fn test_ao_sample_kernel_length() {
-        let kernel = ao_sample_kernel(16).expect("kernel generation failed");
-        assert_eq!(kernel.len(), 16 * 3);
-    }
-
-    #[test]
-    fn test_ao_sample_kernel_various_sizes() {
-        for n in [1, 4, 8, 32, 64] {
-            let kernel = ao_sample_kernel(n).expect("kernel generation failed");
-            assert_eq!(kernel.len(), n * 3, "n={n}");
-        }
-    }
-
-    #[test]
-    fn test_ao_sample_kernel_within_unit_sphere() {
-        let kernel = ao_sample_kernel(64).expect("kernel generation failed");
-        let n = kernel.len() / 3;
-        for i in 0..n {
-            let x = kernel[i * 3];
-            let y = kernel[i * 3 + 1];
-            let z = kernel[i * 3 + 2];
-            let len = (x * x + y * y + z * z).sqrt();
-            assert!(
-                len <= 1.001,
-                "Sample {i} length {len:.4} exceeds unit sphere"
-            );
-        }
-    }
-
-    #[test]
-    fn test_ao_sample_kernel_z_nonnegative() {
-        let kernel = ao_sample_kernel(32).expect("kernel generation failed");
-        let n = kernel.len() / 3;
-        for i in 0..n {
-            let z = kernel[i * 3 + 2];
-            assert!(z >= 0.0, "Sample {i} has negative z={z}");
-        }
-    }
-
-    #[test]
-    fn test_ao_sample_kernel_zero_samples_error() {
-        let result = ao_sample_kernel(0);
-        assert!(
-            matches!(result, Err(AoError::InvalidConfig(_))),
-            "Expected InvalidConfig, got {result:?}"
-        );
-    }
-
-    #[test]
-    fn test_ao_sample_kernel_deterministic() {
-        let k1 = ao_sample_kernel(16).expect("kernel 1 failed");
-        let k2 = ao_sample_kernel(16).expect("kernel 2 failed");
-        assert_eq!(k1, k2, "Kernel generation must be deterministic");
-    }
-
-    #[test]
-    fn test_ao_sample_kernel_different_sizes_differ() {
-        let k8 = ao_sample_kernel(8).expect("kernel 8 failed");
-        let k16 = ao_sample_kernel(16).expect("kernel 16 failed");
-        // Different seeds (based on n_samples), so values should differ
-        assert_ne!(
-            &k8[..8.min(k8.len())],
-            &k16[..8.min(k16.len())],
-            "Kernels with different n_samples should differ"
-        );
-    }
-
-    // ── ao_noise_texture tests ────────────────────────────────────────────────
-
-    #[test]
-    fn test_ao_noise_texture_length() {
-        let noise = ao_noise_texture();
-        assert_eq!(
-            noise.len(),
-            32,
-            "Noise texture should have 32 values (16 pairs)"
-        );
-    }
-
-    #[test]
-    fn test_ao_noise_texture_values_in_range() {
-        let noise = ao_noise_texture();
-        for (i, &v) in noise.iter().enumerate() {
-            assert!(
-                (-1.0..=1.0).contains(&v),
-                "Noise value {i} = {v} out of [-1, 1]"
-            );
-        }
-    }
-
-    #[test]
-    fn test_ao_noise_texture_deterministic() {
-        let n1 = ao_noise_texture();
-        let n2 = ao_noise_texture();
-        assert_eq!(n1, n2, "Noise texture must be deterministic");
-    }
-
-    #[test]
-    fn test_ao_noise_texture_has_variation() {
-        let noise = ao_noise_texture();
-        let first = noise[0];
-        let has_different = noise.iter().any(|&v| (v - first).abs() > 1e-6);
-        assert!(has_different, "Noise texture should have variation");
-    }
-
-    // ── ao_smoothstep tests ───────────────────────────────────────────────────
-
-    #[test]
-    fn test_ao_smoothstep_below_edge0() {
-        let v = ao_smoothstep(0.0, 1.0, -0.5);
-        assert!(approx_eq(v, 0.0, 1e-6), "Below edge0 should be 0, got {v}");
-    }
-
-    #[test]
-    fn test_ao_smoothstep_above_edge1() {
-        let v = ao_smoothstep(0.0, 1.0, 1.5);
-        assert!(approx_eq(v, 1.0, 1e-6), "Above edge1 should be 1, got {v}");
-    }
-
-    #[test]
-    fn test_ao_smoothstep_at_edge0() {
-        let v = ao_smoothstep(0.0, 1.0, 0.0);
-        assert!(approx_eq(v, 0.0, 1e-6), "At edge0 should be 0, got {v}");
-    }
-
-    #[test]
-    fn test_ao_smoothstep_at_edge1() {
-        let v = ao_smoothstep(0.0, 1.0, 1.0);
-        assert!(approx_eq(v, 1.0, 1e-6), "At edge1 should be 1, got {v}");
-    }
-
-    #[test]
-    fn test_ao_smoothstep_midpoint() {
-        let v = ao_smoothstep(0.0, 1.0, 0.5);
-        assert!(approx_eq(v, 0.5, 1e-5), "Midpoint should be 0.5, got {v}");
-    }
-
-    #[test]
-    fn test_ao_smoothstep_monotone() {
-        let mut prev = 0.0_f32;
-        for i in 0..=20 {
-            let x = i as f32 * 0.05;
-            let v = ao_smoothstep(0.0, 1.0, x);
-            assert!(v >= prev - 1e-6, "Smoothstep not monotone at x={x}");
-            prev = v;
-        }
-    }
-
-    // ── ao_cross tests ────────────────────────────────────────────────────────
-
-    #[test]
-    fn test_ao_cross_x_cross_y_equals_z() {
-        let r = ao_cross([1.0, 0.0, 0.0], [0.0, 1.0, 0.0]);
-        assert!(approx_eq(r[0], 0.0, 1e-6));
-        assert!(approx_eq(r[1], 0.0, 1e-6));
-        assert!(approx_eq(r[2], 1.0, 1e-6));
-    }
-
-    #[test]
-    fn test_ao_cross_y_cross_z_equals_x() {
-        let r = ao_cross([0.0, 1.0, 0.0], [0.0, 0.0, 1.0]);
-        assert!(approx_eq(r[0], 1.0, 1e-6));
-        assert!(approx_eq(r[1], 0.0, 1e-6));
-        assert!(approx_eq(r[2], 0.0, 1e-6));
-    }
-
-    #[test]
-    fn test_ao_cross_z_cross_x_equals_y() {
-        let r = ao_cross([0.0, 0.0, 1.0], [1.0, 0.0, 0.0]);
-        assert!(approx_eq(r[0], 0.0, 1e-6));
-        assert!(approx_eq(r[1], 1.0, 1e-6));
-        assert!(approx_eq(r[2], 0.0, 1e-6));
-    }
-
-    #[test]
-    fn test_ao_cross_anticommutative() {
-        let a = [1.0_f32, 2.0, 3.0];
-        let b = [4.0_f32, 5.0, 6.0];
-        let ab = ao_cross(a, b);
-        let ba = ao_cross(b, a);
-        for i in 0..3 {
-            assert!(
-                approx_eq(ab[i], -ba[i], 1e-5),
-                "Not anticommutative at component {i}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_ao_cross_parallel_vectors_zero() {
-        let r = ao_cross([1.0, 0.0, 0.0], [2.0, 0.0, 0.0]);
-        for v in r {
-            assert!(
-                approx_eq(v, 0.0, 1e-6),
-                "Parallel cross product should be zero, got {v}"
-            );
-        }
-    }
-
-    // ── ao_dot tests ──────────────────────────────────────────────────────────
-
-    #[test]
-    fn test_ao_dot_orthogonal() {
-        let d = ao_dot([1.0, 0.0, 0.0], [0.0, 1.0, 0.0]);
-        assert!(approx_eq(d, 0.0, 1e-6), "Orthogonal dot should be 0");
-    }
-
-    #[test]
-    fn test_ao_dot_parallel() {
-        let d = ao_dot([1.0, 2.0, 3.0], [1.0, 2.0, 3.0]);
-        let expected = 1.0 + 4.0 + 9.0;
-        assert!(approx_eq(d, expected, 1e-5));
-    }
-
-    #[test]
-    fn test_ao_dot_antiparallel() {
-        let d = ao_dot([1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]);
-        assert!(approx_eq(d, -1.0, 1e-6));
-    }
-
-    // ── ao_normalize tests ────────────────────────────────────────────────────
-
-    #[test]
-    fn test_ao_normalize_unit_result() {
-        let v = ao_normalize([3.0, 4.0, 0.0]);
-        let len = ao_dot(v, v).sqrt();
-        assert!(
-            approx_eq(len, 1.0, 1e-5),
-            "Normalized length should be 1, got {len}"
-        );
-    }
-
-    #[test]
-    fn test_ao_normalize_zero_vector_fallback() {
-        let v = ao_normalize([0.0, 0.0, 0.0]);
-        assert_eq!(v, [0.0, 0.0, 1.0], "Zero vector fallback should be (0,0,1)");
-    }
-
-    #[test]
-    fn test_ao_normalize_already_unit() {
-        let v = ao_normalize([1.0, 0.0, 0.0]);
-        assert!(approx_eq(v[0], 1.0, 1e-6));
-        assert!(approx_eq(v[1], 0.0, 1e-6));
-        assert!(approx_eq(v[2], 0.0, 1e-6));
-    }
-
-    #[test]
-    fn test_ao_normalize_direction_preserved() {
-        let input = [3.0_f32, 0.0, 0.0];
-        let v = ao_normalize(input);
-        assert!(approx_eq(v[0], 1.0, 1e-6), "Direction should be preserved");
-        assert!(approx_eq(v[1], 0.0, 1e-6));
-        assert!(approx_eq(v[2], 0.0, 1e-6));
-    }
-
-    // ── ao_sample_depth tests ─────────────────────────────────────────────────
-
-    #[test]
-    fn test_ao_sample_depth_exact_pixel() {
-        let depth_buf = vec![1.0_f32, 2.0, 3.0, 4.0];
-        let d = ao_sample_depth(&depth_buf, 2, 2, 0.0, 0.0);
-        assert!(
-            approx_eq(d, 1.0, 1e-5),
-            "Top-left pixel should be 1.0, got {d}"
-        );
-    }
-
-    #[test]
-    fn test_ao_sample_depth_center_pixel() {
-        let depth_buf = vec![5.0_f32; 9]; // 3x3 all 5.0
-        let d = ao_sample_depth(&depth_buf, 3, 3, 1.0, 1.0);
-        assert!(
-            approx_eq(d, 5.0, 1e-5),
-            "Center pixel should be 5.0, got {d}"
-        );
-    }
-
-    #[test]
-    fn test_ao_sample_depth_clamp_boundary() {
-        let depth_buf = vec![1.0_f32, 2.0, 3.0, 4.0];
-        // Out of bounds coordinates should clamp
-        let d_neg = ao_sample_depth(&depth_buf, 2, 2, -1.0, -1.0);
-        assert!(
-            approx_eq(d_neg, 1.0, 1e-5),
-            "Negative coords should clamp to top-left"
-        );
-        let d_over = ao_sample_depth(&depth_buf, 2, 2, 10.0, 10.0);
-        assert!(
-            approx_eq(d_over, 4.0, 1e-5),
-            "Overflow coords should clamp to bottom-right"
-        );
-    }
-
-    #[test]
-    fn test_ao_sample_depth_bilinear_center() {
-        // 2x2 with values [1, 2; 3, 4]
-        // At (0.5, 0.5) the bilinear interpolation should give 2.5
-        let depth_buf = vec![1.0_f32, 2.0, 3.0, 4.0];
-        let d = ao_sample_depth(&depth_buf, 2, 2, 0.5, 0.5);
-        assert!(
-            approx_eq(d, 2.5, 1e-5),
-            "Bilinear center should be 2.5, got {d}"
-        );
-    }
-
-    #[test]
-    fn test_ao_sample_depth_empty() {
-        let d = ao_sample_depth(&[], 0, 0, 0.0, 0.0);
-        assert!(approx_eq(d, 0.0, 1e-6), "Empty buffer should return 0.0");
-    }
-
-    // ── ao_compute tests ──────────────────────────────────────────────────────
-
-    #[test]
-    fn test_ao_compute_all_background_returns_ones() {
-        let w = 8;
-        let h = 8;
-        let depth_buf = vec![0.0_f32; w * h]; // all background
-        let normal_buf = vec![0.0_f32; w * h * 3];
-        let kernel = ao_sample_kernel(8).expect("kernel failed");
-        let noise = ao_noise_texture();
-        let config = AoConfig::default();
-
-        let ao = ao_compute(
-            &depth_buf,
-            &normal_buf,
-            w,
-            h,
-            AoSamplingBuffers {
-                kernel: &kernel,
-                noise: &noise,
-            },
-            AoProjParams::new(1.0, 1.0),
-            &config,
-        )
-        .expect("ao_compute failed");
-
-        for (i, &v) in ao.iter().enumerate() {
-            assert!(
-                approx_eq(v, 1.0, 1e-6),
-                "Background pixel {i} should be 1.0, got {v}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_ao_compute_output_dimensions() {
-        let w = 12;
-        let h = 8;
-        let (depth_buf, normal_buf, _) = make_flat_scene(w, h, 2.0);
-        let kernel = ao_sample_kernel(8).expect("kernel failed");
-        let noise = ao_noise_texture();
-        let config = AoConfig::default();
-
-        let ao = ao_compute(
-            &depth_buf,
-            &normal_buf,
-            w,
-            h,
-            AoSamplingBuffers {
-                kernel: &kernel,
-                noise: &noise,
-            },
-            AoProjParams::new(1.0, 1.0),
-            &config,
-        )
-        .expect("ao_compute failed");
-
-        assert_eq!(ao.len(), w * h);
-    }
-
-    #[test]
-    fn test_ao_compute_dimension_mismatch_depth() {
-        let w = 4;
-        let h = 4;
-        let depth_buf = vec![1.0_f32; w * h + 1]; // wrong size
-        let normal_buf = vec![0.0_f32; w * h * 3];
-        let kernel = ao_sample_kernel(8).expect("kernel failed");
-        let noise = ao_noise_texture();
-        let config = AoConfig::default();
-
-        let result = ao_compute(
-            &depth_buf,
-            &normal_buf,
-            w,
-            h,
-            AoSamplingBuffers {
-                kernel: &kernel,
-                noise: &noise,
-            },
-            AoProjParams::new(1.0, 1.0),
-            &config,
-        );
-        assert!(
-            matches!(result, Err(AoError::DimensionMismatch { .. })),
-            "Expected DimensionMismatch, got {result:?}"
-        );
-    }
-
-    #[test]
-    fn test_ao_compute_dimension_mismatch_normal() {
-        let w = 4;
-        let h = 4;
-        let depth_buf = vec![1.0_f32; w * h];
-        let normal_buf = vec![0.0_f32; w * h * 3 + 1]; // wrong size
-        let kernel = ao_sample_kernel(8).expect("kernel failed");
-        let noise = ao_noise_texture();
-        let config = AoConfig::default();
-
-        let result = ao_compute(
-            &depth_buf,
-            &normal_buf,
-            w,
-            h,
-            AoSamplingBuffers {
-                kernel: &kernel,
-                noise: &noise,
-            },
-            AoProjParams::new(1.0, 1.0),
-            &config,
-        );
-        assert!(
-            matches!(result, Err(AoError::DimensionMismatch { .. })),
-            "Expected DimensionMismatch, got {result:?}"
-        );
-    }
-
-    #[test]
-    fn test_ao_compute_empty_input_error() {
-        let kernel = ao_sample_kernel(8).expect("kernel failed");
-        let noise = ao_noise_texture();
-        let config = AoConfig::default();
-        let result = ao_compute(
-            &[],
-            &[],
-            0,
-            0,
-            AoSamplingBuffers {
-                kernel: &kernel,
-                noise: &noise,
-            },
-            AoProjParams::new(1.0, 1.0),
-            &config,
-        );
-        assert!(matches!(result, Err(AoError::EmptyInput)));
-    }
-
-    #[test]
-    fn test_ao_compute_invalid_radius_error() {
-        let w = 4;
-        let h = 4;
-        let (depth_buf, normal_buf, _) = make_flat_scene(w, h, 1.0);
-        let kernel = ao_sample_kernel(8).expect("kernel failed");
-        let noise = ao_noise_texture();
-        let config = AoConfig {
-            radius: -0.1,
-            ..Default::default()
-        };
-
-        let result = ao_compute(
-            &depth_buf,
-            &normal_buf,
-            w,
-            h,
-            AoSamplingBuffers {
-                kernel: &kernel,
-                noise: &noise,
-            },
-            AoProjParams::new(1.0, 1.0),
-            &config,
-        );
-        assert!(matches!(result, Err(AoError::InvalidRadius(_))));
-    }
-
-    #[test]
-    fn test_ao_compute_flat_surface_high_ao() {
-        let w = 16;
-        let h = 16;
-        let (depth_buf, normal_buf, _) = make_flat_scene(w, h, 2.0);
-        let kernel = ao_sample_kernel(16).expect("kernel failed");
-        let noise = ao_noise_texture();
-        let config = AoConfig::default();
-
-        let ao = ao_compute(
-            &depth_buf,
-            &normal_buf,
-            w,
-            h,
-            AoSamplingBuffers {
-                kernel: &kernel,
-                noise: &noise,
-            },
-            AoProjParams::new(500.0, 500.0),
-            &config,
-        )
-        .expect("ao_compute failed");
-
-        let mean = ao.iter().sum::<f32>() / ao.len() as f32;
-        assert!(
-            mean > 0.5,
-            "Flat surface should have reasonably high mean AO, got {mean:.3}"
-        );
-    }
-
-    #[test]
-    fn test_ao_compute_values_in_range() {
-        let w = 8;
-        let h = 8;
-        let (depth_buf, normal_buf, _) = make_flat_scene(w, h, 1.5);
-        let kernel = ao_sample_kernel(16).expect("kernel failed");
-        let noise = ao_noise_texture();
-        let config = AoConfig::default();
-
-        let ao = ao_compute(
-            &depth_buf,
-            &normal_buf,
-            w,
-            h,
-            AoSamplingBuffers {
-                kernel: &kernel,
-                noise: &noise,
-            },
-            AoProjParams::new(1.0, 1.0),
-            &config,
-        )
-        .expect("ao_compute failed");
-
-        for (i, &v) in ao.iter().enumerate() {
-            assert!((0.0..=1.0).contains(&v), "AO value {i} = {v} out of [0,1]");
-        }
-    }
-
-    #[test]
-    fn test_ao_compute_depth_disparity_causes_occlusion() {
-        // Create a scene where some pixels are much closer than neighbors
-        let w = 8;
-        let h = 8;
-        let n = w * h;
-        let mut depth_buf = vec![5.0_f32; n];
-        // Make center pixels very close
-        for py in 2..6 {
-            for px in 2..6 {
-                depth_buf[py * w + px] = 0.1;
-            }
-        }
-        let mut normal_buf = vec![0.0_f32; n * 3];
-        for i in 0..n {
-            normal_buf[i * 3 + 2] = 1.0;
-        }
-        let kernel = ao_sample_kernel(16).expect("kernel failed");
-        let noise = ao_noise_texture();
-        let config = AoConfig::default();
-
-        let ao = ao_compute(
-            &depth_buf,
-            &normal_buf,
-            w,
-            h,
-            AoSamplingBuffers {
-                kernel: &kernel,
-                noise: &noise,
-            },
-            AoProjParams::new(10.0, 10.0),
-            &config,
-        )
-        .expect("ao_compute failed");
-
-        // Check that values are in range
-        for (i, &v) in ao.iter().enumerate() {
-            assert!((0.0..=1.0).contains(&v), "AO value {i} = {v} out of [0,1]");
-        }
-    }
-
-    #[test]
-    fn test_ao_compute_infinite_depth_treated_as_background() {
-        let w = 4;
-        let h = 4;
-        let depth_buf = vec![f32::INFINITY; w * h];
-        let normal_buf = vec![0.0_f32; w * h * 3];
-        let kernel = ao_sample_kernel(8).expect("kernel failed");
-        let noise = ao_noise_texture();
-        let config = AoConfig::default();
-
-        let ao = ao_compute(
-            &depth_buf,
-            &normal_buf,
-            w,
-            h,
-            AoSamplingBuffers {
-                kernel: &kernel,
-                noise: &noise,
-            },
-            AoProjParams::new(1.0, 1.0),
-            &config,
-        )
-        .expect("ao_compute failed");
-
-        for (i, &v) in ao.iter().enumerate() {
-            assert!(
-                approx_eq(v, 1.0, 1e-6),
-                "Infinite depth pixel {i} should be 1.0"
-            );
-        }
-    }
-
-    // ── ao_bilateral_blur tests ───────────────────────────────────────────────
-
-    #[test]
-    fn test_ao_bilateral_blur_flat_unchanged() {
-        let w = 8;
-        let h = 8;
-        let ao_buf = vec![1.0_f32; w * h];
-        let depth_buf = vec![1.0_f32; w * h];
-        let config = AoConfig::default();
-
-        let blurred =
-            ao_bilateral_blur(&ao_buf, &depth_buf, w, h, &config).expect("bilateral blur failed");
-
-        for (i, (&a, &b)) in ao_buf.iter().zip(blurred.iter()).enumerate() {
-            assert!(approx_eq(a, b, 1e-5), "Flat AO pixel {i}: {a} != {b}");
-        }
-    }
-
-    #[test]
-    fn test_ao_bilateral_blur_output_dimensions() {
-        let w = 10;
-        let h = 6;
-        let ao_buf = vec![0.8_f32; w * h];
-        let depth_buf = vec![2.0_f32; w * h];
-        let config = AoConfig::default();
-
-        let blurred =
-            ao_bilateral_blur(&ao_buf, &depth_buf, w, h, &config).expect("bilateral blur failed");
-
-        assert_eq!(blurred.len(), w * h);
-    }
-
-    #[test]
-    fn test_ao_bilateral_blur_dimension_mismatch_ao() {
-        let w = 4;
-        let h = 4;
-        let ao_buf = vec![1.0_f32; w * h + 1];
-        let depth_buf = vec![1.0_f32; w * h];
-        let config = AoConfig::default();
-
-        let result = ao_bilateral_blur(&ao_buf, &depth_buf, w, h, &config);
-        assert!(matches!(result, Err(AoError::DimensionMismatch { .. })));
-    }
-
-    #[test]
-    fn test_ao_bilateral_blur_dimension_mismatch_depth() {
-        let w = 4;
-        let h = 4;
-        let ao_buf = vec![1.0_f32; w * h];
-        let depth_buf = vec![1.0_f32; w * h + 1];
-        let config = AoConfig::default();
-
-        let result = ao_bilateral_blur(&ao_buf, &depth_buf, w, h, &config);
-        assert!(matches!(result, Err(AoError::DimensionMismatch { .. })));
-    }
-
-    #[test]
-    fn test_ao_bilateral_blur_empty_input() {
-        let config = AoConfig::default();
-        let result = ao_bilateral_blur(&[], &[], 0, 0, &config);
-        assert!(matches!(result, Err(AoError::EmptyInput)));
-    }
-
-    #[test]
-    fn test_ao_bilateral_blur_values_in_range() {
-        let w = 8;
-        let h = 8;
-        let ao_buf: Vec<f32> = (0..w * h).map(|i| (i % 10) as f32 / 10.0).collect();
-        let depth_buf = vec![1.0_f32; w * h];
-        let config = AoConfig::default();
-
-        let blurred =
-            ao_bilateral_blur(&ao_buf, &depth_buf, w, h, &config).expect("bilateral blur failed");
-
-        for (i, &v) in blurred.iter().enumerate() {
-            assert!(
-                (0.0..=1.0).contains(&v),
-                "Blurred value {i} = {v} out of [0,1]"
-            );
-        }
-    }
-
-    #[test]
-    fn test_ao_bilateral_blur_preserves_background() {
-        let w = 4;
-        let h = 4;
-        // Mix background (depth=0) and foreground
-        let mut depth_buf = vec![1.0_f32; w * h];
-        depth_buf[0] = 0.0; // background pixel
-        let mut ao_buf = vec![0.5_f32; w * h];
-        ao_buf[0] = 1.0; // background AO value
-        let config = AoConfig::default();
-
-        let blurred =
-            ao_bilateral_blur(&ao_buf, &depth_buf, w, h, &config).expect("bilateral blur failed");
-
-        // Background pixel should pass through unchanged
-        assert!(
-            approx_eq(blurred[0], 1.0, 1e-5),
-            "Background AO should be unchanged"
-        );
-    }
-
-    // ── ao_apply_to_image tests ───────────────────────────────────────────────
-
-    #[test]
-    fn test_ao_apply_strength_zero_unchanged() {
-        let w = 4;
-        let h = 4;
-        let image: Vec<f32> = (0..w * h * 3).map(|i| (i % 10) as f32 / 10.0).collect();
-        let ao_buf = vec![0.0_f32; w * h]; // fully occluded
-        let result = ao_apply_to_image(&image, &ao_buf, w, h, 0.0).expect("apply failed");
-
-        for (i, (&a, &b)) in image.iter().zip(result.iter()).enumerate() {
-            assert!(
-                approx_eq(a, b, 1e-5),
-                "strength=0 changed pixel {i}: {a} != {b}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_ao_apply_full_ao_one_unchanged() {
-        let w = 4;
-        let h = 4;
-        let image = vec![0.7_f32; w * h * 3];
-        let ao_buf = vec![1.0_f32; w * h]; // no occlusion
-        let result = ao_apply_to_image(&image, &ao_buf, w, h, 1.0).expect("apply failed");
-
-        for (i, (&a, &b)) in image.iter().zip(result.iter()).enumerate() {
-            assert!(
-                approx_eq(a, b, 1e-5),
-                "AO=1.0 changed pixel {i}: {a} != {b}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_ao_apply_full_ao_zero_darkens() {
-        let w = 2;
-        let h = 2;
-        let image = vec![1.0_f32; w * h * 3];
-        let ao_buf = vec![0.0_f32; w * h];
-        let result = ao_apply_to_image(&image, &ao_buf, w, h, 1.0).expect("apply failed");
-
-        for (i, &v) in result.iter().enumerate() {
-            assert!(approx_eq(v, 0.0, 1e-5), "Pixel {i} should be 0, got {v}");
-        }
-    }
-
-    #[test]
-    fn test_ao_apply_dimension_mismatch_ao() {
-        let w = 4;
-        let h = 4;
-        let image = vec![0.5_f32; w * h * 3];
-        let ao_buf = vec![1.0_f32; w * h + 1];
-        let result = ao_apply_to_image(&image, &ao_buf, w, h, 1.0);
-        assert!(matches!(result, Err(AoError::DimensionMismatch { .. })));
-    }
-
-    #[test]
-    fn test_ao_apply_dimension_mismatch_image() {
-        let w = 4;
-        let h = 4;
-        let image = vec![0.5_f32; w * h * 3 + 1];
-        let ao_buf = vec![1.0_f32; w * h];
-        let result = ao_apply_to_image(&image, &ao_buf, w, h, 1.0);
-        assert!(matches!(result, Err(AoError::DimensionMismatch { .. })));
-    }
-
-    #[test]
-    fn test_ao_apply_empty_input() {
-        let result = ao_apply_to_image(&[], &[], 0, 0, 1.0);
-        assert!(matches!(result, Err(AoError::EmptyInput)));
-    }
-
-    #[test]
-    fn test_ao_apply_output_length() {
-        let w = 4;
-        let h = 4;
-        let image = vec![0.5_f32; w * h * 3];
-        let ao_buf = vec![0.8_f32; w * h];
-        let result = ao_apply_to_image(&image, &ao_buf, w, h, 1.0).expect("apply failed");
-        assert_eq!(result.len(), image.len());
-    }
-
-    #[test]
-    fn test_ao_apply_partial_strength() {
-        // With strength=0.5 and ao=0.0, pixel should be 0.5 (lerp between 1.0 and 0.0)
-        let w = 1;
-        let h = 1;
-        let image = vec![1.0_f32, 1.0, 1.0];
-        let ao_buf = vec![0.0_f32; 1];
-        let result = ao_apply_to_image(&image, &ao_buf, w, h, 0.5).expect("apply failed");
-        for &v in &result {
-            assert!(
-                approx_eq(v, 0.5, 1e-5),
-                "Half strength should give 0.5, got {v}"
-            );
-        }
-    }
-
-    // ── apply_ssao tests ──────────────────────────────────────────────────────
-
-    #[test]
-    fn test_apply_ssao_all_background_image_unchanged() {
-        let w = 8;
-        let h = 8;
-        let n = w * h;
-        let depth_buf = vec![0.0_f32; n]; // all background
-        let normal_buf = vec![0.0_f32; n * 3];
-        let image = vec![0.6_f32; n * 3];
-        let config = AoConfig::default();
-
-        let result = apply_ssao(
-            &image,
-            &depth_buf,
-            &normal_buf,
-            w,
-            h,
-            AoProjParams::new(1.0, 1.0),
-            &config,
-        )
-        .expect("apply_ssao failed");
-
-        // All background → AO = 1.0 → image unchanged
-        for (i, (&a, &b)) in image.iter().zip(result.image.iter()).enumerate() {
-            assert!(
-                approx_eq(a, b, 1e-4),
-                "Background: image changed at pixel {i}: {a} != {b}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_apply_ssao_valid_input_correct_dimensions() {
-        let w = 8;
-        let h = 8;
-        let (depth_buf, normal_buf, image) = make_flat_scene(w, h, 2.0);
-        let config = AoConfig::default();
-
-        let result = apply_ssao(
-            &image,
-            &depth_buf,
-            &normal_buf,
-            w,
-            h,
-            AoProjParams::new(1.0, 1.0),
-            &config,
-        )
-        .expect("apply_ssao failed");
-
-        assert_eq!(result.image.len(), w * h * 3);
-        assert_eq!(result.ao_map.len(), w * h);
-        assert_eq!(result.ao_map_blurred.len(), w * h);
-    }
-
-    #[test]
-    fn test_apply_ssao_ao_maps_in_range() {
-        let w = 8;
-        let h = 8;
-        let (depth_buf, normal_buf, image) = make_flat_scene(w, h, 1.5);
-        let config = AoConfig::default();
-
-        let result = apply_ssao(
-            &image,
-            &depth_buf,
-            &normal_buf,
-            w,
-            h,
-            AoProjParams::new(1.0, 1.0),
-            &config,
-        )
-        .expect("apply_ssao failed");
-
-        for (i, &v) in result.ao_map.iter().enumerate() {
-            assert!((0.0..=1.0).contains(&v), "ao_map[{i}] = {v} out of [0,1]");
-        }
-        for (i, &v) in result.ao_map_blurred.iter().enumerate() {
-            assert!(
-                (0.0..=1.0).contains(&v),
-                "ao_map_blurred[{i}] = {v} out of [0,1]"
-            );
-        }
-    }
-
-    #[test]
-    fn test_apply_ssao_invalid_config_error() {
-        let w = 4;
-        let h = 4;
-        let (depth_buf, normal_buf, image) = make_flat_scene(w, h, 1.0);
-        let config = AoConfig {
-            n_samples: 0,
-            ..Default::default()
-        }; // invalid
-
-        let result = apply_ssao(
-            &image,
-            &depth_buf,
-            &normal_buf,
-            w,
-            h,
-            AoProjParams::new(1.0, 1.0),
-            &config,
-        );
-        assert!(result.is_err(), "Zero n_samples should fail");
-    }
-
-    // ── ao_compute_stats tests ────────────────────────────────────────────────
-
-    #[test]
-    fn test_ao_compute_stats_all_ones() {
-        let ao_buf = vec![1.0_f32; 16];
-        let depth_buf = vec![1.0_f32; 16];
-        let stats = ao_compute_stats(&ao_buf, &depth_buf);
-
-        assert!(approx_eq(stats.mean_ao, 1.0, 1e-5));
-        assert!(approx_eq(stats.occlusion_fraction, 0.0, 1e-6));
-    }
-
-    #[test]
-    fn test_ao_compute_stats_all_zero_ao() {
-        let n = 16;
-        let ao_buf = vec![0.0_f32; n];
-        let depth_buf = vec![1.0_f32; n]; // all foreground
-        let stats = ao_compute_stats(&ao_buf, &depth_buf);
-
-        assert!(
-            approx_eq(stats.occlusion_fraction, 1.0, 1e-5),
-            "All zero AO should have 100% occlusion fraction, got {}",
-            stats.occlusion_fraction
-        );
-    }
-
-    #[test]
-    fn test_ao_compute_stats_background_fraction() {
-        let n = 8;
-        let mut depth_buf = vec![1.0_f32; n];
-        // Set half as background
-        for d in depth_buf.iter_mut().take(n / 2) {
-            *d = 0.0;
-        }
-        let ao_buf = vec![1.0_f32; n];
-        let stats = ao_compute_stats(&ao_buf, &depth_buf);
-
-        assert!(
-            approx_eq(stats.background_fraction, 0.5, 1e-5),
-            "Half background, got {}",
-            stats.background_fraction
-        );
-    }
-
-    #[test]
-    fn test_ao_compute_stats_empty() {
-        let stats = ao_compute_stats(&[], &[]);
-        assert!(approx_eq(stats.mean_ao, 1.0, 1e-6));
-        assert!(approx_eq(stats.occlusion_fraction, 0.0, 1e-6));
-        assert!(approx_eq(stats.background_fraction, 0.0, 1e-6));
-    }
-
-    #[test]
-    fn test_ao_compute_stats_min_max() {
-        let ao_buf = vec![0.2_f32, 0.5, 0.8, 0.9];
-        let depth_buf = vec![1.0_f32; 4];
-        let stats = ao_compute_stats(&ao_buf, &depth_buf);
-
-        assert!(approx_eq(stats.min_ao, 0.2, 1e-5));
-        assert!(approx_eq(stats.max_ao, 0.9, 1e-5));
-    }
-
-    // ── format helpers tests ──────────────────────────────────────────────────
-
-    #[test]
-    fn test_format_ao_config_non_empty() {
-        let config = AoConfig::default();
-        let s = format_ao_config(&config);
-        assert!(
-            !s.is_empty(),
-            "format_ao_config should return non-empty string"
-        );
-        assert!(s.contains("n_samples"), "Should contain n_samples");
-        assert!(s.contains("radius"), "Should contain radius");
-    }
-
-    #[test]
-    fn test_format_ao_stats_non_empty() {
-        let stats = AoStats {
-            mean_ao: 0.8,
-            min_ao: 0.3,
-            max_ao: 1.0,
-            occlusion_fraction: 0.2,
-            background_fraction: 0.1,
-        };
-        let s = format_ao_stats(&stats);
-        assert!(
-            !s.is_empty(),
-            "format_ao_stats should return non-empty string"
-        );
-        assert!(s.contains("mean"), "Should contain mean");
-    }
-
-    // ── Single pixel edge cases ───────────────────────────────────────────────
-
-    #[test]
-    fn test_ao_compute_single_pixel() {
-        let depth_buf = vec![1.0_f32];
-        let normal_buf = vec![0.0_f32, 0.0, 1.0];
-        let kernel = ao_sample_kernel(4).expect("kernel failed");
-        let noise = ao_noise_texture();
-        let config = AoConfig::default();
-
-        let ao = ao_compute(
-            &depth_buf,
-            &normal_buf,
-            1,
-            1,
-            AoSamplingBuffers {
-                kernel: &kernel,
-                noise: &noise,
-            },
-            AoProjParams::new(1.0, 1.0),
-            &config,
-        )
-        .expect("ao_compute failed");
-
-        assert_eq!(ao.len(), 1);
-        assert!(ao[0] >= 0.0 && ao[0] <= 1.0);
-    }
-
-    #[test]
-    fn test_apply_ssao_1x1_image() {
-        let depth_buf = vec![1.0_f32];
-        let normal_buf = vec![0.0_f32, 0.0, 1.0];
-        let image = vec![0.5_f32, 0.5, 0.5];
-        let config = AoConfig::default();
-
-        let result = apply_ssao(
-            &image,
-            &depth_buf,
-            &normal_buf,
-            1,
-            1,
-            AoProjParams::new(1.0, 1.0),
-            &config,
-        )
-        .expect("apply_ssao on 1x1 failed");
-
-        assert_eq!(result.image.len(), 3);
-        assert_eq!(result.ao_map.len(), 1);
-    }
-}
+mod tests;

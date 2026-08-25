@@ -250,7 +250,10 @@ fn bench_scheduler_step(c: &mut Criterion) {
 
     // Create scheduler
     let mut scheduler = DdimScheduler::new(1000, PredictionType::VPrediction);
-    scheduler.set_timesteps(50);
+    if let Err(e) = scheduler.set_timesteps(50) {
+        eprintln!("Failed to configure scheduler timesteps: {e}");
+        return;
+    }
 
     let sample_data: Vec<f32> = (0..latent_size).map(|i| (i as f32 * 0.001).sin()).collect();
     let model_output_data: Vec<f32> = (0..latent_size).map(|i| (i as f32 * 0.002).cos()).collect();
@@ -305,7 +308,10 @@ fn bench_scheduler_full_loop(c: &mut Criterion) {
     // Different number of steps
     for &num_steps in &[10, 25, 50] {
         let mut scheduler = DdimScheduler::new(1000, PredictionType::VPrediction);
-        scheduler.set_timesteps(num_steps);
+        if let Err(e) = scheduler.set_timesteps(num_steps) {
+            eprintln!("Failed to configure scheduler for {num_steps} steps: {e}");
+            continue;
+        }
 
         let sample_data: Vec<f32> = (0..latent_size).map(|i| (i as f32 * 0.001).sin()).collect();
 

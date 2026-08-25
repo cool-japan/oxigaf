@@ -7,6 +7,29 @@
 //! rotation, and Σ3D is the 3D Gaussian covariance matrix.
 //!
 //! This module is a pure-CPU reference implementation, requiring no GPU.
+//!
+//! # Relationship to the shader that actually runs
+//!
+//! The kernel used in training is `preprocess_backward` in
+//! `shaders/preprocess_bwd.wgsl` (sections "2. grad_cov2d from grad_conics" and
+//! "3. grad_cov3d from grad_cov2d"); `shaders/cov2d_bwd.wgsl` is a third,
+//! entry-point-less transcription of the same derivation. Nothing in the build
+//! keeps these in step automatically, so the test module below pins the two
+//! things that silently drift:
+//!
+//! * `test_shader_conic_inverse_gradient_matches_finite_differences` checks the
+//!   shader's `∂L/∂conic → ∂L/∂Σ2D` matrix-inverse derivative — a step this
+//!   module does not model at all — against finite differences.
+//! * `test_shader_cov3d_chain_matches_cpu_reference` checks the shader's
+//!   `∂L/∂Σ3D = Tᵀ · G · T` (with `T = J·W`) against [`cov2d_backward`].
+//!
+//! **Off-diagonal convention.** The two derivations disagree by a factor of two
+//! on the off-diagonal *by design*, and reconciling them is the whole point of
+//! that second test: the shader's `dL_db_elem` is the gradient w.r.t. the
+//! off-diagonal *matrix element* (used unhalved in both slots of a symmetric
+//! matrix), whereas [`Cov2dBwdInput::d_cov2d`]`[1]` is the *combined* gradient
+//! for both slots and is halved internally. Converting one to the other means
+//! doubling/halving the inputs, never changing the math on either side.
 
 use nalgebra as na;
 
@@ -338,6 +361,147 @@ mod tests {
             fd_check(cov3d, view_rotation, jacobian, d_cov2d, 1e-1, 0.01),
             "finite-difference gradient check failed (large Σ3D)"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Parity with `shaders/preprocess_bwd.wgsl`
+    //
+    // These mirror the shader's arithmetic literally so that a change to either
+    // derivation shows up as a failure here instead of as a silently biased
+    // training run. See the module docs for the off-diagonal convention.
+    // -----------------------------------------------------------------------
+
+    /// Forward conic: `conic = inverse([[a, b], [b, c]])`, returned as the three
+    /// stored scalars `[ca, cb, cc]` (matching `preprocess.wgsl`'s
+    /// `conics[idx] = (c/det, -b/det, a/det)`).
+    fn conic_of(cov2d: [f32; 3]) -> [f32; 3] {
+        let (a, b, c) = (cov2d[0], cov2d[1], cov2d[2]);
+        let det = a * c - b * b;
+        [c / det, -b / det, a / det]
+    }
+
+    /// Literal mirror of `preprocess_bwd.wgsl` section 2
+    /// (`dL_da` / `dL_db_elem` / `dL_dc_cov`).
+    ///
+    /// `d_conic` is `[∂L/∂ca, ∂L/∂cb, ∂L/∂cc]`, where `cb` is the single stored
+    /// off-diagonal scalar. The result is the **matrix-element** gradient
+    /// `[∂L/∂Σ2D(0,0), ∂L/∂Σ2D(0,1), ∂L/∂Σ2D(1,1)]`.
+    fn shader_dl_dcov2d(conic: [f32; 3], d_conic: [f32; 3]) -> [f32; 3] {
+        let (ca, cb, cc) = (conic[0], conic[1], conic[2]);
+        let ga = d_conic[0];
+        let gb_half = d_conic[1] * 0.5;
+        let gc = d_conic[2];
+        [
+            -(ca * ga + cb * gb_half) * ca - (ca * gb_half + cb * gc) * cb,
+            -(ca * ga + cb * gb_half) * cb - (ca * gb_half + cb * gc) * cc,
+            -(cb * ga + cc * gb_half) * cb - (cb * gb_half + cc * gc) * cc,
+        ]
+    }
+
+    /// The shader's `∂L/∂conic → ∂L/∂Σ2D` step (matrix-inverse derivative
+    /// `∂L/∂S = −S⁻¹ · G · S⁻¹`) must agree with finite differences of
+    /// `conic = inverse(Σ2D)`.
+    ///
+    /// This step has no counterpart in [`cov2d_backward`], so nothing else in
+    /// the crate verifies it.
+    #[test]
+    fn test_shader_conic_inverse_gradient_matches_finite_differences() {
+        let cov2d = [3.0_f32, 0.7, 2.0];
+        let d_conic = [0.9_f32, -0.4, 1.3];
+
+        let analytic = shader_dl_dcov2d(conic_of(cov2d), d_conic);
+
+        let loss = |s: [f32; 3]| -> f32 {
+            let k = conic_of(s);
+            d_conic[0] * k[0] + d_conic[1] * k[1] + d_conic[2] * k[2]
+        };
+
+        // The stored scalar `b` occupies BOTH off-diagonal slots of the
+        // symmetric matrix, so perturbing it moves the loss by twice the
+        // matrix-element gradient.
+        let slot_multiplicity = [1.0_f32, 2.0, 1.0];
+        let eps = 1e-3_f32;
+        for k in 0..3 {
+            let mut plus = cov2d;
+            let mut minus = cov2d;
+            plus[k] += eps;
+            minus[k] -= eps;
+            let fd = (loss(plus) - loss(minus)) / (2.0 * eps);
+            let an = analytic[k] * slot_multiplicity[k];
+            let scale = fd.abs().max(an.abs()).max(1e-4_f32);
+            assert!(
+                (fd - an).abs() / scale < 0.01,
+                "conic-inverse gradient mismatch at k={k}: fd={fd:.6} analytic={an:.6}"
+            );
+        }
+    }
+
+    /// The shader's `∂L/∂Σ3D = Tᵀ · G · T` (with `T = J · W`) must reproduce
+    /// [`cov2d_backward`] once the off-diagonal convention is mapped.
+    #[test]
+    fn test_shader_cov3d_chain_matches_cpu_reference() {
+        // Projection fixture built exactly as preprocess_bwd.wgsl builds `J`,
+        // whose third row is identically zero.
+        let fx = 500.0_f32;
+        let fy = 480.0_f32;
+        let tz = 4.0_f32;
+        let tz2 = tz * tz;
+        let vx = 0.6_f32;
+        let vy = -0.35_f32;
+        let jacobian = [[fx / tz, 0.0, fx * vx / tz2], [0.0, fy / tz, fy * vy / tz2]];
+        let view_rotation = rotation_30_deg_y();
+
+        // Matrix-element gradient ∂L/∂Σ2D, straight out of the shader's step 2.
+        let d_elem = shader_dl_dcov2d(conic_of([3.0, 0.7, 2.0]), [0.9, -0.4, 1.3]);
+
+        // Shader step 3, in matrix form.
+        let vr = view_rotation;
+        let r = nalgebra::Matrix3::<f32>::new(
+            vr[0][0], vr[1][0], vr[2][0], vr[0][1], vr[1][1], vr[2][1], vr[0][2], vr[1][2],
+            vr[2][2],
+        );
+        let j = nalgebra::Matrix2x3::<f32>::new(
+            jacobian[0][0],
+            jacobian[0][1],
+            jacobian[0][2],
+            jacobian[1][0],
+            jacobian[1][1],
+            jacobian[1][2],
+        );
+        let t = j * r;
+        let g = nalgebra::Matrix2::<f32>::new(d_elem[0], d_elem[1], d_elem[1], d_elem[2]);
+        let m = t.transpose() * g * t;
+        let shader_grads = [
+            m[(0, 0)],
+            m[(0, 1)] + m[(1, 0)],
+            m[(0, 2)] + m[(2, 0)],
+            m[(1, 1)],
+            m[(1, 2)] + m[(2, 1)],
+            m[(2, 2)],
+        ];
+
+        // `cov2d_backward` halves `d_cov2d[1]` internally, so feed it the
+        // combined (doubled) off-diagonal.
+        let cpu = cov2d_backward(&Cov2dBwdInput {
+            // Σ3D itself does not enter this chain; any well-formed value works.
+            cov3d: anisotropic_cov3d(),
+            view_rotation,
+            jacobian,
+            d_cov2d: [d_elem[0], 2.0 * d_elem[1], d_elem[2]],
+        });
+
+        let scale = shader_grads
+            .iter()
+            .chain(cpu.d_cov3d.iter())
+            .fold(0.0_f32, |acc, v| acc.max(v.abs()))
+            .max(1e-6_f32);
+        for (k, (&sg, &cg)) in shader_grads.iter().zip(cpu.d_cov3d.iter()).enumerate() {
+            let diff = (sg - cg).abs();
+            assert!(
+                diff <= 1e-4 * scale,
+                "shader/CPU cov3D gradient drift at k={k}: shader={sg:.6} cpu={cg:.6}"
+            );
+        }
     }
 
     /// Scaling d_cov2d by a factor must scale all d_cov3d by the same factor
