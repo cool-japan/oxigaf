@@ -147,16 +147,25 @@ three targeted convergence fixers. Highlights:
       failures (emotion intensity, landmark-fitter parity) and the
       nondeterministic pinch-vertex boundary test fixed at the root.
 
-## W2 — Convergence & verification (IN PROGRESS)
+## W2 — Convergence & verification (DONE — final certification 2026-08-26)
 
-- [ ] `cargo check --workspace --all-features` → fix all compile errors from
-      the wave (dedicated serial fix pass).
-- [ ] `cargo nextest run --workspace --all-features --no-fail-fast` → converge
-      to zero failures (baseline was 12,537 pass).
-- [ ] `cargo clippy --workspace --all-features -- -D warnings` → zero.
-- [ ] Doc tests + `cargo deny check bans` re-run.
-- [ ] Orchestrator gatekeeper review of wave diffs (spot-check every hard/GPU
-      bucket, sample wave-1 buckets).
+- [x] `cargo check --workspace --all-features --all-targets` → clean, zero
+      warnings.
+- [x] `cargo nextest run --workspace --all-features --no-fail-fast` →
+      **15,289 / 15,289 passed** (28 skipped; baseline was 12,537 — the waves
+      added ~2,750 tests).
+- [x] `cargo clippy --workspace --all-features --all-targets -- -D warnings`
+      → zero.
+- [x] Doc tests: 194 passed, 0 failed. `RUSTDOCFLAGS="-D warnings" cargo doc
+      --workspace --no-deps --all-features` → zero warnings.
+- [x] `cargo fmt --all -- --check` → clean. `cargo deny check bans` → ok.
+      `cargo tree -i ring` → empty; zero `onig` in Cargo.lock.
+- [x] Orchestrator gatekeeper review: GPU backward shader (uniform loop
+      bound + validity masks, documented), RadixSorter dynamic scratch,
+      tile_assign uniform tile_size — all verified against the audited
+      defects; policy sweep (2000-line cap, production dead_code allows,
+      hardcoded paths) enforced; accepted structural allows documented under
+      Deferred.
 
 ## Deferred / known-tradeoff items
 
