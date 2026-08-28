@@ -4,6 +4,8 @@ Pure Rust Gaussian Avatar Reconstruction — unified API for the OxiGAF ecosyste
 
 OxiGAF implements [GAF: Gaussian Avatar Reconstruction from Monocular Videos via Multi-View Diffusion](https://arxiv.org/abs/2412.10209) (Tang et al., CVPR 2025) in pure Rust.
 
+**Version 0.1.2** (2026-08-28) — 7 examples, 67 tests passing (`--all-features`), zero `todo!()`/`unimplemented!()` in `src/`.
+
 ## What "pure Rust" means here
 
 It describes the **Rust build and runtime**: the default feature set pulls in no C/C++/Fortran code and no Python interpreter, so building and running this crate needs nothing but a Rust toolchain.
@@ -18,6 +20,22 @@ OxiGAF provides a complete pipeline for reconstructing photorealistic 3D head av
 - **Multi-view diffusion** — novel view synthesis via CLIP + U-Net + VAE
 - **Differentiable 3DGS rasterizer** — wgpu compute shaders with FLAME binding
 - **Full training pipeline** — Adam optimizer, density control, checkpointing
+- **Pipeline convenience API** — `export`, `render_from_file`, `quick_train`, `verify_assets`, `check_gpu`, `detect_best_backend` in [`oxigaf::pipeline`](src/pipeline.rs) for going from a saved model to a file, or a validated config, without depending on the sub-crates directly
+
+**New in 0.1.2: `export` and `render_from_file` do real work.** Through 0.1.1
+both were validation-only stubs — `export`'s own doc comment called it "a
+thin validation wrapper" that checked `model_path.exists()` and otherwise did
+nothing (`let _ = (output_path.as_ref(), format); Ok(())`), silently
+returning `Ok(())` without writing a single byte. As of 0.1.2:
+
+- `export` loads a `.ply`/`.safetensors` Gaussian model and writes it as
+  binary PLY, Wavefront OBJ, or glTF 2.0.
+- `render_from_file` loads the model, auto-frames a camera from its bounding
+  box, rasterizes it with `Rasterizer`, and saves the image.
+
+See [Export, Render, and Verify Assets](#export-render-and-verify-assets) below
+and the `[0.1.2]` entry in [`CHANGELOG.md`](../../CHANGELOG.md) for the full
+migration notes.
 
 ## Installation
 
@@ -96,9 +114,49 @@ oxigaf = { version = "0.1", features = ["npz"] }
 
 ## Usage
 
+### Export, Render, and Verify Assets
+
+The `pipeline` module (re-exported at the crate root and through the prelude)
+is the fastest path from a saved model on disk to a file or an image. All
+three of `export`, `render_from_file`, and `quick_train` take two independent
+generic path parameters, so the two path arguments passed to each do not need
+to be the same concrete type:
+
+```rust,no_run
+use oxigaf::prelude::*;
+use std::path::{Path, PathBuf};
+
+fn main() -> oxigaf::Result<()> {
+    // Report any FLAME .npy files missing from a model directory.
+    let missing = verify_assets("path/to/flame/model");
+    if !missing.is_empty() {
+        eprintln!("missing FLAME assets: {missing:?}");
+    }
+
+    let model: PathBuf = PathBuf::from("avatar.ply");
+
+    // Re-serialise a saved Gaussian model (.ply or .safetensors) to a
+    // different format. Note the mixed path types across the two calls.
+    export(&model, "avatar.obj", ExportFormat::Obj)?;
+    export(&model, String::from("avatar.gltf"), ExportFormat::Gltf)?;
+
+    // Load `avatar.ply`, auto-frame a camera around its bounding box,
+    // rasterize with `Rasterizer`, and save a PNG.
+    render_from_file(&model, Path::new("render.png"), 512, 512)?;
+
+    Ok(())
+}
+```
+
+`quick_train` validates a `PipelineConfig` and resolves its output directory
+(returning the `PathBuf`); `validate_config` just validates one you already
+built, returning `()`. Neither invokes `oxigaf_trainer::Trainer` — full GPU
+training is `oxigaf_trainer::Trainer` directly, shown in the
+[`training_loop`](examples/training_loop.rs) example.
+
 ### Load FLAME and Generate a Mesh
 
-```rust
+```rust,no_run
 use oxigaf::prelude::*;
 
 fn main() -> oxigaf::Result<()> {

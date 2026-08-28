@@ -11,6 +11,10 @@
 //! - [`init`] — Gaussian initialization on FLAME mesh surfaces
 //! - [`optimizer`] — per-parameter Adam with group-wise learning rates
 //! - [`loss`] / [`lpips`] — photometric + structural loss (L1, SSIM, LPIPS)
+//! - [`image_gradient`] — pixel-space gradient of the configured photometric
+//!   loss, fed straight to the backward rasterizer pass (this is what makes
+//!   `LossConfig`'s weights actually change what gets optimized, not just what
+//!   gets logged)
 //! - [`density`] — adaptive density control (split / clone / prune)
 //! - [`diffusion_target`] — render ↔ diffusion distillation targets (SDS)
 //! - [`mixed_precision`] — loss scaling and precision mode
@@ -19,19 +23,28 @@
 //! - [`tensorboard`] / [`profiler_integration`] — logging and phase profiling
 //! - [`config`] — the [`TrainingConfig`] tree parameterising all of the above
 //!
+//! Four more are built by [`Trainer::new`] and consumed inside
+//! [`Trainer::train_step`], but only when configured — each is a no-op by
+//! default:
+//!
+//! - [`lr_scheduler`] — learning-rate multiplier schedule
+//!   (`TrainingConfig::lr_schedule`, default [`config::LrScheduleConfig::Fixed`])
+//! - [`gradient_clipping`] — global / per-group / value / adaptive clipping
+//!   (`TrainingConfig::gradient_clip`, default [`config::GradientClipConfig::Disabled`])
+//! - [`gradient_accumulation`] — micro-batch gradient accumulation
+//!   (`TrainingConfig::gradient_accumulation_steps`, default `1`)
+//! - [`ema`] — EMA shadow weights (`TrainingConfig::ema_decay`, default `None`)
+//!
 //! ## Opt-in components (not driven by `Trainer`)
 //!
 //! Every *other* module in this crate is a standalone, independently tested
-//! building block that [`Trainer`] does **not** invoke: learning-rate schedules
-//! ([`lr_scheduler`]), gradient clipping ([`gradient_clipping`]), gradient
-//! accumulation ([`gradient_accumulation`]), EMA shadow weights ([`ema`]),
-//! layer freezing ([`layer_freezing`]), curriculum sampling, diagnostics,
-//! calibration, landscape analysis, and so on.
+//! building block that [`Trainer`] does **not** invoke: layer freezing
+//! ([`layer_freezing`]), curriculum sampling, diagnostics, calibration,
+//! landscape analysis, and so on.
 //!
 //! They are exported so callers can compose their own loops, but importing one
 //! has **no** effect on [`Trainer::train_step`] — using it means driving it from
-//! your own loop.  The `pub mod` block below is split into the two groups so the
-//! distinction is visible at a glance.
+//! your own loop.
 //!
 //! # Examples
 //!
@@ -291,17 +304,25 @@
 //
 // These are the modules `trainer::Trainer` actually reaches during
 // `train_step` / `run` (plus `init`, which produces the model it is handed).
-// Changing one changes what the shipped training loop does.
+// Changing one changes what the shipped training loop does. The last four
+// (`ema`, `gradient_accumulation`, `gradient_clipping`, `lr_scheduler`) are
+// built by `Trainer::new` and consumed inside `train_step` only when their
+// `TrainingConfig` field is set away from its no-op default — see the
+// `Trainer` doc comment above for which field gates which module.
 // ---------------------------------------------------------------------------
 
 pub mod checkpoint;
 pub mod config;
 pub mod density;
 pub mod diffusion_target;
+pub mod ema;
+pub mod gradient_accumulation;
+pub mod gradient_clipping;
 pub mod image_gradient;
 pub mod init;
 pub mod loss;
 pub mod lpips;
+pub mod lr_scheduler;
 pub mod metrics;
 pub mod mixed_precision;
 pub mod optimizer;
@@ -336,11 +357,8 @@ pub mod data_augmentation;
 pub mod data_parallel;
 pub mod diagnostics;
 pub mod domain_adaptation;
-pub mod ema;
 pub mod feature_bank;
 pub mod few_shot_adaptation;
-pub mod gradient_accumulation;
-pub mod gradient_clipping;
 pub mod gradient_flow;
 pub mod gradient_surgery;
 pub mod hparam_search;
@@ -348,7 +366,6 @@ pub mod knowledge_distillation;
 pub mod layer_freezing;
 pub mod loss_landscape;
 pub mod loss_reweighting;
-pub mod lr_scheduler;
 pub mod meta_learning;
 /// A [`meta_learning::MetaModel`] over a real Gaussian avatar.
 ///

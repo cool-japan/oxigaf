@@ -6,6 +6,58 @@ Implements the methods from [GAF: Gaussian Avatar Reconstruction from Monocular 
 
 ## What's in v0.1.2
 
+### Gradient-Correctness Fixes (read before upgrading)
+- **Backward rasterizer shaders fixed**: `rasterize_bwd.wgsl` could accumulate
+  a tile's gradient onto the wrong Gaussian (a WGSL workgroup-uniformity bug
+  around `workgroupBarrier()`), and `preprocess_bwd.wgsl` omitted the position
+  gradient through view-dependent spherical-harmonics color for every
+  `sh_degree >= 1` model. Both affected *every* training run on 0.1.1 —
+  retraining is the only remedy. See `CHANGELOG.md`'s `[0.1.2]` migration
+  notes for the full detail.
+- **`Trainer::compute_gradients` no longer hardcodes an L2 photometric
+  loss** — `LossConfig`'s `w_l1`/`w_ssim`/`w_ms_ssim` weights previously only
+  affected the *logged* loss, never what the optimizer actually descended.
+  Position/scale/opacity regularization losses and SDS (score-distillation)
+  training likewise went from logged-only to actually producing gradients.
+
+### New Capabilities (v0.1.2)
+- **Pure-Rust PyTorch checkpoint ingest**: `oxigaf-bridge` now parses `.pt`/
+  `.pkl` checkpoints directly (`convert_pytorch_checkpoint`,
+  `convert_flame_model`) — no Python, no PyTorch, no `torch.load` needed, and
+  the old `scripts/convert_*.py` fallbacks are deprecated in its favor.
+- **Spec-conformant glTF 2.0 export**: a new `oxigaf_render::gltf` module
+  consolidates what were three independently-written, mutually-incompatible
+  glTF writers in the workspace into one that actually satisfies the spec
+  (per-accessor buffer views, mandatory `min`/`max`).
+- **Gaussian pruning, LR schedules, gradient clipping as config**:
+  `oxigaf-trainer` gained `pruning::GaussianPruner`, a 6-variant
+  `LrScheduleConfig`, and a `GradientClipConfig` — all genuinely wired into
+  `Trainer::train_step` via `TrainingConfig`, not just standalone APIs.
+- **A real meta-learning avatar model**: `meta_learning_avatar::
+  GaussianAvatarModel` is the first `MetaModel` implementation over an
+  actual Gaussian avatar (the prior `LinearModel` was a disconnected toy).
+- **GPU-side pass profiling**: `oxigaf_render::profiler::GpuTimestampProfiler`
+  (backed by `wgpu::Features::TIMESTAMP_QUERY`), alongside device-limit
+  validation so an under-provisioned GPU fails fast with a clear error
+  instead of an opaque pipeline-validation panic.
+
+### Also Fixed
+- PLY files with `sh_degree >= 1` written before this release load with
+  permuted higher-order SH coefficients (`f_rest_*` property order is now
+  channel-major, matching the reference 3DGS Python convention) — re-export
+  any you care about.
+- macOS: the default asset cache directory moved to `~/Library/Caches/oxigaf`
+  (`setup`/`doctor`/`cache` previously disagreed on where it lived).
+- `oxigaf::pipeline::export`/`render_from_file` were previously no-op stubs
+  despite their own doc comments describing real behavior — now genuinely
+  load, convert, render, and save.
+- Remaining C dependencies removed from `oxigaf-cli`'s HTTP stack (OpenSSL,
+  then `ring`) in favor of a pure-Rust `ureq`/`rustls`/RustCrypto stack.
+
+See `CHANGELOG.md` for the complete, verified list (breaking signature
+changes, deprecated APIs, and everything above with exact type/function
+names).
+
 ### 512×512 Multi-View Generation (v0.1.0)
 - **Latent Upsampler**: 32×32 → 64×64 latent upsampling for 512×512 output resolution
 - **IP-Adapter**: Identity-preserving image conditioning for consistent face/object generation
@@ -122,9 +174,10 @@ See "GPU / BLAS Backends" above to additionally enable `oxicandle-core`'s
 
 OxiGAF supports both legacy NPY and modern Safetensors formats for FLAME models.
 
-### Option 1: Safetensors (Recommended, v0.1.1)
+### Option 1: Safetensors (Recommended)
 
-Safetensors format is supported for runtime loading/saving.
+Safetensors format is supported for runtime loading/saving. The PyTorch
+conversion step is pure-Rust as of v0.1.2 (previously Python-only).
 
 1. Download the FLAME 2023 model from <https://flame.is.tue.mpg.de/>
 2. Convert the PyTorch checkpoint to safetensors — pure Rust, no Python,
@@ -207,7 +260,7 @@ let model = load_flame_model_safetensors(Path::new("flame_model.safetensors"))?;
 save_flame_model_safetensors(&model, Path::new("output.safetensors"))?;
 ```
 
-### PyTorch Weight Conversion (v0.1.1)
+### PyTorch Weight Conversion
 
 `oxigaf-bridge` is a standalone library crate — add `oxigaf-bridge` to your
 own `Cargo.toml` to use it (`cargo add oxigaf-bridge`); it is not exposed

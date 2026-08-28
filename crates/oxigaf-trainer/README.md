@@ -2,18 +2,71 @@
 
 GAF optimization pipeline — iterative denoising distillation.
 
+**Status: Alpha (0.1.2, 2026-08-28).** Pre-1.0: this release breaks
+struct-literal construction of `TrainingConfig`, `LossConfig`, and
+`ViewConsistencyLoss` (each gained new fields) and changes several
+function signatures and semantics (`detect_convergence_phase`,
+`GaussianOptimizer::step`/`step_accumulated`, the `mr_*` functions, and
+more). See "Migration Notes" below and `CHANGELOG.md`'s `[0.1.2]` entry for
+the full list.
+
 ## Overview
 
 This crate provides the training infrastructure for optimizing 3D Gaussian avatars:
 
 - **Gaussian initialization** on FLAME mesh surfaces
-- **Per-parameter Adam optimizer** with group-wise learning rates
-- **Photometric + structural losses** (L1, SSIM, LPIPS)
-- **Adaptive density control** (split, clone, prune)
+- **Per-parameter Adam optimizer** with group-wise learning rates, plus
+  opt-in **learning-rate schedules** (6 variants), **gradient clipping**
+  (4 modes), **gradient accumulation**, and **EMA** shadow weights — all
+  built by `Trainer::new` and consumed inside `train_step` when configured,
+  no-op by default
+- **Photometric + structural losses** (L1, SSIM, MS-SSIM, LPIPS) whose
+  configured weights now actually shape the optimized gradient, not just
+  the logged value (see "Migration Notes")
+- **Position/scale/opacity regularization** with real gradients as of this
+  release (see "Migration Notes" for the one exception)
+- **Adaptive density control** (split, clone, prune), plus standalone
+  **pruning utilities** (prune-to-sparsity, min-scale pruning, mask
+  application)
 - **Checkpoint management** (save/load with metadata)
 - **Metric tracking** (PSNR, SSIM history)
-- **Diffusion target generation** for iterative denoising distillation
+- **Diffusion target generation** for iterative denoising distillation,
+  including a real **score-distillation (SDS) gradient path** (see
+  "Migration Notes")
+- **Meta-learning avatar model** (`GaussianAvatarModel`) — a real
+  `MetaModel` implementation trained through the actual rasterizer
+  forward/backward pass
 - **TensorBoard logging** for training visualization
+
+## Migration Notes (0.1.1 → 0.1.2)
+
+**If you trained with 0.1.1 using anything other than default `LossConfig`
+weights, retrain — the objective actually being optimized has changed:**
+
+- `Trainer::compute_gradients` optimized a **hardcoded L2 photometric
+  loss** regardless of `LossConfig`. `w_l1`, `w_ssim`, and `w_ms_ssim` only
+  ever changed the *logged* loss value, never the direction the optimizer
+  descended. Fixed via the new `image_gradient::photometric_pixel_gradient`,
+  built from the installed `LossComputer`'s actual config, SSIM window, and
+  MS-SSIM scale weights.
+- **Position/scale/opacity regularization** (`w_position_reg`,
+  `w_scale_reg`, `w_opacity_reg`) were computed for logging only —
+  `Gradients::offset` was never written by anything, so a Gaussian's
+  `local_offsets` never moved during training no matter how
+  `w_position_reg` was set. Fixed via the new (private)
+  `add_regularization_gradients`. **`w_normal` and `w_gradient_penalty`
+  remain logging-only** — no FLAME mesh is retained by the trainer and no
+  external gradient buffer is threaded through for either term; this is a
+  documented limitation, not a silent gap.
+- **Score-distillation (SDS) training** (`use_sds`) had no real gradient
+  path at all — it contributed nothing beyond the ordinary photometric
+  term. Fixed via `DiffusionTargetGenerator::compute_sds_gradient` /
+  `compute_sds_gradient_with_horizon`, and a validated
+  `SdsLoss::new(weighting, max_timestep)` constructor (rejects
+  `max_timestep < 2`, which previously divided by zero).
+
+See `CHANGELOG.md`'s `[0.1.2]` entry for the complete list of signature and
+semantics changes.
 
 ## Installation
 
@@ -185,7 +238,12 @@ fn main() -> Result<(), oxigaf_trainer::TrainerError> {
         w_position_reg: 0.01,  // Penalize offset from the mesh surface
         w_scale_reg: 0.01,     // Penalize extreme scales
         w_opacity_reg: 0.001,  // Encourage binary opacity
-        w_normal: 0.05,        // Normal consistency (needs a FLAME mesh)
+        // Normal consistency. Logging-only: `Trainer::train_step` computes
+        // this value but does not differentiate it into a gradient (no
+        // FLAME mesh is retained by the trainer to compute it against).
+        w_normal: 0.05,
+        // Gradient penalty (training stability). Also logging-only, for the
+        // same reason — no external gradient buffer is threaded through.
         w_gradient_penalty: 0.0,
         gradient_penalty_threshold: 100.0,
         // World-space scale (post-`exp()`) above which `w_scale_reg` starts
@@ -776,8 +834,9 @@ TrainingConfig {
     enable_profiling: false,
 
     // Learning-rate schedule, gradient clipping, gradient accumulation, and
-    // EMA shadow weights are all opt-in (see "Opt-in components" in the
-    // crate docs) — disabled/no-op by default.
+    // EMA shadow weights are built by `Trainer::new` and consumed inside
+    // `train_step` whenever set away from these defaults — no separate
+    // wiring needed, and a no-op out of the box.
     lr_schedule: LrScheduleConfig::Fixed,
     gradient_clip: GradientClipConfig::Disabled,
     gradient_accumulation_steps: 1,
@@ -795,6 +854,11 @@ Training performance on various hardware (512×512 resolution, 10K Gaussians):
 | NVIDIA RTX 3080 | ~80 ms | ~5 GB |
 | Apple M2 Max | ~120 ms | ~6 GB |
 
+These figures predate the 0.1.2 photometric-gradient fix (per-view
+SSIM/MS-SSIM pixel-gradient computation replacing a fixed `2·(rendered −
+target)` term) and have not been re-measured against it; treat them as
+directional rather than current benchmarks.
+
 Typical training times:
 
 - **Quick preview**: 500 iterations (~1 minute on RTX 4090)
@@ -803,8 +867,8 @@ Typical training times:
 
 ## Statistics
 
-- **Tests**: 3,174 `#[test]`-attributed tests in source (`src/` + `tests/`) — the count that actually compiles and runs depends on enabled features and platform
-- **Key modules**: `trainer.rs` (1,985 lines), `loss.rs` (1,604 lines), `tensorboard.rs` (1,290 lines), `lpips.rs` (806 lines), `density.rs` (624 lines), `checkpoint.rs` (1,029 lines)
+- **Tests**: 3,271 `#[test]`-attributed tests in source (`src/` + `tests/`); 3,259 pass and 12 are `#[ignore]`d (GPU/slow — LPIPS VGG inference, GPU resume/end-to-end) with `cargo nextest run -p oxigaf-trainer --all-features` — the exact count that compiles and runs depends on enabled features and platform
+- **Key modules**: `trainer.rs` (1,921 lines), `loss.rs` (1,879 lines), `image_gradient.rs` (833 lines — the corrected photometric-gradient path), `tensorboard.rs` (1,307 lines), `checkpoint.rs` (1,028 lines), `density.rs` (638 lines), `lpips.rs` (805 lines)
 - **LPIPS**: Pure Rust VGG network (no Python/C dependencies)
 - **TensorBoard**: Native Rust implementation — scalar, image, histogram, graph logging
 

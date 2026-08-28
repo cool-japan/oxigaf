@@ -1,5 +1,12 @@
 # TODO for oxigaf-diffusion
 
+**Status: v0.1.2** (released 2026-08-28) — 3213/3213 tests passing
+(`cargo nextest run -p oxigaf-diffusion --all-features`) + 51/51 passing doc
+tests (1 ignored, `cargo test --doc --all-features`), zero
+`todo!()`/`unimplemented!()` stubs in `src/`. See [README.md](README.md) for
+the feature/API summary and the 0.1.2 breaking-changes list. One-person
+project; contributions welcome via PR.
+
 ## ✅ Completed (from plan)
 
 ### Core Architecture
@@ -71,16 +78,19 @@
 - ✅ Candle backend error propagation
 
 ### Testing
-- ✅ 2677 tests (161 unit + 51 new streaming/batch_gen + 99 integration + 13 doc + ~22 doc-tests, including 44 new mixed_precision tests, 22 new kv_cache tests, 20 new streaming tests, 31 new batch_gen tests):
-  - `attention_tests.rs` (13 tests)
-  - `camera_tests.rs` (11 tests)
-  - `scheduler_tests.rs` (17 tests)
-  - `debug_hooks` tests (22 new tests)
-  - `sliced_attention.rs` (23 new tests)
-  - `numerics.rs` (28 new tests)
-  - `mixed_precision.rs` (44 new tests — with and without feature flag)
-  - `kv_cache.rs` (22 new tests)
-  - `tests/comprehensive_tests.rs` (47 new integration tests: scheduler, DiffusionConfig, error types, DebugHooks, SlicedAttention public API, CFG formula)
+- ✅ 3213 tests passing (`cargo nextest run --all-features`) + 51 passing doc
+  tests (1 ignored). Breakdown verified against
+  `cargo nextest list --all-features` on 2026-08-28:
+  - Library unit tests: 3075 (across all `src/*.rs` modules)
+  - `tests/attention_precision_tests.rs` (6 tests)
+  - `tests/attention_tests.rs` (13 tests)
+  - `tests/camera_tests.rs` (11 tests)
+  - `tests/cfg_ip_adapter_tests.rs` (11 tests)
+  - `tests/comprehensive_tests.rs` (47 tests: scheduler, DiffusionConfig, error types, DebugHooks, SlicedAttention public API, CFG formula)
+  - `tests/memory_tests.rs` (22 tests)
+  - `tests/scheduler_tests.rs` (19 tests)
+  - `tests/vae_tests.rs` (9 tests)
+  - Doc tests: 51 passing, 1 ignored (`upsampler::LatentUpsampler`, requires real weights)
 - ✅ Shape preservation tests
 - ✅ Attention mechanism tests
 - ✅ Camera embedding tests
@@ -105,10 +115,18 @@
   - Full denoising loops
 
 ### Code Quality
-- ✅ No unwrap policy (`#![deny(clippy::unwrap_used)]`)
-- ✅ No expect in library code (`#![deny(clippy::expect_used)]`)
-- ✅ All source files under 700 lines (well within 2000 line limit)
-- ✅ Total codebase: 3,342 lines
+- ✅ No `unwrap()`/`.expect()` in production code paths — verified 2026-08-28:
+  every occurrence in `src/` is confined to `#[cfg(test)] mod tests` blocks or
+  `///`/`//!` rustdoc examples. Not compiler-enforced via `#![deny(...)]` (no
+  such attribute exists in `lib.rs`, and there is no workspace-level
+  `[lints]` table or `clippy.toml`) — this is achieved by discipline, not a
+  lint gate. `cargo clippy --all-features --all-targets` is currently clean.
+- ✅ All source files under the 2000-line policy limit — largest is
+  `stochastic_interpolant.rs` at 1996 lines (4 lines of headroom; see
+  "Known Issues" below)
+- ✅ Total codebase: 72 source files, ~65,000 lines of code (`tokei src`,
+  2026-08-28) — grown substantially since the single-digit-file, 3,342-line
+  v0.1.0 baseline as the modules under "Future Enhancements" below were added
 - ✅ Clean module structure
 
 ### Feature Flags
@@ -121,6 +139,9 @@ set:*
 - ✅ `flash_attention` - Memory-efficient attention (opt-in since v0.1.2, not in `default`)
 - ✅ `mixed_precision` - FP32↔BF16/FP16 conversion utilities (`mixed_precision.rs`); real and tested, but not yet called from `unet.rs`/`vae.rs`/`pipeline.rs`, so it doesn't change `generate()`'s output
 - ✅ `gpu_debug` - NaN/Inf debug hooks (`debug_hooks::assert_finite`, `DebugConfig`)
+- ✅ `parallel` - `rayon`-backed data parallelism (`dep:rayon`), currently
+  driving the per-sample ControlNet feature injection in `unet.rs`; every
+  parallelised routine is arithmetic-identical to its serial form
 - ❌ ~~`accelerate` - CPU BLAS/LAPACK acceleration~~ — removed in v0.1.2;
   enable it on the resolved `candle-core`/`candle-nn` package instead
   (`oxicandle-core`/`oxicandle-nn` fork — see README "GPU / BLAS Backends")
@@ -223,7 +244,7 @@ Currently none.
 
 ### Numerical Stability
 - ✅ **Selective FP32 for sensitive ops** — `numerics.rs` (480 lines). `AttentionPrecision` enum (Standard, UpcastedSoftmax [default], FullUpcast). `softmax_inplace`, `softmax`, `log_softmax` (numerically stable log-sum-exp). `layer_norm` (f64 accumulation for extra precision), `rms_norm`. `gelu`/`gelu_slice` (tanh approximation), `silu`/`silu_slice`. `NumericsError` (EmptyInput, LengthMismatch). `count_subnormal`, `is_subnormal`. `SlicedAttentionConfig` extended with `attention_precision: AttentionPrecision` field. 28 new tests.
-- ✅ **Mixed precision (FP16/BF16 inference)** — `mixed_precision.rs` (~560 lines code + ~260 lines tests). `PrecisionMode` enum, `MixedPrecisionConfig`, `OpType` enum, pure-Rust BF16/FP16 conversion, `simulate_bf16`/`simulate_f16`, `apply_precision`, `PrecisionStats::compute`. 44 new tests. 2677 total tests passing (161 lib unit + 51 new streaming/batch_gen + 99 integration + ~22 doc-tests, 1 ignored).
+- ✅ **Mixed precision (FP16/BF16 inference)** — `mixed_precision.rs` (~560 lines code + ~260 lines tests). `PrecisionMode` enum, `MixedPrecisionConfig`, `OpType` enum, pure-Rust BF16/FP16 conversion, `simulate_bf16`/`simulate_f16`, `apply_precision`, `PrecisionStats::compute`. Added with 44 tests in v0.1.1, since grown to 47 (see "Testing" above for the current crate-wide total).
 - ✅ **NaN/Inf detection hooks** (`debug_hooks.rs`, 382 lines)
   - `TensorHealth` struct, `check_tensor_health()`, `all_finite()` fast-path
   - `assert_finite()` returning `Err(DiffusionError::NanInfDetected{…})`
@@ -235,7 +256,7 @@ Currently none.
 ### Testing Gaps
 - ✅ **U-Net forward pass tests / Pipeline integration tests**
   - `tests/comprehensive_tests.rs` with 47 new integration tests: scheduler (10), DiffusionConfig (7), error types (3), DebugHooks via public re-exports (14), SlicedAttention public API (8), CFG formula (5)
-  - Total at time of completion: 207 tests passing (now ~260 with mixed_precision additions)
+  - Total at time of completion: 207 tests passing (see "Testing" above for the current crate-wide total)
 - ⬜ **VAE encode/decode tests**
   - Round-trip reconstruction loss
   - Latent statistics (mean, std)
@@ -333,11 +354,16 @@ Currently none.
   - Flash attention may have slightly different outputs vs standard (tiling artifacts)
   - Need more testing with fp16
   - Mitigation: Make it optional, default to standard for now
-- ✅ ~~**Mixed precision**~~ — The conversion toolkit itself is fully implemented (`mixed_precision.rs`, 44 tests): BF16/FP16 conversion, `PrecisionStats`, feature-gated default. Not yet wired into `unet.rs`/`vae.rs`/`pipeline.rs`, though, so turning the feature on doesn't change `generate()`'s numerics — see "Feature Flags" above.
+- ✅ ~~**Mixed precision**~~ — The conversion toolkit itself is fully implemented (`mixed_precision.rs`, 47 tests): BF16/FP16 conversion, `PrecisionStats`, feature-gated default. Not yet wired into `unet.rs`/`vae.rs`/`pipeline.rs`, though, so turning the feature on doesn't change `generate()`'s numerics — see "Feature Flags" above.
+- ⬜ **File size creep**: `stochastic_interpolant.rs` is 1996 lines — 4 lines
+  from the workspace's 2000-line-per-file policy limit. Not yet split; the
+  next feature or test addition to this file should go through `splitrs`
+  (or a manual split) instead of pushing it over the limit. Runner-up:
+  `token_merging.rs` at 1889 lines.
 
 ## 📊 Current Status
 
-### Implementation: ~99% complete (v0.1.1+)
+### Implementation: ~99% complete (v0.1.2)
 - ✅ Core U-Net: 100%
 - ✅ VAE: 100%
 - ✅ CLIP: 100%
@@ -347,17 +373,21 @@ Currently none.
 - ✅ IP-Adapter: 100%
 - ✅ CFG: 100%
 - ✅ Pipeline orchestration: 100%
-- ✅ Selective FP32 / Numerical stability: 100% (`numerics.rs`, 28 tests)
-- ✅ Mixed precision (FP16/BF16) conversion toolkit: 100% (`mixed_precision.rs`, 44 tests) — not yet wired into the inference path (see "Feature Flags" above)
+- ✅ Selective FP32 / Numerical stability: 100% (`numerics.rs`, 33 tests)
+- ✅ Mixed precision (FP16/BF16) conversion toolkit: 100% (`mixed_precision.rs`, 47 tests) — not yet wired into the inference path (see "Feature Flags" above)
 - ✅ Variable resolution support: 100% (`resolution.rs`, 771 lines)
 - ✅ Noise schedule analysis (Karras EDM): 100% (`noise_schedule_analysis.rs`, 1213 lines)
 - ⬜ Weight loading: 50% (structure exists, conversion script pending)
 - ⬜ Optimization strategies: 80% (flash attention + attention slicing + numerics + mixed precision + KV-cache + streaming inference + batch generation + variable resolution done, profiling pending)
 
-### Tests: 2677 tests (all passing, 1 ignored)
-- ✅ Unit tests: 161 (attention, camera, scheduler, debug_hooks, sliced_attention, numerics, mixed_precision, kv_cache) + 51 new (streaming: 20, batch_gen: 31)
-- ✅ Integration tests: 99 (52 prior + 47 new comprehensive tests)
-- ✅ Doc tests: ~22
+### Tests: 3213 tests (all passing, 0 skipped) + 51 passing doc tests (1 ignored)
+- ✅ Library unit tests: 3075 (across all `src/*.rs` modules — attention,
+  camera, scheduler, debug_hooks, sliced_attention, numerics,
+  mixed_precision, kv_cache, streaming, batch_gen, and the ~60 modules under
+  "Future Enhancements" below)
+- ✅ Integration tests: 138 across 8 files in `tests/` (see "Testing" above
+  for the per-file breakdown)
+- ✅ Doc tests: 51 passing, 1 ignored
 - ⬜ Cross-validation with Python: 0
 - Coverage: Excellent — comprehensive integration tests cover pipeline, CFG, error types, DebugHooks, SlicedAttention, numerics, mixed precision, KV-cache, streaming inference, batch generation
 
@@ -365,7 +395,9 @@ Currently none.
 - ✅ Rustdoc with feature explanations
 - ✅ Error variant documentation
 - ✅ Module-level documentation
-- ⬜ Missing: Usage examples
+- ✅ Usage examples (`examples/*.rs`, 6 files, all build with
+  `cargo build --examples --all-features`) — see "Documentation Gaps" above
+  for the one known display bug (`streaming_demo.rs`)
 - ⬜ Missing: Mathematical background
 
 ### Benchmarks: Excellent
@@ -404,21 +436,20 @@ Currently none.
 
 **Future priority:**
 1. ⬜ **Weight conversion script** — Convert PyTorch → SafeTensors (needed to load real weights)
-2. ✅ ~~**Pipeline integration tests**~~ — Done (`tests/comprehensive_tests.rs`, 47 new tests, 160 total)
+2. ✅ ~~**Pipeline integration tests**~~ — Done (`tests/comprehensive_tests.rs`, 47 tests)
 3. ⬜ Cross-validation with Python reference
-4. ✅ ~~Attention slicing (for <8GB GPUs)~~ — Done (`sliced_attention.rs`, 23 new tests, chunked softmax, graceful fallback)
-5. ✅ ~~Mixed precision~~ (`mixed_precision.rs` — Done, 44 tests, BF16/FP16 inference)
-8. ⬜ Usage examples
+4. ✅ ~~Attention slicing (for <8GB GPUs)~~ — Done (`sliced_attention.rs`, chunked softmax, graceful fallback)
+5. ✅ ~~Usage examples~~ — Done (`examples/*.rs`, 6 files, all build; see "Documentation Gaps" above for one known display bug)
 
 **Medium Priority:**
-9. ✅ ~~Mixed precision~~ — Done (`mixed_precision.rs`, 44 tests, BF16/FP16, `PrecisionStats`)
-10. ✅ ~~Selective FP32 for numerical stability~~ — Done (`numerics.rs`, `AttentionPrecision`, `softmax_inplace`, `layer_norm` f64, 28 tests)
-11. ⬜ Sequential VAE processing
+6. ✅ ~~Mixed precision~~ — Done (`mixed_precision.rs`, BF16/FP16, `PrecisionStats`; not yet wired into the inference path — see "Feature Flags" above)
+7. ✅ ~~Selective FP32 for numerical stability~~ — Done (`numerics.rs`, `AttentionPrecision`, `softmax_inplace`, `layer_norm` f64)
+8. ✅ ~~Sequential VAE processing~~ — Done (`sequential_vae.rs`, 940 lines, 20 tests)
 
 **Low Priority:**
-12. ⬜ Model variants support
-13. ⬜ Alternative encoders
-14. ⬜ Debugging visualization
+9. ✅ ~~Model variants support~~ — Done (`model_variants.rs`, 1321 lines, 43 tests: SD1.5/2.1/XL/Zero123 registry). The narrower "different CLIP encoders" / "alternative VAE models" sub-items remain open — see item 10.
+10. ⬜ Alternative encoders (different CLIP encoder variants, alternative VAE models)
+11. ✅ ~~Debugging visualization~~ — Done (`attention_viz.rs`, 1080 lines, 28 tests; `denoising_viz.rs`, 1094 lines, 23 tests)
 
 ## 🏆 Implementation Highlights
 
@@ -438,8 +469,11 @@ Currently none.
    - NaN/Inf detection hooks prepared
 
 3. **Testing Infrastructure** (more thorough than planned)
-   - 41 unit tests across 3 test files
-   - Property-based testing potential
+   - 3213 tests passing across the library target and 8 integration-test
+     files, plus 51 passing doc tests (see "Testing" above for the
+     breakdown) — grown from the original plan's much smaller unit-test
+     baseline as the crate's scope expanded
+   - Property-based testing (`proptest`) in use
    - Extensive benchmarking suite
 
 4. **Feature Flag Design** (cleaner than planned)
@@ -450,8 +484,8 @@ Currently none.
    - Flash attention opt-in (not part of `default`)
 
 5. **Code Quality** (stricter than planned)
-   - All files well under 2000 lines (largest: 665 lines)
-   - No unwrap policy
+   - All files under the 2000-line policy limit (largest: `stochastic_interpolant.rs` at 1996 lines — see "Known Issues" above)
+   - No `unwrap()`/`.expect()` in production code paths (see "Code Quality" above for how this was verified)
    - Clear module boundaries
 
 **Current implementation is PRODUCTION-READY for:**
@@ -479,11 +513,47 @@ Currently none.
 - ✅ Distillation loss, CLIP scoring, DDIM inversion, Denoising visualisation
 - ✅ Image preprocessing, Image variations, Batch generation
 
+**v0.1.2 completed (2026-08-28, 3213 tests + 51 doc tests passing):**
+- ✅ `flash_attention` moved out of `default` (now a real opt-in — previously
+  `default = ["flash_attention"]` meant the feature could never actually be
+  turned off) — see "Feature Flags" above
+- ✅ `candle-core`/`candle-nn` switched to the COOLJAPAN `oxicandle-core`/
+  `oxicandle-nn` fork (0.10 → 0.11; dependency keys unchanged), removing
+  the transitive C Oniguruma (`onig`/`onig_sys`) dependency pulled in by
+  upstream `candle-core`'s `tokenizers` dependency
+- ✅ Unused `candle-transformers` workspace dependency removed
+- ✅ Ten breaking signature/semantics changes made previously-infallible
+  operations honest about failure, or fixed a mislabeled/renamed API — full
+  list in [README.md](README.md#breaking-changes-in-012):
+  `compute_distillation_loss`/`DistillationStep::aggregate_losses` return
+  `Result`; `DistillationConfig` gained `latent_dims`; `TeacherStudentPair`
+  gained `teacher_mid`; `dpm_plus_plus_2m_step` takes `prev_x0`/`h_prev`
+  (6→7 args); `InversionTrajectory::x_0()`/`x_t()` return `Option`;
+  `DdimInversionConfig::refinement_threshold` is now RMS-based;
+  `pad_to_square`/`flip_horizontal`/`flip_vertical` return `Result`;
+  `FlowStats::divergence_estimate` renamed to `mean_squared_norm`;
+  `EditMask::all_ones` argument order now matches `EditMask::new`;
+  `fm_interpolate`/`fm_target_velocity` honor a non-zero `sigma_min`;
+  `softmax_over_dim` returns `Result`; `sdedit::ImageEditError` removed
+  (folded into `image_editing::ImageEditingError`);
+  `MultiViewDiffusionPipeline::begin_session_from_latents` takes a
+  `SessionRequest` struct instead of seven positional arguments
+- ✅ New `parallel` feature (rayon-backed ControlNet parallelism) — added
+  during the 0.1.2 cycle (absent from the `Availability of 0.1.1` commit's
+  `Cargo.toml`) and now documented in README.md/TODO.md for the first time
+- ✅ Test suite grown from 2677 (v0.1.1) to 3213 passing (`--all-features`)
+  + 51 passing doc tests
+
 **Not yet ready for:**
 - Production weight loading (PyTorch → SafeTensors conversion script pending)
 - End-to-end Python cross-validation
 
-## 🚀 Next Steps (post v0.1.1)
+## 🚀 Next Steps (post v0.1.2)
+
+The two real, still-open items (weight conversion, integration testing with
+real weights) carry forward unchanged from v0.1.1 — no progress was made on
+either during the 0.1.2 cycle, which was scoped to the API/dependency
+changes above instead.
 
 1. **Weight Conversion Script** (~2-3 days)
    - Python script: PyTorch GAF checkpoint → SafeTensors
@@ -495,6 +565,6 @@ Currently none.
    - Multi-view consistency validation
    - Visual quality checks
 
-3. ✅ ~~**Mixed Precision**~~ — Done (`mixed_precision.rs`, 44 tests)
-4. ✅ ~~**Streaming Inference**~~ — Done (`streaming.rs`, 260 lines, 20 tests)
-5. ✅ ~~**Batch Generation**~~ — Done (`batch_gen.rs`, 323 lines, 31 tests)
+3. ✅ ~~**Mixed Precision**~~ — Done (`mixed_precision.rs`, 47 tests)
+4. ✅ ~~**Streaming Inference**~~ — Done (`streaming.rs`, grew from 260 to 880 lines post-v0.1.1, 23 tests)
+5. ✅ ~~**Batch Generation**~~ — Done (`batch_gen.rs`, 48 tests)

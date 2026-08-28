@@ -13,6 +13,35 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
+ignore = [
+    # RUSTSEC-2023-0071 (Marvin Attack: rsa timing side-channel on private-key
+    # operations). Forced transitively by oxitls-rustcrypto-provider 0.3.0
+    # (oxigaf-cli's pure-Rust rustls CryptoProvider, ~/work/oxitls) as an
+    # unconditional, non-feature-gated dependency needed for RSA-signed TLS
+    # certificate *verification*. No safe upgrade exists upstream as of this
+    # writing (RustCrypto/RSA#626 tracks a constant-time rewrite).
+    #
+    # Accepted risk, reviewed 2026-08-28: oxigaf-cli only uses this
+    # CryptoProvider as a TLS *client* verifying server certificates during
+    # asset downloads (see CHANGELOG [0.1.2] Fixed -> "C OpenSSL, and later
+    # `ring`, removed from oxigaf-cli's HTTP stack"). It never holds or
+    # performs private-key operations with an RSA key itself -- the timing
+    # side-channel this advisory describes targets whoever holds the private
+    # key, which is the remote server being verified, not this client. Revisit
+    # if oxigaf-cli ever gains a server role or otherwise handles an RSA
+    # private key, or when oxitls-rustcrypto-provider ships a fix/opt-out.
+    "RUSTSEC-2023-0071",
+
+    # RUSTSEC-2024-0436 ("unmaintained", not a vulnerability): `paste`'s
+    # author archived it as feature-complete. Pulled in transitively by
+    # several large, unrelated third-party dependency trees (gemm via
+    # oxicandle-core/oxiblas, oxitls-rustcrypto-provider directly), none of
+    # which are in this project's control. `paste` is a tiny, stable
+    # token-pasting proc-macro with no runtime component; "unmaintained"
+    # here means finished, not broken. Revisit if a maintained fork (e.g.
+    # `pastey`) becomes the de facto replacement across those upstreams.
+    "RUSTSEC-2024-0436",
+]
 
 [licenses]
 version = 2
@@ -20,6 +49,10 @@ allow = [
     "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "MIT",
     "BSD-2-Clause", "BSD-3-Clause", "ISC", "Zlib",
     "Unicode-3.0", "MPL-2.0", "CC0-1.0", "BSL-1.0",
+    # Mozilla's CA root bundle data license (webpki-roots, pulled in via
+    # ureq -> rustls-webpki-roots for the pure-Rust oxigaf-cli HTTP stack).
+    # Permissive data license, not copyleft.
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.9
 

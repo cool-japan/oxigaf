@@ -32,11 +32,8 @@ Baseline before this effort: 12,537 tests passing (46 skipped), zero warnings,
       `{ workspace = true }`; workspace table carries `version = "0.1.2"` so
       crates stay publishable.
 - [x] `.gitignore`'s `Cargo.lock` entry removed (workspace ships a binary, so
-      the lockfile belongs in version control).
-      **Not yet fully done**: the file itself is still absent from the git
-      index (`git ls-files -- Cargo.lock` is empty) — it needs a `git add
-      Cargo.lock` once dependency churn from the current wave settles, so it
-      isn't staged mid-edit by every agent that happens to touch a manifest.
+      the lockfile belongs in version control). Now fully done: `Cargo.lock`
+      is tracked (`git ls-files -- Cargo.lock` returns it).
 - Residual non-Rust on the default feature set: **NONE** (ring eliminated in
   W1.5 below). Dev/bench-only: criterion → `alloca` (alloca.c), documented
   in deny.toml.
@@ -166,6 +163,60 @@ three targeted convergence fixers. Highlights:
       defects; policy sweep (2000-line cap, production dead_code allows,
       hardcoded paths) enforced; accepted structural allows documented under
       Deferred.
+
+## W3 — Release-pipeline documentation & dependency-audit pass (DONE — 2026-08-28)
+
+- [x] `cargo deny check`: fixed two real, previously-uncaught findings —
+      `webpki-roots`'s `CDLA-Permissive-2.0` license (added to `[licenses]
+      allow`; it's a permissive data license for Mozilla's CA bundle, not a
+      copyleft one) and a **yanked** `chacha20 0.10.1` (via `rand 0.10.2`;
+      `cargo update -p chacha20@0.10.1` → `0.10.2` resolves it, one package
+      changed). Also documented two accepted-risk `[advisories] ignore`
+      entries with written justification: RUSTSEC-2023-0071 (rsa timing
+      side-channel, unconditional dep of `oxitls-rustcrypto-provider` for TLS
+      *client* certificate verification — no private-key ops, no upstream
+      fix exists) and RUSTSEC-2024-0436 (`paste` unmaintained-not-vulnerable,
+      pulled in by unrelated upstream trees). `cargo deny check` → **fully
+      clean**: `advisories ok, bans ok, licenses ok, sources ok`.
+- [x] Removed a stray compiled `librust_out.rlib` that had been committed to
+      the repo root (not under `target/`); added `**/*.rlib` to `.gitignore`.
+- [x] CHANGELOG.md `[0.1.2]` gap-filled against the full diff since the 0.1.1
+      release commit: two unconditional gradient-correctness bugs in the
+      backward rasterizer shaders (wrong-Gaussian gradient accumulation from
+      a WGSL workgroup-uniformity violation; missing position gradient
+      through view-dependent SH color for `sh_degree >= 1`) that affected
+      *every* 0.1.1 training run, plus the trainer's hardcoded-L2-loss bug
+      (`LossConfig` weights were logged but never actually optimized),
+      unwired regularization/SDS gradients, the new glTF/pruning/meta-
+      learning-avatar/gaze-controller-method/pickle-ingest additions, and
+      more — see CHANGELOG.md `[0.1.2]` for the full, verified list. One
+      self-caught correction during this pass: `gaze_controller` was
+      initially misreported as a new 0.1.2 module (it's a 0.1.1-era single
+      file split into a directory this release — only one method,
+      `synthesize_blinks`, is genuinely new).
+- [x] All 7 crate READMEs/TODOs refreshed against live source + a fresh
+      `cargo nextest -p <crate> --all-features` run each (not reused stale
+      numbers). Found and removed real fabrications in the process: fake
+      performance numbers in `oxigaf-bridge/README.md` ("2,743 layers
+      mapped", made-up latency/speedup figures with no `benches/` behind
+      them), a fabricated 16-test list plus self-graded "EXEMPLARY"/"10/10"
+      ratings in `oxigaf/TODO.md`, and claimed-shipped winit/wgpu preview
+      window + ffmpeg video extraction in `oxigaf-cli/TODO.md` that don't
+      exist anywhere in the dependency graph or source.
+- [x] Final verified count after all of the above (chacha20 lockfile bump +
+      one cosmetic `oxigaf-trainer/src/lib.rs` mod-ordering fix, no test-
+      affecting source changes): **15,289 / 15,289 passed, 28 skipped**
+      (unchanged from W2 — cross-validated by independently summing all 7
+      crates' fresh per-crate counts, which total exactly 15,317 = 15,289 +
+      28). Of the 28 skipped: 16 in `oxigaf-render` (GPU-only) and 12 in
+      `oxigaf-trainer` (GPU/slow) — this pass additionally ran all 16 of
+      `oxigaf-render`'s under `--run-ignored ignored-only` against real GPU
+      hardware (Metal) and confirmed all 16 pass; the FD-threshold-tightening
+      item below is unaffected (verifying today's threshold isn't the same
+      question as whether it can be tightened, which needs dedicated
+      numerical analysis this pass did not do).
+- [x] `cargo build --release --workspace --all-features` → clean, zero
+      warnings (not previously checked in W2, which only used debug builds).
 
 ## Deferred / known-tradeoff items
 

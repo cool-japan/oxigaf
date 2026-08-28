@@ -1,5 +1,10 @@
 # TODO for oxigaf-flame
 
+**Current release: v0.1.2.** Provenance tags below such as "(v0.1.1)" mark
+when a feature shipped, not the current version — this document tracks what
+is done and what remains, not a version-by-version changelog (see
+`CHANGELOG.md` at the workspace root for that). Contributions welcome.
+
 ## ✅ Completed (from plan)
 
 ### Core Functionality
@@ -75,7 +80,16 @@ Currently none.
 
 ### Avatar Rigging & Expression System (v0.1.1)
 - ✅ **AvatarRig** — skeleton-mesh binding for full avatar control
-- ✅ **GazeController** — gaze direction control with pupil tracking
+- ✅ **GazeController** — comprehensive gaze control system (`gaze_controller/`):
+  Listing's-law gaze rotation (`gz_listing_rotation`/`gz_listing_axis`),
+  I-VT saccade/fixation classification (`gz_detect_saccades`/
+  `gz_detect_fixations`), natural blink detection/synthesis
+  (`gz_detect_blinks`/`gz_synthesize_blinks`), vergence estimation
+  (`gz_vergence_from_iod`/`gz_convergence_angle_deg`), and ring-buffered
+  history/statistics via `GazeController`/`GazeStats`. **v0.1.2:** split
+  from a single file into a module directory and gained
+  `GazeController::synthesize_blinks`, a config-aware convenience wrapper
+  around `gz_synthesize_blinks`.
 - ✅ **HeadTracker** — real-time head pose tracking integration
 - ✅ **HeadGeometry** — head geometry analysis and symmetry tools
 - ✅ **PoseEstimation** — camera-relative head pose estimation
@@ -84,6 +98,14 @@ Currently none.
 - ✅ **ExpressionAnimation** — keyframe expression animation
 - ✅ **ExpressionClustering** — cluster expressions into prototypes
 - ✅ **ExpressionTransfer** — transfer expressions between identities
+- ✅ **Expression-space retargeting** — `expression_retargeting.rs`:
+  `LinearExpressionRetargeter` learns a linear map between two identities'
+  expression spaces, plus trajectory analysis (velocity/acceleration/
+  smoothing/resampling) and blending utilities (weighted blend, SLERP).
+  Distinct from `ExpressionTransfer` above (direct/scaled/style transfer of
+  individual expressions) and from `retargeting.rs`'s `ExpressionRetargeter`
+  (shape-*identity* retargeting, not expression-space retargeting) —
+  three related but separate modules, not duplicates.
 - ✅ **FACS AU coefficients** — Action Unit decomposition from expressions
 - ✅ **Emotion recognition** — emotion classification from AU coefficients
 - ✅ **Phoneme-driven animation** — lip-sync from phoneme sequence
@@ -98,23 +120,71 @@ Currently none.
 - ✅ **Mesh analysis** — area, volume, curvature, quality metrics
 
 ### Geometry & Statistical Tools (v0.1.1)
-- ✅ **Geodesic distance** — heat-method geodesic distance computation
+- ✅ **Geodesic distance** — Dijkstra and heat-method distance computation
+  (`geodesic/`). **v0.1.2:** `heat_geodesic` is now a real implementation of
+  the heat method (Crane, Weischedel & Wardetzky 2013) — solving
+  `(M + t·Lc)u = δ_source`, normalizing `∇u`, then a Poisson solve, both via
+  Jacobi-preconditioned CG — replacing what its own v0.1.1 doc comment
+  called "a simplified approximation, not the full heat method." Also new:
+  `heat_geodesic_multi` (multi-source), `heat_time_step` (standard `dt`
+  heuristic), and `geodesic_center_sampled`/`DEFAULT_CENTER_SAMPLES = 64`.
+  **Behavior change:** `geodesic_center` with an empty candidate list now
+  farthest-point-samples 64 candidates by default instead of searching every
+  vertex exhaustively (which took minutes on a 5023-vertex head); pass
+  `(0..mesh.n_vertices()).collect()` for the old exhaustive behavior.
 - ✅ **Spectral analysis** — Laplace-Beltrami spectral decomposition
-- ✅ **Multiresolution mesh** — wavelet-based multiresolution representation
-- ✅ **Statistical shape model** — PCA shape space with sampling
+- ✅ **Multiresolution mesh** — Garland-Heckbert Quadric Error Metric (QEM)
+  edge-collapse decimation for LOD generation (`multiresolution.rs`) — this
+  is decimation-based, not wavelet-based. **v0.1.2:**
+  `DecimationConfig::default().target_vertex_count` changed from `0`
+  (always rejected by validation — an always-reject footgun) to
+  `usize::MAX` (a documented no-op default: decimation only runs while
+  `live_vertex_count > target_vertex_count`).
+- ✅ **Statistical shape model** — PCA shape space with sampling (`statistical_shape_model.rs`)
+- ✅ **Shape-space statistics** — `shape_analysis.rs`: distance metrics,
+  descriptive statistics, PCA via power iteration, outlier detection, and
+  shape interpolation over the FLAME shape parameter space. Distinct from
+  `statistical_shape_model.rs` above (which builds/samples the shape space
+  itself) and from `mesh_analysis.rs` (geometric mesh metrics, not
+  shape-parameter statistics).
 - ✅ **Symmetry detection** — bilateral symmetry plane estimation
 
 ### UV & Texture Pipeline (v0.1.1)
-- ✅ **UV parameterisation** — least-squares conformal mapping
+- ✅ **UV parameterisation** — least-squares conformal mapping (`uv.rs`:
+  `UvAccessor`, `UvMeshExt`, `UvChartInfo`)
+- ✅ **UV texture sampling** — `uv_texture.rs`: `TextureMap`,
+  `UvTextureSampler` (nearest/bilinear filtering, clamp/repeat/mirror
+  wrapping), `TextureMeshExt` for sampling at barycentric surface points
 - ✅ **Texture baking** — render-to-texture from 3D attributes
 - ✅ **Face atlas generation** — packed UV atlas for head mesh
 - ✅ **Albedo map** — diffuse colour texture extraction
 - ✅ **SH lighting model** — spherical harmonic environment lighting
+  (`lighting_model.rs`). **v0.1.2:** `LightingError` gained
+  `InvalidFaceIndex { face, index, vertices }` (a face referencing an
+  out-of-range vertex is now reported instead of the caller getting a
+  panic or silently-wrong output), and `shade_mesh_directional`/
+  `shade_mesh_multi_light` now call the existing light-colour-range check
+  and return `Err` for a component outside `[0, 1]` instead of proceeding
+  unvalidated.
 
 ### Motion, Fitting & Utilities (v0.1.1)
 - ✅ **Timeline** — frame-indexed parameter sequence
 - ✅ **Warp field** — per-vertex displacement field animation
 - ✅ **Shape retargeting** — identity-shape transfer retargeting
+- ✅ **Landmark-to-FLAME fitting** — `fitting/`: CPU gradient-descent fitting
+  of FLAME parameters (shape/expression/global rotation/translation/jaw) to
+  2D landmark observations. `PinholeCamera` for 3D→2D projection, a
+  `FlameForward` trait decouples the optimizer from the full model
+  (`MockFlameForward` for fast deterministic tests), `fit_landmarks` runs
+  steepest descent with a central-difference-estimated gradient (plain
+  gradient descent, not Gauss-Newton — no residual Jacobian, normal
+  equations, or damping term). **v0.1.2:** added `FlameLandmarkFitter` (a
+  landmark-specialised forward pass keeping the finite-difference loop
+  proportional to landmark count rather than vertex count); fixed
+  `FittingError::CameraProjectionFailed` to be actually reachable
+  (previously declared but never constructed — dead code — so a fit where
+  zero landmarks project in front of the camera silently proceeded on a
+  degenerate projection); added `FittingResult::n_visible_landmarks: usize`.
 - ✅ **Dynamic landmark tracking** — per-frame 3D landmark estimation
 - ✅ **Blend shape solver** — least-squares blend shape coefficient solver
 - ✅ **Rigid alignment** — Procrustes alignment to canonical pose
@@ -129,7 +199,10 @@ Currently none.
 ## 📋 Planned (future versions)
 - ✅ **OBJ export** (`Mesh::export_obj()`)
 - ✅ **PLY export** (`Mesh::export_ply()`)
-- ⬜ Support for exporting with UV coordinates (if loaded)
+- ✅ **Export with UV coordinates (if loaded)** — `MeshExportConfig::export_uv`
+  (default `true`) writes `vt` lines + `f v/vt/vn` faces in OBJ and `s`/`t`
+  vertex properties in PLY whenever `uv_coords` matches the vertex count;
+  set it `false` to omit UVs even when present.
 
 ### Spatial Search
 - ✅ **KD-tree integration** (using `kiddo` crate)
@@ -147,10 +220,18 @@ Currently none.
   - Priority: Medium (CPU renderer is fast enough for most use cases)
 
 ### Advanced FLAME Features
-- ⬜ **UV texture mapping** support
-  - Load `texture_data_*.npy` files
-  - UV coordinate interpolation
-  - Texture map rendering
+- ✅ **UV coordinate interpolation and texture sampling** (v0.1.1) — see
+  "UV & Texture Pipeline (v0.1.1)" above (`uv.rs`, `uv_texture.rs`,
+  `texture_baking.rs`, `face_atlas.rs`).
+  - ⬜ **Remaining gap:** loading FLAME's own official `texture_data_*.npy`
+    files specifically — the infrastructure above samples/bakes textures
+    generically but has no loader for that particular FLAME asset format.
+- ✅ **`io::REQUIRED_NPY_FILES`** — new in v0.1.2: the single source of truth
+  for the 8 `.npy` filenames `load_flame_model` requires. Previously
+  `oxigaf`'s `verify_assets` hardcoded its own, disagreeing list that used
+  the wrong names for 3 files and omitted `lbs_weights.npy` entirely, so a
+  model directory missing the skinning weights was reported as complete;
+  it now iterates this constant instead.
 - ✅ **estimate_pitch_from_vertical** — reference-based geometric foreshortening
   solve in `pose_estimation.rs` (`PitchReference` supplies the model-space
   upper/lower landmark-group centroids plus a weak-perspective scale; the
@@ -200,9 +281,13 @@ Currently none.
   - Full FLAME forward pass on GPU
   - Target: <1ms for 5023 vertices
   - Benefit: Reduce CPU→GPU transfer overhead in training loop
-- ⬜ **Multi-resolution mesh support**
-  - Decimated FLAME variants (1K, 2.5K, 10K vertices)
-  - Adaptive LOD based on distance
+- ✅ **Multi-resolution mesh decimation** — `multiresolution.rs`'s
+  `MeshDecimator`/`DecimationConfig` (QEM edge collapse) produce a decimated
+  mesh at any target vertex count on demand, covering the "1K/2.5K/10K
+  variants" use case generally rather than as fixed pre-baked assets.
+  - ⬜ **Remaining gap:** adaptive LOD *selection* at render time based on
+    camera distance — this crate provides the decimator, not a runtime LOD
+    switcher.
 - ✅ **Cached computation results**
   - `joint_cache: Mutex<HashMap<u64, Vec<[f32; 3]>>>` in `FlameModel`
   - `compute_shape_hash(shape) -> u64` (FNV-style hash)
@@ -223,9 +308,18 @@ Currently none.
   - Private helpers: `axis_angle_to_quat`, `quat_slerp`, `quat_to_axis_angle`
   - Handles: near-zero rotation, antiparallel quaternions, dimension mismatch errors
   - 19 new tests including 2 proptest property-based tests
-- ⬜ **Expression library**
-  - Predefined expressions (smile, frown, surprise, etc.)
-  - Load from canonical expression dataset
+- ✅ **Expression library (placeholder presets)** —
+  `ExpressionLibrary::placeholder_expressions()` (`expressions.rs`; renamed
+  from `default_expressions()` in v0.1.2, which is now `#[deprecated]`)
+  provides named presets: smile, grin, frown, surprised, angry, sad,
+  disgusted, fearful, winking, open_mouth. **Caveat, by design:** these are
+  hand-authored, illustrative coefficients — not fitted to any FLAME
+  expression basis — tagged `ExpressionProvenance::Placeholder` so callers
+  can detect this at runtime via `has_placeholders()`.
+  - ⬜ **Remaining gap:** sourcing real, fitted coefficients from a canonical
+    expression dataset. The fitting path already exists
+    (`NamedExpression::fit_to_basis` + `ExpressionLibrary::to_json_string`/
+    `from_json_file`); only the canonical reference data is missing.
 
 ### Integration
 - ✅ **Trait for oxigaf-diffusion integration** (`traits.rs`)
@@ -249,30 +343,55 @@ Currently none reported.
 
 ## 📊 Current Status
 
-### Implementation: ~97% complete
+### Implementation: ~98% complete
 - ✅ Core LBS algorithm: 100%
-- ✅ Normal map rendering: 100% (CPU), 0% (GPU)
+- ✅ Normal map rendering: 100% (CPU); 0% (GPU — not implemented in this
+  crate, see `oxigaf-render` for the GPU rasterizer)
 - ✅ Mesh sampling: 100%
-- ✅ SIMD optimizations: 100%
+- ✅ SIMD optimizations: 100% (functionality complete; only exercised when
+  built with `simd` on a nightly compiler — see Statistics below)
 - ✅ Parallel processing: 100%
-- ✅ Model format support: 100% (.npy ✅, .safetensors ✅)
+- ✅ Model format support: 100% (.npy, .safetensors always available;
+  `FlameSequence` NPZ loading behind the `npz` feature — reader only, no
+  writer)
 - ✅ Sequence loading: 100% (FlameSequence with LRU cache)
-- ✅ Mesh export: 100% (OBJ + PLY binary LE)
-- ✅ Static landmarks: 100% (`landmarks.rs`, 68 landmarks, 8 groups, 32 tests)
-- ✅ GPU buffer export: 100% (`gpu_buffers.rs`, padded f32/u32 buffers, bytemuck, 18 tests)
-- ⬜ Advanced FLAME features: 60% (static landmarks + dynamic landmarks + GPU buffers done, UV/GPU rasterizer pending)
+- ✅ Mesh export: 100% (OBJ + PLY binary LE, including UV coordinates when
+  present — `MeshExportConfig::export_uv`)
+- ✅ Static + dynamic landmarks: 100% (`landmarks.rs`, `dynamic_landmarks.rs`)
+- ✅ GPU buffer export: 100% (`gpu_buffers.rs`, padded f32/u32 buffers, bytemuck)
+- ✅ Avatar rigging & expression system: 100% (`avatar_rig.rs` plus 8
+  expression-related modules — presets are illustrative placeholders, not
+  fitted; see the "Expression library" caveat above)
+- ✅ Mesh processing suite: 100% (boolean/repair/smoothing/subdivision/
+  morphing/analysis, plus QEM decimation)
+- ✅ Geometry & statistical tools: 100% (`heat_geodesic` is the real
+  Crane et al. heat method as of v0.1.2, not an approximation; spectral
+  analysis, symmetry detection, shape-space statistics)
+- ✅ UV & texture pipeline: ~95% (parameterisation, sampling, atlas,
+  baking, albedo, SH lighting all done; loading FLAME's official
+  `texture_data_*.npy` files specifically is not — see above)
+- ✅ Pose estimation & landmark fitting: 100%
+  (`FittingError::CameraProjectionFailed` now reachable as of v0.1.2)
+- ✅ Gaze control: 100% (`gaze_controller/`)
+- ⬜ GPU-accelerated LBS: 0% (not implemented in this crate)
+- ⬜ WASM compatibility: 0% (not attempted)
 
-### Tests: 2,582 `#[test]`-attributed tests in source
+### Tests: 2,589 passed, 0 failed
 
-The count that actually compiles depends on features/toolchain
-(`tests/simd_tests.rs` is `nightly`-gated and contributes 0 on a stable
-compiler); rustdoc doctests are separate and not counted here.
+Measured via `cargo nextest run -p oxigaf-flame --all-features --no-fail-fast`
+(2,581 with default features — the gap is `parallel`/`npz`-gated tests).
+`tests/simd_tests.rs` needs both the `simd` feature and a `nightly` compiler,
+so it contributes 0 either way on the stable toolchain this was measured
+with. Doctests run separately and aren't included in the 2,589 above: 39
+passed via `cargo test --doc -p oxigaf-flame --all-features`.
 
 The category breakdown below is the original v0.1.0 core count (280) and
-predates the much larger v0.1.1 feature set (mesh processing, geometry/
-statistical tools, UV/texture pipeline, motion/fitting utilities, avatar
-rigging — see "Completed (v0.1.1)" above), which accounts for most of the
-growth to 2,582 and is not broken out per-category here:
+predates the much larger v0.1.1/v0.1.2 feature set (mesh processing,
+geometry/statistical tools, UV/texture pipeline, motion/fitting utilities,
+avatar rigging, gaze control — see "Completed (v0.1.1)" and
+"Completed (from plan)" above), which accounts for most of the growth to
+2,589 and is not broken out per-category here (the "Doc tests: 16" row
+below is this same historical v0.1.0 snapshot — current doc tests: 39, above):
 
 - ✅ Unit tests: 43 (in `src/`)
 - ✅ Doc tests: 16
@@ -320,7 +439,7 @@ growth to 2,582 and is not broken out per-category here:
 | Sequence loading | ⬜ Planned | ✅ **Done** (v0.1.0) | `sequence.rs` (1,351 lines) |
 | Mesh export | ⬜ Planned | ✅ **Done** (v0.1.1) | `Mesh::export_obj()`, `Mesh::export_ply()` |
 | KD-tree | ⬜ Planned | ✅ **Done** | `build_kdtree()` + `nearest_vertex_in_tree()` (kiddo crate) |
-| UV mapping | ⬜ Optional | ⬜ Not started | Only needed for texture rendering |
+| UV mapping | ⬜ Optional | ✅ **Done** (v0.1.1) | `uv.rs` (LSCM parameterisation), `uv_texture.rs` (sampling), `texture_baking.rs`, `face_atlas.rs`; loading FLAME's official `texture_data_*.npy` files specifically remains ⬜ |
 | Landmarks | ⬜ Optional | ✅ **Done** | `landmarks.rs` (386 lines), 68 landmarks, 8 groups, 32 tests |
 | Vertex masks | ⬜ Optional | ✅ **Done** | `vertex_mask.rs`, 8 FaceRegion variants, geometric classification, 12 tests |
 | GPU buffer export | ⬜ Planned | ✅ **Done** | `gpu_buffers.rs`, padded f32/u32 buffers, bytemuck, degenerate detection, 18 tests |
@@ -339,7 +458,9 @@ growth to 2,582 and is not broken out per-category here:
 
 **Low Priority:**
 7. ⬜ GPU normal map renderer
-8. ⬜ UV mapping
+8. ✅ ~~UV mapping~~ — Done (v0.1.1: `uv.rs`, `uv_texture.rs`,
+   `texture_baking.rs`, `face_atlas.rs`); loading FLAME's official
+   `texture_data_*.npy` files specifically remains a gap
 9. ✅ ~~Landmarks~~ — Done (`landmarks.rs`, 386 lines, 68 landmarks, 8 `LandmarkGroup` variants, 32 tests)
 10. ✅ ~~Dynamic landmarks~~ — Done (`dynamic_landmarks.rs`, 295 lines, pose-dependent contours, 25 tests)
 
@@ -396,6 +517,15 @@ growth to 2,582 and is not broken out per-category here:
 - Dynamic (pose-dependent) contour landmarks: `DynamicLandmarkExtractor`, `ContourVertexChains::default_flame()`, `Mesh::extract_dynamic_landmarks()`, 25 tests ✅
 - GPU buffer export: `GpuMeshBuffers` with padded f32/u32 arrays, `GpuBufferConfig`, `Mesh::to_gpu_buffers()`, bytemuck byte accessors, degenerate face detection, normal recomputation, 18 tests ✅
 
+**Production-ready additions since original plan (v0.1.2):**
+- Real heat-method geodesics: `heat_geodesic` now implements Crane, Weischedel & Wardetzky (2013) instead of the v0.1.1 approximation, plus `heat_geodesic_multi`/`heat_time_step`/`geodesic_center_sampled` ✅
+- Landmark-fitting correctness: `FittingError::CameraProjectionFailed` actually reachable, `FittingResult::n_visible_landmarks`, and the new `FlameLandmarkFitter` for landmark-proportional (not vertex-proportional) fitting cost ✅
+- Lighting validation: `LightingError::InvalidFaceIndex`, and `shade_mesh_directional`/`shade_mesh_multi_light` now reject out-of-range light colours instead of proceeding unvalidated ✅
+- Decimation default fix: `DecimationConfig::default()` no longer always rejects (`target_vertex_count` `0` → `usize::MAX`) ✅
+- Honest expression-preset naming: `ExpressionLibrary::placeholder_expressions()` (deprecates `default_expressions()`) ✅
+- Asset verification correctness: `io::REQUIRED_NPY_FILES` as the shared source of truth consumed by `oxigaf`'s `verify_assets` (previously checked the wrong filenames and missed `lbs_weights.npy`) ✅
+
 **Not yet ready for:**
-- GPU-accelerated LBS / normal map rendering
-- UV texture mapping
+- GPU-accelerated LBS / normal map rendering (not implemented in this crate — see `oxigaf-render`)
+- Loading FLAME's official `texture_data_*.npy` texture files directly (generic UV/texture sampling infrastructure exists; see "UV & Texture Pipeline" above)
+- WASM builds (not attempted)

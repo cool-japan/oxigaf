@@ -2,6 +2,18 @@
 
 Multi-view diffusion model inference for GAF.
 
+**Version 0.1.2** (2026-08-28) — **Status: Alpha.** The multi-view
+generation pipeline (Latent Upsampler + IP-Adapter + CFG) and the wider
+sampler/attention/conditioning/editing/analysis toolkit below (see
+[API Overview](#api-overview)) are implemented and covered by 3213 passing
+tests plus 51 passing doc tests (1 ignored), `--all-features`. A
+PyTorch→SafeTensors weight-conversion script and Python cross-validation are
+not yet built (bring your own converted weights) — see [TODO.md](TODO.md)
+for the itemized state. The public API is still settling: this release alone
+made ten breaking signature/semantics changes — read
+["Breaking Changes in 0.1.2"](#breaking-changes-in-012) before upgrading
+from 0.1.1.
+
 ## Overview
 
 This crate implements the multi-view diffusion pipeline for Gaussian Avatar Framework (GAF):
@@ -23,8 +35,46 @@ Output is **256×256 by default** (`DiffusionConfig::image_size`); setting
 
 **v0.1.2 — what's included:**
 - Multi-view generation pipeline (Latent Upsampler + IP-Adapter + CFG) — 256×256 by default, 512×512 with the upsampler enabled
-- 66 tests (all passing)
+- 3213 unit/integration tests (all passing) + 51 passing doc tests (1 ignored)
 - Benchmarks: standard vs Flash Attention, sequence lengths, DDIM scheduler
+
+## Breaking Changes in 0.1.2
+
+Full detail (and the rest of the workspace's changes) is in the top-level
+[CHANGELOG.md](../../CHANGELOG.md#012---2026-08-28). The three most likely
+to affect existing callers of this crate:
+
+- **`MultiViewDiffusionPipeline::begin_session_from_latents`** now takes a
+  single `SessionRequest` instead of seven positional arguments (four of
+  them `&Tensor`, and therefore trivially transposable at a call site) — see
+  "Custom Camera Poses" below for the shape of the old-style call this
+  replaces.
+- **`dpm_plus_plus_2m_step`** now takes `prev_x0: Option<&[f32]>` and
+  `h_prev: Option<f32>` instead of a single `prev_noise_pred` (6 → 7
+  arguments) — the DPM-Solver++ 2M multistep formula needs the previous
+  denoised sample and step size, not just the previous noise prediction.
+- **`image_editing::sdedit::ImageEditError` was removed.** `sdedit` now
+  returns the parent `ImageEditingError` directly instead of a separate enum
+  bridged in via `From`; old variants map onto it as `InvalidStrength` /
+  `InvalidParam` → `InvalidConfig`, `InvalidMask` → `InvalidImage`,
+  `TimestepOutOfRange` → `NoiseLevelOutOfRange`, and `DimensionMismatch`'s
+  `got` field is renamed to `actual`.
+
+Also, in brief: `flash_attention` is no longer a `default` feature (see
+"Features" below — this is the change most likely to surprise an existing
+build); `compute_distillation_loss`, `DistillationStep::aggregate_losses`,
+`pad_to_square`, `flip_horizontal`, `flip_vertical`, and `softmax_over_dim`
+now return `Result` instead of an infallible value;
+`InversionTrajectory::x_0()` / `x_t()` now return `Option<&[f32]>`;
+`DdimInversionConfig::refinement_threshold` is now compared against an
+RMS (not raw L2) reconstruction error, so a pinned threshold value means
+something different and should be re-tuned; `FlowStats::divergence_estimate`
+was renamed to `mean_squared_norm`; `EditMask::all_ones` now takes
+`(height, width)` (matching `EditMask::new`); `fm_interpolate` /
+`fm_target_velocity`'s `Linear` path now honors a non-zero
+`FlowMatchingConfig::sigma_min`; and `candle-core`/`candle-nn` moved to the
+`oxicandle-core`/`oxicandle-nn` COOLJAPAN fork (0.10 → 0.11 — the dependency
+*keys* are unchanged, so no source changes are needed for that one).
 
 ## Installation
 
@@ -41,6 +91,7 @@ oxigaf-diffusion = "0.1"
 | `flash_attention` | Memory-efficient O(N) attention, opt-in — only above the score-matrix budget (see below) |
 | `mixed_precision` | FP32↔BF16/FP16 conversion utilities; not yet wired into the inference path (see below) |
 | `gpu_debug` | NaN/Inf debug hooks (`debug_hooks::assert_finite`, `DebugConfig`) |
+| `parallel` | Data-parallel CPU work via `rayon` (`dep:rayon`) — currently drives the per-sample ControlNet feature injection in `unet.rs`. Purely a performance switch: every parallelised routine is arithmetic-identical to its serial form |
 
 ### Feature Details
 
@@ -72,6 +123,13 @@ oxigaf-diffusion = "0.1"
 - **`gpu_debug`**: Turns on NaN/Inf assertions (`debug_hooks::assert_finite`,
   configured via `DebugConfig`) during the diffusion forward pass, useful
   for diagnosing numerical instability
+
+- **`parallel`**: Enables `rayon`-backed data parallelism for CPU work.
+  Currently wired into `unet.rs`'s per-sample ControlNet feature injection
+  (the batch dimension is embarrassingly parallel: each sample reads only
+  its own slice plus a shared, immutable condition cache). Every
+  parallelised routine is arithmetic-identical to its serial form, so
+  enabling this feature never changes results, only throughput.
 
 ### GPU / BLAS Backends
 
@@ -141,7 +199,7 @@ fn save_tensor_as_png(t: &Tensor, width: u32, height: u32, path: &str) -> Result
 fn main() -> Result<(), DiffusionError> {
     let device = Device::Cpu;
 
-    // Configure diffusion pipeline. DiffusionConfig has ~25 fields covering
+    // Configure diffusion pipeline. DiffusionConfig has 30 fields covering
     // U-Net architecture, attention, and CFG — override what you need and
     // take the rest from Default (num_views: 4, guidance_scale: 3.0, ...).
     let config = DiffusionConfig {
@@ -194,10 +252,12 @@ fn main() -> Result<(), DiffusionError> {
 flattened 4×3 world-to-camera extrinsics matrix (9 rotation floats, then 3
 translation floats), not a struct of azimuth/elevation/distance. Build it
 from `oxigaf_flame::Camera` the same way `oxigaf-trainer`'s
-`cameras_to_tensor` (`src/diffusion_target.rs`) does. This needs
-`oxigaf-flame` and `nalgebra` as direct dependencies too (both are already
-transitive dependencies of `oxigaf-diffusion`, but Cargo does not expose a
-crate's own dependencies to its downstream users):
+`cameras_to_tensor` (`src/diffusion_target.rs`) does. Neither `oxigaf-flame`
+nor `nalgebra` is a dependency of `oxigaf-diffusion` itself (verified via
+`cargo tree -p oxigaf-diffusion --all-features`: neither appears) — add both
+as direct dependencies in your own `Cargo.toml` to build camera poses this
+way, the same way `oxigaf-trainer` already does (it depends on
+`oxigaf-diffusion`, `oxigaf-flame`, and `nalgebra` side by side):
 
 ```rust
 use candle_core::{DType, Device, Tensor};
@@ -268,18 +328,20 @@ fn main() -> Result<(), DiffusionError> {
 ### DDIM Scheduler Configuration
 
 ```rust
-use oxigaf_diffusion::{DdimScheduler, PredictionType};
+use oxigaf_diffusion::{DdimScheduler, DiffusionError, PredictionType};
 
-fn main() {
+fn main() -> Result<(), DiffusionError> {
     // Create a DDIM scheduler (SD-2.1 defaults: scaled-linear beta schedule,
     // 1000 training timesteps). `new` is infallible — it only builds the
-    // alpha-cumprod table; call `set_timesteps` to pick the inference stride.
+    // alpha-cumprod table; `set_timesteps` picks the inference stride and is
+    // fallible (errors on 0 steps), so its `Result` needs handling.
     let mut scheduler = DdimScheduler::new(1000, PredictionType::VPrediction);
-    scheduler.set_timesteps(50);
+    scheduler.set_timesteps(50)?;
 
     let timesteps = scheduler.timesteps();
     println!("Using {} inference steps", timesteps.len());
     println!("Timesteps: {:?}", timesteps);
+    Ok(())
 }
 ```
 
@@ -333,6 +395,24 @@ fn main() -> Result<(), DiffusionError> {
     Ok(())
 }
 ```
+
+## API Overview
+
+The crate has grown to 72 source files (~65,000 lines of code) across the
+areas below. `pipeline.rs` + `config.rs` are the integration surface most
+callers need; everything else is available for advanced use (custom
+samplers, training-time distillation losses, latent-space analysis tooling).
+
+| Area | Key types / entry points | Modules |
+|------|---------------------------|---------|
+| Core pipeline | `MultiViewDiffusionPipeline`, `SessionRequest`, `MultiViewOutput`, `DiffusionConfig`, `AttentionBackend` (Standard/Flash/Sliced, config-selectable) | `pipeline.rs`, `config.rs` |
+| Schedulers & samplers | `DdimScheduler`, DDPM/adaptive/consistency-model/flow-matching/rectified-flow/stochastic-interpolant samplers, `MultiStepSampler` (`dpm_plus_plus_2m_step`, `plms_step`) | `scheduler.rs`, `ddpm_sampler.rs`, `adaptive_sampling.rs`, `consistency_model.rs`, `flow_matching.rs`, `rectified_flow.rs`, `stochastic_interpolant.rs`, `multi_step_sampler/`, `step_scheduler.rs` |
+| Attention | `FlashAttention` (feature-gated), `SlicedAttention`, `fused_attention`, `attention_masking`, `attention_viz`, `KVCache`, ToMe `token_merging` | `attention.rs`, `flash_attention.rs`, `sliced_attention.rs`, `fused_attention.rs`, `attention_masking.rs`, `attention_viz.rs`, `kv_cache.rs`, `token_merging.rs` |
+| Conditioning & guidance | CFG, classifier guidance, identity/avatar/text conditioning, `ControlNet`, `LoRA`, prompt weighting/scheduling, unconditional dropout | `cfg_guidance.rs`, `classifier_guidance.rs`, `identity_conditioning.rs`, `avatar_conditioning.rs`, `text_conditioning.rs`, `controlnet.rs`, `lora_adapter.rs`, `guidance_rescaling.rs`, `prompt_weighting.rs`, `prompt_scheduler.rs`, `uncond_dropout.rs` |
+| Image editing & inversion | SDEdit (two overlapping APIs sharing `ImageEditingError`), DDIM inversion (`InversionTrajectory`), image variations/preprocessing, style transfer | `image_editing/` (`mod.rs`, `sdedit.rs`), `inversion.rs`, `image_variations.rs`, `image_preprocessing.rs`, `style_transfer.rs` |
+| Distillation & training support | Score distillation (SDS), `compute_distillation_loss` (CM/LCM-style), score matching, prior preservation | `distillation_loss.rs`, `score_distillation.rs`, `score_matching.rs`, `prior_preservation.rs` |
+| Latent-space analysis | Latent blend/interp/walk/PCA analysis, denoising trajectory/visualisation, noise-schedule/-prediction analysis, view-consistency checks | `latent_blend.rs`, `latent_interp.rs`, `latent_walk.rs`, `latent_space_analysis.rs`, `denoising_trajectory.rs`, `denoising_viz.rs`, `noise_schedule_analysis.rs`, `noise_prediction_analysis.rs`, `multi_view_consistency.rs`, `cross_frame_consistency.rs` |
+| Performance & serving | Mixed precision (not yet wired — see "Features"), `numerics` (stable softmax/layer-norm), `quantization`, `weight_offload`, `sequential_vae`, `streaming`, `batch_gen`, `dynamic_views`, `resolution`, `model_variants`, `profiling`, `debug_hooks` | `mixed_precision.rs`, `numerics.rs`, `quantization.rs`, `weight_offload.rs`, `sequential_vae.rs`, `streaming.rs`, `batch_gen.rs`, `dynamic_views.rs`, `resolution.rs`, `model_variants.rs`, `profiling.rs`, `debug_hooks.rs` |
 
 ## Pipeline Components
 
@@ -446,9 +526,12 @@ output resolution.
 
 ## Statistics
 
-- **Tests**: 66 (all passing)
-- **Source files**: `attention.rs`, `camera.rs`, `clip.rs`, `flash_attention.rs`, `pipeline.rs`, `scheduler.rs`, `unet.rs`, `upsampler.rs`, `vae.rs`
-- **Benchmarks**: `diffusion_bench.rs`, `flash_attention_bench.rs`
+- **Tests**: 3213 unit/integration tests (`cargo nextest run --all-features`,
+  all passing: 3075 in the library target + 138 across 8 integration-test
+  files) + 51 passing doc tests (`cargo test --doc --all-features`, 1
+  ignored)
+- **Source files**: 72 (~65,000 lines of code) — see [API Overview](#api-overview) above for the grouping
+- **Benchmarks**: `diffusion_bench.rs` (requires the `flash_attention` feature), `flash_attention_bench.rs`
 
 ## Documentation
 

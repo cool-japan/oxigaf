@@ -5,11 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.1.2] - Unreleased
+## [0.1.2] - 2026-08-28
 
 > **Migration notes.** Most of what follows is additive or affects only
-> advanced/internal APIs. Two changes are worth reading before you upgrade:
+> advanced/internal APIs. Four changes are worth reading before you upgrade —
+> the first two affected *every* training run on the previous release:
 >
+> - **Every 0.1.1 training run optimized a hardcoded L2 photometric loss,
+>   regardless of `LossConfig` weights.** `Trainer::compute_gradients` built
+>   the image-space gradient fed to the backward pass as a fixed
+>   `2.0 * (rendered - target) / num_views`; `w_l1`, `w_ssim` and
+>   `w_ms_ssim` only ever changed the *logged* loss value, never the
+>   direction the optimizer actually descended — see *Fixed → oxigaf-trainer*
+>   below. Retrain if you were relying on a non-default photometric loss mix.
+> - **Every 0.1.1 model with `sh_degree >= 1` trained with a systematically
+>   incomplete position gradient.** The backward rasterizer shader
+>   (`preprocess_bwd.wgsl`) differentiated the projection path but not the
+>   view-dependent spherical-harmonics color path, both of which depend on
+>   Gaussian position — see *Fixed → oxigaf-render* below. Retraining is the
+>   only remedy; there is no way to recover the missing gradient signal from
+>   an already-trained model.
 > - **PLY files with `sh_degree >= 1` written by `GaussianModel::save_ply`
 >   (`oxigaf-render`) before this release load with permuted higher-order SH
 >   coefficients.** The `f_rest_*` property order changed to
@@ -110,6 +125,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Result<[f32; 2], _>` instead of `Result<f32, _>`. The arity change means
   old call sites fail to compile rather than silently compiling against a
   changed meaning.
+- **`heat_geodesic` is now a real implementation of the heat method** (Crane,
+  Weischedel & Wardetzky 2013): solving `(M + t·Lc)u = δ_source`, normalizing
+  `∇u`, then a Poisson solve — both via Jacobi-preconditioned CG — replacing
+  what its own 0.1.1 doc comment called "a simplified approximation, not the
+  full heat method of Crane et al." Signature unchanged; returned distances
+  differ (more accurate) for the same inputs.
+- **`geodesic_center` no longer searches exhaustively by default.** An empty
+  `sample_vertices` previously searched every vertex (`O(V·(E + V log V))` —
+  thousands of Dijkstra runs, minutes on a 5023-vertex FLAME head); it now
+  selects a farthest-point-sampled subset of `DEFAULT_CENTER_SAMPLES` (64)
+  candidates instead — a good approximation at a fixed, small cost, but no
+  longer exact. Callers that relied on the old exhaustive behavior must pass
+  `(0..mesh.n_vertices()).collect()` explicitly, or use
+  `geodesic_center_sampled` to choose their own candidate budget.
 
 #### oxigaf-render — signature and semantics changes
 
@@ -149,6 +178,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `SyncReport` gained `buckets` and `gradient_compression` fields
   (`data_parallel.rs`); `estimated_bandwidth_mb` changed meaning — see
   *Added* below for the new fields' semantics.
+- **`TrainingConfig` gained four new fields** — `lr_schedule:
+  LrScheduleConfig`, `gradient_clip: GradientClipConfig`,
+  `gradient_accumulation_steps: u32`, `ema_decay: Option<f32>` — breaking
+  external `TrainingConfig { .. }` struct-literal construction that doesn't
+  list them. All four carry `#[serde(default...)]`, so TOML/JSON configs
+  serialized before they existed still deserialize unchanged; only direct
+  Rust construction breaks.
+- **`LossConfig` gained `w_scale_reg_max_scale: f32`**
+  (`#[serde(default = ...)]`, defaulting to
+  `crate::loss::MAX_REASONABLE_WORLD_SCALE`) — same struct-literal-breaking
+  / deserialization-safe pattern.
 
 #### oxigaf-cli — signature and semantics changes
 
@@ -169,6 +209,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `RenderArgs::width` / `height` are now `Option<u32>` instead of `u32` (the
   render command now derives a default from the source model/camera instead
   of hardcoding one).
+
+#### oxigaf — signature and semantics changes
+
+- `pipeline::export<P: AsRef<Path>>(model_path: P, output_path: P, ...)` /
+  `render_from_file<P>(..., output_path: P, ...)` /
+  `quick_train<P>(..., output_dir: P, ...)` each gained a second, independent
+  generic parameter (`P`, `Q`), so the two path arguments no longer need to
+  be the same concrete type.
 
 ### Fixed
 
@@ -226,6 +274,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   correctly-valued but permuted higher-order SH coefficients (`sh_degree >=
   1`); re-export them. Covered by a new regression test,
   `test_ply_save_writes_f_rest_channel_major`.
+- **`rasterize_bwd.wgsl`'s backward tile kernel could accumulate a tile's
+  gradient sum onto the wrong Gaussian.** The reverse-traversal loop bound
+  was read per-pixel from `out_n_contrib[pixel_idx]`, so different threads in
+  the same 16×16 workgroup ran the loop a different number of times while
+  the loop body contained `workgroupBarrier()` calls — non-uniform control
+  flow around a barrier, which WGSL requires to be uniform. Thread 0 flushed
+  the 256-thread gradient sum onto whichever Gaussian *it* was visiting at a
+  given iteration, attributing other threads' contributions to that same
+  Gaussian even when they were processing a different one (or none). Fixed
+  by computing a single workgroup-uniform loop bound (`tile_end`, the max of
+  all 256 per-pixel stopping indices via tree reduction +
+  `workgroupUniformLoad`), with per-thread validity now expressed as a
+  `contributes` mask instead of a per-thread trip count.
+- **`preprocess_bwd.wgsl` omitted the position gradient through
+  view-dependent spherical-harmonics color, for every `sh_degree >= 1`
+  model.** The forward pass evaluates SH color at
+  `dir = normalize(pos - cam_pos)`, so the loss depends on `pos` through
+  color as well as through projection; the backward shader only
+  differentiated the projection path, matching a term present in the
+  reference 3DGS implementation but missing here. Fixed by adding the
+  `∂L/∂color → ∂L/∂dir → ∂L/∂pos` chain. See the migration note at the top
+  of this section — retraining is the only way to recover the missing
+  signal.
+- **`rasterize_bwd.wgsl` omitted the background's contribution to
+  `∂L/∂α`.** The forward pass composites `color += T_final · background`
+  after the last Gaussian, so every Gaussian's opacity influences the loss
+  both through its own blend weight and through `T_final`; the backward pass
+  only differentiated the first path, biasing training against any
+  non-black background. Fixed by adding the
+  `(−T_final / (1 − α)) · (background · ∂L/∂color)` term; covered by the new
+  `test_gpu_self_consistent_nonzero_background`.
+- **`preprocess_bwd.wgsl` could write NaN gradients for culled Gaussians.**
+  The kernel divides by `tz = -p_view.z` in its projection-Jacobian terms
+  for every Gaussian unconditionally; for one culled at/behind the near
+  plane, `tz <= 0` produces `inf`, and `inf * 0` (its zero incoming 2D
+  gradient) is NaN, written straight into `grad_positions`. Fixed by a cull
+  guard reproducing the forward near/far test that writes exact zeros
+  instead.
+- **`rasterize_bwd.wgsl`'s Gaussian-skip test let a NaN `power` through as a
+  live contribution**, since the old reject-test
+  (`power > 0.0 || power < -4.0`) is `false` on both sides for NaN, risking
+  NaN contaminating a whole tile's shared-memory reduction. The rewritten
+  `contributes` accept-test (`power <= 0.0 && power >= -4.0`) excludes NaN
+  explicitly. (Minor, and only reachable together with the two fixes above.)
+- **`gpu_gradient_verify.rs`'s own `summarize_errors`/`median_error` helpers
+  previously reported a "clean" `0.0` error for a NaN, `Infinity`, or empty
+  error set instead of failing** — meaning a regression as severe as the
+  four backward-shader bugs above was not guaranteed to be caught by the
+  existing finite-difference test suite. Now explicitly checked (new
+  `test_median_error_nan_propagates`,
+  `test_summarize_errors_nan_fails_every_threshold`/`_infinity_fails`/
+  `_empty_is_not_a_silent_pass`). The FD tolerance itself (30% outlier
+  allowance, `err > 0.1` per-element) is unchanged.
 
 #### oxigaf-trainer — bug fixes
 
@@ -243,6 +344,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   where consecutive stages left an uncovered gap between them; both now
   return a validation error instead of producing a schedule that silently
   skips or inverts a training stage at runtime.
+- **The trainer's backward pass now differentiates the objective it actually
+  reports, instead of a hardcoded L2 loss.** `Trainer::compute_gradients`
+  previously built the image-space gradient fed to `Rasterizer::backward` as
+  `2.0 * (rendered - target) / num_views` unconditionally — `LossConfig`'s
+  `w_l1`, `w_ssim` and `w_ms_ssim` only changed the *logged* loss value,
+  never the direction the optimizer descended. It now calls the new
+  `image_gradient::photometric_pixel_gradient` with a `PhotometricSpec`
+  built from the installed `LossComputer`'s actual config, SSIM window and
+  MS-SSIM scale weights, so the reported and optimized objectives cannot
+  drift apart. See the migration note at the top of this section.
+- **Position/scale/opacity regularization losses now actually produce
+  gradients.** `w_position_reg`, `w_scale_reg` and `w_opacity_reg` were
+  computed as scalar values for logging (`LossOutput`) but never
+  differentiated into the parameter gradients the optimizer applies — in
+  particular `Gradients::offset` was never written by anything, so
+  `GaussianModel::local_offsets` never moved during training no matter how
+  `w_position_reg` was set. The new private `add_regularization_gradients`
+  adds the analytic gradients of these three terms directly into
+  `Gradients::offset`/`scale`/`opacity`. `w_normal` and
+  `w_gradient_penalty` remain disconnected from any gradient — this is now
+  a documented limitation (no FLAME mesh is retained by the trainer, no
+  external gradient buffer is threaded through), not a silent gap.
+- **Score-distillation (SDS) training now has a real gradient path.**
+  `SdsLoss` previously exposed only a scalar `compute()` with no way to
+  differentiate it, and `compute_gradients` had no SDS-related code at all,
+  so `use_sds` distillation contributed no gradient beyond the ordinary
+  photometric term. `DiffusionTargetGenerator` gained
+  `compute_sds_gradient` / `compute_sds_gradient_with_horizon`, and
+  `SdsLoss` gained a validated `new(weighting, max_timestep) ->
+  Result<Self, TrainerError>` constructor (rejecting `max_timestep < 2`,
+  which previously divided by zero in the weighting curve);
+  `compute_gradients` now adds the SDS pixel residual — weighted identically
+  to what `SdsLoss` reports — into the backward pass.
 
 #### oxigaf-cli — bug fixes
 
@@ -259,6 +393,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the top of this section.
 - **CLI `convert`'s `.pkl` path now actually works** — see the annotation on
   the `[0.1.0]` `convert` entry below.
+- **`oxigaf export --format gltf` (`export_gltf::export_gltf`) now writes
+  spec-conformant glTF.** It previously put all five accessors onto one
+  buffer view with no `byteStride`, which glTF 2.0 forbids for accessors of
+  differing element size. It now delegates to the new
+  `oxigaf_render::gltf::write_gltf`; signature and `CliError::GltfExport`
+  are unchanged, but the bytes written differ from earlier 0.1.x output.
+  Note: `oxigaf_cli::export::export_gltf` (`ExportStage`, self-contained
+  `.glb`, extension `OXIGAF_gaussians`) remains a separate, third,
+  unconsolidated writer — a deliberate, documented scope limit, not an
+  oversight.
+
+#### oxigaf — bug fixes
+
+- **`pipeline::export` and `pipeline::render_from_file` are no longer no-op
+  stubs.** Both were previously documented in their own doc comments as "a
+  thin validation wrapper" that only checked `model_path.exists()` and
+  otherwise did nothing (`let _ = (output_path.as_ref(), format); Ok(())`),
+  silently returning `Ok(())` without writing any file or rendering
+  anything. `export` now loads the model (`.ply` / `.safetensors`) and
+  writes it via `GaussianModel::save_ply` (`ExportFormat::Ply`), a new
+  Wavefront-OBJ point-cloud writer (`ExportFormat::Obj`), or
+  `oxigaf_render::gltf::write_gltf` (`ExportFormat::Gltf`).
+  `render_from_file` now loads the model, auto-frames a camera from its
+  bounding box, and actually rasterizes and saves an image via
+  `Rasterizer`.
+- **`verify_assets` checked for the wrong `.npy` file names.** Its
+  hardcoded list disagreed with what `oxigaf_flame::io::load_flame_model`
+  actually opens (`shape_dirs.npy`/`exp_dirs.npy`/`J_regressor.npy` vs. the
+  loader's `shapedirs.npy`/`expressiondirs.npy`/`j_regressor.npy`) and
+  omitted `lbs_weights.npy` entirely, so a directory missing the skinning
+  weights was reported as complete. Fixed by iterating the new
+  `oxigaf_flame::io::REQUIRED_NPY_FILES`, the same constant the loader now
+  names each file with.
+
+#### oxigaf-bridge — bug fixes
+
+- **`GafLayerMapper` no longer relies on a hardcoded, enumerated layer
+  table.** The previous implementation built two `HashMap`s per
+  `GafLayerMapper::new()` call by walking an assumed U-Net/VAE/CLIP/Upsampler
+  topology that hardcoded `transformer_layers_per_block = [1, 2, 10, 10]` —
+  which does not match `DiffusionConfig::default()`'s `[1, 1, 1, 1]`
+  (`oxigaf-diffusion/src/config.rs`) — causing `validate_coverage` false
+  negatives (missing transformer blocks) and false positives (nonexistent
+  blocks) against any model built from the default config. The same two
+  `HashMap`s also flattened all four components into one namespace, so
+  entries sharing a prefix (e.g. the VAE encoder's and the CLIP encoder's
+  `encoder/`) could silently overwrite each other. `GafLayerMapper` now
+  performs the ToRSh ⟷ OxiGAF `/` ↔ `.` substitution directly, with a small
+  explicit override table (`GafLayerMapper::add_override`) for names that
+  are genuine exceptions — there are none today. **`num_mappings()`'s
+  meaning changed accordingly**: it now reports the number of explicit
+  overrides registered (`0` on a freshly-created mapper), not a total
+  enumerated layer count as before (the old implementation's own module
+  documentation described enumerating on the order of 2,000 concrete layer
+  paths up front) — any caller that treated its return value as "total GAF
+  layers mapped" needs to stop.
 
 ### Removed
 
@@ -314,6 +504,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   literal repeated at each call site (see the `Rasterizer::from_device` /
   `WorkgroupConfig::from_profile` entries under *Changed* above, which both
   now key off this constant).
+- **`gltf` module** — `write_gltf`, `GltfError`,
+  `EXTENSION_NAME = "OXIGAF_gaussian_splat"`: the single, spec-conformant
+  glTF 2.0 writer, consolidating what were three independently-written,
+  mutually-incompatible glTF emitters in the workspace (this crate had none
+  before; `oxigaf-cli` had two). One buffer view per accessor (glTF 2.0
+  forbids a shared strideless view across differently-sized accessors,
+  which one of the old emitters did), mandatory `min`/`max` on the
+  `POSITION` accessor, and an asset-only document for an empty model.
+- `rasterizer::rasterizer_device_limits`,
+  `rasterizer::RASTERIZER_STORAGE_BUFFERS_PER_STAGE` (= 16),
+  `rasterizer::RASTERIZE_FWD_WORKGROUP_STORAGE_BYTES` (= 17,408) —
+  `Rasterizer::from_device` now validates a caller-supplied `wgpu::Device`'s
+  limits upfront, instead of letting an under-provisioned device fail later
+  as an opaque wgpu pipeline-validation error the first time a pass
+  actually runs.
+- `profiler::GpuTimestampProfiler` — GPU-side pass profiler backed by
+  `wgpu::Features::TIMESTAMP_QUERY` (`REQUIRED_FEATURES`,
+  `DEFAULT_MAX_PASSES = 32`; `new`, `stats`, `period_ns`,
+  `reserved_passes`, `pass_writes`, `resolve`, `collect`, `discard`),
+  complementing the pre-existing CPU-side `PassProfiler`. Paired with new
+  `Rasterizer::enable_gpu_timestamps() -> Result<(), RenderError>`,
+  `Rasterizer::disable_gpu_timestamps()`,
+  `Rasterizer::gpu_timestamps() -> Option<&GpuTimestampProfiler>`.
 
 #### oxigaf-trainer
 
@@ -322,6 +535,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only an aggregate. `estimated_bandwidth_mb` now reflects the
   post-compression transfer size when `gradient_compression` is active,
   rather than always reporting the uncompressed size.
+- `config::LrScheduleConfig` — 6-variant serializable enum (`Fixed`,
+  `WarmupCosine`, `Cosine`, `Step`, `Exponential`, `Cyclic`) bridging to
+  `crate::lr_scheduler::LrScheduler` via `build(total_iterations)` /
+  `validate(total_iterations)`, so LR schedules can now be declared in a
+  config file instead of only constructed programmatically.
+- `config::GradientClipConfig` — serializable selection of a `ClipMode`
+  (`clip_mode()`, `threshold()`, `validate()`), same declarative purpose
+  for gradient clipping.
+- `pruning::GaussianPruner::prune_by_min_scale`,
+  `pruning::prune_to_sparsity(scores, target_sparsity)`,
+  `pruning::apply_mask_to_model(model, mask)`.
+- `synthetic_data::SyntheticGaussianCloud::into_gaussian_model(self,
+  sh_degree: u32) -> GaussianModel` — converts a sampled synthetic cloud
+  into a renderer-ready model, so synthetic data can drive the
+  trainer/renderer end-to-end instead of only exercising isolated sampling
+  code.
+- **`meta_learning_avatar` module** (source at `meta_learning/avatar.rs`) —
+  `GaussianAvatarModel`, the first real `MetaModel` implementation over an
+  actual Gaussian avatar (the only prior implementation, `LinearModel`, was
+  a toy regressor never connected to what the crate trains). Implements
+  `MetaModel::loss_and_grad` via the real rasterizer forward/backward pass;
+  also adds `ParamLayout` (flat-vector packing), `AvatarRenderer` (shared,
+  non-cloneable rasterizer wrapper), `AvatarBatch`.
+- **`image_gradient` module** — backs the hardcoded-loss fix above (see
+  *Fixed*); also exposes `ssim_pixel_gradient`, `ms_ssim_pixel_gradient`,
+  `convolve_separable`, `downsample_2x`/`upsample_adjoint_2x`,
+  `sign_or_zero`, and the mirrored SSIM/MS-SSIM constants (`SSIM_C1`/`C2`,
+  `SSIM_KERNEL_TAPS`/`SIGMA`, `MS_SSIM_*`) for building custom photometric
+  adjoints.
+- `diffusion_target::DDPM_TRAIN_TIMESTEPS: u32 = 1000` — the standard DDPM
+  horizon, now a named constant. `diffusion_target::sds_timestep_weight` is
+  newly `pub` (was a private `fn` in 0.1.1).
+
+#### oxigaf-flame
+
+- `GazeController::synthesize_blinks(&self, duration_steps, seed) -> Vec<f32>`
+  — an instance-method convenience wrapper around the existing
+  `gz_synthesize_blinks` free function. (`gaze_controller` itself, and the
+  rest of its API — `GazeController`, event detection, Listing's-law
+  helpers, I-VT classification, vergence — predates 0.1.1; only its source
+  file was split into a `gaze_controller/` module directory this release,
+  which is not a public-API change.)
+- `heat_geodesic_multi(mesh, sources, n_iter, time_step)` — multi-source
+  heat-method geodesics (`heat_geodesic` now delegates to it for the
+  single-source case); `heat_time_step(mesh) -> f32` — the standard `dt`
+  heuristic (squared mean edge length).
+- `geodesic_center_sampled(mesh, sample_vertices, n_samples, config)` and
+  `DEFAULT_CENTER_SAMPLES: usize = 64` — see the `geodesic_center` behavior
+  change under *Changed* above.
+- `io::REQUIRED_NPY_FILES: &[&str]` — see the `verify_assets` fix under
+  *Fixed → oxigaf* above.
+
+#### oxigaf-bridge
+
+- **Pure-Rust `.pt` / `.pkl` ingest** — new `pickle` module (`value`, `vm`,
+  `torch`, `numpy`, `flame`, `error` submodules) implementing a
+  non-executing Python pickle reader (protocols 0–5: `GLOBAL`, `REDUCE`,
+  `NEWOBJ` and `BUILD` all produce inert data records instead of resolving
+  or calling anything), plus two new crate-root functions built on it.
+  `convert_pytorch_checkpoint(checkpoint, output_dir, target_dtype)` reads a
+  raw PyTorch `.pt` / `.pth` checkpoint directly (no `torch.load`, no
+  Python), splits its tensors into `unet` / `vae` / `clip` / `other` by the
+  same prefixes `scripts/convert_weights.py` recognized, and writes each
+  non-empty group as `<component>.safetensors` with `VarBuilder`-loadable
+  dotted names, returning a `ConversionReport`. `convert_flame_model(model,
+  output_dir)` reads a FLAME `.pkl` head model and writes `v_template`,
+  `faces`, `shapedirs`, `expressiondirs`, `posedirs`, `j_regressor`,
+  `kintree_table` and `lbs_weights` as `.npy`, including the same
+  identity/expression split of `shapedirs` and densification of the
+  SciPy-sparse `J_regressor` that made `scipy` a dependency of the Python
+  script it replaces (`scripts/convert_flame.py`). New examples
+  `convert_pytorch` and `convert_flame_pkl` wrap both as CLI entry points.
+  The Python scripts remain in the repository as a reference/escape hatch,
+  but nothing in the OxiGAF pipeline requires Python, PyTorch, NumPy, or
+  SciPy for this step anymore.
 
 ## [0.1.1] - 2026-06-19
 
