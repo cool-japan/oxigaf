@@ -110,15 +110,9 @@ mod tests {
             opacity: 0.0,
         };
 
-        let model = GaussianModel {
-            gaussians: vec![gaussian],
-            sh_coeffs: vec![0.5, 0.5, 0.5],
-            sh_degree: 0,
-            face_indices: vec![],
-            barycentric: vec![],
-            local_offsets: vec![],
-            is_rigid: vec![],
-        };
+        // `model_from_gaussians` sizes the FLAME binding arrays to the
+        // Gaussian count; a hand-written literal used to leave them empty.
+        let model = model_from_gaussians(vec![gaussian], vec![0.5, 0.5, 0.5], 0);
 
         let camera = create_test_camera((64, 64));
         let target = create_target_image((64, 64));
@@ -162,15 +156,9 @@ mod tests {
             opacity: 0.0,
         };
 
-        let model = GaussianModel {
-            gaussians: vec![gaussian],
-            sh_coeffs: vec![0.5, 0.5, 0.5],
-            sh_degree: 0,
-            face_indices: vec![],
-            barycentric: vec![],
-            local_offsets: vec![],
-            is_rigid: vec![],
-        };
+        // `model_from_gaussians` sizes the FLAME binding arrays to the
+        // Gaussian count; a hand-written literal used to leave them empty.
+        let model = model_from_gaussians(vec![gaussian], vec![0.5, 0.5, 0.5], 0);
 
         let camera = create_test_camera((64, 64));
         let target = create_target_image((64, 64));
@@ -215,15 +203,9 @@ mod tests {
             opacity: 0.0,
         };
 
-        let model = GaussianModel {
-            gaussians: vec![gaussian],
-            sh_coeffs: vec![0.5, 0.5, 0.5],
-            sh_degree: 0,
-            face_indices: vec![],
-            barycentric: vec![],
-            local_offsets: vec![],
-            is_rigid: vec![],
-        };
+        // `model_from_gaussians` sizes the FLAME binding arrays to the
+        // Gaussian count; a hand-written literal used to leave them empty.
+        let model = model_from_gaussians(vec![gaussian], vec![0.5, 0.5, 0.5], 0);
 
         let camera = create_test_camera((64, 64));
         let target = create_target_image((64, 64));
@@ -277,15 +259,7 @@ mod tests {
 
         let sh_coeffs = vec![0.5; 9]; // 3 Gaussians × 3 channels
 
-        let model = GaussianModel {
-            gaussians,
-            sh_coeffs,
-            sh_degree: 0,
-            face_indices: vec![],
-            barycentric: vec![],
-            local_offsets: vec![],
-            is_rigid: vec![],
-        };
+        let model = model_from_gaussians(gaussians, sh_coeffs, 0);
 
         let camera = create_test_camera((64, 64));
         let target = create_target_image((64, 64));
@@ -316,9 +290,17 @@ mod tests {
     }
 
     /// GRADIENT VERIFICATION TEST: Compare analytical vs numerical rotation gradients.
+    ///
+    /// Not `#[ignore]`d: skips itself at runtime via `gpu_available()` when no
+    /// compatible GPU adapter is present, so it still runs (and gates CI) on
+    /// any machine that does have one. A blanket `#[ignore]` let the whole
+    /// suite report green without a single backward shader ever running.
     #[test]
-    #[ignore = "requires GPU hardware"]
     fn test_rotation_analytical_vs_numerical() {
+        if !gpu_available() {
+            return;
+        }
+
         let scene_config = TestSceneConfig {
             num_gaussians: 5,
             resolution: (64, 64),
@@ -366,10 +348,16 @@ mod tests {
     }
 
     /// Test rotation gradients with varying quaternion configurations.
+    ///
+    /// Not `#[ignore]`d: skips itself at runtime via `gpu_available()` when no
+    /// compatible GPU adapter is present.
     #[test]
-    #[ignore = "requires GPU hardware"]
     fn test_rotation_gradients_various_angles() {
         use nalgebra as na;
+
+        if !gpu_available() {
+            return;
+        }
 
         let angles = [
             0.0,
@@ -391,15 +379,7 @@ mod tests {
                 opacity: 0.0,
             };
 
-            let model = GaussianModel {
-                gaussians: vec![gaussian],
-                sh_coeffs: vec![0.5, 0.5, 0.5],
-                sh_degree: 0,
-                face_indices: vec![],
-                barycentric: vec![],
-                local_offsets: vec![],
-                is_rigid: vec![],
-            };
+            let model = model_from_gaussians(vec![gaussian], vec![0.5, 0.5, 0.5], 0);
 
             let camera = create_test_camera((64, 64));
             let target = create_target_image((64, 64));

@@ -74,6 +74,29 @@ pub struct ConvergenceConfig {
     pub oscillation_window: usize,
     /// Decay for EMA smoothing (default: 0.95).
     pub ema_decay: f32,
+    /// Threshold on the *relative* oscillation score — `std(successive loss
+    /// diffs) / mean(|loss|)` over the oscillation window — above which the
+    /// phase is classified [`ConvergencePhase::Oscillating`] (default: 0.3,
+    /// i.e. step-to-step swings averaging >30% of the loss magnitude).
+    ///
+    /// This is intentionally a *separate* knob from `plateau_threshold`
+    /// rather than derived from it: `plateau_threshold` calibrates a
+    /// relative-improvement-per-window rate (typically ~1e-4, i.e. a
+    /// fraction of a percent), while oscillation noise on a realistic loss
+    /// curve routinely sits in the few-percent range even for healthy,
+    /// non-oscillating runs — comparing the two on the same tiny scale
+    /// would make rule 2 fire on essentially every call.
+    pub oscillation_threshold: f32,
+    /// Optional cap on the number of `(step, loss)` points retained in
+    /// [`ConvergenceAnalyzer`]'s internal history buffer. `None` (default)
+    /// keeps every point ever recorded, which [`detect_phase_transitions`]
+    /// needs to see the whole run. `Some(n)` evicts the oldest points once
+    /// more than `n` are held, bounding memory for very long runs at the
+    /// cost of [`detect_phase_transitions`] only being able to see the most
+    /// recent `n` points. [`ConvergenceAnalyzer::best_loss`] and
+    /// [`ConvergenceAnalyzer::history_len`] are unaffected by eviction: both
+    /// track the true full-run value regardless of this setting.
+    pub max_history: Option<usize>,
 }
 
 impl Default for ConvergenceConfig {
@@ -86,6 +109,8 @@ impl Default for ConvergenceConfig {
             diverge_threshold: 0.1,
             oscillation_window: 20,
             ema_decay: 0.95,
+            oscillation_threshold: 0.3,
+            max_history: None,
         }
     }
 }
@@ -150,12 +175,22 @@ pub struct ConvergenceReport {
 pub struct ConvergenceAnalyzer {
     /// Tuning parameters.
     pub config: ConvergenceConfig,
-    /// `(step, loss)` history — bounded to avoid unbounded memory growth.
+    /// `(step, loss)` history. Unbounded by default (needed so
+    /// [`detect_phase_transitions`] can see the whole run); capped to
+    /// `config.max_history` most-recent points when that is `Some`. Use
+    /// [`Self::best_loss`] / [`Self::history_len`] rather than scanning this
+    /// directly — both remain correct for the *entire* run even when
+    /// eviction is active.
     history: Vec<(usize, f32)>,
     /// Current EMA loss.
     ema_loss: f32,
-    /// Total calls to `update`.
+    /// Total calls to `update`, independent of any `history` eviction.
     n_updates: usize,
+    /// Lowest loss seen across every `update` call so far, tracked
+    /// independently of `history` so it stays correct even after older
+    /// entries (potentially including the one that set this minimum) have
+    /// been evicted under `config.max_history`.
+    best_loss_seen: Option<f32>,
 }
 
 impl ConvergenceAnalyzer {
@@ -166,6 +201,7 @@ impl ConvergenceAnalyzer {
             history: Vec::new(),
             ema_loss: f32::MAX,
             n_updates: 0,
+            best_loss_seen: None,
         }
     }
 
@@ -179,8 +215,32 @@ impl ConvergenceAnalyzer {
             let d = self.config.ema_decay;
             self.ema_loss = d * self.ema_loss + (1.0 - d) * loss;
         }
+        self.best_loss_seen = Some(match self.best_loss_seen {
+            Some(best) => best.min(loss),
+            None => loss,
+        });
         self.history.push((step, loss));
         self.n_updates += 1;
+
+        // Bound memory for very long runs when the caller has opted in.
+        // Evicting from the *front* keeps the most recent points, which is
+        // what `analyze()` (rolling `window_size`) and
+        // `detect_phase_transitions()` (chunked from the front, so eviction
+        // just means older chunks are no longer visible) both want.
+        //
+        // The effective cap is never allowed below `min_history`: `analyze`
+        // requires at least `min_history` points to ever leave
+        // `InsufficientHistory`, so a caller-misconfigured
+        // `max_history < min_history` would otherwise permanently lock the
+        // analyzer in `ConvergencePhase::Initializing` no matter how many
+        // steps are recorded.
+        if let Some(cap) = self.config.max_history {
+            let effective_cap = cap.max(self.config.min_history);
+            if self.history.len() > effective_cap {
+                let excess = self.history.len() - effective_cap;
+                self.history.drain(0..excess);
+            }
+        }
     }
 
     /// Compute [`ConvergenceStats`] over the most recent `window_size` points.
@@ -198,27 +258,35 @@ impl ConvergenceAnalyzer {
         }
 
         let window = self.config.window_size.min(total);
-        let windowed: Vec<f32> = self.history[total - window..]
-            .iter()
-            .map(|(_, l)| *l)
-            .collect();
+        let window_pairs = &self.history[total - window..];
+        let windowed: Vec<f32> = window_pairs.iter().map(|(_, l)| *l).collect();
 
         let current_loss = *windowed.last().ok_or(ConvergenceError::EmptyHistory)?;
         let window_min = windowed.iter().copied().fold(f32::INFINITY, f32::min);
         let window_max = windowed.iter().copied().fold(f32::NEG_INFINITY, f32::max);
 
-        let loss_slope = compute_loss_slope(&windowed)?;
+        // Regress against the *recorded step values*, not the positional
+        // index within the window: callers that log every `log_interval`
+        // steps (rather than every single step) would otherwise get a slope
+        // in "loss per recorded point", silently off by a factor of
+        // `log_interval` from the "loss per training step" the field is
+        // documented (and used by `estimate_steps_to_convergence`) to mean.
+        let loss_slope = compute_loss_slope_xy(window_pairs)?;
         let relative_improvement = compute_relative_improvement(&windowed)?;
 
         // For oscillation we use the smaller oscillation_window clamped to available data.
         let osc_win = self.config.oscillation_window.min(window);
         let osc_slice = &windowed[windowed.len() - osc_win..];
         let oscillation_score = compute_oscillation_score(osc_slice)?;
+        // Scale for turning the absolute `oscillation_score` (loss units)
+        // into a relative quantity comparable to `oscillation_threshold`.
+        let osc_scale = osc_slice.iter().sum::<f32>() / osc_slice.len() as f32;
 
         let phase = detect_convergence_phase(
             loss_slope,
             relative_improvement,
             oscillation_score,
+            osc_scale,
             &self.config,
         );
 
@@ -254,16 +322,26 @@ impl ConvergenceAnalyzer {
         self.history.clear();
         self.ema_loss = f32::MAX;
         self.n_updates = 0;
+        self.best_loss_seen = None;
     }
 
-    /// Best (lowest) loss seen in the entire history.
+    /// Best (lowest) loss seen across every `update()` call so far.
+    ///
+    /// Tracked incrementally (O(1) per call) rather than scanned from
+    /// `history`, so this remains the true whole-run minimum even when
+    /// `config.max_history` has evicted the history entry that originally
+    /// set it.
     pub fn best_loss(&self) -> Option<f32> {
-        self.history.iter().map(|(_, l)| *l).reduce(f32::min)
+        self.best_loss_seen
     }
 
-    /// Number of data points in history.
+    /// Total number of `update()` calls made so far.
+    ///
+    /// This is the true cumulative step count for the whole run, not the
+    /// number of points currently retained in the (possibly
+    /// `config.max_history`-capped) internal buffer.
     pub fn history_len(&self) -> usize {
-        self.history.len()
+        self.n_updates
     }
 }
 
@@ -307,6 +385,45 @@ pub fn compute_loss_slope(losses: &[f32]) -> Result<f32, ConvergenceError> {
 
     let denom = nf * sum_x2 - sum_x * sum_x;
     if denom.abs() < f64::EPSILON {
+        return Ok(0.0);
+    }
+    Ok(((nf * sum_xy - sum_x * sum_y) / denom) as f32)
+}
+
+/// Compute the linear regression slope of `(step, loss)` pairs against the
+/// actual recorded `step` values, rather than their positional index.
+///
+/// Identical OLS formula to [`compute_loss_slope`], but with `x` taken from
+/// `points[i].0` instead of `i`. This matters whenever consecutive history
+/// entries are not exactly one training step apart (e.g. a caller that only
+/// records every `log_interval` steps): [`compute_loss_slope`] would then
+/// return "loss change per *recorded point*", silently off by a factor of
+/// the recording interval from "loss change per *training step*" —
+/// [`ConvergenceStats::loss_slope`] and [`estimate_steps_to_convergence`]
+/// are both specified (and consumed) in the latter unit.
+///
+/// # Errors
+/// - [`ConvergenceError::EmptyHistory`] if `points` is empty.
+/// - [`ConvergenceError::InvalidWindow`] if `points` has fewer than 2 points.
+pub fn compute_loss_slope_xy(points: &[(usize, f32)]) -> Result<f32, ConvergenceError> {
+    let n = points.len();
+    if n == 0 {
+        return Err(ConvergenceError::EmptyHistory);
+    }
+    if n < 2 {
+        return Err(ConvergenceError::InvalidWindow { size: n });
+    }
+    let nf = n as f64;
+    let sum_x: f64 = points.iter().map(|&(s, _)| s as f64).sum();
+    let sum_y: f64 = points.iter().map(|&(_, l)| l as f64).sum();
+    let sum_xy: f64 = points.iter().map(|&(s, l)| s as f64 * l as f64).sum();
+    let sum_x2: f64 = points.iter().map(|&(s, _)| (s as f64) * (s as f64)).sum();
+
+    let denom = nf * sum_x2 - sum_x * sum_x;
+    if denom.abs() < f64::EPSILON {
+        // All points share the same step (or n == 1, handled above) — no
+        // well-defined per-step rate; matches `compute_loss_slope`'s own
+        // degenerate-denominator fallback.
         return Ok(0.0);
     }
     Ok(((nf * sum_xy - sum_x * sum_y) / denom) as f32)
@@ -375,20 +492,33 @@ pub fn ema_smooth_losses(losses: &[f32], decay: f32) -> Vec<f32> {
 ///
 /// Decision order (first matching rule wins):
 /// 1. `slope > diverge_threshold` → [`ConvergencePhase::Diverging`]
-/// 2. `oscillation_score > 2 * plateau_threshold` → [`ConvergencePhase::Oscillating`]
+/// 2. `oscillation_score / loss_scale > oscillation_threshold` → [`ConvergencePhase::Oscillating`]
 /// 3. `|relative_improvement| < plateau_threshold` → [`ConvergencePhase::Plateau`]
 /// 4. `relative_improvement > rapid_threshold` → [`ConvergencePhase::RapidDecline`]
 /// 5. Otherwise → [`ConvergencePhase::SlowImprovement`]
+///
+/// `oscillation_score` (from [`compute_oscillation_score`]) is a standard
+/// deviation expressed in absolute *loss units*, while every threshold in
+/// `config` besides `oscillation_threshold` is a dimensionless relative
+/// rate. `loss_scale` (typically the window's mean loss) converts the score
+/// to the same relative scale before comparing it against
+/// `config.oscillation_threshold`, so the two are actually comparable —
+/// comparing the raw absolute score directly against a relative-rate
+/// threshold such as `plateau_threshold` would make rule 2 fire on
+/// essentially every realistically-scaled loss curve regardless of whether
+/// it is actually oscillating.
 pub fn detect_convergence_phase(
     slope: f32,
     relative_improvement: f32,
     oscillation_score: f32,
+    loss_scale: f32,
     config: &ConvergenceConfig,
 ) -> ConvergencePhase {
     if slope > config.diverge_threshold {
         return ConvergencePhase::Diverging;
     }
-    if oscillation_score > 2.0 * config.plateau_threshold {
+    let relative_oscillation = oscillation_score / loss_scale.abs().max(1e-8);
+    if relative_oscillation > config.oscillation_threshold {
         return ConvergencePhase::Oscillating;
     }
     if relative_improvement.abs() < config.plateau_threshold {
@@ -505,7 +635,10 @@ pub fn detect_phase_transitions(analyzer: &ConvergenceAnalyzer) -> Vec<(usize, C
         if losses.len() < 2 {
             continue;
         }
-        let slope = match compute_loss_slope(&losses) {
+        // Step-aware, matching `analyze()`: regressing against positional
+        // index instead of the real `step` values would silently be wrong
+        // whenever chunk entries are not exactly one training step apart.
+        let slope = match compute_loss_slope_xy(chunk) {
             Ok(s) => s,
             Err(_) => continue,
         };
@@ -517,7 +650,8 @@ pub fn detect_phase_transitions(analyzer: &ConvergenceAnalyzer) -> Vec<(usize, C
             Ok(o) => o,
             Err(_) => continue,
         };
-        let phase = detect_convergence_phase(slope, rel_imp, osc, &analyzer.config);
+        let osc_scale = losses.iter().sum::<f32>() / losses.len() as f32;
+        let phase = detect_convergence_phase(slope, rel_imp, osc, osc_scale, &analyzer.config);
         let step_idx = chunk[0].0;
 
         match prev_phase {
@@ -674,6 +808,65 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // compute_loss_slope_xy
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn slope_xy_matches_positional_slope_for_contiguous_steps() {
+        // When step == positional index (the common case: one update() per
+        // training step), compute_loss_slope_xy must agree exactly with
+        // compute_loss_slope.
+        let losses: Vec<f32> = (0..10).map(|i| 10.0 - i as f32).collect();
+        let points: Vec<(usize, f32)> = losses.iter().enumerate().map(|(i, &l)| (i, l)).collect();
+        let plain = compute_loss_slope(&losses).expect("plain slope");
+        let xy = compute_loss_slope_xy(&points).expect("xy slope");
+        assert!(
+            (plain - xy).abs() < 1e-4,
+            "plain={plain}, xy={xy}: must agree when step == index"
+        );
+    }
+
+    #[test]
+    fn slope_xy_scales_inversely_with_step_spacing() {
+        // Identical loss values, but recorded 10 real steps apart instead
+        // of 1 → the per-step slope must be ~10x shallower.
+        let losses: Vec<f32> = (0..10).map(|i| 10.0 - i as f32).collect();
+        let dense: Vec<(usize, f32)> = losses.iter().enumerate().map(|(i, &l)| (i, l)).collect();
+        let sparse: Vec<(usize, f32)> = losses
+            .iter()
+            .enumerate()
+            .map(|(i, &l)| (i * 10, l))
+            .collect();
+        let dense_slope = compute_loss_slope_xy(&dense).expect("dense slope");
+        let sparse_slope = compute_loss_slope_xy(&sparse).expect("sparse slope");
+        assert!(
+            (dense_slope - sparse_slope * 10.0).abs() < 1e-3,
+            "dense_slope={dense_slope} should equal ~10x sparse_slope={sparse_slope}"
+        );
+    }
+
+    #[test]
+    fn slope_xy_empty_returns_error() {
+        let result = compute_loss_slope_xy(&[]);
+        assert_eq!(result, Err(ConvergenceError::EmptyHistory));
+    }
+
+    #[test]
+    fn slope_xy_single_element_returns_invalid_window() {
+        let result = compute_loss_slope_xy(&[(0, 1.0)]);
+        assert_eq!(result, Err(ConvergenceError::InvalidWindow { size: 1 }));
+    }
+
+    #[test]
+    fn slope_xy_duplicate_steps_returns_zero_not_panic() {
+        // Degenerate denominator (all x equal) must fall back to 0.0
+        // exactly like compute_loss_slope's positional-index counterpart,
+        // not divide by zero.
+        let result = compute_loss_slope_xy(&[(5, 1.0), (5, 2.0), (5, 3.0)]);
+        assert_eq!(result, Ok(0.0));
+    }
+
+    // ------------------------------------------------------------------
     // compute_relative_improvement
     // ------------------------------------------------------------------
 
@@ -800,15 +993,19 @@ mod tests {
     #[test]
     fn phase_diverging_when_slope_high() {
         let config = ConvergenceConfig::default();
-        let phase = detect_convergence_phase(0.5, -0.1, 0.0, &config);
+        // loss_scale = 1.0 throughout this block so relative_oscillation ==
+        // oscillation_score, matching the values these tests were originally
+        // written against.
+        let phase = detect_convergence_phase(0.5, -0.1, 0.0, 1.0, &config);
         assert_eq!(phase, ConvergencePhase::Diverging);
     }
 
     #[test]
     fn phase_oscillating_when_high_osc_score() {
         let config = ConvergenceConfig::default();
-        // slope below diverge threshold, high oscillation
-        let phase = detect_convergence_phase(0.0, 0.001, 1.0, &config);
+        // slope below diverge threshold, high oscillation (1.0 relative to
+        // loss_scale=1.0 is far above the default oscillation_threshold=0.3)
+        let phase = detect_convergence_phase(0.0, 0.001, 1.0, 1.0, &config);
         assert_eq!(phase, ConvergencePhase::Oscillating);
     }
 
@@ -816,14 +1013,14 @@ mod tests {
     fn phase_plateau_when_tiny_improvement() {
         let config = ConvergenceConfig::default();
         // slope < diverge, low osc, tiny improvement
-        let phase = detect_convergence_phase(-1e-6, 1e-6, 0.0, &config);
+        let phase = detect_convergence_phase(-1e-6, 1e-6, 0.0, 1.0, &config);
         assert_eq!(phase, ConvergencePhase::Plateau);
     }
 
     #[test]
     fn phase_rapid_decline_when_large_improvement() {
         let config = ConvergenceConfig::default();
-        let phase = detect_convergence_phase(-0.05, 0.5, 0.0, &config);
+        let phase = detect_convergence_phase(-0.05, 0.5, 0.0, 1.0, &config);
         assert_eq!(phase, ConvergencePhase::RapidDecline);
     }
 
@@ -831,8 +1028,49 @@ mod tests {
     fn phase_slow_improvement_otherwise() {
         let config = ConvergenceConfig::default();
         // relative_improvement in (plateau, rapid) range
-        let phase = detect_convergence_phase(-0.001, 0.005, 0.0, &config);
+        let phase = detect_convergence_phase(-0.001, 0.005, 0.0, 1.0, &config);
         assert_eq!(phase, ConvergencePhase::SlowImprovement);
+    }
+
+    // ------------------------------------------------------------------
+    // detect_convergence_phase — oscillation unit-mismatch regression
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn phase_not_oscillating_for_realistic_small_relative_noise() {
+        // Regression for the absolute-vs-relative unit mismatch: a loss
+        // around 0.05 with an absolute step-to-step std dev of 5e-4 (1% of
+        // the loss magnitude -- ordinary minibatch noise on a converging
+        // run) used to ALWAYS be classified Oscillating, because the raw
+        // absolute oscillation_score (5e-4) was compared directly against
+        // `2 * plateau_threshold` (2e-4), a relative-rate threshold two
+        // orders of magnitude too tight for an absolute quantity at this
+        // loss scale. With the score normalized by loss_scale (0.05) before
+        // comparison, 5e-4/0.05 = 0.01 (1%) sits well under the default
+        // relative `oscillation_threshold` (0.3), so a healthy
+        // slow-improvement run must be able to reach a non-Oscillating
+        // phase.
+        let config = ConvergenceConfig::default();
+        // relative_improvement = 0.005 lands strictly between
+        // plateau_threshold (1e-4) and rapid_threshold (1e-2), i.e.
+        // SlowImprovement once oscillation no longer short-circuits rule 2.
+        let phase = detect_convergence_phase(-1e-5, 0.005, 5e-4, 0.05, &config);
+        assert_ne!(
+            phase,
+            ConvergencePhase::Oscillating,
+            "1% relative noise on a realistic loss scale must not be flagged as oscillating"
+        );
+        assert_eq!(phase, ConvergencePhase::SlowImprovement);
+    }
+
+    #[test]
+    fn phase_still_oscillating_for_genuinely_large_relative_swings() {
+        // Same realistic loss scale (0.05) but with the loss swinging by an
+        // absolute std dev of 0.04 between steps -- 80% of the loss
+        // magnitude, i.e. genuinely oscillating -- must still be detected.
+        let config = ConvergenceConfig::default();
+        let phase = detect_convergence_phase(0.0, 0.0, 0.04, 0.05, &config);
+        assert_eq!(phase, ConvergencePhase::Oscillating);
     }
 
     // ------------------------------------------------------------------
@@ -956,6 +1194,123 @@ mod tests {
         let analyzer = ConvergenceAnalyzer::default();
         let result = estimate_steps_to_convergence(&analyzer, 0.01);
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn estimate_steps_scales_with_real_step_spacing_not_index() {
+        // Regression: `analyze()` previously regressed `loss_slope` against
+        // the POSITIONAL index within the window (0, 1, 2, ...) instead of
+        // the actually-recorded `step` values, so `estimate_steps_to_convergence`
+        // silently reported "additional recorded points" mislabeled as
+        // "additional training steps". Two analyzers fed the identical loss
+        // trajectory but different real step spacing must therefore produce
+        // DIFFERENT (spacing-scaled) slopes/estimates -- under the bug they
+        // would have been identical, since positional index never saw the
+        // step values at all.
+        let n = 100usize;
+        let make = |step_gap: usize| {
+            let cfg = ConvergenceConfig {
+                window_size: n,
+                min_history: n / 2,
+                ..Default::default()
+            };
+            let mut a = ConvergenceAnalyzer::new(cfg);
+            for i in 0..n {
+                let loss = 1.0 - 0.9 * (i as f32 / (n - 1) as f32);
+                a.update(i * step_gap, loss);
+            }
+            a
+        };
+
+        let dense = make(1);
+        let sparse = make(50);
+
+        let dense_slope = dense.analyze().expect("dense analyze").loss_slope;
+        let sparse_slope = sparse.analyze().expect("sparse analyze").loss_slope;
+
+        // Same total loss change spread over 50x more real steps between
+        // recordings -> the per-real-step slope must be proportionally
+        // shallower (closer to zero), not identical to the dense case.
+        assert!(
+            dense_slope.abs() > sparse_slope.abs() * 20.0,
+            "dense_slope={dense_slope}, sparse_slope={sparse_slope}: wider real step spacing \
+             must yield a proportionally shallower per-step slope"
+        );
+
+        let target = 0.05;
+        let dense_steps = estimate_steps_to_convergence(&dense, target).expect("dense estimate");
+        let sparse_steps = estimate_steps_to_convergence(&sparse, target).expect("sparse estimate");
+
+        // The wider-spaced run needs proportionally more *real steps* to
+        // close the same absolute loss gap.
+        assert!(
+            sparse_steps > dense_steps * 20,
+            "dense_steps={dense_steps}, sparse_steps={sparse_steps}: wider step spacing must \
+             yield a proportionally larger step estimate, not the same positional-index one"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // ConvergenceAnalyzer — max_history / best_loss / history_len
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn analyzer_max_history_bounds_buffer_but_best_loss_and_len_stay_exact() {
+        // Regression for the "bounded to avoid unbounded memory growth" doc
+        // claim that the implementation never actually enforced.
+        // `max_history` now genuinely bounds the internal buffer when set,
+        // but `best_loss()` and `history_len()` must remain correct for the
+        // WHOLE run rather than silently degrading to "best/length within
+        // whatever happens to still be in the capped buffer".
+        let cfg = ConvergenceConfig {
+            window_size: 10,
+            min_history: 5,
+            max_history: Some(20),
+            ..Default::default()
+        };
+        let mut analyzer = ConvergenceAnalyzer::new(cfg);
+        // The true global minimum (0.01) is recorded early and would be
+        // long evicted from a 20-entry capped buffer after 100 updates.
+        for i in 0..100usize {
+            let loss = if i == 3 { 0.01 } else { 1.0 };
+            analyzer.update(i, loss);
+        }
+
+        assert_eq!(
+            analyzer.history_len(),
+            100,
+            "history_len() must report the true cumulative update count, not the capped \
+             buffer size"
+        );
+        let best = analyzer.best_loss().expect("best_loss should be Some");
+        assert!(
+            (best - 0.01).abs() < 1e-6,
+            "best_loss() must still find the long-evicted global minimum, got {best}"
+        );
+        assert!(
+            analyzer.analyze().is_ok(),
+            "analyze() must still succeed once enough points remain post-cap"
+        );
+    }
+
+    #[test]
+    fn analyzer_max_history_never_locks_out_below_min_history() {
+        // A misconfigured `max_history < min_history` must not permanently
+        // strand the analyzer in `InsufficientHistory` / `Initializing`.
+        let cfg = ConvergenceConfig {
+            window_size: 10,
+            min_history: 50,
+            max_history: Some(5), // smaller than min_history
+            ..Default::default()
+        };
+        let mut analyzer = ConvergenceAnalyzer::new(cfg);
+        for i in 0..60usize {
+            analyzer.update(i, 1.0);
+        }
+        assert!(
+            analyzer.analyze().is_ok(),
+            "analyze() must be reachable even when max_history < min_history"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -1283,6 +1638,8 @@ mod tests {
         assert!((cfg.diverge_threshold - 0.1).abs() < 1e-6);
         assert_eq!(cfg.oscillation_window, 20);
         assert!((cfg.ema_decay - 0.95).abs() < 1e-6);
+        assert!((cfg.oscillation_threshold - 0.3).abs() < 1e-6);
+        assert_eq!(cfg.max_history, None);
     }
 
     // ------------------------------------------------------------------

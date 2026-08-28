@@ -21,6 +21,32 @@
 // pos = histogram_prefix[digit * num_wg + wid] + local_rank.
 // out_key[pos] = in_key[i];  out_val[pos] = in_val[i].
 // The starting position for (digit, wg_id) = prefix[d*nwg + wg] - count[d*nwg + wg].
+//
+// Local rank via digit ballot
+// ───────────────────────────
+// `local_rank` is the number of LOWER-INDEXED lanes in this workgroup that
+// carry the same digit; adding it to the workgroup's global start is what makes
+// the sort stable.  The obvious implementation — scan `wg_digits[0 .. lane]`
+// and count matches — costs O(256) shared-memory reads per lane, i.e. ~32768
+// reads per workgroup per pass, and it is the slowest part of the scatter.
+//
+// Instead each lane sets one bit in a per-digit 256-bit ballot mask
+// (16 digits × 8 words of 32 bits = 128 u32 = 512 B of workgroup storage — less
+// than the 1 KiB the old `wg_digits` array needed), and the rank is then the
+// population count of the bits strictly below this lane in its own digit's
+// mask.  That is at most 8 loads + 8 `countOneBits` per lane regardless of
+// workgroup size: O(256) → O(8).
+//
+// The result is bit-for-bit identical to the serial scan, including the
+// treatment of out-of-range lanes: those never set a bit, so they can never be
+// counted as predecessors of a real element.
+//
+// Barrier discipline
+// ──────────────────
+// Both workgroupBarrier() calls must be executed by every lane, so the
+// out-of-range early return has to come AFTER the second one.  Lanes that are
+// past `params.count` still zero their slice of the ballot table and still hit
+// both barriers; they simply skip the atomicOr and then return.
 
 struct SortParams {
     count: u32,
@@ -49,8 +75,15 @@ fn extract_digit(key: vec2<u32>, pass_idx: u32) -> u32 {
     return (word >> shift) & 0xFu;
 }
 
-// Shared memory for local rank computation
-var<workgroup> wg_digits: array<u32, 256>;
+// Number of distinct digits produced by `extract_digit` (4-bit radix).
+const RADIX_DIGITS: u32 = 16u;
+// 256 lanes / 32 bits per word = 8 words to hold one bit per lane.
+const BALLOT_WORDS: u32 = 8u;
+
+// Per-digit lane ballot: wg_ballot[d * BALLOT_WORDS + w] bit b is set iff lane
+// (w * 32 + b) of this workgroup carries digit d.  Written with atomicOr
+// because up to 32 lanes contend for the same word.
+var<workgroup> wg_ballot: array<atomic<u32>, 128>; // RADIX_DIGITS * BALLOT_WORDS
 
 @compute @workgroup_size(256)
 fn radix_scatter(
@@ -60,27 +93,46 @@ fn radix_scatter(
 ) {
     let idx = gid.x;
     let nwg = params.num_workgroups;
+    let lane = lid.x;
 
-    // Each thread loads its digit into shared memory
-    var digit = 16u; // sentinel for out-of-bounds
-    if idx < params.count {
-        digit = extract_digit(keys_in[idx], params.pass_idx);
+    // ── Clear the ballot table ────────────────────────────────────────────
+    // 128 words, one per lane for the first 128 lanes.  Every lane reaches the
+    // barrier, including the ones this dispatch has no element for.
+    if lane < RADIX_DIGITS * BALLOT_WORDS {
+        atomicStore(&wg_ballot[lane], 0u);
     }
-    wg_digits[lid.x] = digit;
     workgroupBarrier();
 
-    if idx >= params.count {
+    // ── Cast this lane's ballot ───────────────────────────────────────────
+    // Out-of-range lanes must NOT write: `extract_digit` was never called for
+    // them, and a sentinel digit of 16 would index past the end of the table.
+    // Leaving their bit clear is exactly the right semantics — they are not
+    // predecessors of anything.
+    let in_range = idx < params.count;
+    var digit = 0u;
+    if in_range {
+        digit = extract_digit(keys_in[idx], params.pass_idx);
+        atomicOr(&wg_ballot[digit * BALLOT_WORDS + (lane >> 5u)], 1u << (lane & 31u));
+    }
+    workgroupBarrier();
+
+    // Safe to leave only now: both barriers above are behind every lane.
+    if !in_range {
         return;
     }
 
-    // Compute local rank: count how many earlier threads in this workgroup
-    // have the same digit (stable sort: preserve relative order)
+    // ── Local rank = popcount of same-digit lanes strictly below this one ──
+    // Whole words below this lane's word, then the partial word masked to the
+    // bits under this lane.  `lane & 31u` is at most 31, so the shift below is
+    // always well defined and `below_mask` is never the full word.
+    let base = digit * BALLOT_WORDS;
+    let my_word = lane >> 5u;
     var local_rank = 0u;
-    for (var i = 0u; i < lid.x; i++) {
-        if wg_digits[i] == digit {
-            local_rank++;
-        }
+    for (var w = 0u; w < my_word; w++) {
+        local_rank += countOneBits(atomicLoad(&wg_ballot[base + w]));
     }
+    let below_mask = (1u << (lane & 31u)) - 1u;
+    local_rank += countOneBits(atomicLoad(&wg_ballot[base + my_word]) & below_mask);
 
     // Look up global starting position for this (digit, workgroup)
     let hist_idx = digit * nwg + wid.x;

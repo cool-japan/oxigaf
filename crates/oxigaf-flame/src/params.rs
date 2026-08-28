@@ -109,32 +109,39 @@ impl FlameParams {
 
     /// Validate that parameters are within typical ranges.
     ///
-    /// Returns `true` if all parameters are within reasonable bounds:
+    /// Returns `true` if all parameters are finite AND within reasonable bounds:
     /// - Shape: [-3.0, 3.0]
     /// - Expression: [-2.0, 2.0]
     /// - Pose: [-pi, pi]
     /// - Translation: [-1.0, 1.0]
+    ///
+    /// `NaN` and `±inf` always fail validation: IEEE-754 comparisons against
+    /// `NaN` are false, so a naive `.abs() > limit` check alone would let
+    /// `NaN` silently pass.
     #[must_use]
     pub fn validate(&self) -> bool {
         use std::f32::consts::PI;
 
+        // A value fails if it's non-finite (NaN or ±inf) OR outside [-lim, lim].
+        let out_of_range = |v: &f32, lim: f32| !v.is_finite() || v.abs() > lim;
+
         // Check shape coefficients
-        if self.shape.iter().any(|&s| s.abs() > 3.0) {
+        if self.shape.iter().any(|s| out_of_range(s, 3.0)) {
             return false;
         }
 
         // Check expression coefficients
-        if self.expression.iter().any(|&e| e.abs() > 2.0) {
+        if self.expression.iter().any(|e| out_of_range(e, 2.0)) {
             return false;
         }
 
         // Check pose angles
-        if self.pose.iter().any(|&p| p.abs() > PI) {
+        if self.pose.iter().any(|p| out_of_range(p, PI)) {
             return false;
         }
 
         // Check translation
-        if self.translation.iter().any(|&t| t.abs() > 1.0) {
+        if self.translation.iter().any(|t| out_of_range(t, 1.0)) {
             return false;
         }
 
@@ -181,6 +188,18 @@ impl FlameParams {
                 "pose length {} is not a multiple of 3 (axis-angle triples required)",
                 self.pose.len()
             )));
+        }
+        // A NaN `t` slips past both boundary fast paths below (`NaN <= 0.0`
+        // and `NaN >= 1.0` are both false), so without this guard it would
+        // fall through to the interpolation arithmetic and silently
+        // produce an all-NaN result. `±inf` is deliberately NOT rejected
+        // here: `t <= 0.0` / `t >= 1.0` already handle it correctly
+        // (`NEG_INFINITY <= 0.0` and `INFINITY >= 1.0` are both true), so
+        // rejecting it too would only narrow previously-correct behavior.
+        if t.is_nan() {
+            return Err(FlameError::InvalidParams(
+                "lerp t must not be NaN".to_string(),
+            ));
         }
 
         // Fast paths for t at the boundary.
@@ -428,6 +447,53 @@ mod tests {
         }
     }
 
+    // ------ validate: NaN/inf must always fail ------
+
+    #[test]
+    fn validate_accepts_in_range_finite_params() {
+        let p = make_params(vec![1.0], vec![0.5], vec![0.1, 0.0, 0.0], [0.1, 0.0, 0.0]);
+        assert!(p.validate(), "in-range finite params must be valid");
+    }
+
+    #[test]
+    fn validate_rejects_nan_shape() {
+        let p = make_params(vec![f32::NAN], vec![], vec![], [0.0; 3]);
+        assert!(!p.validate(), "NaN shape coefficient must fail validation");
+    }
+
+    #[test]
+    fn validate_rejects_nan_expression() {
+        let p = make_params(vec![], vec![f32::NAN], vec![], [0.0; 3]);
+        assert!(
+            !p.validate(),
+            "NaN expression coefficient must fail validation"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_nan_pose() {
+        let p = make_params(vec![], vec![], vec![f32::NAN, 0.0, 0.0], [0.0; 3]);
+        assert!(!p.validate(), "NaN pose component must fail validation");
+    }
+
+    #[test]
+    fn validate_rejects_nan_translation() {
+        let p = make_params(vec![], vec![], vec![], [f32::NAN, 0.0, 0.0]);
+        assert!(
+            !p.validate(),
+            "NaN translation component must fail validation"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_infinite_shape() {
+        let p = make_params(vec![f32::INFINITY], vec![], vec![], [0.0; 3]);
+        assert!(
+            !p.validate(),
+            "infinite shape coefficient must fail validation"
+        );
+    }
+
     // ------ lerp boundary conditions ------
 
     #[test]
@@ -468,6 +534,38 @@ mod tests {
         assert_slice_close(&r.shape, &b.shape, 1e-6, "shape");
         assert_slice_close(&r.expression, &b.expression, 1e-6, "expression");
         assert_slice_close(&r.translation, &b.translation, 1e-6, "translation");
+    }
+
+    #[test]
+    fn lerp_rejects_nan_t() {
+        // A NaN `t` slips past both `t <= 0.0` and `t >= 1.0` (both false
+        // for NaN), so without an explicit NaN guard it would fall through
+        // to the interpolation arithmetic and produce a silently all-NaN
+        // result instead of a diagnosable error.
+        let a = make_params(vec![1.0], vec![0.5], vec![0.1, 0.2, 0.3], [0.1, 0.2, 0.3]);
+        let b = make_params(vec![3.0], vec![1.5], vec![0.4, 0.5, 0.6], [0.4, 0.5, 0.6]);
+        assert!(
+            a.lerp(&b, f32::NAN).is_err(),
+            "lerp with NaN t must return an error, not a NaN-filled result"
+        );
+    }
+
+    #[test]
+    fn lerp_infinite_t_still_clamps_to_boundary() {
+        // Unlike NaN, ±inf is NOT rejected: `t <= 0.0` / `t >= 1.0` already
+        // handle it correctly via the existing boundary fast paths, so
+        // this behavior must be preserved exactly as before the NaN guard
+        // was added.
+        let a = make_params(vec![1.0], vec![0.5], vec![0.1, 0.2, 0.3], [0.1, 0.2, 0.3]);
+        let b = make_params(vec![3.0], vec![1.5], vec![0.4, 0.5, 0.6], [0.4, 0.5, 0.6]);
+        let r_pos = a
+            .lerp(&b, f32::INFINITY)
+            .expect("+inf must clamp, not error");
+        assert_slice_close(&r_pos.shape, &b.shape, 1e-6, "shape (+inf -> other)");
+        let r_neg = a
+            .lerp(&b, f32::NEG_INFINITY)
+            .expect("-inf must clamp, not error");
+        assert_slice_close(&r_neg.shape, &a.shape, 1e-6, "shape (-inf -> self)");
     }
 
     // ------ midpoint for shape / expression / translation ------

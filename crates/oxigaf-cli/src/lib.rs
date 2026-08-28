@@ -1,16 +1,71 @@
 //! OxiGAF CLI library interface.
 //!
-//! This module exposes internal functionality for integration testing.
+//! This is the crate's **single module root**. `src/main.rs` is a thin shim
+//! that `use`s this library; it declares no modules of its own. Anything
+//! reachable from the `oxigaf` binary — and anything an integration test
+//! under `tests/` can drive — is declared exactly once, here.
+//!
+//! # Adding a module
+//!
+//! 1. `pub mod <name>;` in the list below.
+//! 2. If it should be a subcommand, add a handler under
+//!    [`commands`] and one variant to [`cli::Command`].
+//!
+//! Do **not** add a `mod` declaration to `main.rs`: a module declared in
+//! both roots is compiled twice into two unrelated types, which is how the
+//! forty-plus "library-only, unreachable from the binary" modules came
+//! about in the first place.
+//!
+//! # Subcommand coverage
+//!
+//! Every tool module below is reachable from the shipped `oxigaf` binary
+//! through one of the twenty subcommand families, grouped by what a caller
+//! is trying to do rather than one flag per module:
+//!
+//! | Family | Modules it exposes |
+//! |--------|--------------------|
+//! | `anim` | [`animation_export`] |
+//! | `analyze` | [`color_calibration`], [`diff_tool`], [`evaluation_suite`] |
+//! | `batch` | [`batch_processor`] |
+//! | `camera` | [`camera_path_tool`], [`arcball`] |
+//! | `dataset` | [`dataset_tools`] |
+//! | `inspect` | [`model_inspector`], [`memory_estimator`], [`export_ply`], [`export_pointcloud_stats`] |
+//! | `monitor` | [`dashboard`] |
+//! | `perf` | [`benchmark_suite`] |
+//! | `pipeline` | [`stages`] |
+//! | `preset` | [`config_presets`] |
+//! | `preview` | [`preview`] |
+//! | `profile` | [`profiling_report`] |
+//! | `quality` | [`quality_checker`] |
+//! | `report` | [`experiment_report`] |
+//! | `runs` | [`workspace_manager`] |
+//! | `scene` | [`scene_analyzer`], [`scene_merge`], [`scene_optimizer`], [`scene_streaming`], [`cloud_registration`], [`geometry_tools`], [`mod@filter_gaussians`], [`gaussian_deduplicator`], [`gaussian_compressor`], [`lod_generator`], [`format_converter`] |
+//! | `sweep` | [`parameter_sweep`] |
+//! | `training` | [`training_monitor`], [`report_generator`], [`resume_analyzer`], [`telemetry`] |
+//! | `video` | [`video_export`] |
+//! | `workspace` | [`checkpoint_browser`] |
+//!
+//! [`progress_types`] and [`parallel_render`] are consumed by the handlers
+//! themselves rather than exposed as subcommands: they are the progress
+//! bars, timing tables and frame scheduler those commands run on.
 
 // Test code builds configs via Default then overrides individual fields to
 // exercise boundary conditions with intentionally invalid values.  Using the
 // struct-update syntax would obscure which single field is under test.
 #![allow(clippy::field_reassign_with_default)]
+// The no-unwrap policy applies to every production path in this crate, not
+// just the binary target (`main.rs` carries the same three lints). Test code
+// is exempt — `cfg(test)` is set for the whole crate when compiling the test
+// harness, so the deny only binds in ordinary builds.
+#![cfg_attr(not(test), deny(clippy::unwrap_used))]
+#![cfg_attr(not(test), deny(clippy::expect_used))]
+#![warn(clippy::panic)]
 
 pub mod animation_export;
 pub mod arcball;
 pub mod assets;
 pub mod batch_processor;
+pub mod benchmark;
 pub mod benchmark_suite;
 pub mod cache;
 pub mod camera_path_tool;
@@ -18,13 +73,16 @@ pub mod checkpoint_browser;
 pub mod cli;
 pub mod cloud_registration;
 pub mod color_calibration;
+pub mod commands;
 pub mod compare;
 pub mod config;
 pub mod config_cmd;
 pub mod config_presets;
+pub mod convert;
 pub mod dashboard;
 pub mod dataset_tools;
 pub mod diff_tool;
+pub mod dry_run;
 pub mod error;
 pub mod evaluation_suite;
 pub mod experiment_report;
@@ -47,8 +105,10 @@ pub mod log_rotation;
 pub mod memory_estimator;
 pub mod metrics;
 pub mod model_inspector;
+pub mod output;
 pub mod parallel_render;
 pub mod parameter_sweep;
+pub mod pipeline;
 pub mod preview;
 pub mod profiling_report;
 pub mod progress;
@@ -58,8 +118,10 @@ pub mod report_generator;
 pub mod resume_analyzer;
 pub mod scene_analyzer;
 pub mod scene_merge;
+pub mod scene_optimizer;
 pub mod scene_streaming;
 pub mod stages;
+pub mod summary;
 pub mod telemetry;
 pub mod training_monitor;
 pub mod verbosity;
@@ -127,10 +189,11 @@ pub use dataset_tools::{
     FileEntry, FileType, SplitConfig, SplitStats,
 };
 pub use diff_tool::{
-    change_score_histogram, compute_field_diff, detect_regression, diff_models, diff_sequence,
-    format_field_diff, format_model_diff, largest_position_changes, opacity_changes,
-    per_gaussian_change_score, snapshots_approximately_equal, summarize_progress, DiffConfig,
-    DiffError, FieldDiff, ModelDiff, ModelSnapshot, ProgressSummary, RegressionReport,
+    change_score_histogram, compute_field_diff, detect_regression, diff_models,
+    diff_models_variable, diff_sequence, format_field_diff, format_field_diff_header,
+    format_model_diff, largest_position_changes, opacity_changes, per_gaussian_change_score,
+    snapshots_approximately_equal, summarize_progress, DiffConfig, DiffError, FieldDiff, ModelDiff,
+    ModelSnapshot, ProgressSummary, RegressionReport,
 };
 pub use error::CliError;
 pub use evaluation_suite::{
@@ -182,8 +245,8 @@ pub use geometry_tools::{
     center_at_origin, cloud_distance, compute_bounding_sphere, compute_centroid,
     compute_gaussian_bbox, compute_geometry_stats, compute_obb, filter_by_bbox, filter_by_sphere,
     mean_gaussian_scale, nearest_neighbor_distances, normalize_to_unit_cube, rescale_gaussians,
-    spatial_coverage, transform_positions, transform_rotations, BoundingSphere, GaussianBBox,
-    GeometryError, GeometryStats, ObbResult, RigidTransform,
+    spatial_coverage, transform_positions, transform_rotations, transform_scales, BoundingSphere,
+    GaussianBBox, GeometryError, GeometryStats, ObbResult, RigidTransform,
 };
 pub use interactive::InteractiveController;
 pub use lod_generator::{
@@ -248,6 +311,22 @@ pub use scene_merge::{
     merge_at_boundary, merge_scenes, merge_scenes_with_stats, GaussianEntry, MergeError,
     MergeStats, SceneGaussians, SceneMergeConfig,
 };
+// `scene_optimizer` was the one scene module with no re-export block, so
+// `OpacitySpace` — the type that decides whether an opacity array is read as
+// logits or as already-activated probabilities, and therefore whether
+// `--prune-opacity 0.5` keeps half a scene or all of it — was reachable only
+// through the module path while its siblings' types were not. Every public
+// item of the module is surfaced here, `OpacitySpace` included.
+pub use scene_optimizer::{
+    so_apply_keep_mask_1d, so_apply_keep_mask_3d, so_apply_keep_mask_4d, so_apply_keep_mask_nd,
+    so_clamp_scales, so_clip_to_aabb, so_clip_to_sphere, so_compute_snapshot, so_deduplicate_near,
+    so_format_config, so_format_report, so_format_snapshot, so_format_step_result, so_morton_code,
+    so_morton_interleave, so_normalize_opacity, so_profile_config, so_prune_by_opacity,
+    so_quantize_position, so_quick_optimize, so_reorder_by_indices, so_sort_morton,
+    so_top_n_by_opacity, GaussianArrays, OpacitySpace, OptimizationPipeline, OptimizationProfile,
+    OptimizationReport, OptimizationStep, OptimizationStepResult, OptimizedScene, OptimizerError,
+    SceneOptimizerConfig, SceneSnapshot,
+};
 pub use scene_streaming::{
     ss_chunk_bounds, ss_chunk_id, ss_chunk_scene, ss_compute_priority, ss_compute_scene_bounds,
     ss_compute_stats, ss_distance_to_aabb, ss_format_config, ss_format_stats,
@@ -278,3 +357,48 @@ pub use workspace_manager::{
     ws_prune_checkpoints, ws_timestamped_name, ws_validate_name, Workspace, WorkspaceConfig,
     WorkspaceError, WorkspaceManager, WorkspaceStats, WorkspaceStatus, WorkspaceStatusCounts,
 };
+
+#[cfg(test)]
+mod tests {
+    // A glob import of the crate root: this is what makes the regression
+    // test below meaningful. `GaussianArrays` lives in `scene_optimizer`, so
+    // `super::scene_optimizer::GaussianArrays` would resolve whether or not
+    // it is re-exported here — only the *bare* name reaching this glob
+    // proves the `pub use scene_optimizer::{ .. }` list above actually
+    // carries it.
+    use super::*;
+
+    /// Regression: `scene_optimizer` was the one scene module whose
+    /// re-export block omitted a type its own public function needs —
+    /// `so_quick_optimize` takes `GaussianArrays<'_>`, but `GaussianArrays`
+    /// itself was not in the `pub use` list, so a caller reaching
+    /// `so_quick_optimize` through the crate root had no crate-root path to
+    /// its own argument type. This would fail to compile if the re-export
+    /// regressed, since `GaussianArrays` here is the bare name brought in by
+    /// `use super::*` above, not a `scene_optimizer::` qualified path.
+    #[test]
+    fn gaussian_arrays_is_reexported_alongside_so_quick_optimize() {
+        let n = 2;
+        let sh_channels = 3;
+        let positions: Vec<f32> = (0..n * 3).map(|i| i as f32 * 0.01).collect();
+        let rotations: Vec<f32> = (0..n).flat_map(|_| [0.0f32, 0.0, 0.0, 1.0]).collect();
+        let scales: Vec<f32> = vec![0.05f32; n * 3];
+        let opacities: Vec<f32> = (0..n).map(|i| (i as f32) * 0.5 - 1.0).collect();
+        let sh_coefficients: Vec<f32> = vec![0.0f32; n * sh_channels];
+
+        let arrays = GaussianArrays {
+            positions: &positions,
+            rotations: &rotations,
+            scales: &scales,
+            opacities: &opacities,
+            sh_coefficients: &sh_coefficients,
+        };
+
+        let result = so_quick_optimize(arrays, n, sh_channels, OptimizationProfile::Quality);
+        assert!(
+            result.is_ok(),
+            "so_quick_optimize with a valid GaussianArrays must succeed: {:?}",
+            result.err()
+        );
+    }
+}

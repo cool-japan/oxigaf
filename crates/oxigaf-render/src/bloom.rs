@@ -245,17 +245,22 @@ pub fn gaussian_blur_rgb(
 ///
 /// Returns `(pixels, out_width, out_height)`.  Minimum output size is 1×1.
 /// For odd input dimensions the last row/column is handled by clamping.
+/// Returns `(Vec::new(), 0, 0)` if `width == 0 || height == 0` rather than
+/// indexing into the (necessarily empty) input.
 pub fn downsample_2x(image: &[f32], width: usize, height: usize) -> (Vec<f32>, usize, usize) {
+    if width == 0 || height == 0 {
+        return (Vec::new(), 0, 0);
+    }
     let ow = (width / 2).max(1);
     let oh = (height / 2).max(1);
     let mut out = vec![0.0_f32; ow * oh * 3];
     for oy in 0..oh {
         for ox in 0..ow {
             // Source 2×2 block, clamped so odd dimensions don't overflow.
-            let sx0 = (ox * 2).min(width - 1);
-            let sx1 = (ox * 2 + 1).min(width - 1);
-            let sy0 = (oy * 2).min(height - 1);
-            let sy1 = (oy * 2 + 1).min(height - 1);
+            let sx0 = (ox * 2).min(width.saturating_sub(1));
+            let sx1 = (ox * 2 + 1).min(width.saturating_sub(1));
+            let sy0 = (oy * 2).min(height.saturating_sub(1));
+            let sy1 = (oy * 2 + 1).min(height.saturating_sub(1));
 
             let b00 = (sy0 * width + sx0) * 3;
             let b01 = (sy0 * width + sx1) * 3;
@@ -274,7 +279,12 @@ pub fn downsample_2x(image: &[f32], width: usize, height: usize) -> (Vec<f32>, u
 
 /// Upsample an RGB image by 2× using bilinear interpolation.
 ///
-/// Output size is `(width * 2) × (height * 2)`.
+/// Output size is `(width * 2) × (height * 2)`. Uses pixel-centre-aligned
+/// sampling (`(ox + 0.5) * 0.5 - 0.5`, not `ox * 0.5`): mapping output pixel
+/// *centres* to source pixel *centres* keeps a resample's centre of mass
+/// fixed. Corner-aligned sampling instead shifts the whole image by a
+/// quarter of a source pixel toward the origin, which compounds visibly
+/// across a multi-level mip chain.
 pub fn upsample_2x(image: &[f32], width: usize, height: usize) -> Vec<f32> {
     let ow = width * 2;
     let oh = height * 2;
@@ -297,8 +307,8 @@ pub fn upsample_2x(image: &[f32], width: usize, height: usize) -> Vec<f32> {
 
     for oy in 0..oh {
         for ox in 0..ow {
-            let sx = ox as f32 / 2.0;
-            let sy = oy as f32 / 2.0;
+            let sx = ((ox as f32 + 0.5) * 0.5 - 0.5).max(0.0);
+            let sy = ((oy as f32 + 0.5) * 0.5 - 0.5).max(0.0);
             let out_base = (oy * ow + ox) * 3;
             for c in 0..3 {
                 out[out_base + c] = sample(sx, sy, c);
@@ -339,14 +349,21 @@ pub fn build_mip_pyramid(
     levels.push((image.to_vec(), width, height));
 
     for _ in 1..num_levels {
-        let (prev_pixels, prev_w, prev_h) = match levels.last() {
-            Some(l) => (l.0.clone(), l.1, l.2),
+        // Borrow the previous level's pixels only for the blur call itself
+        // (no clone of the, potentially large, pixel buffer just to satisfy
+        // the borrow checker) and propagate a blur failure instead of
+        // silently falling back to unblurred data — `gaussian_blur_rgb` can
+        // only fail on a dimension mismatch, which would indicate a real
+        // bug in how this level's dimensions were tracked and is worth
+        // surfacing rather than hiding.
+        let blurred_level = match levels.last().map(|l| (&l.0, l.1, l.2)) {
+            Some((prev_pixels, prev_w, prev_h)) => {
+                let blurred = gaussian_blur_rgb(prev_pixels, prev_w, prev_h, 1, 1.0)?;
+                (blurred, prev_w, prev_h)
+            }
             None => break,
         };
-
-        // Blur before downsampling to avoid aliasing.
-        let blurred = gaussian_blur_rgb(&prev_pixels, prev_w, prev_h, 1, 1.0)
-            .unwrap_or_else(|_| prev_pixels.clone());
+        let (blurred, prev_w, prev_h) = blurred_level;
 
         let (down_pixels, down_w, down_h) = downsample_2x(&blurred, prev_w, prev_h);
         levels.push((down_pixels, down_w, down_h));
@@ -551,38 +568,20 @@ pub fn apply_hdr_bloom(
             config.blur_sigma,
         )?;
 
-        // Upsample to original size in a chain of 2× steps.
-        let mut up = blurred;
-        let mut uw = *level_w;
-        let mut uh = *level_h;
-        while uw < width || uh < height {
-            let next = upsample_2x(&up, uw, uh);
-            uw = (uw * 2).min(width);
-            uh = (uh * 2).min(height);
-            // Crop to exact original size if overshooting.
-            if uw == width && uh == height {
-                up = next;
-            } else {
-                // Re-crop: take the top-left width×height region of the upsampled image.
-                let actual_w = uw.max(width);
-                let actual_h = uh.max(height);
-                let _ = actual_w;
-                let _ = actual_h;
-                up = next;
-            }
-        }
-
-        // Ensure exact size match (can differ by a pixel for odd dims).
-        if up.len() == n * 3 {
-            for i in 0..n * 3 {
-                bloom_acc[i] += up[i] * level_weight;
-            }
-        } else {
-            // Crop to n*3.
-            let copy_len = up.len().min(n * 3);
-            for i in 0..copy_len {
-                bloom_acc[i] += up[i] * level_weight;
-            }
+        // Upsample directly to the original size with a single size-targeted
+        // bilinear resample (rather than a chain of `upsample_2x` doublings:
+        // for a non-power-of-two `width`/`height`, `uw * 2` can overshoot
+        // `width`, and there is no dimension at which the chain's real
+        // buffer size (always exactly double the previous step) matches the
+        // clamped `width × height` target — a discrepancy previous code
+        // detected but never actually corrected before compositing the
+        // wrongly-shaped buffer, producing a diagonally row-skewed bloom
+        // layer). `bloom_simple::bloom_upsample` resamples straight from
+        // `(level_w, level_h)` to `(width, height)` and always returns
+        // exactly `width * height * 3` samples.
+        let up = crate::bloom_simple::bloom_upsample(&blurred, *level_w, *level_h, width, height);
+        for i in 0..n * 3 {
+            bloom_acc[i] += up[i] * level_weight;
         }
     }
 
@@ -959,6 +958,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_downsample_2x_zero_width_no_panic() {
+        // Regression: `(ox * 2).min(width - 1)` used to underflow `width - 1`
+        // as a `usize` subtraction when `width == 0`, which either panics in
+        // debug builds or wraps to `usize::MAX` and then panics on the
+        // resulting out-of-bounds slice index in release builds.
+        let (out, ow, oh) = downsample_2x(&[], 0, 4);
+        assert_eq!((out.len(), ow, oh), (0, 0, 0));
+    }
+
+    #[test]
+    fn test_downsample_2x_zero_height_no_panic() {
+        let (out, ow, oh) = downsample_2x(&[], 4, 0);
+        assert_eq!((out.len(), ow, oh), (0, 0, 0));
+    }
+
+    #[test]
+    fn test_downsample_2x_zero_width_and_height_no_panic() {
+        let (out, ow, oh) = downsample_2x(&[], 0, 0);
+        assert_eq!((out.len(), ow, oh), (0, 0, 0));
+    }
+
     // ── upsample_2x ──────────────────────────────────────────────────────────
 
     #[test]
@@ -979,6 +1000,36 @@ mod tests {
             assert!((out[b] - 0.8).abs() < 1e-6);
             assert!((out[b + 1] - 0.4).abs() < 1e-6);
             assert!((out[b + 2] - 0.2).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn test_upsample_2x_pixel_center_aligned() {
+        // 4x1 horizontal ramp (R channel = column index; G, B = 0). With
+        // the pre-fix corner-aligned sampling (`sx = ox * 0.5`) the whole
+        // image is shifted by a quarter source pixel toward the origin;
+        // with pixel-centre alignment the ramp's centre of mass is
+        // preserved and these exact values result (hand-derived from the
+        // bilinear formula).
+        let width = 4;
+        let height = 1;
+        let mut img = vec![0.0_f32; width * height * 3];
+        for x in 0..width {
+            img[x * 3] = x as f32;
+        }
+        let out = upsample_2x(&img, width, height);
+        assert_eq!(out.len(), 8 * 2 * 3);
+
+        let expected_r = [0.0_f32, 0.25, 0.75, 1.25];
+        let corner_aligned_r = [0.0_f32, 0.5, 1.0, 1.5];
+        for (ox, &exp) in expected_r.iter().enumerate() {
+            let r = out[ox * 3];
+            assert!(
+                (r - exp).abs() < 1e-4,
+                "pixel-centre-aligned upsample at ox={ox}: expected r={exp}, got {r} \
+                 (corner-aligned sampling would give {})",
+                corner_aligned_r[ox]
+            );
         }
     }
 
@@ -1007,6 +1058,33 @@ mod tests {
     fn test_build_mip_pyramid_zero_levels_error() {
         let img = vec![0.5_f32; 4 * 4 * 3];
         assert!(build_mip_pyramid(&img, 4, 4, 0).is_err());
+    }
+
+    #[test]
+    fn test_build_mip_pyramid_level1_reflects_blur() {
+        // Regression guard for the borrow-avoiding refactor of the per-level
+        // blur call: level 1 must actually be blurred-then-downsampled, not
+        // just downsampled (which is what a silently-swallowed blur error
+        // used to fall back to).
+        let mut img = vec![0.0_f32; 8 * 8 * 3];
+        let center = (4 * 8 + 4) * 3;
+        img[center] = 1.0;
+        img[center + 1] = 1.0;
+        img[center + 2] = 1.0;
+
+        let levels = build_mip_pyramid(&img, 8, 8, 2).expect("pyramid build failed");
+        assert_eq!(levels.len(), 2);
+        let (ref level1_pixels, w1, h1) = levels[1];
+        assert_eq!((w1, h1), (4, 4));
+
+        // A plain downsample of the *unblurred* image, for comparison: if
+        // the per-level blur genuinely ran, level 1 must differ from this.
+        let (unblurred_down, _, _) = downsample_2x(&img, 8, 8);
+        assert_ne!(
+            level1_pixels, &unblurred_down,
+            "level 1 should reflect the blur pass, not a plain downsample of \
+             the unblurred image"
+        );
     }
 
     // ── HdrBloomConfig ───────────────────────────────────────────────────────
@@ -1116,6 +1194,70 @@ mod tests {
         let sum_in: f32 = img.iter().sum();
         let sum_out: f32 = out.iter().sum();
         assert!(sum_out >= sum_in, "bloom should add light, not remove it");
+    }
+
+    #[test]
+    fn test_apply_hdr_bloom_non_power_of_two_stays_centered() {
+        // Regression for a row-skewed upsample chain: on non-power-of-two
+        // dimensions, the old chained-doubling upsample tracked clamped
+        // dimensions that diverged from the real (always-doubling) buffer
+        // size, and never actually re-cropped the mismatch, so the
+        // composited bloom was a diagonally row-skewed reinterpretation of
+        // the buffer instead of a soft glow around the source pixel.
+        //
+        // width/height are both non-power-of-two and mutually coprime-ish
+        // so every pyramid level stays non-power-of-two too.
+        let width = 37;
+        let height = 23;
+        let n = width * height;
+        let mut img = vec![0.0_f32; n * 3];
+        let cx = 20;
+        let cy = 12;
+        let base = (cy * width + cx) * 3;
+        img[base] = 4.0;
+        img[base + 1] = 4.0;
+        img[base + 2] = 4.0;
+
+        let cfg = HdrBloomConfig {
+            threshold: 1.0,
+            knee: 0.1,
+            intensity: 1.0,
+            num_levels: 4,
+            blur_radius: 2,
+            blur_sigma: 1.5,
+            level_weights: vec![],
+        };
+        let out = apply_hdr_bloom(&img, width, height, &cfg).expect("bloom failed");
+        assert_eq!(out.len(), n * 3);
+        for &v in &out {
+            assert!(v.is_finite(), "bloom output must stay finite, got {v}");
+        }
+
+        // Find the pixel with the largest bloom-only contribution
+        // (out - image summed over channels) and check it lands at (or
+        // very near) the source bright pixel rather than somewhere the
+        // buffer's true stride happened to place it.
+        let mut best_idx = 0usize;
+        let mut best_val = f32::MIN;
+        for i in 0..n {
+            let b = i * 3;
+            let contribution =
+                (out[b] - img[b]) + (out[b + 1] - img[b + 1]) + (out[b + 2] - img[b + 2]);
+            if contribution > best_val {
+                best_val = contribution;
+                best_idx = i;
+            }
+        }
+        let peak_x = best_idx % width;
+        let peak_y = best_idx / width;
+        let dx = (peak_x as isize - cx as isize).abs();
+        let dy = (peak_y as isize - cy as isize).abs();
+        assert!(
+            dx <= 2 && dy <= 2,
+            "bloom peak should stay near the source pixel ({cx},{cy}); got \
+             ({peak_x},{peak_y}) — a row-skewed buffer would displace this \
+             far more than a couple of pixels"
+        );
     }
 
     // ── apply_hdr_bloom_and_tonemap ──────────────────────────────────────────

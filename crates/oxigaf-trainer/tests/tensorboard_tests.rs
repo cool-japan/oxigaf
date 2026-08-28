@@ -66,6 +66,7 @@ fn test_scalar_logging_creates_valid_file() {
     let config = TensorBoardConfig::new(&dir).with_flush_interval(0);
     let mut writer_result = TensorBoardWriter::new(config);
 
+    assert!(writer_result.is_ok(), "Writer creation should succeed");
     if let Ok(ref mut writer) = writer_result {
         // Log multiple scalars
         let result = writer.log_scalar("loss/total", 0.5, 1);
@@ -107,6 +108,7 @@ fn test_batch_scalar_logging() {
     let config = TensorBoardConfig::new(&dir);
     let mut writer_result = TensorBoardWriter::new(config);
 
+    assert!(writer_result.is_ok(), "Writer creation should succeed");
     if let Ok(ref mut writer) = writer_result {
         let result = writer.log_scalars(
             &[
@@ -131,6 +133,7 @@ fn test_image_logging() {
     let config = TensorBoardConfig::new(&dir);
     let mut writer_result = TensorBoardWriter::new(config);
 
+    assert!(writer_result.is_ok(), "Writer creation should succeed");
     if let Ok(ref mut writer) = writer_result {
         // Create a simple 4x4 RGB gradient image
         let width = 4u32;
@@ -165,6 +168,7 @@ fn test_image_logging_dimension_mismatch() {
     let config = TensorBoardConfig::new(&dir);
     let mut writer_result = TensorBoardWriter::new(config);
 
+    assert!(writer_result.is_ok(), "Writer creation should succeed");
     if let Ok(ref mut writer) = writer_result {
         // Wrong size image data (should be 4x4x3 = 48, but we provide 10)
         let image_data = vec![0.5f32; 10];
@@ -183,6 +187,7 @@ fn test_histogram_logging() {
     let config = TensorBoardConfig::new(&dir);
     let mut writer_result = TensorBoardWriter::new(config);
 
+    assert!(writer_result.is_ok(), "Writer creation should succeed");
     if let Ok(ref mut writer) = writer_result {
         // Generate random-ish gradient data
         let gradient_data: Vec<f32> = (0..1000)
@@ -261,6 +266,7 @@ fn test_training_metrics_logger_log_step() {
     let config = TensorBoardConfig::new(&dir);
     let logger_result = TrainingMetricsLogger::new(config);
 
+    assert!(logger_result.is_ok(), "Logger creation should succeed");
     if let Ok(mut logger) = logger_result {
         let lr = LearningRates::from_config(1e-4, 1e-3, 5e-3, 5e-2, 2.5e-3);
 
@@ -288,6 +294,7 @@ fn test_training_metrics_logger_log_losses() {
     let config = TensorBoardConfig::new(&dir);
     let logger_result = TrainingMetricsLogger::new(config);
 
+    assert!(logger_result.is_ok(), "Logger creation should succeed");
     if let Ok(mut logger) = logger_result {
         let result = logger.log_losses(100, 0.03, 0.01, 0.005, 0.002, 0.003);
         assert!(result.is_ok(), "log_losses should succeed");
@@ -306,6 +313,7 @@ fn test_training_metrics_logger_intervals() {
 
     let logger_result = TrainingMetricsLogger::new(config);
 
+    assert!(logger_result.is_ok(), "Logger creation should succeed");
     if let Ok(mut logger) = logger_result {
         let lr = LearningRates::default();
 
@@ -444,6 +452,7 @@ fn test_writer_auto_flush_on_drop() {
         let config = TensorBoardConfig::new(&dir).with_flush_interval(1000); // High interval
         let mut writer_result = TensorBoardWriter::new(config);
 
+        assert!(writer_result.is_ok(), "Writer creation should succeed");
         if let Ok(ref mut writer) = writer_result {
             for i in 1..=10 {
                 let _ = writer.log_scalar("test", i as f32, i);
@@ -466,6 +475,7 @@ fn test_step_tracking() {
     let config = TensorBoardConfig::new(&dir);
     let mut writer_result = TensorBoardWriter::new(config);
 
+    assert!(writer_result.is_ok(), "Writer creation should succeed");
     if let Ok(ref mut writer) = writer_result {
         assert_eq!(writer.current_step(), 0);
 

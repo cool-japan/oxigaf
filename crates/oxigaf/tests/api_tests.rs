@@ -82,9 +82,13 @@ fn test_pipeline_builder_zero_iterations_rejected() {
 
 #[test]
 fn test_validate_config_catches_nonexistent_paths() {
+    let missing_flame_dir =
+        std::env::temp_dir().join("oxigaf_validate_missing_flame_dir_does_not_exist");
+    fs::remove_dir_all(&missing_flame_dir).ok();
+
     let config = PipelineConfig {
-        flame_model_path: std::path::PathBuf::from("/nonexistent/flame/path/that/cannot/exist"),
-        output_dir: std::path::PathBuf::from("/tmp/out"),
+        flame_model_path: missing_flame_dir,
+        output_dir: std::env::temp_dir().join("oxigaf_validate_nonexistent_out"),
         num_views: 8,
         iterations: 1000,
     };
@@ -141,20 +145,21 @@ fn test_verify_assets_returns_missing_list() {
     let tmp = std::env::temp_dir().join("oxigaf_assets_test");
     fs::create_dir_all(&tmp).expect("create temp dir");
 
-    // Create some but not all expected assets.
-    fs::write(tmp.join("shape_dirs.npy"), b"dummy").expect("write");
-    fs::write(tmp.join("exp_dirs.npy"), b"dummy").expect("write");
+    // Create some but not all expected assets, using the exact names
+    // `oxigaf_flame::io::load_flame_model` reads (see pipeline::verify_assets).
+    fs::write(tmp.join("shapedirs.npy"), b"dummy").expect("write");
+    fs::write(tmp.join("expressiondirs.npy"), b"dummy").expect("write");
 
     let missing = verify_assets(&tmp);
 
-    // shape_dirs and exp_dirs are present; others should be missing.
+    // shapedirs and expressiondirs are present; others should be missing.
     assert!(
-        !missing.contains(&"shape_dirs.npy".to_string()),
-        "shape_dirs.npy should not be in missing list"
+        !missing.contains(&"shapedirs.npy".to_string()),
+        "shapedirs.npy should not be in missing list"
     );
     assert!(
-        !missing.contains(&"exp_dirs.npy".to_string()),
-        "exp_dirs.npy should not be in missing list"
+        !missing.contains(&"expressiondirs.npy".to_string()),
+        "expressiondirs.npy should not be in missing list"
     );
     assert!(
         missing.contains(&"v_template.npy".to_string()),
@@ -166,14 +171,17 @@ fn test_verify_assets_returns_missing_list() {
 
 #[test]
 fn test_verify_assets_all_present() {
+    // Exactly the file set `oxigaf_flame::io::load_flame_model` reads (see
+    // the doc comment on `pipeline::verify_assets`), not the legacy names.
     const EXPECTED: &[&str] = &[
-        "shape_dirs.npy",
-        "exp_dirs.npy",
-        "posedirs.npy",
         "v_template.npy",
-        "J_regressor.npy",
-        "kintree_table.npy",
         "faces.npy",
+        "shapedirs.npy",
+        "expressiondirs.npy",
+        "posedirs.npy",
+        "j_regressor.npy",
+        "kintree_table.npy",
+        "lbs_weights.npy",
     ];
 
     let tmp = std::env::temp_dir().join("oxigaf_assets_all_test");
@@ -199,8 +207,10 @@ fn test_verify_assets_all_present() {
 fn test_detect_best_backend_non_empty() {
     let backend = detect_best_backend();
     assert!(!backend.is_empty(), "backend string must not be empty");
-    // Should be one of the known backends.
-    let known = ["Metal", "Vulkan", "Dx12", "Gl", "Unknown"];
+    // detect_best_backend() is a pure cfg(target_os) dispatch over exactly
+    // these four targets (see pipeline::detect_best_backend) — "Unknown" is
+    // not a value any code path can return, so it must not be in this set.
+    let known = ["Metal", "Vulkan", "Dx12", "Gl"];
     assert!(
         known.contains(&backend.as_str()),
         "unexpected backend string: {backend}"
@@ -233,13 +243,21 @@ fn test_export_format_equality() {
 }
 
 // ============================================================================
-// render_from_file and export stub tests
+// render_from_file and export tests
 // ============================================================================
 
 #[test]
 fn test_render_from_file_missing_path_returns_err() {
-    let err = render_from_file("/nonexistent/model.ply", "/tmp/out.png", 512, 512)
-        .expect_err("missing model path should fail");
+    let missing_model = std::env::temp_dir().join("oxigaf_render_missing_model_does_not_exist.ply");
+    fs::remove_file(&missing_model).ok();
+
+    let err = render_from_file(
+        &missing_model,
+        std::env::temp_dir().join("oxigaf_render_missing_out.png"),
+        512,
+        512,
+    )
+    .expect_err("missing model path should fail");
     assert!(matches!(err, OxigafError::PathNotFound(_)));
 }
 
@@ -248,8 +266,9 @@ fn test_render_from_file_zero_dimensions_returns_err() {
     let tmp = std::env::temp_dir().join("oxigaf_render_test.ply");
     fs::write(&tmp, b"ply").expect("write dummy ply");
 
-    let err = render_from_file(tmp.as_path(), std::path::Path::new("/tmp/out.png"), 0, 512)
-        .expect_err("zero width should fail");
+    let out = std::env::temp_dir().join("oxigaf_render_zero_dim_out.png");
+    let err =
+        render_from_file(tmp.as_path(), out.as_path(), 0, 512).expect_err("zero width should fail");
     assert!(matches!(err, OxigafError::InvalidConfig(_)));
 
     fs::remove_file(&tmp).ok();
@@ -257,9 +276,12 @@ fn test_render_from_file_zero_dimensions_returns_err() {
 
 #[test]
 fn test_export_missing_path_returns_err() {
+    let missing_model = std::env::temp_dir().join("oxigaf_export_missing_model_does_not_exist.ply");
+    fs::remove_file(&missing_model).ok();
+
     let err = export(
-        "/nonexistent/model.ply",
-        "/tmp/out.gltf",
+        &missing_model,
+        std::env::temp_dir().join("oxigaf_export_missing_out.gltf"),
         ExportFormat::Gltf,
     )
     .expect_err("missing model path should fail");

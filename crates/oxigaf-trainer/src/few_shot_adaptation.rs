@@ -39,6 +39,8 @@ pub enum FewShotError {
     InvalidLR { lr: f32 },
     #[error("No episodes to compute statistics")]
     NoEpisodes,
+    #[error("Invalid support label {label}: must be in 0..{n_way}")]
+    InvalidLabel { label: usize, n_way: usize },
 }
 
 // ── Support / Query / Episode structures ─────────────────────────────────────
@@ -85,6 +87,9 @@ impl SupportSet {
         }
         if embeddings.is_empty() {
             return Err(FewShotError::EmptySupportSet);
+        }
+        if let Some(&bad) = labels.iter().find(|&&l| l >= n_way) {
+            return Err(FewShotError::InvalidLabel { label: bad, n_way });
         }
         Ok(Self {
             embeddings,
@@ -312,8 +317,15 @@ impl PrototypicalNet {
         }
     }
 
-    /// Euclidean distance from `query_emb` to each prototype.
-    pub fn query_distances(&self, query_emb: &[f32]) -> Vec<f32> {
+    /// Squared Euclidean distance from `query_emb` to each prototype.
+    ///
+    /// Prototypical Networks (Snell et al. 2017, §3.2) define the class
+    /// posterior as `softmax(-||f(x) - c_k||^2)` using the **squared**
+    /// Euclidean distance -- this is what makes the classifier equivalent to
+    /// a linear model under a Bregman-divergence parameterization. Used by
+    /// [`Self::softmax_probs`] (and therefore [`fsa_proto_loss`]); see
+    /// [`Self::query_distances`] for a true (non-squared) metric distance.
+    pub fn query_sq_distances(&self, query_emb: &[f32]) -> Vec<f32> {
         (0..self.n_way)
             .map(|c| {
                 let proto = &self.prototypes[c * self.d..(c + 1) * self.d];
@@ -322,14 +334,24 @@ impl PrototypicalNet {
                     .zip(query_emb.iter())
                     .map(|(p, q)| (p - q) * (p - q))
                     .sum::<f32>()
-                    .sqrt()
             })
+            .collect()
+    }
+
+    /// True (non-squared) Euclidean distance from `query_emb` to each
+    /// prototype. For classification decisions and the prototypical-network
+    /// softmax posterior, prefer [`Self::query_sq_distances`] -- the argmin
+    /// is the same either way, but the posterior shape is not.
+    pub fn query_distances(&self, query_emb: &[f32]) -> Vec<f32> {
+        self.query_sq_distances(query_emb)
+            .into_iter()
+            .map(f32::sqrt)
             .collect()
     }
 
     /// Classify a single query embedding: returns the index of the nearest prototype.
     pub fn classify(&self, query_emb: &[f32]) -> usize {
-        let dists = self.query_distances(query_emb);
+        let dists = self.query_sq_distances(query_emb);
         dists
             .iter()
             .enumerate()
@@ -339,20 +361,28 @@ impl PrototypicalNet {
     }
 
     /// Classify all query embeddings in batch.
+    ///
+    /// If `query_embs` is shorter than `n_query * self.d` (a caller-supplied
+    /// `n_query` that does not match the buffer), `n_query` is silently
+    /// clamped down to the number of complete embeddings actually available
+    /// rather than indexing out of bounds.
     pub fn classify_batch(&self, query_embs: &[f32], n_query: usize) -> Vec<usize> {
+        let d = self.d.max(1);
+        let available = query_embs.len() / d;
+        let n_query = n_query.min(available);
         (0..n_query)
             .map(|i| {
-                let emb = &query_embs[i * self.d..(i + 1) * self.d];
+                let emb = &query_embs[i * d..(i + 1) * d];
                 self.classify(emb)
             })
             .collect()
     }
 
-    /// Softmax probabilities over classes: `exp(-dist/T) / sum(exp(-dist/T))`.
+    /// Softmax probabilities over classes: `exp(-dist²/T) / sum(exp(-dist²/T))`.
     ///
     /// Numerically stable — subtracts max before exponentiation.
     pub fn softmax_probs(&self, query_emb: &[f32], temperature: f32) -> Vec<f32> {
-        let dists = self.query_distances(query_emb);
+        let dists = self.query_sq_distances(query_emb);
         let t = temperature.max(1e-9);
         let neg_scaled: Vec<f32> = dists.iter().map(|&d| -d / t).collect();
         let max_val = neg_scaled.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
@@ -475,7 +505,14 @@ pub fn fsa_inner_gradient(params: &[f32], target: &[f32]) -> Vec<f32> {
 /// Returns the final inner loss.
 pub fn fsa_maml_adapt(state: &mut MamlState, support_embeddings: &[f32], n_support: usize) -> f32 {
     let d = state.d;
-    if n_support == 0 || d == 0 {
+    if d == 0 {
+        return 0.0;
+    }
+    // Defensively clamp down to the number of complete embeddings actually
+    // present, so a caller-supplied `n_support` that overstates the buffer
+    // cannot index out of bounds below.
+    let n_support = n_support.min(support_embeddings.len() / d);
+    if n_support == 0 {
         return 0.0;
     }
 
@@ -802,6 +839,110 @@ impl FewShotConfig {
     }
 }
 
+// ── Episode runner ───────────────────────────────────────────────────────────
+
+/// Run `config.n_episodes` full few-shot adaptation episodes end-to-end.
+///
+/// For each episode this samples an N-way K-shot task via
+/// [`fsa_sample_episode`] (seeded by `config.seed + episode_index`), then
+/// runs a genuine MAML pre/post adaptation comparison:
+///
+/// - **pre_accuracy**: query-set accuracy of a [`PrototypicalNet`] built from
+///   the *un-adapted* (zero meta-init) prototypes -- the model has not yet
+///   seen the episode's support set.
+/// - **post_accuracy**: query-set accuracy of the *same* prototypes after
+///   independently adapting each class's prototype via [`MamlState`] /
+///   [`fsa_maml_adapt`] for `config.n_inner_steps` steps at `config.inner_lr`,
+///   targeting that class's own support-set mean.
+///
+/// `config.proto_temperature` weights the post-adaptation query
+/// cross-entropy ([`fsa_proto_loss`]) reported as each episode's
+/// `final_loss`. Per-episode [`AdaptationResult`]s are logged via
+/// [`fsa_format_result`] at `debug` level, and the post-adaptation
+/// accuracies are aggregated via [`fsa_compute_stats`].
+///
+/// # Errors
+///
+/// Propagates any [`FewShotError`] from episode sampling or `MamlState`
+/// construction (e.g. `config.inner_lr <= 0.0`), and
+/// [`FewShotError::NoEpisodes`] if `config.n_episodes == 0`.
+pub fn fsa_run_episodes(
+    all_embeddings: &[f32],
+    all_labels: &[usize],
+    n_total: usize,
+    d: usize,
+    config: &FewShotConfig,
+) -> Result<FewShotStats, FewShotError> {
+    let mut accuracies: Vec<f32> = Vec::with_capacity(config.n_episodes);
+    let mut n_ways: Vec<usize> = Vec::with_capacity(config.n_episodes);
+    let mut k_shots: Vec<usize> = Vec::with_capacity(config.n_episodes);
+
+    for i in 0..config.n_episodes {
+        let seed_i = config.seed.wrapping_add(i as u64);
+        let episode = fsa_sample_episode(
+            all_embeddings,
+            all_labels,
+            n_total,
+            d,
+            config.n_way,
+            config.k_shot,
+            config.n_query,
+            seed_i,
+        )?;
+        let sup = &episode.support;
+
+        // "Meta-initial" prototypes: zero for every class, representing a
+        // model that has not yet adapted to this episode's support set.
+        let pre_net = PrototypicalNet {
+            prototypes: vec![0.0f32; sup.n_way * sup.d],
+            n_way: sup.n_way,
+            d: sup.d,
+        };
+        let pre_accuracy = fsa_proto_accuracy(&pre_net, &episode.query);
+
+        // MAML inner loop: independently adapt each class's prototype from
+        // the same zero meta-init, via `n_inner_steps` of gradient descent
+        // (at `inner_lr`) toward that class's own support mean.
+        let mut adapted_prototypes = vec![0.0f32; sup.n_way * sup.d];
+        for c in 0..sup.n_way {
+            let start = c * sup.k_shot * sup.d;
+            let end = start + sup.k_shot * sup.d;
+            let class_support = &sup.embeddings[start..end];
+
+            let mut maml_state =
+                MamlState::new(vec![0.0f32; sup.d], config.inner_lr, config.n_inner_steps)?;
+            fsa_maml_adapt(&mut maml_state, class_support, sup.k_shot);
+            adapted_prototypes[c * sup.d..(c + 1) * sup.d]
+                .copy_from_slice(&maml_state.adapted_params);
+        }
+
+        let post_net = PrototypicalNet {
+            prototypes: adapted_prototypes,
+            n_way: sup.n_way,
+            d: sup.d,
+        };
+        let post_accuracy = fsa_proto_accuracy(&post_net, &episode.query);
+        let final_loss = fsa_proto_loss(&post_net, &episode.query, config.proto_temperature);
+
+        let result = AdaptationResult {
+            n_support: sup.labels.len(),
+            n_query: episode.query.labels.len(),
+            pre_accuracy,
+            post_accuracy,
+            n_steps: config.n_inner_steps,
+            final_loss,
+            improvement: post_accuracy - pre_accuracy,
+        };
+        tracing::debug!("few-shot episode {i}: {}", fsa_format_result(&result));
+
+        accuracies.push(post_accuracy);
+        n_ways.push(sup.n_way);
+        k_shots.push(sup.k_shot);
+    }
+
+    fsa_compute_stats(&accuracies, &n_ways, &k_shots)
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -867,6 +1008,17 @@ mod tests {
         assert!(matches!(
             result,
             Err(FewShotError::DimensionMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn test_support_set_label_out_of_range_errors() {
+        let emb = vec![0.0f32; 2 * 2 * 4]; // n_way=2, k_shot=2, d=4
+        let lbl = vec![0usize, 0, 1, 5]; // label 5 is out of range for n_way=2
+        let result = SupportSet::new(emb, lbl, 2, 2, 4);
+        assert!(matches!(
+            result,
+            Err(FewShotError::InvalidLabel { label: 5, n_way: 2 })
         ));
     }
 
@@ -1088,6 +1240,20 @@ mod tests {
     }
 
     #[test]
+    fn test_proto_classify_batch_short_buffer_does_not_panic() {
+        let ss = make_support(2, 2, 4);
+        let net = PrototypicalNet::from_support(&ss);
+        // Claim n_query=10 but only provide embeddings for 1 query.
+        let short_query = vec![0.0f32; 4];
+        let preds = net.classify_batch(&short_query, 10);
+        assert_eq!(
+            preds.len(),
+            1,
+            "should clamp to the embeddings actually available"
+        );
+    }
+
+    #[test]
     fn test_proto_query_distances_non_negative() {
         let ss = make_support(3, 2, 8);
         let net = PrototypicalNet::from_support(&ss);
@@ -1095,6 +1261,41 @@ mod tests {
         for d in net.query_distances(&emb) {
             assert!(d >= 0.0, "distance must be non-negative");
         }
+    }
+
+    #[test]
+    fn test_proto_softmax_uses_squared_distance() {
+        // Two classes: prototype 0 at [0,0], prototype 1 at [3,4] (distance
+        // 5 from the origin). Query at the origin: distance to class 0 = 0,
+        // distance to class 1 = 5.
+        //
+        // With SQUARED distance (Snell et al., the correct formula): logits
+        // are [0, -25/T]. With unsquared distance (the bug): logits would be
+        // [0, -5/T]. At T=1 these produce very different probability ratios.
+        let d = 2;
+        let embs = vec![0.0f32, 0.0, 3.0, 4.0];
+        let labels = vec![0usize, 1];
+        let ss = SupportSet::new(embs, labels, 2, 1, d).expect("valid");
+        let net = PrototypicalNet::from_support(&ss);
+        let query = vec![0.0f32, 0.0];
+        let probs = net.softmax_probs(&query, 1.0);
+
+        // Expected under the squared-distance (correct) formula:
+        // logit0 = -0^2 = 0, logit1 = -5^2 = -25.
+        let expected_p1 = (-25.0f32).exp() / (1.0 + (-25.0f32).exp());
+        assert!(
+            (probs[1] - expected_p1).abs() < 1e-6,
+            "expected squared-distance softmax p1={expected_p1}, got {}",
+            probs[1]
+        );
+        // Sanity: under the old (buggy) unsquared-distance formula, p1 would
+        // be exp(-5)/(1+exp(-5)) ≈ 0.0067 -- orders of magnitude larger than
+        // the correct ~1.4e-11. Guard against regressing to that behaviour.
+        let buggy_unsquared_p1 = (-5.0f32).exp() / (1.0 + (-5.0f32).exp());
+        assert!(
+            probs[1] < buggy_unsquared_p1 / 100.0,
+            "softmax should use squared distance, not unsquared"
+        );
     }
 
     #[test]
@@ -1591,6 +1792,16 @@ mod tests {
     }
 
     #[test]
+    fn test_fsa_maml_adapt_short_buffer_does_not_panic() {
+        let mut state = MamlState::new(vec![0.0f32; 4], 0.1, 3).expect("valid maml state");
+        // Claim n_support=10 but only provide embeddings for 1 support
+        // sample.
+        let short_support = vec![1.0f32; 4];
+        let loss = fsa_maml_adapt(&mut state, &short_support, 10);
+        assert!(loss.is_finite());
+    }
+
+    #[test]
     fn test_fsa_episode_id_equals_seed() {
         let (embs, lbls) = build_synthetic_dataset(5, 20, 8);
         let seed = 9999u64;
@@ -1638,5 +1849,142 @@ mod tests {
         let adapter = LoraAdapter::new(8, 8, 4, 8.0, 1);
         // scale = alpha / rank = 8.0 / 4 = 2.0
         assert!((adapter.scale - 2.0).abs() < 1e-6);
+    }
+
+    // ── fsa_run_episodes ──────────────────────────────────────────────────────
+
+    fn default_run_config(n_way: usize, k_shot: usize, n_query: usize) -> FewShotConfig {
+        FewShotConfig {
+            n_way,
+            k_shot,
+            n_query,
+            n_episodes: 5,
+            inner_lr: 0.5,
+            n_inner_steps: 50,
+            proto_temperature: 1.0,
+            lora_rank: 4,
+            lora_alpha: 4.0,
+            seed: 123,
+        }
+    }
+
+    #[test]
+    fn test_fsa_run_episodes_pre_accuracy_is_uninformative_baseline() {
+        // With zero meta-init prototypes shared by every class, pre-
+        // adaptation classification carries no information about the
+        // episode: `classify()` always picks class 0 (ties broken toward
+        // the first element), so accuracy is exactly 1/n_way on a balanced
+        // query set.
+        let (embs, lbls) = build_synthetic_dataset(5, 20, 8);
+        let config = default_run_config(3, 2, 4);
+        let episode = fsa_sample_episode(
+            &embs,
+            &lbls,
+            100,
+            8,
+            config.n_way,
+            config.k_shot,
+            config.n_query,
+            config.seed,
+        )
+        .expect("episode should sample");
+        let sup = &episode.support;
+        let pre_net = PrototypicalNet {
+            prototypes: vec![0.0f32; sup.n_way * sup.d],
+            n_way: sup.n_way,
+            d: sup.d,
+        };
+        let pre_accuracy = fsa_proto_accuracy(&pre_net, &episode.query);
+        assert!(
+            (pre_accuracy - 1.0 / config.n_way as f32).abs() < 1e-5,
+            "with identical (zero) prototypes, classify() always picks class 0, \
+             giving exactly 1/n_way accuracy; got {pre_accuracy}"
+        );
+    }
+
+    #[test]
+    fn test_fsa_run_episodes_post_accuracy_converges_to_closed_form() {
+        let (embs, lbls) = build_synthetic_dataset(5, 30, 4);
+        let config = FewShotConfig {
+            n_way: 3,
+            k_shot: 3,
+            n_query: 5,
+            n_episodes: 1,
+            inner_lr: 0.9,
+            n_inner_steps: 200, // enough for near-exact convergence
+            proto_temperature: 1.0,
+            lora_rank: 2,
+            lora_alpha: 2.0,
+            seed: 7,
+        };
+        let episode = fsa_sample_episode(
+            &embs,
+            &lbls,
+            150,
+            4,
+            config.n_way,
+            config.k_shot,
+            config.n_query,
+            config.seed,
+        )
+        .expect("episode should sample");
+        let sup = &episode.support;
+
+        // Ground truth: the closed-form per-class mean.
+        let closed_form_net = PrototypicalNet::from_support(sup);
+        let closed_form_accuracy = fsa_proto_accuracy(&closed_form_net, &episode.query);
+
+        // MAML-adapted prototypes, starting from zero, targeting the same
+        // per-class support mean that the closed form computes directly.
+        let mut adapted = vec![0.0f32; sup.n_way * sup.d];
+        for c in 0..sup.n_way {
+            let start = c * sup.k_shot * sup.d;
+            let end = start + sup.k_shot * sup.d;
+            let class_support = &sup.embeddings[start..end];
+            let mut state =
+                MamlState::new(vec![0.0f32; sup.d], config.inner_lr, config.n_inner_steps)
+                    .expect("valid maml state");
+            fsa_maml_adapt(&mut state, class_support, sup.k_shot);
+            adapted[c * sup.d..(c + 1) * sup.d].copy_from_slice(&state.adapted_params);
+        }
+        let post_net = PrototypicalNet {
+            prototypes: adapted,
+            n_way: sup.n_way,
+            d: sup.d,
+        };
+        let post_accuracy = fsa_proto_accuracy(&post_net, &episode.query);
+
+        assert!(
+            (post_accuracy - closed_form_accuracy).abs() < 1e-4,
+            "with enough inner steps, MAML-adapted prototypes should converge to \
+             the closed-form mean: closed_form={closed_form_accuracy}, post={post_accuracy}"
+        );
+    }
+
+    #[test]
+    fn test_fsa_run_episodes_produces_stats_and_positive_improvement() {
+        let (embs, lbls) = build_synthetic_dataset(5, 20, 8);
+        let config = default_run_config(3, 2, 4);
+        let stats = fsa_run_episodes(&embs, &lbls, 100, 8, &config).expect("episodes should run");
+        assert_eq!(stats.n_episodes, 5);
+        assert!(stats.mean_accuracy >= 0.0 && stats.mean_accuracy <= 1.0);
+        // Post-adaptation accuracy on this well-separated synthetic dataset
+        // should comfortably beat the 1/n_way chance baseline the
+        // (uninformative) pre-adaptation prototypes are limited to.
+        assert!(
+            stats.mean_accuracy > 1.0 / config.n_way as f32,
+            "post-adaptation accuracy should exceed the pre-adaptation chance \
+             baseline, got {}",
+            stats.mean_accuracy
+        );
+    }
+
+    #[test]
+    fn test_fsa_run_episodes_invalid_lr_errors() {
+        let (embs, lbls) = build_synthetic_dataset(5, 20, 8);
+        let mut config = default_run_config(3, 2, 4);
+        config.inner_lr = -1.0;
+        let result = fsa_run_episodes(&embs, &lbls, 100, 8, &config);
+        assert!(matches!(result, Err(FewShotError::InvalidLR { .. })));
     }
 }

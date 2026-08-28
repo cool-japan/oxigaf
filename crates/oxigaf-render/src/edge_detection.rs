@@ -47,6 +47,20 @@ pub enum EdgeDetectionError {
     InvalidKernelSize { size: u32 },
 }
 
+/// Largest kernel side accepted by any kernel-size-taking function in this
+/// module (`build_edge_gaussian_kernel`, `edge_convolve`,
+/// `edge_gaussian_blur`, `log_edges`, `CannyConfig::validate`).
+///
+/// Without a cap, a caller-supplied or `sigma`-derived kernel size can grow
+/// unboundedly: a 1-D kernel of size `k` produces a `k × k` 2-D kernel
+/// (`build_edge_gaussian_kernel`) and a per-pixel convolution cost of
+/// `O(k²)` (`edge_convolve`) or `O(k)` per pass (`edge_gaussian_blur`), so
+/// an unbounded `k` is effectively a hang or a multi-gigabyte allocation
+/// from ordinary (non-malicious) input, e.g. a very large `sigma` passed to
+/// `log_edges`. `129` is generous for any real blur radius while keeping
+/// the worst case bounded.
+const MAX_KERNEL_SIZE: u32 = 129;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // EdgeMap
 // ─────────────────────────────────────────────────────────────────────────────
@@ -170,16 +184,28 @@ impl Default for CannyConfig {
 impl CannyConfig {
     /// Validate all configuration parameters.
     pub fn validate(&self) -> Result<(), EdgeDetectionError> {
-        if self.sigma <= 0.0 {
+        // An explicit `is_nan()` check (rather than plain `sigma <= 0.0`) is
+        // required to reject NaN: every comparison with NaN is `false`, so
+        // `NaN <= 0.0` is `false` and a NaN sigma would otherwise sail
+        // through validation and propagate as an all-NaN kernel/image.
+        if self.sigma.is_nan() || self.sigma <= 0.0 {
             return Err(EdgeDetectionError::InvalidSigma { sigma: self.sigma });
         }
-        if self.low_threshold > self.high_threshold {
+        // Same NaN-rejection reasoning as above: `low_threshold >
+        // high_threshold` alone would let a NaN threshold slip through.
+        if self.low_threshold.is_nan()
+            || self.high_threshold.is_nan()
+            || self.low_threshold > self.high_threshold
+        {
             return Err(EdgeDetectionError::InvalidThreshold {
                 low: self.low_threshold,
                 high: self.high_threshold,
             });
         }
-        if self.kernel_size < 3 || self.kernel_size.is_multiple_of(2) {
+        if self.kernel_size < 3
+            || self.kernel_size.is_multiple_of(2)
+            || self.kernel_size > MAX_KERNEL_SIZE
+        {
             return Err(EdgeDetectionError::InvalidKernelSize {
                 size: self.kernel_size,
             });
@@ -304,10 +330,15 @@ pub fn rgba_to_luminance(
 /// Build a square 2-D Gaussian kernel of side `size` (must be odd) normalized
 /// so all elements sum to 1.
 pub fn build_edge_gaussian_kernel(size: u32, sigma: f32) -> Result<Vec<f32>, EdgeDetectionError> {
-    if sigma <= 0.0 {
+    // An explicit `is_nan()` check (a plain `sigma <= 0.0` does not reject
+    // NaN, since every comparison with NaN is `false`) is required here:
+    // otherwise a NaN sigma would produce an all-NaN kernel that then
+    // silently passes the `sum > 0.0` normalisation guard below (NaN
+    // comparisons are also always `false`).
+    if sigma.is_nan() || sigma <= 0.0 {
         return Err(EdgeDetectionError::InvalidSigma { sigma });
     }
-    if size < 1 || size.is_multiple_of(2) {
+    if size < 1 || size.is_multiple_of(2) || size > MAX_KERNEL_SIZE {
         return Err(EdgeDetectionError::InvalidKernelSize { size });
     }
     let center = (size / 2) as f32;
@@ -354,7 +385,7 @@ pub fn edge_convolve(
             actual: image.len(),
         });
     }
-    if kernel_size < 1 || kernel_size.is_multiple_of(2) {
+    if kernel_size < 1 || kernel_size.is_multiple_of(2) || kernel_size > MAX_KERNEL_SIZE {
         return Err(EdgeDetectionError::InvalidKernelSize { size: kernel_size });
     }
     let expected_k = (kernel_size * kernel_size) as usize;
@@ -402,10 +433,11 @@ pub fn edge_gaussian_blur(
     sigma: f32,
     kernel_size: u32,
 ) -> Result<Vec<f32>, EdgeDetectionError> {
-    if sigma <= 0.0 {
+    // `is_nan()` check also rejects NaN - see `build_edge_gaussian_kernel`.
+    if sigma.is_nan() || sigma <= 0.0 {
         return Err(EdgeDetectionError::InvalidSigma { sigma });
     }
-    if kernel_size < 1 || kernel_size.is_multiple_of(2) {
+    if kernel_size < 1 || kernel_size.is_multiple_of(2) || kernel_size > MAX_KERNEL_SIZE {
         return Err(EdgeDetectionError::InvalidKernelSize { size: kernel_size });
     }
     let n = (width as usize) * (height as usize);
@@ -624,13 +656,19 @@ pub fn log_edges(
     sigma: f32,
 ) -> Result<EdgeMap, EdgeDetectionError> {
     validate_luminance(luminance, width, height)?;
-    if sigma <= 0.0 {
+    // `is_nan()` check also rejects NaN - see `build_edge_gaussian_kernel`.
+    if sigma.is_nan() || sigma <= 0.0 {
         return Err(EdgeDetectionError::InvalidSigma { sigma });
     }
 
-    // Gaussian blur first
+    // Gaussian blur first. `kernel_size` grows unboundedly with `sigma` (a
+    // 1-D kernel diameter of `6*sigma` is standard so the Gaussian's tails
+    // are negligible), so it must be capped: an uncapped `sigma` of e.g.
+    // 1e6 would demand a ~6-million-tap 1-D kernel (effectively a hang),
+    // and a `sigma` large enough to overflow the `as u32` cast would
+    // saturate to `u32::MAX` and attempt a multi-gigabyte allocation.
     let kernel_size = ((6.0 * sigma).ceil() as u32) | 1; // ensure odd
-    let kernel_size = kernel_size.max(3);
+    let kernel_size = kernel_size.clamp(3, MAX_KERNEL_SIZE);
     let blurred = edge_gaussian_blur(luminance, width, height, sigma, kernel_size)?;
 
     // Apply Laplacian kernel
@@ -790,7 +828,8 @@ pub fn hysteresis_threshold(
             actual: suppressed.len(),
         });
     }
-    if low > high {
+    // `is_nan()` check also rejects NaN - see `CannyConfig::validate`.
+    if low.is_nan() || high.is_nan() || low > high {
         return Err(EdgeDetectionError::InvalidThreshold { low, high });
     }
 
@@ -1556,5 +1595,132 @@ mod tests {
         let kernel = vec![1.0 / 9.0; 9];
         let out = edge_convolve(&image, 4, 5, &kernel, 3).expect("convolve failed");
         assert_eq!(out.len(), 20);
+    }
+
+    // ── Regression: NaN must not bypass sigma/threshold validation ───────────
+    //
+    // `x <= 0.0` (and `low > high`) are `false` for NaN, since every
+    // comparison involving NaN is `false` - so these guards must pair that
+    // check with an explicit `x.is_nan()` (rather than relying solely on
+    // `!(x > 0.0)` / `!(low <= high)`, which clippy's `neg_cmp_op_on_partial_ord`
+    // rejects) to actually reject NaN.
+
+    #[test]
+    fn test_canny_config_validate_rejects_nan_sigma() {
+        let cfg = CannyConfig {
+            sigma: f32::NAN,
+            ..CannyConfig::default()
+        };
+        assert!(matches!(
+            cfg.validate(),
+            Err(EdgeDetectionError::InvalidSigma { .. })
+        ));
+    }
+
+    #[test]
+    fn test_canny_config_validate_rejects_nan_threshold() {
+        let cfg = CannyConfig {
+            low_threshold: f32::NAN,
+            ..CannyConfig::default()
+        };
+        assert!(matches!(
+            cfg.validate(),
+            Err(EdgeDetectionError::InvalidThreshold { .. })
+        ));
+    }
+
+    #[test]
+    fn test_build_edge_gaussian_kernel_rejects_nan_sigma() {
+        let result = build_edge_gaussian_kernel(5, f32::NAN);
+        assert!(matches!(
+            result,
+            Err(EdgeDetectionError::InvalidSigma { .. })
+        ));
+    }
+
+    #[test]
+    fn test_edge_gaussian_blur_rejects_nan_sigma() {
+        let lum = vec![0.5_f32; 25];
+        let result = edge_gaussian_blur(&lum, 5, 5, f32::NAN, 3);
+        assert!(matches!(
+            result,
+            Err(EdgeDetectionError::InvalidSigma { .. })
+        ));
+    }
+
+    #[test]
+    fn test_log_edges_rejects_nan_sigma() {
+        let lum = vec![0.5_f32; 49];
+        let result = log_edges(&lum, 7, 7, f32::NAN);
+        assert!(matches!(
+            result,
+            Err(EdgeDetectionError::InvalidSigma { .. })
+        ));
+    }
+
+    #[test]
+    fn test_hysteresis_threshold_rejects_nan_low() {
+        let suppressed = vec![0.5_f32; 25];
+        let result = hysteresis_threshold(&suppressed, 5, 5, f32::NAN, 0.15);
+        assert!(matches!(
+            result,
+            Err(EdgeDetectionError::InvalidThreshold { .. })
+        ));
+    }
+
+    // ── Regression: kernel size must be bounded ───────────────────────────────
+
+    #[test]
+    fn test_log_edges_clamps_huge_sigma_kernel_size() {
+        // A pathologically large sigma (whose naive `6*sigma` kernel diameter
+        // would be millions of taps) must not hang or attempt a huge
+        // allocation - `log_edges` clamps the derived kernel size to
+        // `MAX_KERNEL_SIZE` instead of using it unbounded.
+        let lum = vec![0.5_f32; 25];
+        let result = log_edges(&lum, 5, 5, 1.0e6);
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+    }
+
+    #[test]
+    fn test_edge_gaussian_blur_rejects_oversized_kernel() {
+        let lum = vec![0.5_f32; 25];
+        let result = edge_gaussian_blur(&lum, 5, 5, 1.0, MAX_KERNEL_SIZE + 2);
+        assert!(matches!(
+            result,
+            Err(EdgeDetectionError::InvalidKernelSize { .. })
+        ));
+    }
+
+    #[test]
+    fn test_edge_convolve_rejects_oversized_kernel() {
+        let image = vec![0.5_f32; 25];
+        let size = MAX_KERNEL_SIZE + 2;
+        let kernel = vec![0.0_f32; (size * size) as usize];
+        let result = edge_convolve(&image, 5, 5, &kernel, size);
+        assert!(matches!(
+            result,
+            Err(EdgeDetectionError::InvalidKernelSize { .. })
+        ));
+    }
+
+    #[test]
+    fn test_build_edge_gaussian_kernel_rejects_oversized_kernel() {
+        let result = build_edge_gaussian_kernel(MAX_KERNEL_SIZE + 2, 1.0);
+        assert!(matches!(
+            result,
+            Err(EdgeDetectionError::InvalidKernelSize { .. })
+        ));
+    }
+
+    #[test]
+    fn test_canny_config_validate_rejects_oversized_kernel() {
+        let cfg = CannyConfig {
+            kernel_size: MAX_KERNEL_SIZE + 2,
+            ..CannyConfig::default()
+        };
+        assert!(matches!(
+            cfg.validate(),
+            Err(EdgeDetectionError::InvalidKernelSize { .. })
+        ));
     }
 }

@@ -59,15 +59,106 @@ fn create_test_scene(num_gaussians: usize, sh_degree: u32, seed: u64) -> Gaussia
         }
     }
 
+    model_from_parts(gaussians, sh_coeffs, sh_degree)
+}
+
+/// Assemble a [`GaussianModel`] with its FLAME binding arrays sized to the
+/// Gaussian count.
+///
+/// `GaussianModel`'s invariant is that `face_indices`, `barycentric`,
+/// `local_offsets` and `is_rigid` are all parallel to `gaussians` - code that
+/// indexes them in lockstep (FLAME deform, density-control clone/split) panics
+/// or reads misaligned data otherwise. The hand-written literals this replaces
+/// left them empty. The defaults mirror `GaussianModel::load_ply`'s "no
+/// binding" case.
+fn model_from_parts(
+    gaussians: Vec<GaussianAttributes>,
+    sh_coeffs: Vec<f32>,
+    sh_degree: u32,
+) -> GaussianModel {
+    let n = gaussians.len();
+    let third = 1.0_f32 / 3.0_f32;
+
     GaussianModel {
         gaussians,
         sh_coeffs,
         sh_degree,
-        face_indices: vec![],
-        barycentric: vec![],
-        local_offsets: vec![],
-        is_rigid: vec![],
+        face_indices: vec![0u32; n],
+        barycentric: vec![[third, third, third]; n],
+        local_offsets: vec![[0.0, 0.0, 0.0]; n],
+        is_rigid: vec![false; n],
     }
+}
+
+/// Create a dense cluster of `num_gaussians` Gaussians, all in front of the
+/// camera and all overlapping the frame.
+///
+/// Unlike [`create_test_scene`], which walks Gaussians steadily away from the
+/// camera (`z = -3 - i * 0.1`, so the 2000th sits 200 units out and is culled),
+/// this keeps every Gaussian inside a compact box, so the whole scene is
+/// actually rasterized. Used as the visible payload of
+/// `test_gpu_render_is_invariant_across_prefix_sum_blocks`.
+fn create_dense_scene(num_gaussians: usize, seed: u64) -> GaussianModel {
+    let mut gaussians = Vec::with_capacity(num_gaussians);
+    let mut sh_coeffs = Vec::with_capacity(num_gaussians * 3);
+
+    for i in 0..num_gaussians {
+        // Deterministic, well-spread pseudo-random coordinates: irrational
+        // multipliers keep successive Gaussians from lining up on a lattice.
+        let t = (i as f32) + (seed as f32) * 0.001;
+        let x = (t * 1.618_034).sin() * 0.9;
+        let y = (t * 2.399_963).sin() * 0.9;
+        // Depths must be DISTINCT. The sort key is `(tile_id, depth_bits)`,
+        // so Gaussians at exactly equal depths are ordered by whatever the
+        // radix sort's tie-break happens to be - which depends on the order
+        // the tile-assignment pass emitted them in, and therefore on the tile
+        // grid. Equal depths would make the rendered image depend on the
+        // resolution through blend order alone, destroying the GPU-vs-GPU
+        // oracles below. The golden-ratio fractional sequence is
+        // equidistributed and repeats no value.
+        let z = -3.0 - ((i as f32) * 0.618_034).fract() * 1.5;
+
+        gaussians.push(GaussianAttributes {
+            position: [x, y, z],
+            _pad0: 0.0,
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            // exp(-2.3) ~ 0.1 world units: small enough that a few thousand
+            // Gaussians stay within the sort-pair budget, large enough to cover
+            // several tiles each.
+            scale: [-2.3, -2.3, -2.3],
+            opacity: -1.0,
+        });
+
+        sh_coeffs.push((t * 0.31).sin() * 0.5);
+        sh_coeffs.push((t * 0.47).sin() * 0.5);
+        sh_coeffs.push((t * 0.53).sin() * 0.5);
+    }
+
+    model_from_parts(gaussians, sh_coeffs, 0)
+}
+
+/// Cached result of probing for a usable GPU adapter (see [`gpu_available`]).
+static GPU_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Whether a compatible GPU adapter is available in this environment.
+///
+/// The regression tests below construct a real [`Rasterizer`], which fails with
+/// `RenderError::GpuInit`/`AdapterNotFound` on a machine with no compatible
+/// adapter (e.g. many headless CI runners). They call this at the top and
+/// return early when it is `false` instead of being permanently `#[ignore]`d,
+/// so they still run - and gate CI - on any machine that does have a GPU.
+fn gpu_available() -> bool {
+    *GPU_AVAILABLE.get_or_init(|| {
+        match pollster::block_on(Rasterizer::new(RasterConfig::new())) {
+            Ok(_) => true,
+            Err(err) => {
+                eprintln!(
+                    "skipping GPU-dependent comparison test: no compatible GPU adapter available ({err})"
+                );
+                false
+            }
+        }
+    })
 }
 
 /// Create the standard test camera matching gradient_verification::create_test_camera.
@@ -492,15 +583,7 @@ fn test_cpu_gpu_compare_single_gaussian() {
         opacity: 0.0,
     };
 
-    let model = GaussianModel {
-        gaussians: vec![gaussian],
-        sh_coeffs: vec![0.5, 0.5, 0.5],
-        sh_degree,
-        face_indices: vec![],
-        barycentric: vec![],
-        local_offsets: vec![],
-        is_rigid: vec![],
-    };
+    let model = model_from_parts(vec![gaussian], vec![0.5, 0.5, 0.5], sh_degree);
 
     let camera = create_test_camera(resolution);
     let config = RasterConfig::new()
@@ -703,4 +786,379 @@ fn test_cpu_gpu_compare_intermediate_diagnostics() {
         resolution.1,
     );
     print_report(&report, "Intermediate diagnostics");
+}
+
+// ---------------------------------------------------------------------------
+// GPU forward regression tests (asserting, unlike the diagnostics above)
+// ---------------------------------------------------------------------------
+//
+// These two tests deliberately do NOT use the CPU reference rasterizer as
+// their oracle. `CpuRasterizer` and the GPU pipeline disagree by an MSE of
+// ~1e-4 on dense, heavily overlapping scenes (see the note in this crate's
+// followups) - a pre-existing discrepancy that has nothing to do with the two
+// shader fixes being locked in here, and that would drown the effects under
+// test. Instead each test compares the GPU against *itself* under a
+// transformation that must leave the rendered image unchanged, which makes the
+// oracle exact.
+
+/// Render `model` on the GPU only and return the RGBA pixel buffer.
+///
+/// A discarded warm-up pass runs first. The first forward on a freshly created
+/// `Rasterizer` can differ slightly from subsequent ones while the GPU
+/// pipeline state settles - `test_gpu_self_consistent_all_params` in
+/// `gpu_gradient_verify.rs` documents and works around the same effect - and
+/// the comparisons below expect two renders to agree bit-for-bit.
+fn render_gpu(model: &GaussianModel, config: &RasterConfig, camera: &CpuCamera) -> Vec<f32> {
+    let render_camera = cpu_to_render_camera(camera).expect("Camera conversion failed");
+    pollster::block_on(async {
+        let mut rasterizer = Rasterizer::new(config.clone())
+            .await
+            .expect("GPU rasterizer creation failed");
+        rasterizer.upload_gaussians(model);
+        let _warmup = rasterizer
+            .forward(model, &render_camera)
+            .expect("GPU warm-up forward pass failed");
+
+        rasterizer.upload_gaussians(model);
+        rasterizer
+            .forward(model, &render_camera)
+            .expect("GPU forward pass failed")
+            .color_data
+    })
+}
+
+/// Mean squared error between two RGBA buffers of the same length.
+fn buffer_mse(a: &[f32], b: &[f32]) -> f64 {
+    assert_eq!(a.len(), b.len(), "buffers must have the same length");
+    assert!(!a.is_empty(), "cannot compare empty buffers");
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| ((x - y) as f64).powi(2))
+        .sum::<f64>()
+        / a.len() as f64
+}
+
+/// Count pixels with any non-zero RGB channel.
+fn nonzero_pixels(data: &[f32]) -> usize {
+    data.chunks_exact(4)
+        .filter(|p| p[0].abs() > 1e-8 || p[1].abs() > 1e-8 || p[2].abs() > 1e-8)
+        .count()
+}
+
+/// Number of coincident copies emitted at each probe position.
+///
+/// A *cluster* rather than a single Gaussian is essential. The barrier bug
+/// this scene guards against corrupts the workgroup's cooperative-load slots
+/// owned by threads whose pixel is outside the image, and a thread only owns a
+/// slot when `local_idx < batch_size` - i.e. when the tile's Gaussian list is
+/// at least as long as that thread's flat index. With one Gaussian per probe
+/// the list length is 1, only `local_idx == 0` (an in-bounds pixel) loads
+/// anything, and no surviving thread ever reads a slot an out-of-image thread
+/// owned: the test would pass with the bug fully reinstated.
+///
+/// 16 copies put `local_idx 0..15` to work. In the 4-pixel-wide right edge
+/// tile of a 100-pixel-wide image, `local_idx = lid.y * 16 + lid.x` means
+/// slots 0..3 belong to in-bounds threads and slots 4..15 to threads whose
+/// pixel is off the right edge - so three quarters of the batch is loaded by
+/// threads the pre-fix shader let leave.
+const PROBE_CLUSTER: usize = 16;
+
+/// Build a scene of small Gaussian *clusters* placed at chosen *pixel*
+/// positions for `resolution`.
+///
+/// `create_test_camera` puts the camera at the origin looking down -Z with
+/// `focal = height / (2 tan(fov_y / 2))` on both axes, so a Gaussian at world
+/// `(x, y, z)` lands at `mean2d = (x, y) * focal / -z + (width, height) / 2`.
+/// Inverting that lets a test aim Gaussians straight at the partial edge tiles
+/// of an arbitrary resolution.
+///
+/// The [`PROBE_CLUSTER`] copies at each position are **exactly identical** -
+/// same position, rotation, scale, opacity and colour. Alpha compositing of
+/// identical layers is permutation-invariant, so the blend order (and hence
+/// the radix sort's tie-break, which depends on the tile grid) cannot change
+/// the result, and the CPU reference stays an exact oracle. Different probe
+/// positions never overlap, so their relative order does not matter either.
+fn create_edge_probe_scene(resolution: (u32, u32), pixel_targets: &[(f32, f32)]) -> GaussianModel {
+    let (width, height) = (resolution.0 as f32, resolution.1 as f32);
+    let fov_y = 45.0f32.to_radians();
+    let focal = height / (2.0 * (fov_y / 2.0).tan());
+    let depth = 4.0f32;
+
+    // sigma of 1.5 px keeps the 3-sigma footprint near 5 px, far smaller than
+    // the spacing between the probe positions.
+    let sigma_world = 1.5 * depth / focal;
+    let log_scale = sigma_world.ln();
+
+    let count = pixel_targets.len() * PROBE_CLUSTER;
+    let mut gaussians = Vec::with_capacity(count);
+    let mut sh_coeffs = Vec::with_capacity(count * 3);
+
+    for (i, (px, py)) in pixel_targets.iter().enumerate() {
+        let gaussian = GaussianAttributes {
+            position: [
+                (px - width / 2.0) * depth / focal,
+                (py - height / 2.0) * depth / focal,
+                // Probe positions get distinct depths; the copies within one
+                // probe deliberately share theirs (see the doc comment).
+                -depth - i as f32 * 0.01,
+            ],
+            _pad0: 0.0,
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            scale: [log_scale, log_scale, log_scale],
+            // sigmoid(-3) ~ 0.047. Deliberately faint: 16 stacked layers then
+            // leave transmittance around 0.46 at the core, well above the
+            // 1/255 early-out, so every one of the 40 shared-memory slots is
+            // actually read. An opaque cluster would terminate after a few
+            // layers and never touch the later slots - exactly the ones an
+            // out-of-image thread owns.
+            opacity: -3.0,
+        };
+
+        for _ in 0..PROBE_CLUSTER {
+            gaussians.push(gaussian);
+            sh_coeffs.extend_from_slice(&[1.0, 0.5, -0.5]);
+        }
+    }
+
+    model_from_parts(gaussians, sh_coeffs, 0)
+}
+
+/// Probe positions for `resolution`: the corner, the right edge, the bottom
+/// edge - all inside the partial tiles when the resolution is not a multiple
+/// of the 16-pixel tile size - plus two interior controls.
+fn edge_probe_targets(resolution: (u32, u32)) -> Vec<(f32, f32)> {
+    let (w, h) = (resolution.0 as f32, resolution.1 as f32);
+    vec![
+        (w - 2.0, h - 2.0),
+        (w - 2.0, h / 2.0),
+        (w / 2.0, h - 2.0),
+        (w / 2.0, h / 2.0),
+        (6.0, 6.0),
+    ]
+}
+
+/// Upper bound on the CPU-vs-GPU MSE for an isolated-Gaussian scene.
+///
+/// Both rasterizers run the same arithmetic in the same order here, so the
+/// only difference is f32 rounding; measured values are around 1e-15. A
+/// phantom Gaussian blended out of stale shared memory, or a dropped edge
+/// tile, moves whole pixels.
+const MAX_SPARSE_CPU_GPU_MSE: f64 = 1e-12;
+
+/// Regression test: partial edge tiles - the tiles at the right and bottom of a
+/// resolution that is not a multiple of the 16x16 tile size - must rasterize
+/// exactly like the CPU reference.
+///
+/// `rasterize_fwd.wgsl` used to `return` early from every thread whose pixel
+/// lay outside the image. In a partial edge tile that leaves the workgroup's
+/// `workgroupBarrier()` calls non-uniform - undefined behaviour - and in
+/// practice the shared-memory slots owned by the departed threads keep stale
+/// data that the surviving threads then blend as phantom Gaussians. The fix
+/// keeps those threads alive through the batch loop and suppresses only their
+/// final stores.
+///
+/// The scene deliberately puts an isolated, opaque Gaussian two pixels inside
+/// the bottom-right corner, the right edge and the bottom edge, so at least
+/// three partial tiles carry real work; two interior Gaussians act as controls.
+/// 100x70 leaves a 4-pixel-wide right edge and a 6-pixel-tall bottom edge;
+/// 37x53 is prime on both axes. 96x64 tiles exactly and validates the oracle.
+#[test]
+fn test_gpu_partial_edge_tiles_match_cpu_reference() {
+    if !gpu_available() {
+        return;
+    }
+
+    for (resolution, partial) in [
+        ((96u32, 64u32), false),
+        ((100u32, 70u32), true),
+        ((37u32, 53u32), true),
+    ] {
+        assert_eq!(
+            !resolution.0.is_multiple_of(16) || !resolution.1.is_multiple_of(16),
+            partial,
+            "{resolution:?} does not have the expected tiling"
+        );
+
+        let model = create_edge_probe_scene(resolution, &edge_probe_targets(resolution));
+        let config = RasterConfig::new()
+            .with_resolution(resolution.0, resolution.1)
+            .with_sh_degree(0);
+        let camera = create_test_camera(resolution);
+
+        let cpu = CpuRasterizer::new(config.clone())
+            .render(&model, &camera)
+            .expect("CPU render failed");
+        let gpu = render_gpu(&model, &config, &camera);
+
+        let report = compare_outputs(&cpu.color_data, &gpu, resolution.0, resolution.1);
+        print_report(
+            &report,
+            &format!(
+                "Edge probes ({}x{}, partial tiles: {partial})",
+                resolution.0, resolution.1
+            ),
+        );
+
+        // Every probe must actually have rendered something, or a dropped
+        // edge tile would look like a pass.
+        assert!(
+            nonzero_pixels(&cpu.color_data) >= 5,
+            "the CPU reference rendered almost nothing at {resolution:?}"
+        );
+        assert!(
+            nonzero_pixels(&gpu) >= 5,
+            "the GPU rendered almost nothing at {resolution:?};              an edge tile is being dropped entirely"
+        );
+        assert_eq!(
+            report.differing_pixels, 0,
+            "{resolution:?}: {} of {} pixels differ between CPU and GPU -              partial edge tiles are being rasterized incorrectly",
+            report.differing_pixels, report.total_pixels
+        );
+        assert!(
+            report.overall_mse < MAX_SPARSE_CPU_GPU_MSE,
+            "{resolution:?}: CPU/GPU MSE {:.6e} exceeds {MAX_SPARSE_CPU_GPU_MSE:.0e}",
+            report.overall_mse
+        );
+    }
+}
+
+/// Upper bound on the difference between two GPU renders that must be
+/// bit-identical: the same visible Gaussians, once alone and once preceded by
+/// culled padding. Nothing legitimate differs between them - measured value is
+/// exactly 0.0 - so this is pure headroom.
+const MAX_PADDING_INVARIANT_MSE: f64 = 1e-12;
+
+/// Regression test: a Gaussian count large enough to need a **multi-block**
+/// prefix sum must produce the same image as the same visible Gaussians alone.
+///
+/// The tile-offset scan runs `shaders/prefix_sum.wgsl` over one element per
+/// Gaussian in 512-element blocks, then `shaders/prefix_sum_add.wgsl` folds the
+/// scanned block totals back in. That second shader used to add
+/// `block_offsets[wid.x]` - the *inclusive* total of the block's own elements -
+/// instead of the exclusive prefix `block_offsets[wid.x - 1]`, inflating every
+/// block after the first. Each Gaussian's tile-pair write index then landed
+/// past its true slot, so `tile_ranges` covered the wrong Gaussians.
+///
+/// The construction isolates exactly that: the scene is padded at the *front*
+/// with Gaussians behind the camera, which `preprocess.wgsl` culls to
+/// `tile_counts = 0`. The visible Gaussians therefore sit in block 1 (or 3)
+/// with a preceding exclusive prefix of zero, so the correct offsets are
+/// identical to the unpadded scene's and the two renders must match exactly.
+/// With the bug, block 1 is shifted by its own total and the image changes.
+///
+/// The bug is invisible below 513 Gaussians - a single block needs no offset
+/// pass at all - which is why every other test in this crate missed it.
+#[test]
+fn test_gpu_render_is_invariant_across_prefix_sum_blocks() {
+    if !gpu_available() {
+        return;
+    }
+
+    // `shaders/prefix_sum.wgsl`: 256 threads x 2 elements each.
+    const SCAN_BLOCK: usize = 512;
+    const VISIBLE: usize = 48;
+
+    let resolution = (128u32, 128u32);
+    let config = RasterConfig::new()
+        .with_resolution(resolution.0, resolution.1)
+        .with_sh_degree(0);
+    let camera = create_test_camera(resolution);
+
+    let visible = create_dense_scene(VISIBLE, 7);
+    let reference = render_gpu(&visible, &config, &camera);
+    assert!(
+        nonzero_pixels(&reference) > 100,
+        "the unpadded render is nearly empty; the comparison would be vacuous"
+    );
+
+    // 600 -> 2 scan blocks; 2000 -> 4 scan blocks (plus a level-1 scan).
+    for total in [600usize, 2000usize] {
+        let padding = total - VISIBLE;
+        assert!(
+            padding >= SCAN_BLOCK,
+            "{total} Gaussians leave the visible ones in the first scan block; \
+             prefix_sum_add would not be exercised"
+        );
+
+        let mut gaussians = Vec::with_capacity(total);
+        let mut sh_coeffs = Vec::with_capacity(total * 3);
+        for _ in 0..padding {
+            // Behind the camera: `preprocess.wgsl` writes radii = -1 and
+            // tile_counts = 0, so these contribute nothing but still occupy a
+            // scan element each.
+            gaussians.push(GaussianAttributes {
+                position: [0.0, 0.0, 5.0],
+                _pad0: 0.0,
+                rotation: [0.0, 0.0, 0.0, 1.0],
+                scale: [-2.3, -2.3, -2.3],
+                opacity: -1.0,
+            });
+            sh_coeffs.extend_from_slice(&[0.0, 0.0, 0.0]);
+        }
+        gaussians.extend_from_slice(&visible.gaussians);
+        sh_coeffs.extend_from_slice(&visible.sh_coeffs);
+
+        let padded = model_from_parts(gaussians, sh_coeffs, 0);
+        assert_eq!(padded.len(), total);
+
+        let image = render_gpu(&padded, &config, &camera);
+        let mse = buffer_mse(&image, &reference);
+        println!(
+            "{} Gaussians ({} scan blocks, {} culled): mse vs unpadded = {:.6e}",
+            total,
+            total.div_ceil(SCAN_BLOCK),
+            padding,
+            mse
+        );
+
+        assert!(
+            nonzero_pixels(&image) > 100,
+            "the {total}-Gaussian render is nearly empty; \
+             the comparison would be vacuous"
+        );
+        assert!(
+            mse < MAX_PADDING_INVARIANT_MSE,
+            "padding to {} Gaussians ({} scan blocks) changed the image \
+             (MSE={:.6e}) - the cross-block tile offsets are wrong",
+            total,
+            total.div_ceil(SCAN_BLOCK),
+            mse
+        );
+    }
+}
+
+/// Regression test: the local `create_test_scene` and `create_dense_scene`
+/// must keep the FLAME binding arrays parallel to `gaussians`; the
+/// hand-written literals they replaced left them empty, breaking the
+/// `GaussianModel` invariant that code indexing them in lockstep (FLAME
+/// deform, density-control clone/split) relies on.
+#[test]
+fn test_local_scenes_have_parallel_binding_arrays() {
+    for model in [create_test_scene(5, 1, 42), create_dense_scene(9, 3)] {
+        let n = model.gaussians.len();
+        assert!(n > 0);
+        assert_eq!(model.face_indices.len(), n);
+        assert_eq!(model.barycentric.len(), n);
+        assert_eq!(model.local_offsets.len(), n);
+        assert_eq!(model.is_rigid.len(), n);
+    }
+}
+
+/// The dense scene must put every Gaussian in front of the camera and inside
+/// the default clip range, or the tests above would rasterize nothing.
+#[test]
+fn test_dense_scene_is_in_front_of_the_camera() {
+    let model = create_dense_scene(600, 7);
+
+    for (i, gaussian) in model.gaussians.iter().enumerate() {
+        let z = gaussian.position[2];
+        assert!(
+            (-4.5..=-3.0).contains(&z),
+            "Gaussian {i} sits at z={z}, outside the intended cluster"
+        );
+        assert!(
+            gaussian.position[0].abs() <= 0.9 && gaussian.position[1].abs() <= 0.9,
+            "Gaussian {i} sits outside the intended lateral spread"
+        );
+    }
 }

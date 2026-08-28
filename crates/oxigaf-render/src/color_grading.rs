@@ -11,6 +11,8 @@
 //! - **Pipeline**: composable chain of the above, with an optional final LUT.
 //! - **Histogram**: per-channel count analysis.
 
+use std::collections::HashMap;
+
 use thiserror::Error;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -447,8 +449,45 @@ impl Lut3D {
         Ok(Self { size, table })
     }
 
+    /// Validate this LUT's internal invariants.
+    ///
+    /// `size` and `table` are both public with no invariant enforcement
+    /// outside the [`Lut3D::identity`]/[`Lut3D::from_tone_curve`]
+    /// constructors, so a directly-constructed or hand-deserialized (e.g.
+    /// from a truncated `.cube` file) `Lut3D` can violate them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ColorGradingError::InvalidLut`] if `size < 2` or
+    /// `table.len() != size^3 * 3`.
+    pub fn validate(&self) -> Result<(), ColorGradingError> {
+        if self.size < 2 {
+            return Err(ColorGradingError::InvalidLut(format!(
+                "LUT size must be >= 2, got {}",
+                self.size
+            )));
+        }
+        let expected = self.size * self.size * self.size * 3;
+        if self.table.len() != expected {
+            return Err(ColorGradingError::InvalidLut(format!(
+                "LUT table has {} entries, expected size^3*3 = {} for size {}",
+                self.table.len(),
+                expected,
+                self.size
+            )));
+        }
+        Ok(())
+    }
+
     /// Trilinear lookup for an RGB value in [0, 1].
+    ///
+    /// Degenerate LUTs (`size == 0`, or a `table` shorter than `size^3 * 3`
+    /// — see [`Lut3D::validate`]) do not panic: `size == 0` returns
+    /// `(0.0, 0.0, 0.0)` directly, and missing table entries read as `0.0`.
     pub fn lookup(&self, r: f32, g: f32, b: f32) -> (f32, f32, f32) {
+        if self.size == 0 {
+            return (0.0, 0.0, 0.0);
+        }
         let s = (self.size - 1) as f32;
 
         let lr = (r.clamp(0.0, 1.0) * s).min(s);
@@ -467,9 +506,11 @@ impl Lut3D {
         let fb = lb - b0 as f32;
 
         // Fetch a table value at lattice point (ri, gi, bi), channel ch.
+        // `.get(..)` rather than direct indexing: a `table` shorter than
+        // `size^3 * 3` (see `validate`) must not panic here.
         let fetch = |ri: usize, gi: usize, bi: usize, ch: usize| -> f32 {
             let base = (ri * self.size * self.size + gi * self.size + bi) * 3;
-            self.table[base + ch]
+            self.table.get(base + ch).copied().unwrap_or(0.0)
         };
 
         // Trilinear interpolation per channel.
@@ -501,9 +542,11 @@ impl Lut3D {
     ///
     /// # Errors
     ///
-    /// Returns [`ColorGradingError::InvalidImage`] if the image length is not a multiple of 3.
+    /// - [`ColorGradingError::InvalidImage`] if the image length is not a multiple of 3.
+    /// - [`ColorGradingError::InvalidLut`] if `self` fails [`Lut3D::validate`].
     pub fn apply_image(&self, image: &[f32]) -> Result<Vec<f32>, ColorGradingError> {
         validate_rgb_image(image)?;
+        self.validate()?;
         let mut out = Vec::with_capacity(image.len());
         for chunk in image.chunks_exact(3) {
             let (r, g, b) = self.lookup(chunk[0], chunk[1], chunk[2]);
@@ -558,9 +601,16 @@ pub enum GradingStep {
     Saturation(f32),
     /// Tone curve remapping.
     ToneCurve(ToneCurve),
-    /// Marker for a user-defined step (not applied automatically).
+    /// A named user-defined step. Dispatched by name to a handler
+    /// registered via [`ColorGradingPipeline::with_custom_handler`];
+    /// [`ColorGradingPipeline::apply`] returns
+    /// [`ColorGradingError::InvalidConfig`] if no handler is registered
+    /// for the name.
     Custom(String),
 }
+
+/// A user-supplied transform for a named [`GradingStep::Custom`] step.
+type CustomStepHandler = Box<dyn Fn(&[f32]) -> Result<Vec<f32>, ColorGradingError> + Send + Sync>;
 
 /// Composable color grading pipeline.
 ///
@@ -569,6 +619,9 @@ pub struct ColorGradingPipeline {
     steps: Vec<GradingStep>,
     /// Optional 3D LUT applied after all other steps.
     pub lut: Option<Lut3D>,
+    /// Handlers for named [`GradingStep::Custom`] steps, registered via
+    /// [`Self::with_custom_handler`].
+    custom_handlers: HashMap<String, CustomStepHandler>,
 }
 
 impl ColorGradingPipeline {
@@ -577,6 +630,7 @@ impl ColorGradingPipeline {
         Self {
             steps: Vec::new(),
             lut: None,
+            custom_handlers: HashMap::new(),
         }
     }
 
@@ -589,6 +643,22 @@ impl ColorGradingPipeline {
     /// Attach a 3D LUT to be applied last (builder pattern).
     pub fn with_lut(mut self, lut: Lut3D) -> Self {
         self.lut = Some(lut);
+        self
+    }
+
+    /// Register a handler for a named [`GradingStep::Custom`] step
+    /// (builder pattern).
+    ///
+    /// When [`Self::apply`] encounters `GradingStep::Custom(name)`, it
+    /// looks up `name` in this registry and invokes the handler with the
+    /// current image buffer; the handler's output becomes the input to the
+    /// next step. A `Custom` step whose name has no registered handler
+    /// makes `apply` return [`ColorGradingError::InvalidConfig`].
+    pub fn with_custom_handler<F>(mut self, name: impl Into<String>, handler: F) -> Self
+    where
+        F: Fn(&[f32]) -> Result<Vec<f32>, ColorGradingError> + Send + Sync + 'static,
+    {
+        self.custom_handlers.insert(name.into(), Box::new(handler));
         self
     }
 
@@ -630,7 +700,15 @@ impl ColorGradingPipeline {
                 }
                 GradingStep::Saturation(s) => SaturationAdjust::new(*s)?.apply_image(&current)?,
                 GradingStep::ToneCurve(curve) => curve.apply_image(&current)?,
-                GradingStep::Custom(_) => current,
+                GradingStep::Custom(name) => match self.custom_handlers.get(name) {
+                    Some(handler) => handler(&current)?,
+                    None => {
+                        return Err(ColorGradingError::InvalidConfig(format!(
+                            "no handler registered for custom grading step {name:?} \
+                             (register one with ColorGradingPipeline::with_custom_handler)"
+                        )))
+                    }
+                },
             };
         }
 
@@ -1002,6 +1080,64 @@ mod tests {
         assert!(approx_eq(b, 0.9, 0.02), "b={}", b);
     }
 
+    // 20b. Lut3D::lookup: size == 0 does not panic (usize underflow guard).
+    #[test]
+    fn test_lut3d_lookup_zero_size_no_panic() {
+        let lut = Lut3D {
+            size: 0,
+            table: Vec::new(),
+        };
+        assert_eq!(lut.lookup(0.5, 0.5, 0.5), (0.0, 0.0, 0.0));
+    }
+
+    // 20c. Lut3D::lookup: truncated table does not panic (out-of-bounds guard).
+    #[test]
+    fn test_lut3d_lookup_truncated_table_no_panic() {
+        // size=2 needs 2*2*2*3=24 floats; give it far fewer.
+        let lut = Lut3D {
+            size: 2,
+            table: vec![0.5f32; 4],
+        };
+        let (r, g, b) = lut.lookup(1.0, 1.0, 1.0);
+        assert!(
+            r.is_finite() && g.is_finite() && b.is_finite(),
+            "missing table entries should read as 0.0, not panic: ({r}, {g}, {b})"
+        );
+    }
+
+    // 20d. Lut3D::validate: rejects size < 2 and a mismatched table length.
+    #[test]
+    fn test_lut3d_validate_rejects_invalid_luts() {
+        assert!(Lut3D {
+            size: 0,
+            table: Vec::new(),
+        }
+        .validate()
+        .is_err());
+        assert!(Lut3D {
+            size: 2,
+            table: vec![0.5f32; 4], // needs 24, has 4
+        }
+        .validate()
+        .is_err());
+        assert!(Lut3D::identity(4).expect("valid").validate().is_ok());
+    }
+
+    // 20e. Lut3D::apply_image: propagates validate()'s error instead of
+    // panicking on a malformed LUT.
+    #[test]
+    fn test_lut3d_apply_image_rejects_invalid_lut() {
+        let lut = Lut3D {
+            size: 0,
+            table: Vec::new(),
+        };
+        let image = vec![0.5f32, 0.5, 0.5];
+        assert!(matches!(
+            lut.apply_image(&image),
+            Err(ColorGradingError::InvalidLut(_))
+        ));
+    }
+
     // 21. ColorGradingPipeline: empty pipeline → image unchanged
     #[test]
     fn test_pipeline_empty_unchanged() {
@@ -1024,6 +1160,46 @@ mod tests {
         for (a, b) in image.iter().zip(out.iter()) {
             assert!(approx_eq(*a, *b, 2e-3), "a={} b={}", a, b);
         }
+    }
+
+    // 22b. ColorGradingPipeline: unregistered Custom step is now an error,
+    // not a silent no-op.
+    #[test]
+    fn test_pipeline_unregistered_custom_step_errors() {
+        let pipeline = ColorGradingPipeline::new().push(GradingStep::Custom("my_lut".into()));
+        let image = vec![0.4f32, 0.6, 0.2];
+        let result = pipeline.apply(&image);
+        assert!(matches!(result, Err(ColorGradingError::InvalidConfig(_))));
+    }
+
+    // 22c. ColorGradingPipeline: registered Custom handler is actually invoked.
+    #[test]
+    fn test_pipeline_registered_custom_handler_is_invoked() {
+        let pipeline = ColorGradingPipeline::new()
+            .with_custom_handler("invert", |img| Ok(img.iter().map(|&v| 1.0 - v).collect()))
+            .push(GradingStep::Custom("invert".to_string()));
+        let image = vec![0.2f32, 0.5, 0.9];
+        let out = pipeline
+            .apply(&image)
+            .expect("registered handler should run");
+        for (a, b) in image.iter().zip(out.iter()) {
+            assert!(
+                approx_eq(1.0 - *a, *b, EPSILON),
+                "expected inverted value: a={a} b={b}"
+            );
+        }
+    }
+
+    // 22d. ColorGradingPipeline: unrelated Custom name still errors even
+    // when a different handler is registered.
+    #[test]
+    fn test_pipeline_custom_handler_name_must_match() {
+        let pipeline = ColorGradingPipeline::new()
+            .with_custom_handler("invert", |img| Ok(img.to_vec()))
+            .push(GradingStep::Custom("not_invert".to_string()));
+        let image = vec![0.4f32, 0.6, 0.2];
+        let result = pipeline.apply(&image);
+        assert!(matches!(result, Err(ColorGradingError::InvalidConfig(_))));
     }
 
     // 23. RgbHistogram: uniform image → all bins roughly equal

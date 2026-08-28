@@ -19,25 +19,12 @@
 
 use thiserror::Error;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Private PRNG helpers (not re-exported — module-local only)
-// ─────────────────────────────────────────────────────────────────────────────
-
-#[allow(dead_code)]
-fn xorshift64(state: &mut u64) -> u64 {
-    *state ^= *state << 13;
-    *state ^= *state >> 7;
-    *state ^= *state << 17;
-    if *state == 0 {
-        *state = 1;
-    }
-    *state
-}
-
-#[allow(dead_code)]
-fn xorshift_f32(state: &mut u64) -> f32 {
-    xorshift64(state) as f32 / u64::MAX as f32
-}
+// This module used to carry two private `xorshift64` / `xorshift_f32`
+// helpers, suppressed with `#[allow(dead_code)]` because nothing called them:
+// every operation here — lerp, slerp, masks, harmonisation, frequency and
+// trajectory blending — is deterministic, and none of the public API takes a
+// seed. A seeded generator lives in `pipeline::support::seeded_normal_tensor`
+// for the code that actually needs one.
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Error type
@@ -214,6 +201,34 @@ fn check_same_shape(a: &LatentTensor, b: &LatentTensor) -> Result<usize, LatentB
 fn check_weight(t: f32) -> Result<(), LatentBlendError> {
     if !(0.0..=1.0).contains(&t) {
         return Err(LatentBlendError::InvalidWeight(t));
+    }
+    Ok(())
+}
+
+/// Verify that `t.data.len()` matches its declared shape and that the
+/// spatial extent is non-empty.
+///
+/// `LatentTensor`'s fields are all `pub`, so a struct literal (or an
+/// in-place mutation of `data`) can desynchronize `data` from
+/// `channels`/`height`/`width` without going through
+/// [`LatentTensor::from_data`]'s validation — `check_same_shape` alone does
+/// not catch this, since it only compares `a`/`b`'s *declared* dimensions
+/// against each other, never against either one's actual `data.len()`. Every
+/// function below that slices `data` per channel (`base = c * spatial_size();
+/// &data[base..base + spatial_size()]`) calls this first instead of trusting
+/// the declared dimensions, which would otherwise panic on a slice-index
+/// out-of-bounds for a truncated buffer, or silently divide by zero for a
+/// zero-sized spatial extent.
+fn check_data_len(t: &LatentTensor) -> Result<(), LatentBlendError> {
+    let expected = t.n_elements();
+    if t.data.len() != expected {
+        return Err(LatentBlendError::DimensionMismatch {
+            a: t.data.len(),
+            b: expected,
+        });
+    }
+    if t.spatial_size() == 0 {
+        return Err(LatentBlendError::EmptyInput);
     }
     Ok(())
 }
@@ -478,7 +493,23 @@ pub fn lb_gradient_mask(
 /// Morphological dilation with a square kernel of half-size `radius`.
 ///
 /// Any spatial position becomes `max` over a `(2*radius+1) × (2*radius+1)` window.
-pub fn lb_dilate_mask(mask: &[f32], height: usize, width: usize, radius: usize) -> Vec<f32> {
+///
+/// # Errors
+///
+/// [`LatentBlendError::SpatialMismatch`] if `mask.len() != height * width`.
+pub fn lb_dilate_mask(
+    mask: &[f32],
+    height: usize,
+    width: usize,
+    radius: usize,
+) -> Result<Vec<f32>, LatentBlendError> {
+    let expected = height * width;
+    if mask.len() != expected {
+        return Err(LatentBlendError::SpatialMismatch {
+            n: expected,
+            m: mask.len(),
+        });
+    }
     let mut out = vec![0.0_f32; height * width];
     let r = radius as isize;
     for h in 0..height {
@@ -499,15 +530,31 @@ pub fn lb_dilate_mask(mask: &[f32], height: usize, width: usize, radius: usize) 
             out[h * width + w] = best;
         }
     }
-    out
+    Ok(out)
 }
 
 /// Smooth a mask with a box blur of the given pixel radius.
 ///
 /// Uses two-pass (horizontal then vertical) separable box blur for efficiency.
-pub fn lb_smooth_mask(mask: &[f32], height: usize, width: usize, radius: usize) -> Vec<f32> {
+///
+/// # Errors
+///
+/// [`LatentBlendError::SpatialMismatch`] if `mask.len() != height * width`.
+pub fn lb_smooth_mask(
+    mask: &[f32],
+    height: usize,
+    width: usize,
+    radius: usize,
+) -> Result<Vec<f32>, LatentBlendError> {
+    let expected = height * width;
+    if mask.len() != expected {
+        return Err(LatentBlendError::SpatialMismatch {
+            n: expected,
+            m: mask.len(),
+        });
+    }
     if radius == 0 {
-        return mask.to_vec();
+        return Ok(mask.to_vec());
     }
     let r = radius as isize;
 
@@ -534,7 +581,7 @@ pub fn lb_smooth_mask(mask: &[f32], height: usize, width: usize, radius: usize) 
             out[h * width + w] = sum / count;
         }
     }
-    out
+    Ok(out)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -554,6 +601,8 @@ pub fn lb_harmonize_statistics(
     target: &LatentTensor,
 ) -> Result<LatentTensor, LatentBlendError> {
     check_same_shape(source, target)?;
+    check_data_len(source)?;
+    check_data_len(target)?;
     let spatial = source.spatial_size();
     let mut data = source.data.clone();
 
@@ -594,9 +643,7 @@ pub fn lb_harmonize_statistics(
 
 /// Normalize a latent to zero mean and unit variance, computed per channel.
 pub fn lb_normalize(latent: &LatentTensor) -> Result<LatentTensor, LatentBlendError> {
-    if latent.data.is_empty() {
-        return Err(LatentBlendError::EmptyInput);
-    }
+    check_data_len(latent)?;
     let spatial = latent.spatial_size();
     let mut data = latent.data.clone();
 
@@ -658,7 +705,15 @@ pub fn lb_denormalize(
 /// Compute per-channel mean and standard deviation.
 ///
 /// Returns `(means, stds)` each of length `channels`.
-pub fn lb_channel_stats(latent: &LatentTensor) -> (Vec<f32>, Vec<f32>) {
+///
+/// # Errors
+///
+/// [`LatentBlendError::DimensionMismatch`] if `latent.data.len() !=
+/// latent.n_elements()`; [`LatentBlendError::EmptyInput`] if the spatial
+/// extent (`height * width`) is zero — without this check the per-channel
+/// mean/variance below would divide by zero, silently producing `NaN`.
+pub fn lb_channel_stats(latent: &LatentTensor) -> Result<(Vec<f32>, Vec<f32>), LatentBlendError> {
+    check_data_len(latent)?;
     let spatial = latent.spatial_size();
     let mut means = Vec::with_capacity(latent.channels);
     let mut stds = Vec::with_capacity(latent.channels);
@@ -671,7 +726,7 @@ pub fn lb_channel_stats(latent: &LatentTensor) -> (Vec<f32>, Vec<f32>) {
         means.push(mean);
         stds.push(var.sqrt());
     }
-    (means, stds)
+    Ok((means, stds))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -685,9 +740,7 @@ pub fn lb_frequency_separate(
     latent: &LatentTensor,
     radius: usize,
 ) -> Result<(LatentTensor, LatentTensor), LatentBlendError> {
-    if latent.data.is_empty() {
-        return Err(LatentBlendError::EmptyInput);
-    }
+    check_data_len(latent)?;
 
     let spatial = latent.spatial_size();
     let channels = latent.channels;
@@ -702,7 +755,7 @@ pub fn lb_frequency_separate(
         let base = c * spatial;
         let channel_slice = &latent.data[base..base + spatial];
         // Apply box blur on the channel slice.
-        let blurred = lb_smooth_mask(channel_slice, height, width, radius);
+        let blurred = lb_smooth_mask(channel_slice, height, width, radius)?;
         for (s, &blurred_val) in blurred.iter().enumerate() {
             low_data.push(blurred_val);
             high_data.push(latent.data[base + s] - blurred_val);
@@ -1323,7 +1376,7 @@ mod tests {
         let w = 5;
         let mut mask = vec![0.0_f32; h * w];
         mask[2 * w + 2] = 1.0; // centre pixel
-        let dilated = lb_dilate_mask(&mask, h, w, 1);
+        let dilated = lb_dilate_mask(&mask, h, w, 1).unwrap();
         // All 3x3 neighbours should be 1.0.
         for dh in 1..=3 {
             for dw in 1..=3 {
@@ -1339,7 +1392,7 @@ mod tests {
     #[test]
     fn test_smooth_mask_constant_unchanged() {
         let mask = vec![0.5_f32; 16];
-        let result = lb_smooth_mask(&mask, 4, 4, 2);
+        let result = lb_smooth_mask(&mask, 4, 4, 2).unwrap();
         for &v in &result {
             assert!(
                 (v - 0.5).abs() < 1e-5,
@@ -1383,7 +1436,7 @@ mod tests {
     fn test_normalize_mean_near_zero() {
         let lt = make_latent_range(2, 4, 4);
         let norm = lb_normalize(&lt).unwrap();
-        let (means, _) = lb_channel_stats(&norm);
+        let (means, _) = lb_channel_stats(&norm).unwrap();
         for m in &means {
             assert!(m.abs() < 1e-4, "channel mean after normalize: {m}");
         }
@@ -1393,7 +1446,7 @@ mod tests {
     fn test_normalize_std_near_one() {
         let lt = make_latent_range(2, 4, 4);
         let norm = lb_normalize(&lt).unwrap();
-        let (_, stds) = lb_channel_stats(&norm);
+        let (_, stds) = lb_channel_stats(&norm).unwrap();
         for s in &stds {
             assert!((s - 1.0).abs() < 1e-4, "channel std after normalize: {s}");
         }
@@ -1404,7 +1457,7 @@ mod tests {
     #[test]
     fn test_denormalize_round_trip() {
         let lt = make_latent_range(2, 4, 4);
-        let (means, stds) = lb_channel_stats(&lt);
+        let (means, stds) = lb_channel_stats(&lt).unwrap();
         let norm = lb_normalize(&lt).unwrap();
         let restored = lb_denormalize(&norm, &means, &stds).unwrap();
         for (orig, res) in lt.data.iter().zip(restored.data.iter()) {
@@ -1425,7 +1478,7 @@ mod tests {
             *v = 3.0;
         }
         let lt = LatentTensor::from_data(data, 2, 2, 2).unwrap();
-        let (means, _) = lb_channel_stats(&lt);
+        let (means, _) = lb_channel_stats(&lt).unwrap();
         assert!((means[0] - 1.0).abs() < 1e-6);
         assert!((means[1] - 3.0).abs() < 1e-6);
     }
@@ -1705,7 +1758,54 @@ mod tests {
     #[test]
     fn test_smooth_mask_zero_radius_unchanged() {
         let mask = vec![0.1, 0.5, 0.9, 0.3];
-        let result = lb_smooth_mask(&mask, 2, 2, 0);
+        let result = lb_smooth_mask(&mask, 2, 2, 0).unwrap();
         assert_eq!(result, mask);
+    }
+
+    #[test]
+    fn test_dilate_mask_rejects_length_mismatch() {
+        let mask = vec![0.0_f32; 3]; // 3 != 2*2
+        let result = lb_dilate_mask(&mask, 2, 2, 1);
+        assert!(matches!(
+            result,
+            Err(LatentBlendError::SpatialMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn test_smooth_mask_rejects_length_mismatch() {
+        let mask = vec![0.0_f32; 3]; // 3 != 2*2
+        let result = lb_smooth_mask(&mask, 2, 2, 1);
+        assert!(matches!(
+            result,
+            Err(LatentBlendError::SpatialMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn test_channel_stats_rejects_length_mismatch() {
+        let lt = LatentTensor {
+            data: vec![1.0, 2.0],
+            channels: 3,
+            height: 2,
+            width: 2,
+        };
+        let result = lb_channel_stats(&lt);
+        assert!(matches!(
+            result,
+            Err(LatentBlendError::DimensionMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn test_channel_stats_rejects_zero_spatial_extent() {
+        let lt = LatentTensor {
+            data: vec![],
+            channels: 3,
+            height: 0,
+            width: 4,
+        };
+        let result = lb_channel_stats(&lt);
+        assert!(matches!(result, Err(LatentBlendError::EmptyInput)));
     }
 }

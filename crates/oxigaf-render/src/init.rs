@@ -13,6 +13,7 @@
 //! - SH coefficients: degree-0 DC term encodes color via `color = 0.5 + SH_C0 * sh_dc`.
 
 use crate::{
+    deform::{build_tbn, mat3_cols_to_quat},
     gaussian::{GaussianAttributes, GaussianModel},
     RenderError,
 };
@@ -80,7 +81,18 @@ impl Xorshift64 {
 
     /// Return a pseudo-random `f32` in `[0, 1)`.
     fn next_f32(&mut self) -> f32 {
-        (self.next() >> 11) as f32 / (1u64 << 53) as f32
+        // Build a 24-bit mantissa directly (f32 has exactly 24 bits of
+        // precision, including the implicit leading bit), so the integer
+        // numerator is always exactly representable and the quotient is
+        // always strictly < 1.0.
+        //
+        // The previous `(self.next() >> 11) as f32 / (1u64 << 53) as f32`
+        // construction produced a 53-bit numerator, and casting that to
+        // f32 rounds to the nearest *f32* — any value in
+        // `[2^53 - 2^28, 2^53)` rounds up to exactly `2^53`, making the
+        // quotient exactly `1.0` (violating the documented `[0, 1)` range
+        // roughly once every 2^25 draws).
+        ((self.next() >> 40) as f32) / (1u32 << 24) as f32
     }
 }
 
@@ -307,8 +319,12 @@ fn get_vertex(vertices: &[[f32; 3]], idx: u32, face_idx: usize) -> Result<[f32; 
 
 /// Sample barycentric coordinates `(u, v, w)` uniformly on a triangle.
 ///
-/// Uses the method: `u = rand, v = rand * (1 - u), w = 1 - u - v`.
-/// A mirror fold is applied if `u + v > 1` (safety guard).
+/// Uses the mirror-fold construction: draw `r1, r2` uniformly in `[0, 1)`
+/// (as a point in the unit square); if `r1 + r2 > 1` that point falls
+/// outside the unit triangle, so reflect both through `1 - r`, which maps
+/// it back inside while preserving a uniform distribution. Then
+/// `u = r1', v = r2', w = 1 - u - v` (clamped to `>= 0` to absorb
+/// floating-point noise right at the `w = 0` edge).
 fn sample_barycentric(rng: &mut Xorshift64) -> (f32, f32, f32) {
     let r1 = rng.next_f32();
     let r2 = rng.next_f32();
@@ -338,8 +354,15 @@ struct FaceGeom<'a> {
 
 /// Compute the rotation quaternion `[x, y, z, w]` for a Gaussian placed on a face.
 ///
-/// Builds a TBN frame from the triangle edges and surface normal, then converts
-/// the rotation matrix to a unit quaternion using the Shepperd method.
+/// Builds a genuinely orthonormal TBN frame — the tangent is Gram-Schmidt
+/// projected against the surface normal via [`build_tbn`] rather than used
+/// raw — then converts it directly to a *normalized* unit quaternion via
+/// [`mat3_cols_to_quat`]. This is the same shared construction
+/// `deform::deform_cpu` uses for the post-deformation rotation (see
+/// `deform.rs`), so the initial and deformed rotations stay geometrically
+/// consistent, and both are guaranteed unit quaternions built from a true
+/// rotation matrix (unlike a bare `edge` tangent, which is generally *not*
+/// perpendicular to an interpolated vertex normal).
 fn compute_rotation(geom: FaceGeom<'_>) -> [f32; 4] {
     let FaceGeom {
         i0,
@@ -352,78 +375,26 @@ fn compute_rotation(geom: FaceGeom<'_>) -> [f32; 4] {
         normals,
     } = geom;
 
-    // Compute or interpolate the surface normal.
-    let normal = if let Some(nrm) = normals {
+    // Interpolated vertex normal. Left as the zero vector when no
+    // per-vertex normals were supplied: `build_tbn` treats a near-zero
+    // `interp_n` as "not supplied" and falls back to the triangle's
+    // geometric normal, exactly matching the previous `normals.is_none()`
+    // branch.
+    let interp_n = if let Some(nrm) = normals {
         let n0 = nrm.get(i0 as usize).copied().unwrap_or([0.0, 0.0, 1.0]);
         let n1 = nrm.get(i1 as usize).copied().unwrap_or([0.0, 0.0, 1.0]);
         let n2 = nrm.get(i2 as usize).copied().unwrap_or([0.0, 0.0, 1.0]);
-        let interp = [
+        [
             bary_u * n0[0] + bary_v * n1[0] + bary_w * n2[0],
             bary_u * n0[1] + bary_v * n1[1] + bary_w * n2[1],
             bary_u * n0[2] + bary_v * n1[2] + bary_w * n2[2],
-        ];
-        normalize3_safe(interp, [0.0, 0.0, 1.0])
+        ]
     } else {
-        let e1 = sub3(*v1, *v0);
-        let e2 = sub3(*v2, *v0);
-        let cross = cross3(e1, e2);
-        normalize3_safe(cross, [0.0, 0.0, 1.0])
+        [0.0, 0.0, 0.0]
     };
 
-    // Build TBN: tangent = normalize(v1 - v0), bitangent = cross(normal, tangent).
-    let edge = sub3(*v1, *v0);
-    let tangent = normalize3_safe(edge, [1.0, 0.0, 0.0]);
-    let bitangent = normalize3(cross3(normal, tangent));
-
-    // Rotation matrix columns: [tangent, bitangent, normal].
-    // R = [[t.x, b.x, n.x],
-    //      [t.y, b.y, n.y],
-    //      [t.z, b.z, n.z]]
-    let m = [
-        [tangent[0], bitangent[0], normal[0]],
-        [tangent[1], bitangent[1], normal[1]],
-        [tangent[2], bitangent[2], normal[2]],
-    ];
-
-    rotation_matrix_to_quaternion(m)
-}
-
-/// Convert a 3×3 rotation matrix to a quaternion `[x, y, z, w]` using the Shepperd method.
-///
-/// The matrix is in column-major order: `m[row][col]`.
-fn rotation_matrix_to_quaternion(m: [[f32; 3]; 3]) -> [f32; 4] {
-    // Trace = m[0][0] + m[1][1] + m[2][2]
-    let trace = m[0][0] + m[1][1] + m[2][2];
-
-    if trace > 0.0 {
-        let s = 0.5 / (trace + 1.0).sqrt();
-        let w = 0.25 / s;
-        let x = (m[2][1] - m[1][2]) * s;
-        let y = (m[0][2] - m[2][0]) * s;
-        let z = (m[1][0] - m[0][1]) * s;
-        [x, y, z, w]
-    } else if m[0][0] > m[1][1] && m[0][0] > m[2][2] {
-        let s = 2.0 * (1.0 + m[0][0] - m[1][1] - m[2][2]).sqrt();
-        let w = (m[2][1] - m[1][2]) / s;
-        let x = 0.25 * s;
-        let y = (m[0][1] + m[1][0]) / s;
-        let z = (m[0][2] + m[2][0]) / s;
-        [x, y, z, w]
-    } else if m[1][1] > m[2][2] {
-        let s = 2.0 * (1.0 + m[1][1] - m[0][0] - m[2][2]).sqrt();
-        let w = (m[0][2] - m[2][0]) / s;
-        let x = (m[0][1] + m[1][0]) / s;
-        let y = 0.25 * s;
-        let z = (m[1][2] + m[2][1]) / s;
-        [x, y, z, w]
-    } else {
-        let s = 2.0 * (1.0 + m[2][2] - m[0][0] - m[1][1]).sqrt();
-        let w = (m[1][0] - m[0][1]) / s;
-        let x = (m[0][2] + m[2][0]) / s;
-        let y = (m[1][2] + m[2][1]) / s;
-        let z = 0.25 * s;
-        [x, y, z, w]
-    }
+    let (t, bt, n) = build_tbn(*v0, *v1, *v2, interp_n);
+    mat3_cols_to_quat(t, bt, n)
 }
 
 // ---------------------------------------------------------------------------
@@ -449,27 +420,14 @@ fn len3(a: [f32; 3]) -> f32 {
     (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]).sqrt()
 }
 
-/// Normalize a vector; returns `fallback` if the vector is (near-)zero.
-#[inline]
-fn normalize3_safe(a: [f32; 3], fallback: [f32; 3]) -> [f32; 3] {
-    let l = len3(a);
-    if l < 1e-10 {
-        fallback
-    } else {
-        [a[0] / l, a[1] / l, a[2] / l]
-    }
-}
-
-/// Normalize a vector; panics if zero (only call when length is guaranteed non-zero).
-#[inline]
-fn normalize3(a: [f32; 3]) -> [f32; 3] {
-    let l = len3(a);
-    if l < 1e-10 {
-        [0.0, 1.0, 0.0] // safe fallback
-    } else {
-        [a[0] / l, a[1] / l, a[2] / l]
-    }
-}
+// Note: this module previously defined its own `normalize3_safe` /
+// `normalize3` / `rotation_matrix_to_quaternion` helpers for building the
+// per-Gaussian rotation. They were removed when `compute_rotation` was
+// switched to the shared, Gram-Schmidt-corrected `deform::build_tbn` +
+// `deform::mat3_cols_to_quat` (see `compute_rotation` above) — the bare
+// `edge` tangent those helpers combined was not generally orthogonal to an
+// interpolated vertex normal, and the resulting quaternion was never
+// normalized.
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -1068,5 +1026,77 @@ mod tests {
         };
         let model = init.initialize(&cfg).expect("Zero seed should not panic");
         assert_eq!(model.gaussians.len(), 10);
+    }
+
+    // -----------------------------------------------------------------------
+    // test_next_f32_always_in_zero_one
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_next_f32_always_in_zero_one() {
+        // Regression: the old `(x >> 11) as f32 / (1u64 << 53) as f32`
+        // construction could round up to exactly 1.0 (a 53-bit numerator
+        // cast to f32's 24-bit mantissa rounds up for values in
+        // `[2^53 - 2^28, 2^53)`), violating the documented `[0, 1)` range.
+        // Draw heavily across several seeds/stream positions.
+        for seed in [1u64, 2, 42, 12345, u64::MAX, 0xDEAD_BEEF] {
+            let mut rng = Xorshift64::new(seed);
+            for _ in 0..100_000 {
+                let v = rng.next_f32();
+                assert!(v < 1.0, "next_f32 returned {v} >= 1.0 (seed={seed})");
+                assert!(v >= 0.0, "next_f32 returned {v} < 0.0 (seed={seed})");
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // test_rotation_orthonormal_with_skewed_normal
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_rotation_orthonormal_with_skewed_normal() {
+        // A vertex normal deliberately *not* perpendicular to the
+        // triangle's v0->v1 edge (the tangent's starting point before
+        // Gram-Schmidt correction). Regression for: the previous
+        // implementation used that raw edge as the tangent with no
+        // projection against the normal, producing a non-orthonormal TBN
+        // and an un-normalized quaternion.
+        let v0 = [0.0_f32, 0.0, 0.0];
+        let v1 = [1.0_f32, 0.0, 0.0];
+        let v2 = [0.0_f32, 1.0, 0.0];
+        // Not perpendicular to edge v1-v0 = [1,0,0] (dot = 0.6), and far
+        // from this triangle's own geometric normal [0,0,1].
+        let skewed_normal = [0.6_f32, 0.6, 0.529_150_3];
+        let normals = [skewed_normal, skewed_normal, skewed_normal];
+
+        let geom = FaceGeom {
+            i0: 0,
+            i1: 1,
+            i2: 2,
+            v0: &v0,
+            v1: &v1,
+            v2: &v2,
+            bary: [1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0],
+            normals: Some(&normals[..]),
+        };
+        let q = compute_rotation(geom);
+        let [x, y, z, w] = q;
+
+        let qnorm = (x * x + y * y + z * z + w * w).sqrt();
+        assert!(
+            (qnorm - 1.0).abs() < 1e-5,
+            "quaternion not unit length: {qnorm}"
+        );
+
+        // Reconstruct the TBN directly (the same call `compute_rotation`
+        // makes internally) and check pairwise orthogonality + unit length.
+        let (t, bt, n) = build_tbn(v0, v1, v2, skewed_normal);
+        let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+        let len = |a: [f32; 3]| dot(a, a).sqrt();
+
+        assert!(dot(t, bt).abs() < 1e-5, "t·bt = {}", dot(t, bt));
+        assert!(dot(t, n).abs() < 1e-5, "t·n = {}", dot(t, n));
+        assert!(dot(bt, n).abs() < 1e-5, "bt·n = {}", dot(bt, n));
+        assert!((len(t) - 1.0).abs() < 1e-5, "|t| = {}", len(t));
+        assert!((len(bt) - 1.0).abs() < 1e-5, "|bt| = {}", len(bt));
+        assert!((len(n) - 1.0).abs() < 1e-5, "|n| = {}", len(n));
     }
 }

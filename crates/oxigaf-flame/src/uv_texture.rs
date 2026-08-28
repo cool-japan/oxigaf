@@ -45,14 +45,20 @@ impl TextureMap {
     ///
     /// # Errors
     ///
-    /// Returns [`FlameError::InvalidParams`] if the channel count is not 1, 3, or 4, or
-    /// if `data.len()` does not equal `width * height * channels`.
+    /// Returns [`FlameError::InvalidParams`] if `width` or `height` is 0, if the
+    /// channel count is not 1, 3, or 4, or if `data.len()` does not equal
+    /// `width * height * channels`.
     pub fn new(
         width: usize,
         height: usize,
         channels: usize,
         data: Vec<f32>,
     ) -> Result<Self, FlameError> {
+        if width == 0 || height == 0 {
+            return Err(FlameError::InvalidParams(format!(
+                "TextureMap dimensions must be > 0; got {width}x{height}"
+            )));
+        }
         if channels != 1 && channels != 3 && channels != 4 {
             return Err(FlameError::InvalidParams(format!(
                 "TextureMap channels must be 1, 3, or 4; got {channels}"
@@ -311,25 +317,44 @@ impl UvTextureSampler {
 
         match self.filter {
             FilterMode::Nearest => {
-                // Map [0,1] to pixel indices, clamp to valid range.
-                let px = ((u * w as f32).floor() as isize).clamp(0, w.cast_signed() - 1) as usize;
-                let py = ((v * h as f32).floor() as isize).clamp(0, h.cast_signed() - 1) as usize;
+                // Map [0,1] to pixel indices: texel i covers u in [i/W, (i+1)/W),
+                // so px = floor(u*W). The clamp bound is saturating so a
+                // zero-sized texture (which `TextureMap::new` now rejects,
+                // but a hand-constructed value could still smuggle in) gives
+                // `clamp(0, 0)` instead of the inverted `clamp(0, -1)` range,
+                // which used to panic on the clamp's own precondition.
+                let max_x = w.saturating_sub(1).cast_signed();
+                let max_y = h.saturating_sub(1).cast_signed();
+                let px = ((u * w as f32).floor() as isize).clamp(0, max_x) as usize;
+                let py = ((v * h as f32).floor() as isize).clamp(0, max_y) as usize;
                 texture.pixel(px, py).to_vec()
             }
 
             FilterMode::Bilinear => {
-                // Map u -> floating-point pixel position over [0, W-1].
-                // This ensures u=0→pixel 0 and u=1→pixel W-1 exactly.
-                let x_f = u * (w.saturating_sub(1)) as f32;
-                let y_f = v * (h.saturating_sub(1)) as f32;
+                // GPU-standard texel-center convention, matching Nearest
+                // above: texel i's center sits at u = (i + 0.5) / W, so the
+                // continuous texel-space position is `u*W - 0.5`. Previously
+                // this branch used `u*(W-1)` instead, which agreed with
+                // Nearest only at u=0, u=1, and u=0.5 and disagreed by up to
+                // half a texel elsewhere, so switching `FilterMode` shifted
+                // the sampled image. `x0`/`y0` are floored (and `fx`/`fy`
+                // computed) BEFORE clamping, so a UV exactly at the border
+                // still blends toward the true edge texel with the correct
+                // weight instead of being pulled fully onto it.
+                let x_f = u * w as f32 - 0.5;
+                let y_f = v * h as f32 - 0.5;
 
-                let x0 = (x_f.floor() as isize).clamp(0, w.cast_signed() - 1) as usize;
-                let y0 = (y_f.floor() as isize).clamp(0, h.cast_signed() - 1) as usize;
-                let x1 = (x0 + 1).min(w - 1);
-                let y1 = (y0 + 1).min(h - 1);
+                let x0_raw = x_f.floor() as isize;
+                let y0_raw = y_f.floor() as isize;
+                let fx = x_f - x0_raw as f32;
+                let fy = y_f - y0_raw as f32;
 
-                let fx = x_f - x0 as f32;
-                let fy = y_f - y0 as f32;
+                let max_x = w.saturating_sub(1).cast_signed();
+                let max_y = h.saturating_sub(1).cast_signed();
+                let x0 = x0_raw.clamp(0, max_x) as usize;
+                let y0 = y0_raw.clamp(0, max_y) as usize;
+                let x1 = (x0_raw + 1).clamp(0, max_x) as usize;
+                let y1 = (y0_raw + 1).clamp(0, max_y) as usize;
 
                 // tl=top-left, tr=top-right, bl=bottom-left, br=bottom-right
                 // row y0 = top, row y1 = bottom (v=0 is top in image convention)
@@ -544,6 +569,24 @@ mod tests {
     }
 
     #[test]
+    fn test_texture_map_zero_width_or_height_errors() {
+        // A 0×0 texture used to pass construction (0 == 0*0*channels) and
+        // then panic inside `sample()`'s clamp precondition.
+        assert!(
+            TextureMap::new(0, 0, 3, Vec::new()).is_err(),
+            "0x0 texture must be rejected at construction"
+        );
+        assert!(
+            TextureMap::from_rgb(0, 4, Vec::new()).is_err(),
+            "zero width with nonzero height must be rejected"
+        );
+        assert!(
+            TextureMap::from_rgb(4, 0, Vec::new()).is_err(),
+            "zero height with nonzero width must be rejected"
+        );
+    }
+
+    #[test]
     fn test_solid_color() {
         let color = [0.2, 0.5, 0.8f32];
         let tex = TextureMap::solid_color(&color);
@@ -748,6 +791,40 @@ mod tests {
             (result2[0] - 1.0).abs() < 1e-6,
             "clamped v=-1 should give red TL"
         );
+    }
+
+    #[test]
+    fn test_nearest_and_bilinear_agree_at_texel_centers() {
+        // Nearest and Bilinear must use the same UV-to-texel convention. At a
+        // texel's exact center (u = (i+0.5)/W), Bilinear's fractional weight
+        // is exactly 0 and it should collapse to that same texel, matching
+        // Nearest exactly. Before the fix, Bilinear used `u*(W-1)` instead of
+        // `u*W - 0.5`, which only coincided with this convention at u=0, 0.5,
+        // and 1 — texel 0's center (u=0.125 for W=4) diverged by 0.375 of a
+        // texel.
+        let w = 4usize;
+        let data: Vec<f32> = vec![0.1, 0.2, 0.3, 0.4]; // one distinct value per column
+        let tex = TextureMap::from_grayscale(w, 1, data.clone()).expect("valid texture");
+
+        let nearest = UvTextureSampler::new(FilterMode::Nearest, WrapMode::Clamp);
+        let bilinear = UvTextureSampler::new(FilterMode::Bilinear, WrapMode::Clamp);
+
+        for (i, &expected) in data.iter().enumerate() {
+            let u = (i as f32 + 0.5) / w as f32;
+            let n = nearest.sample(&tex, [u, 0.5]);
+            let b = bilinear.sample(&tex, [u, 0.5]);
+            assert!(
+                (n[0] - expected).abs() < 1e-6,
+                "nearest at texel {i}'s center should read texel {i} exactly, got {}",
+                n[0]
+            );
+            assert!(
+                (b[0] - expected).abs() < 1e-5,
+                "bilinear at texel {i}'s center should also read texel {i} exactly \
+                 (fx=0), got {}",
+                b[0]
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

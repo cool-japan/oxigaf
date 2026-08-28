@@ -58,19 +58,21 @@ pub fn charbonnier_loss(pred: &[f32], target: &[f32], eps: f32) -> f32 {
 // Synthetic image helpers
 // ============================================================================
 
-/// Generate a synthetic 4×4 RGB image in HWC flat layout (H=4, W=4, C=3).
+/// Generate a synthetic RGB image in HWC flat layout (H=`height`, W=`width`, C=3).
 ///
 /// Uses a deterministic LCG to avoid external RNG dependencies.
-fn synthetic_image_4x4(seed_init: u64) -> Vec<f32> {
+fn synthetic_image(width: usize, height: usize, seed_init: u64) -> Vec<f32> {
     let mut seed = seed_init;
-    let n = 4 * 4 * 3;
+    let n = width * height * 3;
     let mut buf = Vec::with_capacity(n);
     for _ in 0..n {
         seed = seed
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
-        // Map to [0, 1]
-        let v = ((seed >> 33) as f32) / (u32::MAX as f32);
+        // Map to [0, 1]. Note: `seed >> 33` would only yield 31 bits (range
+        // [0, 2^31)), which collapses to [0, 0.5) below — use the full top
+        // 32 bits instead.
+        let v = ((seed >> 32) as f32) / (u32::MAX as f32);
         buf.push(v);
     }
     buf
@@ -86,7 +88,9 @@ fn create_demo_model(n: usize) -> GaussianModel {
     let mut seed = 99u64;
     let mut rng = || -> f32 {
         seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-        ((seed >> 33) as f32) / (u32::MAX as f32 / 2.0) - 1.0
+        // Full top 32 bits mapped to [-1, 1); see `synthetic_image` above for
+        // why `>> 33` would be wrong here (it would only ever produce [-1, 0)).
+        ((seed >> 32) as f32) / (u32::MAX as f32 / 2.0) - 1.0
     };
 
     let mut gaussians = Vec::with_capacity(n);
@@ -126,19 +130,26 @@ fn main() {
     println!();
 
     // =========================================================================
-    // Step 1: Build synthetic 4×4 rendered prediction and ground-truth images
+    // Step 1: Build synthetic rendered prediction and ground-truth images
     // =========================================================================
     //
     // In production these would come from the GPU rasterizer (prediction) and
     // the dataset (target).  Here we use deterministic synthetic values so the
     // example runs on any machine without assets or a GPU.
+    //
+    // IMG_SIZE must be at least as large as the 11-tap Gaussian window used
+    // by ssim_loss in Step 4 (`gaussian_kernel_1d(11, 1.5)`). A 4x4 image
+    // (smaller than the 11-wide kernel) would leave almost the entire
+    // window sampling clamped edge padding rather than real image content,
+    // making the resulting "SSIM" number meaningless.
+    const IMG_SIZE: usize = 16;
 
-    println!("Step 1: Creating synthetic 4×4 RGB images (HWC layout)...");
+    println!("Step 1: Creating synthetic {IMG_SIZE}x{IMG_SIZE} RGB images (HWC layout)...");
 
-    let width: usize = 4;
-    let height: usize = 4;
-    let pred = synthetic_image_4x4(1234);
-    let target = synthetic_image_4x4(5678);
+    let width: usize = IMG_SIZE;
+    let height: usize = IMG_SIZE;
+    let pred = synthetic_image(width, height, 1234);
+    let target = synthetic_image(width, height, 5678);
 
     println!("  pred[0..6]   = {:?}", &pred[..6.min(pred.len())]);
     println!("  target[0..6] = {:?}", &target[..6.min(target.len())]);
@@ -147,10 +158,12 @@ fn main() {
     // Step 2: Build a small GaussianModel for regularisation terms
     // =========================================================================
 
-    println!();
-    println!("Step 2: Building demo GaussianModel (16 Gaussians)...");
+    const NUM_GAUSSIANS: usize = 16;
 
-    let model = create_demo_model(16);
+    println!();
+    println!("Step 2: Building demo GaussianModel ({NUM_GAUSSIANS} Gaussians)...");
+
+    let model = create_demo_model(NUM_GAUSSIANS);
     println!(
         "  Gaussians: {}, SH degree: {}",
         model.len(),
@@ -185,7 +198,8 @@ fn main() {
     // =========================================================================
     //
     // ssim_loss requires a pre-computed 1-D Gaussian kernel (separable filter).
-    // gaussian_kernel_1d(11, 1.5) matches the SSIM paper defaults.
+    // gaussian_kernel_1d(11, 1.5) matches the SSIM paper defaults, but only
+    // when width/height are >= the 11-tap window — see IMG_SIZE in Step 1.
 
     println!();
     println!("Step 4: Computing SSIM loss...");
@@ -284,6 +298,8 @@ fn main() {
     println!("  - oxigaf::trainer::loss::l1_loss(pred, target) gives plain mean-absolute-error");
     println!("  - ssim_loss(pred, target, w, h, &kernel) returns 1−SSIM (lower = better match)");
     println!("  - Use gaussian_kernel_1d(11, 1.5) for the standard SSIM 11×11 Gaussian kernel");
+    println!("  - ...but w and h must both be >= the kernel size, or the window falls mostly");
+    println!("    outside the image and the SSIM value stops being meaningful");
     println!("  - scale_reg(&model) / opacity_reg(&model) add structural priors to the objective");
     println!("  - Typical weights: L1/Charb=1.0, SSIM=0.2, scale=0.01, opacity=0.01");
 }

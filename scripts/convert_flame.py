@@ -1,6 +1,29 @@
 #!/usr/bin/env python3
 """Convert a FLAME .pkl model to a directory of .npy files for Rust loading.
 
+DEPRECATED as of 0.1.2 — superseded by a pure-Rust implementation.
+
+    cargo run -p oxigaf-bridge --example convert_flame_pkl -- \
+        --model <input.pkl> --output-dir <output_dir/>
+
+`oxigaf_bridge::convert_flame_model` now reads FLAME `.pkl` models directly:
+`oxigaf-bridge/src/pickle/` implements a non-executing pickle reader plus
+the NumPy-array, chumpy-wrapper and SciPy-sparse handling a FLAME model
+needs, so no Python, no NumPy and no SciPy is involved. It reproduces this
+script's output byte-for-byte — the same 300-column identity/expression
+split of `shapedirs`, the same densification of the sparse `J_regressor`,
+the same f32/i32 dtypes — and additionally validates the cross-array shape
+invariants (`j_regressor` vs `kintree_table`, face indices within
+`v_template`) that `oxigaf_flame::io::load_flame_model` enforces, so a bad
+model is caught at conversion time rather than at load time.
+
+Both pickle protocol 2 (Python 2-era FLAME releases) and protocol 5 are
+supported, as are NumPy 1.x (`numpy.core`) and NumPy 2.x (`numpy._core`)
+module paths.
+
+This script is kept as a reference. Nothing in the OxiGAF pipeline requires
+it.
+
 Usage:
     python convert_flame.py <input.pkl> <output_dir/>
 

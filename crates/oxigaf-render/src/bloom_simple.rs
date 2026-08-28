@@ -12,6 +12,7 @@
 //! 4. Accumulate (progressive upsample + blend).
 //! 5. Composite: `result = original + strength * bloom * color_tint`.
 
+use rayon::prelude::*;
 use thiserror::Error;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -225,6 +226,9 @@ pub fn bloom_make_kernel(kernel_size: usize, sigma: f32) -> Result<Vec<f32>, Blo
 }
 
 /// Apply 1-D separable convolution horizontally (clamp-to-edge).
+///
+/// Rows are independent (each only reads `img`, writes its own row of
+/// `out`), so they are computed in parallel with rayon.
 pub fn bloom_convolve_horizontal(
     img: &[f32],
     width: usize,
@@ -233,26 +237,32 @@ pub fn bloom_convolve_horizontal(
 ) -> Vec<f32> {
     let half = (kernel.len() / 2) as isize;
     let mut out = vec![0.0_f32; width * height * 3];
-    for y in 0..height {
-        for x in 0..width {
-            let mut acc = [0.0_f32; 3];
-            for (ki, &kw) in kernel.iter().enumerate() {
-                let sx = ((x as isize + ki as isize - half).clamp(0, width as isize - 1)) as usize;
-                let b = (y * width + sx) * 3;
-                acc[0] += img[b] * kw;
-                acc[1] += img[b + 1] * kw;
-                acc[2] += img[b + 2] * kw;
+    out.par_chunks_mut(width * 3)
+        .enumerate()
+        .for_each(|(y, row)| {
+            for x in 0..width {
+                let mut acc = [0.0_f32; 3];
+                for (ki, &kw) in kernel.iter().enumerate() {
+                    let sx =
+                        ((x as isize + ki as isize - half).clamp(0, width as isize - 1)) as usize;
+                    let b = (y * width + sx) * 3;
+                    acc[0] += img[b] * kw;
+                    acc[1] += img[b + 1] * kw;
+                    acc[2] += img[b + 2] * kw;
+                }
+                let ob = x * 3;
+                row[ob] = acc[0];
+                row[ob + 1] = acc[1];
+                row[ob + 2] = acc[2];
             }
-            let ob = (y * width + x) * 3;
-            out[ob] = acc[0];
-            out[ob + 1] = acc[1];
-            out[ob + 2] = acc[2];
-        }
-    }
+        });
     out
 }
 
 /// Apply 1-D separable convolution vertically (clamp-to-edge).
+///
+/// Output rows are independent (each reads across all of `img` but writes
+/// only its own row of `out`), so they are computed in parallel with rayon.
 pub fn bloom_convolve_vertical(
     img: &[f32],
     width: usize,
@@ -261,22 +271,25 @@ pub fn bloom_convolve_vertical(
 ) -> Vec<f32> {
     let half = (kernel.len() / 2) as isize;
     let mut out = vec![0.0_f32; width * height * 3];
-    for y in 0..height {
-        for x in 0..width {
-            let mut acc = [0.0_f32; 3];
-            for (ki, &kw) in kernel.iter().enumerate() {
-                let sy = ((y as isize + ki as isize - half).clamp(0, height as isize - 1)) as usize;
-                let b = (sy * width + x) * 3;
-                acc[0] += img[b] * kw;
-                acc[1] += img[b + 1] * kw;
-                acc[2] += img[b + 2] * kw;
+    out.par_chunks_mut(width * 3)
+        .enumerate()
+        .for_each(|(y, row)| {
+            for x in 0..width {
+                let mut acc = [0.0_f32; 3];
+                for (ki, &kw) in kernel.iter().enumerate() {
+                    let sy =
+                        ((y as isize + ki as isize - half).clamp(0, height as isize - 1)) as usize;
+                    let b = (sy * width + x) * 3;
+                    acc[0] += img[b] * kw;
+                    acc[1] += img[b + 1] * kw;
+                    acc[2] += img[b + 2] * kw;
+                }
+                let ob = x * 3;
+                row[ob] = acc[0];
+                row[ob + 1] = acc[1];
+                row[ob + 2] = acc[2];
             }
-            let ob = (y * width + x) * 3;
-            out[ob] = acc[0];
-            out[ob + 1] = acc[1];
-            out[ob + 2] = acc[2];
-        }
-    }
+        });
     out
 }
 
@@ -326,6 +339,12 @@ pub fn bloom_downsample(img: &[f32], width: usize, height: usize) -> (Vec<f32>, 
 }
 
 /// Upsample to `target_w × target_h` using bilinear interpolation.
+///
+/// Uses pixel-centre-aligned sampling (`(tx + 0.5) * scale - 0.5`, not
+/// `tx * scale`): mapping target pixel *centres* to source pixel *centres*
+/// keeps a resample's centre of mass fixed. Corner-aligned sampling instead
+/// shifts the whole image by a fraction of a source pixel toward the
+/// origin, which compounds visibly across a multi-level mip chain.
 pub fn bloom_upsample(
     img: &[f32],
     width: usize,
@@ -341,8 +360,8 @@ pub fn bloom_upsample(
     let sy_scale = height as f32 / target_h as f32;
     for ty in 0..target_h {
         for tx in 0..target_w {
-            let sx = tx as f32 * sx_scale;
-            let sy = ty as f32 * sy_scale;
+            let sx = ((tx as f32 + 0.5) * sx_scale - 0.5).max(0.0);
+            let sy = ((ty as f32 + 0.5) * sy_scale - 0.5).max(0.0);
             let x0 = (sx.floor() as usize).min(width.saturating_sub(1));
             let x1 = (x0 + 1).min(width.saturating_sub(1));
             let y0 = (sy.floor() as usize).min(height.saturating_sub(1));
@@ -451,6 +470,35 @@ pub fn bloom_composite(
     Ok(out)
 }
 
+/// Per-level Gaussian sigma budget used by [`apply_bloom`]. The mip chain's
+/// own resolution halving supplies the large-scale spread once levels are
+/// upsampled and composited, so no single level's convolution should need a
+/// wider blur than this.
+const MAX_LEVEL_SIGMA: f32 = 4.0;
+
+/// Per-level Gaussian kernel-size budget (taps) used by [`apply_bloom`],
+/// paired with [`MAX_LEVEL_SIGMA`].
+const MAX_LEVEL_KERNEL: usize = 25;
+
+/// Derive the `(sigma, kernel_size)` used by [`apply_bloom`] to blur mip
+/// level `idx`, given the level-0 (full-resolution) sigma `sigma_base`.
+///
+/// Halves the sigma at each successive level (rather than the `1/(idx+1)`
+/// harmonic decay a naive implementation might use, which barely shrinks
+/// it) and caps the result to [`MAX_LEVEL_SIGMA`] / [`MAX_LEVEL_KERNEL`]:
+/// the mip chain's own resolution halving supplies the large-scale spread
+/// once levels are upsampled and composited, so no single level's
+/// convolution should need more than a modest local blur. Without the cap,
+/// a default-sized (1920-wide, `radius = 0.1`) image would ask level 0
+/// alone for a ~385-tap separable kernel — on the order of 1.6 billion
+/// multiply-adds for that level alone.
+fn bloom_level_blur_params(sigma_base: f32, idx: usize) -> (f32, usize) {
+    let sigma = (sigma_base / 2f32.powi(idx as i32)).clamp(0.5, MAX_LEVEL_SIGMA);
+    let ks = ((sigma * 6.0).round() as usize).clamp(3, MAX_LEVEL_KERNEL);
+    let ks = if ks.is_multiple_of(2) { ks + 1 } else { ks };
+    (sigma, ks)
+}
+
 /// Apply bloom post-processing to an RGB image (H×W×3, f32).
 ///
 /// Pipeline:
@@ -477,26 +525,22 @@ pub fn apply_bloom(
     let n_levels = config.n_mip_levels.max(1);
     let mip_chain = bloom_build_mip_chain(&bright, width, height, n_levels);
     let sigma_base = (config.radius * width as f32).max(1.0);
-    let kernel_size = {
-        let ks = (sigma_base as usize * 2 + 1).max(3);
-        if ks.is_multiple_of(2) {
-            ks + 1
-        } else {
-            ks
-        }
-    };
+    // Propagate a per-level blur failure instead of silently falling back to
+    // unblurred data: `bloom_level_blur_params` only ever produces an odd,
+    // in-range kernel size paired with dimensions taken directly from the
+    // same mip level, so `bloom_gaussian_blur` cannot fail here in normal
+    // operation — a failure would indicate a real bug in how the mip
+    // chain's dimensions were tracked, which is worth surfacing rather than
+    // masking with an unblurred (aliased) level.
     let blurred_chain: Vec<(Vec<f32>, usize, usize)> = mip_chain
         .iter()
         .enumerate()
         .map(|(idx, (data, w, h))| {
-            let sigma = (sigma_base / (idx as f32 + 1.0)).max(0.5);
-            let ks = (kernel_size / (idx + 1)).max(3);
-            let ks = if ks % 2 == 0 { ks + 1 } else { ks };
-            let blurred =
-                bloom_gaussian_blur(data, *w, *h, sigma, ks).unwrap_or_else(|_| data.clone());
-            (blurred, *w, *h)
+            let (sigma, ks) = bloom_level_blur_params(sigma_base, idx);
+            let blurred = bloom_gaussian_blur(data, *w, *h, sigma, ks)?;
+            Ok((blurred, *w, *h))
         })
-        .collect();
+        .collect::<Result<Vec<_>, BloomError>>()?;
     let bloom_layer = bloom_accumulate_mip_chain(&blurred_chain, width, height)?;
     bloom_composite(img, &bloom_layer, config.strength, &config.color_tint)
 }
@@ -800,6 +844,37 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_bloom_upsample_pixel_center_aligned() {
+        // 4x1 horizontal ramp (R channel = column index; G, B = 0), 2x
+        // upsample. With the pre-fix corner-aligned sampling
+        // (`sx = tx * scale`) the whole image is shifted by a quarter
+        // source pixel toward the origin; with pixel-centre alignment the
+        // ramp's centre of mass is preserved and these exact values result
+        // (hand-derived from the bilinear formula; identical math to
+        // `bloom::upsample_2x`'s equivalent regression test).
+        let width = 4;
+        let height = 1;
+        let mut img = vec![0.0_f32; width * height * 3];
+        for x in 0..width {
+            img[x * 3] = x as f32;
+        }
+        let out = bloom_upsample(&img, width, height, width * 2, height * 2);
+        assert_eq!(out.len(), 8 * 2 * 3);
+
+        let expected_r = [0.0_f32, 0.25, 0.75, 1.25];
+        let corner_aligned_r = [0.0_f32, 0.5, 1.0, 1.5];
+        for (tx, &exp) in expected_r.iter().enumerate() {
+            let r = out[tx * 3];
+            assert!(
+                (r - exp).abs() < 1e-4,
+                "pixel-centre-aligned upsample at tx={tx}: expected r={exp}, got {r} \
+                 (corner-aligned sampling would give {})",
+                corner_aligned_r[tx]
+            );
+        }
+    }
+
     // ── bloom_luminance_map ──────────────────────────────────────────────────
 
     #[test]
@@ -946,6 +1021,51 @@ mod tests {
         let chain = bloom_build_mip_chain(&img, 4, 4, 1);
         let out = bloom_accumulate_mip_chain(&chain, 8, 8).unwrap();
         assert_eq!(out.len(), 8 * 8 * 3);
+    }
+
+    // ── bloom_level_blur_params ──────────────────────────────────────────────
+
+    #[test]
+    fn test_bloom_level_blur_params_capped_at_default_config_scale() {
+        // Regression for a ~385-tap kernel at level 0: with the default
+        // radius (0.1) on a 1920-wide image, sigma_base is 192 -- level 0's
+        // kernel must stay within the fixed budget rather than scaling
+        // directly with sigma_base.
+        let sigma_base = (0.1_f32 * 1920.0).max(1.0);
+        assert!((sigma_base - 192.0).abs() < 1e-3);
+        let (sigma0, ks0) = bloom_level_blur_params(sigma_base, 0);
+        assert!(
+            sigma0 <= MAX_LEVEL_SIGMA,
+            "level-0 sigma should be capped at {MAX_LEVEL_SIGMA}, got {sigma0}"
+        );
+        assert!(
+            ks0 <= MAX_LEVEL_KERNEL,
+            "level-0 kernel size should be capped at {MAX_LEVEL_KERNEL} taps, got {ks0} \
+             (uncapped harmonic decay would give ~385)"
+        );
+        assert!(
+            ks0 >= 3 && !ks0.is_multiple_of(2),
+            "kernel size must be odd and >= 3"
+        );
+    }
+
+    #[test]
+    fn test_bloom_level_blur_params_decays_across_levels() {
+        // Sigma should be non-increasing as the level index grows (halving,
+        // then flattening out once it hits the 0.5 floor).
+        let sigma_base = 200.0_f32;
+        let mut prev_sigma = f32::INFINITY;
+        for idx in 0..6 {
+            let (sigma, ks) = bloom_level_blur_params(sigma_base, idx);
+            assert!(
+                sigma <= prev_sigma + 1e-6,
+                "sigma should not increase across levels: level {idx} sigma={sigma}, \
+                 previous={prev_sigma}"
+            );
+            assert!((0.5..=MAX_LEVEL_SIGMA).contains(&sigma));
+            assert!((3..=MAX_LEVEL_KERNEL).contains(&ks));
+            prev_sigma = sigma;
+        }
     }
 
     // ── apply_bloom ──────────────────────────────────────────────────────────

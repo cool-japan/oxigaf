@@ -383,6 +383,14 @@ pub struct TileHeatmap {
     pub height: usize,
     /// RGBA pixel data, one `[u8; 4]` per tile, in row-major order.
     pub pixels: Vec<[u8; 4]>,
+    /// The normalised `[0, 1]` scalar each tile's Jet colour was derived
+    /// from, in the same row-major order as `pixels`. The Jet colourmap is
+    /// deliberately non-monotonic in luminance (its low end is dark blue,
+    /// its high end dark red, with a bright band in between), so anything
+    /// that needs an ordered/monotonic measure of "how hot is this tile" --
+    /// such as [`Self::to_ascii`] -- must use this field rather than
+    /// reconstructing a brightness from the colour.
+    pub values: Vec<f32>,
 }
 
 impl TileHeatmap {
@@ -418,18 +426,22 @@ impl TileHeatmap {
         // Normalise to [0, 1].
         let max_val = raw_values.iter().cloned().fold(0.0f32, f32::max);
 
-        let pixels = if max_val <= 0.0 {
-            // All zeros → all-blue (cold end of Jet).
-            vec![[0u8, 0u8, 128u8, 255u8]; grid.tiles.len()]
+        let (pixels, values): (Vec<[u8; 4]>, Vec<f32>) = if max_val <= 0.0 {
+            // All zeros → all-blue (cold end of Jet); the normalised value
+            // for every tile is the coldest one, 0.0.
+            (
+                vec![[0u8, 0u8, 128u8, 255u8]; grid.tiles.len()],
+                vec![0.0f32; grid.tiles.len()],
+            )
         } else {
             raw_values
                 .iter()
                 .map(|&v| {
                     let norm = (v / max_val).clamp(0.0, 1.0);
                     let [r, g, b] = jet_rgb(norm);
-                    [r, g, b, 255u8]
+                    ([r, g, b, 255u8], norm)
                 })
-                .collect()
+                .unzip()
         };
 
         Self {
@@ -437,6 +449,7 @@ impl TileHeatmap {
             width: grid.width_tiles,
             height: grid.height_tiles,
             pixels,
+            values,
         }
     }
 
@@ -444,6 +457,13 @@ impl TileHeatmap {
     ///
     /// Each tile maps to one character from the ramp
     /// `' ' . : ; ! | = # % @` (10 levels).  Rows are separated by `'\n'`.
+    ///
+    /// The ramp is indexed directly by each tile's normalised `[0, 1]`
+    /// value ([`Self::values`]), not by a brightness reconstructed from the
+    /// Jet-mapped colour: Jet is deliberately non-monotonic in luminance
+    /// (its low and high ends are both dark, with a bright band in the
+    /// middle), so round-tripping through the colour would make the
+    /// hottest and emptiest tiles render with similarly faint characters.
     pub fn to_ascii(&self) -> String {
         const RAMP: &[u8] = b" .:;!|=#%@";
         let n_levels = RAMP.len();
@@ -452,15 +472,8 @@ impl TileHeatmap {
 
         for ty in 0..self.height {
             for tx in 0..self.width {
-                let pixel = self.pixels[ty * self.width + tx];
-                // Reconstruct approximate brightness from R channel of Jet.
-                // A simpler approach: use the stored pixel's luminance.
-                let r = pixel[0] as f32;
-                let g = pixel[1] as f32;
-                let b = pixel[2] as f32;
-                // Perceptual luminance (BT.601 coefficients).
-                let lum = (0.299 * r + 0.587 * g + 0.114 * b) / 255.0;
-                let level = (lum * (n_levels as f32 - 1.0) + 0.5) as usize;
+                let norm = self.values[ty * self.width + tx];
+                let level = (norm * (n_levels as f32 - 1.0) + 0.5) as usize;
                 let level = level.min(n_levels - 1);
                 out.push(RAMP[level] as char);
             }
@@ -899,6 +912,58 @@ mod tests {
         // Each row: width_tiles chars + '\n'.
         let expected_len = grid.height_tiles * (grid.width_tiles + 1);
         assert_eq!(ascii.len(), expected_len);
+    }
+
+    #[test]
+    fn test_heatmap_to_ascii_uses_normalized_values_not_jet_luminance() {
+        // Regression test: `to_ascii` must index the ramp using the stored
+        // normalised `values`, not a luminance reconstructed from the
+        // Jet-mapped RGB colour. Jet is non-monotonic in luminance (dark
+        // blue at the cold end, dark red at the hot end, bright in
+        // between), so the old luminance-reconstruction rendered the
+        // hottest tile with nearly the same faint character as empty ones.
+        let grid = compute_tile_stats(&[[8.0, 8.0]], &[2.0], &[1.0], 32, 32, 16).expect("grid");
+        let heatmap = TileHeatmap::from_grid(&grid, HeatmapMode::Coverage);
+        assert_eq!(heatmap.values.len(), heatmap.pixels.len());
+
+        let ascii = heatmap.to_ascii();
+        let rows: Vec<&str> = ascii.lines().collect();
+        assert_eq!(rows.len(), heatmap.height);
+
+        const RAMP: &[u8] = b" .:;!|=#%@";
+        for (ty, row) in rows.iter().enumerate() {
+            let chars: Vec<char> = row.chars().collect();
+            assert_eq!(chars.len(), heatmap.width);
+            for (tx, &ch) in chars.iter().enumerate() {
+                let norm = heatmap.values[ty * heatmap.width + tx];
+                let expected_level =
+                    ((norm * (RAMP.len() as f32 - 1.0) + 0.5) as usize).min(RAMP.len() - 1);
+                assert_eq!(
+                    ch, RAMP[expected_level] as char,
+                    "tile ({tx},{ty}): ascii char must follow `values` ({norm}), not Jet luminance"
+                );
+            }
+        }
+
+        // One Gaussian covers exactly one tile out of four: that tile is
+        // the hottest (norm == 1.0, must render as the ramp's hottest
+        // character '@'); the rest are empty (norm == 0.0, coldest
+        // character ' '). Under the old luminance-reconstruction bug both
+        // ends of this range collapsed to nearly the same character.
+        let hottest = *RAMP.last().expect("RAMP is non-empty") as char;
+        let coldest = RAMP[0] as char;
+        let hottest_tiles = heatmap.values.iter().filter(|&&v| v >= 0.999).count();
+        let coldest_tiles = heatmap.values.iter().filter(|&&v| v <= 0.001).count();
+        assert_eq!(hottest_tiles, 1, "exactly one tile should be fully covered");
+        assert!(coldest_tiles >= 1, "at least one tile should be empty");
+        assert!(
+            ascii.contains(hottest),
+            "expected the hottest character {hottest:?} to appear in {ascii:?}"
+        );
+        assert!(
+            ascii.contains(coldest),
+            "expected the coldest character {coldest:?} to appear in {ascii:?}"
+        );
     }
 
     // ── TileAnalysisReport ────────────────────────────────────────────────

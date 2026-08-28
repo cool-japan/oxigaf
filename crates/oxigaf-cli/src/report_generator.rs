@@ -731,9 +731,14 @@ pub fn svg_line_chart(data: &ChartData, width: u32, height: u32) -> Result<Strin
             "  <line x1=\"{:.1}\" y1=\"{:.1}\" x2=\"{:.1}\" y2=\"{:.1}\" stroke=\"{}\" stroke-width=\"2\"/>\n",
             legend_x + 6.0, ly, legend_x + 22.0, ly, color
         ));
-        // Truncate label at 14 chars for legend readability.
-        let label = if series.label.len() > 14 {
-            format!("{}…", &series.label[..13])
+        // Truncate label at 14 chars for legend readability. Truncate by
+        // Unicode scalar value, not by byte offset — a byte-index slice can
+        // land inside a multi-byte character (e.g. a Japanese metric name)
+        // and panic.
+        let label = if series.label.chars().count() > 14 {
+            let mut truncated: String = series.label.chars().take(13).collect();
+            truncated.push('…');
+            truncated
         } else {
             series.label.clone()
         };
@@ -833,10 +838,21 @@ pub fn render_html_report(
             }
             SectionContent::Chart(chart_data) => {
                 if config.show_charts {
-                    // Downsample each series before rendering.
+                    // Downsample each series before rendering. `x_values` must be
+                    // downsampled with the exact same (length, max_points) pair so
+                    // that `downsample_series`'s stride selection picks the same
+                    // source indices as the series values did — otherwise
+                    // `svg_line_chart` derives `x_count` from the untouched,
+                    // full-length `x_values` while the plotted series only has
+                    // `max_series_points` entries, squeezing the polyline into the
+                    // left edge of the plot.
                     let mut downsampled = chart_data.clone();
                     for s in &mut downsampled.series {
                         s.values = downsample_series(&s.values, config.max_series_points);
+                    }
+                    if !downsampled.x_values.is_empty() {
+                        downsampled.x_values =
+                            downsample_series(&downsampled.x_values, config.max_series_points);
                     }
                     let svg = svg_line_chart(&downsampled, config.chart_width, config.chart_height)
                         .map_err(|e| {
@@ -1447,6 +1463,65 @@ mod tests {
         assert!(render_html_report(&page, &cfg).is_err());
     }
 
+    #[test]
+    fn test_render_html_report_chart_downsamples_x_values_in_sync() {
+        // Regression test: `x_values` must be downsampled with the same
+        // (length, max_points) pair as the series values, otherwise the
+        // rendered polyline's last point lands far short of the plot's right
+        // edge instead of at it (see downsample_series doc: identical inputs
+        // produce identical source-index selection).
+        let n = 1000usize;
+        let chart = ChartData {
+            title: "Loss".into(),
+            x_label: "Step".into(),
+            y_label: "Loss".into(),
+            x_values: (0..n).map(|i| i as f32).collect(),
+            series: vec![ChartSeries {
+                label: "loss".into(),
+                values: (0..n).map(|i| i as f32).collect(),
+            }],
+        };
+        let cfg = ReportGeneratorConfig {
+            max_series_points: 10,
+            chart_width: 800,
+            chart_height: 300,
+            ..Default::default()
+        };
+        let page = ReportPage {
+            title: "T".into(),
+            subtitle: String::new(),
+            sections: vec![(
+                ReportSection::Charts,
+                "Loss".into(),
+                SectionContent::Chart(chart),
+            )],
+        };
+        let html = render_html_report(&page, &cfg).unwrap();
+
+        // Pull out the polyline's point list and inspect the last point.
+        let marker = "points=\"";
+        let start = html.find(marker).expect("polyline present") + marker.len();
+        let end = html[start..].find('"').expect("closing quote") + start;
+        let points = &html[start..end];
+        let last_point = points.split(' ').next_back().expect("at least one point");
+        let last_x: f32 = last_point
+            .split(',')
+            .next()
+            .expect("x coordinate present")
+            .parse()
+            .expect("valid float");
+
+        let pad_left = 60.0f32;
+        let pad_right = 20.0f32;
+        let plot_w = cfg.chart_width as f32 - pad_left - pad_right;
+        let expected_right_edge = pad_left + plot_w;
+        assert!(
+            (last_x - expected_right_edge).abs() < 1.0,
+            "last polyline point x={last_x} should land at the plot's right edge \
+             ({expected_right_edge}); x_values was not downsampled in step with series values"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // svg_line_chart
     // -----------------------------------------------------------------------
@@ -1520,6 +1595,25 @@ mod tests {
         };
         assert!(svg_line_chart(&data, 0, 300).is_err());
         assert!(svg_line_chart(&data, 800, 0).is_err());
+    }
+
+    #[test]
+    fn test_svg_line_chart_legend_truncates_multibyte_label_without_panicking() {
+        // Regression test: a caller-supplied multi-byte label (e.g. Japanese
+        // metric names) whose 13th *character* index falls inside a
+        // multi-byte sequence must not panic when truncated for the legend.
+        let data = ChartData {
+            title: "T".into(),
+            x_label: "X".into(),
+            y_label: "Y".into(),
+            x_values: vec![0.0, 1.0],
+            series: vec![ChartSeries {
+                label: "損失関数の値の推移とその詳細な説明".into(),
+                values: vec![1.0, 2.0],
+            }],
+        };
+        let svg = svg_line_chart(&data, 800, 300).unwrap();
+        assert!(svg.contains('…'));
     }
 
     // -----------------------------------------------------------------------

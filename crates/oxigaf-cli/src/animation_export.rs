@@ -186,7 +186,17 @@ pub struct AnimationMeta {
 /// Configuration for animation export.
 #[derive(Debug, Clone)]
 pub struct AnimExportConfig {
-    /// Frames per second (default: 30.0).
+    /// Playback rate written into the exported `meta`, or `0.0` to keep the
+    /// sequence's own rate (default: `0.0`).
+    ///
+    /// Any value `> 0.0` *relabels* the exported animation: the frames are
+    /// written unchanged but `meta.fps`/`meta.duration_ms` describe the
+    /// requested rate. Defaulting that to a fixed number would silently
+    /// retime every sequence that was not already at it — a 24 fps sequence
+    /// exported with `Default::default()` would come back claiming 30 fps —
+    /// so the default is the neutral "inherit" sentinel and re-timing is
+    /// opt-in. Actually resampling the frames is
+    /// [`resample_animation`]'s job, not the exporter's.
     pub fps: f32,
     /// Include SH coefficients (default: true).
     pub include_sh: bool,
@@ -197,7 +207,7 @@ pub struct AnimExportConfig {
 impl Default for AnimExportConfig {
     fn default() -> Self {
         Self {
-            fps: 30.0,
+            fps: 0.0,
             include_sh: true,
             precision: 6,
         }
@@ -318,11 +328,105 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 {
 }
 
 /// Linearly interpolate two equal-length slices into a new `Vec<f32>`.
+///
+/// If the slices differ in length, only the shorter length is produced (via
+/// `zip`). Callers that need a hard guarantee of matching lengths (e.g.
+/// [`interpolate_frames`]) must validate that themselves — this helper is a
+/// low-level numeric primitive, not a validator.
 fn lerp_vec(a: &[f32], b: &[f32], t: f32) -> Vec<f32> {
     a.iter()
         .zip(b.iter())
         .map(|(&av, &bv)| lerp(av, bv, t))
         .collect()
+}
+
+/// Spherically interpolate one quaternion `[qx, qy, qz, qw]` pair.
+///
+/// Inputs are expected to be unit quaternions, but this function never
+/// divides by an exactly-zero norm: if the interpolated result is
+/// (near-)zero — which can only happen for degenerate, non-unit input, since
+/// slerp of two genuine unit quaternions is always itself unit-length — the
+/// raw (unnormalised) interpolated value is returned instead of NaN.
+///
+/// Antipodal inputs (`dot(a, b) < 0`) represent the same rotation with
+/// opposite sign; `b` is negated first so the interpolation takes the short
+/// way around instead of spinning the long way.
+fn slerp_quat(a: &[f32; 4], b: &[f32; 4], t: f32) -> [f32; 4] {
+    let mut bx = b[0];
+    let mut by = b[1];
+    let mut bz = b[2];
+    let mut bw = b[3];
+    let mut dot = a[0] * bx + a[1] * by + a[2] * bz + a[3] * bw;
+
+    if dot < 0.0 {
+        bx = -bx;
+        by = -by;
+        bz = -bz;
+        bw = -bw;
+        dot = -dot;
+    }
+
+    let (wa, wb) = if dot > 0.9995 {
+        // Nearly identical rotations: sin(theta) below would be near zero,
+        // so fall back to (numerically stable) linear blending.
+        (1.0 - t, t)
+    } else {
+        let theta = dot.clamp(-1.0, 1.0).acos();
+        let sin_theta = theta.sin();
+        (
+            ((1.0 - t) * theta).sin() / sin_theta,
+            (t * theta).sin() / sin_theta,
+        )
+    };
+
+    let rx = wa * a[0] + wb * bx;
+    let ry = wa * a[1] + wb * by;
+    let rz = wa * a[2] + wb * bz;
+    let rw = wa * a[3] + wb * bw;
+
+    let norm_sq = rx * rx + ry * ry + rz * rz + rw * rw;
+    if norm_sq < 1e-12 {
+        [rx, ry, rz, rw]
+    } else {
+        let inv_norm = 1.0 / norm_sq.sqrt();
+        [rx * inv_norm, ry * inv_norm, rz * inv_norm, rw * inv_norm]
+    }
+}
+
+/// Spherically interpolate a rotation array of `[qx, qy, qz, qw]` quaternion
+/// groups (see [`slerp_quat`]). Operates on `a.len().min(b.len()) / 4`
+/// complete groups; callers needing a strict length match must validate
+/// that first (see [`interpolate_frames`]).
+fn slerp_vec(a: &[f32], b: &[f32], t: f32) -> Vec<f32> {
+    let n = a.len().min(b.len()) / 4;
+    let mut out = Vec::with_capacity(n * 4);
+    for i in 0..n {
+        let qa = [a[i * 4], a[i * 4 + 1], a[i * 4 + 2], a[i * 4 + 3]];
+        let qb = [b[i * 4], b[i * 4 + 1], b[i * 4 + 2], b[i * 4 + 3]];
+        out.extend_from_slice(&slerp_quat(&qa, &qb, t));
+    }
+    out
+}
+
+/// Round `value` to `precision` decimal places for lossy text-format export.
+///
+/// Non-finite inputs, and precisions large enough to make the rounding scale
+/// overflow (or the rounded result non-finite), are passed through
+/// unchanged — this is a best-effort display aid, not a validated transform.
+fn round_to_precision(value: f32, precision: usize) -> f32 {
+    if !value.is_finite() {
+        return value;
+    }
+    let scale = 10f32.powi(precision.min(30) as i32);
+    if !scale.is_finite() || scale <= 0.0 {
+        return value;
+    }
+    let rounded = (value * scale).round() / scale;
+    if rounded.is_finite() {
+        rounded
+    } else {
+        value
+    }
 }
 
 /// Compute the mean of a slice, returning 0.0 for an empty slice.
@@ -549,7 +653,25 @@ pub fn concatenate_animations(
 
 /// Linearly interpolates between two frames at parameter `t ∈ [0, 1]`.
 ///
-/// Returns an error if the frames have different numbers of Gaussians.
+/// `rotations` are interpolated with spherical (slerp), not linear,
+/// interpolation, since they are unit quaternions `[qx, qy, qz, qw]` and a
+/// component-wise lerp would neither preserve unit norm nor take the short
+/// way around for antipodal pairs.
+///
+/// Both frames are validated individually (see [`AnimationFrame::validate`])
+/// and their `rotations`, `scales`, `opacities`, and `sh_coefficients`
+/// arrays must all have matching lengths — a mismatch (e.g. interpolating a
+/// fully-populated frame with one built by
+/// [`AnimationFrame::from_positions_only`]) returns an error instead of
+/// silently producing a corrupted frame.
+///
+/// # Errors
+///
+/// Returns [`AnimationError::InterpolationMismatch`] if the frames have
+/// different numbers of Gaussians, or if any corresponding array pair
+/// differs in length. Returns [`AnimationError::GaussianCountMismatch`] if
+/// either frame is internally inconsistent (see
+/// [`AnimationFrame::validate`]).
 pub fn interpolate_frames(
     frame_a: &AnimationFrame,
     frame_b: &AnimationFrame,
@@ -558,10 +680,20 @@ pub fn interpolate_frames(
     if frame_a.n_gaussians() != frame_b.n_gaussians() {
         return Err(AnimationError::InterpolationMismatch);
     }
+    frame_a.validate()?;
+    frame_b.validate()?;
+    if frame_a.rotations.len() != frame_b.rotations.len()
+        || frame_a.scales.len() != frame_b.scales.len()
+        || frame_a.opacities.len() != frame_b.opacities.len()
+        || frame_a.sh_coefficients.len() != frame_b.sh_coefficients.len()
+    {
+        return Err(AnimationError::InterpolationMismatch);
+    }
+
     let timestamp_ms =
         frame_a.timestamp_ms + (frame_b.timestamp_ms - frame_a.timestamp_ms) * t as f64;
     let positions = lerp_vec(&frame_a.positions, &frame_b.positions, t);
-    let rotations = lerp_vec(&frame_a.rotations, &frame_b.rotations, t);
+    let rotations = slerp_vec(&frame_a.rotations, &frame_b.rotations, t);
     let scales = lerp_vec(&frame_a.scales, &frame_b.scales, t);
     let opacities = lerp_vec(&frame_a.opacities, &frame_b.opacities, t);
     let sh_coefficients = lerp_vec(&frame_a.sh_coefficients, &frame_b.sh_coefficients, t);
@@ -715,14 +847,62 @@ pub fn compute_animation_stats(sequence: &AnimationSequence) -> AnimationStats {
 // export_animation_json / load_animation_json
 // ---------------------------------------------------------------------------
 
-/// Exports the animation sequence to a JSON file at `path`.
+/// Exports the animation sequence to a JSON file at `path`, honouring
+/// `config`:
 ///
-/// SH coefficients are included only if `meta.has_sh` is true.
+/// - `include_sh`: when `false`, `sh_coefficients` are cleared from every
+///   exported frame (the source `sequence` is not modified).
+/// - `precision`: every `f32` value is rounded to this many decimal places
+///   before serialisation (see `round_to_precision` for the exact,
+///   overflow-safe semantics).
+/// - `fps`: when `> 0.0`, `meta` is rebuilt using this FPS (via
+///   [`build_animation_meta`]) so `meta.fps`/`meta.duration_ms` reflect the
+///   requested export rate; otherwise — including for
+///   [`AnimExportConfig::default`] — the sequence's own `meta.fps` is kept,
+///   so a default export round-trips the rate it was given. Either way,
+///   `meta` is rebuilt from the (possibly SH-cleared) frames actually being
+///   written, so `has_sh`/`sh_degree` stay consistent with `include_sh`.
 pub fn export_animation_json<P: AsRef<Path>>(
     sequence: &AnimationSequence,
     path: P,
+    config: &AnimExportConfig,
 ) -> Result<(), AnimationError> {
-    let json = serde_json::to_string(sequence)?;
+    let mut export_seq = sequence.clone();
+
+    if !config.include_sh {
+        for frame in &mut export_seq.frames {
+            frame.sh_coefficients.clear();
+        }
+    }
+
+    for frame in &mut export_seq.frames {
+        for v in frame.positions.iter_mut() {
+            *v = round_to_precision(*v, config.precision);
+        }
+        for v in frame.rotations.iter_mut() {
+            *v = round_to_precision(*v, config.precision);
+        }
+        for v in frame.scales.iter_mut() {
+            *v = round_to_precision(*v, config.precision);
+        }
+        for v in frame.opacities.iter_mut() {
+            *v = round_to_precision(*v, config.precision);
+        }
+        for v in frame.sh_coefficients.iter_mut() {
+            *v = round_to_precision(*v, config.precision);
+        }
+    }
+
+    let export_fps = if config.fps > 0.0 {
+        config.fps
+    } else {
+        export_seq.meta.fps
+    };
+    if let Ok(new_meta) = build_animation_meta(&export_seq.frames, export_fps) {
+        export_seq.meta = new_meta;
+    }
+
+    let json = serde_json::to_string(&export_seq)?;
     fs::write(path, json)?;
     Ok(())
 }
@@ -1244,6 +1424,123 @@ mod tests {
         assert!(matches!(result, Err(AnimationError::InterpolationMismatch)));
     }
 
+    #[test]
+    fn test_interpolate_rotations_stay_unit_norm_90_degrees() {
+        // identity -> 90-degree rotation about Z.
+        let half = std::f32::consts::FRAC_PI_4; // 45 degrees in radians
+        let frame_a = AnimationFrame {
+            step: 0,
+            timestamp_ms: 0.0,
+            positions: vec![0.0f32; 3],
+            rotations: vec![0.0, 0.0, 0.0, 1.0],
+            scales: vec![0.0f32; 3],
+            opacities: vec![0.0f32; 1],
+            sh_coefficients: Vec::new(),
+        };
+        let frame_b = AnimationFrame {
+            step: 1,
+            timestamp_ms: 100.0,
+            positions: vec![0.0f32; 3],
+            rotations: vec![0.0, 0.0, half.sin(), half.cos()],
+            scales: vec![0.0f32; 3],
+            opacities: vec![0.0f32; 1],
+            sh_coefficients: Vec::new(),
+        };
+
+        for &t in &[0.0f32, 0.25, 0.5, 0.75, 1.0] {
+            let interp = interpolate_frames(&frame_a, &frame_b, t).expect("ok");
+            let q = &interp.rotations;
+            let norm = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
+            assert!(
+                (norm - 1.0).abs() < 1e-5,
+                "t={t}: expected unit norm, got {norm} (q={q:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn test_interpolate_rotations_no_nan_on_degenerate_zero_quaternions() {
+        // A regression guard: an all-zero "quaternion" is not a valid unit
+        // quaternion, but interpolate_frames must not produce NaN via a
+        // divide-by-zero in the slerp renormalisation step.
+        let frame_a = make_frame(0, 0.0, 1);
+        let frame_b = frame_a.clone();
+        let interp = interpolate_frames(&frame_a, &frame_b, 0.5).expect("ok");
+        assert!(interp.rotations.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn test_interpolate_rotations_antipodal_short_path() {
+        // `a` and `-a` represent the same rotation; slerp between them
+        // (dot < 0) must take the short way and stay unit-norm.
+        // 90 degrees about Z: (0, 0, sin(45°), cos(45°)).
+        const SQRT_HALF: f32 = std::f32::consts::FRAC_1_SQRT_2;
+        let a = [0.0f32, 0.0, SQRT_HALF, SQRT_HALF];
+        let frame_a = AnimationFrame {
+            step: 0,
+            timestamp_ms: 0.0,
+            positions: vec![0.0f32; 3],
+            rotations: a.to_vec(),
+            scales: vec![0.0f32; 3],
+            opacities: vec![0.0f32; 1],
+            sh_coefficients: Vec::new(),
+        };
+        let frame_b = AnimationFrame {
+            step: 1,
+            timestamp_ms: 100.0,
+            positions: vec![0.0f32; 3],
+            rotations: a.iter().map(|v| -v).collect(),
+            scales: vec![0.0f32; 3],
+            opacities: vec![0.0f32; 1],
+            sh_coefficients: Vec::new(),
+        };
+        let interp = interpolate_frames(&frame_a, &frame_b, 0.5).expect("ok");
+        let q = &interp.rotations;
+        let norm = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
+        assert!((norm - 1.0).abs() < 1e-5, "got norm {norm}");
+        for i in 0..4 {
+            assert!(
+                (q[i] - a[i]).abs() < 1e-4,
+                "component {i}: expected {}, got {}",
+                a[i],
+                q[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_interpolate_sh_coefficients_length_mismatch_errors() {
+        let n = 4usize;
+        let mut frame_a = make_frame(0, 0.0, n);
+        frame_a.sh_coefficients = vec![0.1f32; n * 12]; // degree 1
+        let frame_b = make_frame(1, 100.0, n); // sh_coefficients empty
+        let result = interpolate_frames(&frame_a, &frame_b, 0.5);
+        assert!(matches!(result, Err(AnimationError::InterpolationMismatch)));
+    }
+
+    #[test]
+    fn test_interpolate_rejects_internally_inconsistent_frame() {
+        // frame_b's n_gaussians() (derived from positions) is 10, but its
+        // rotations array is truncated — validate() must catch this rather
+        // than silently producing a corrupted interpolated frame.
+        let frame_a = make_frame(0, 0.0, 10);
+        let mut frame_b = make_frame(1, 100.0, 10);
+        frame_b.rotations.truncate(4);
+        let result = interpolate_frames(&frame_a, &frame_b, 0.5);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_interpolate_from_positions_only_frame_errors_instead_of_corrupting() {
+        let full = make_frame(0, 0.0, 5);
+        let sparse = AnimationFrame::from_positions_only(1, 100.0, vec![0.0f32; 5 * 3]);
+        let result = interpolate_frames(&full, &sparse, 0.5);
+        assert!(
+            result.is_err(),
+            "must not silently produce a frame with empty rotations/scales/opacities"
+        );
+    }
+
     // --------------- subsample_animation ------------------------------------
 
     #[test]
@@ -1350,7 +1647,7 @@ mod tests {
         tmp.push("oxigaf_animation_test_round_trip.json");
 
         let seq = make_sequence(5, 10, 24.0);
-        export_animation_json(&seq, &tmp).expect("export ok");
+        export_animation_json(&seq, &tmp, &AnimExportConfig::default()).expect("export ok");
         let loaded = load_animation_json(&tmp).expect("load ok");
 
         assert_eq!(loaded.meta.n_frames, seq.meta.n_frames);
@@ -1359,6 +1656,38 @@ mod tests {
         assert!((loaded.meta.fps - seq.meta.fps).abs() < 1e-6);
 
         // Clean up
+        let _ = fs::remove_file(&tmp);
+    }
+
+    /// Regression: [`AnimExportConfig::default`] must not carry a playback
+    /// rate of its own. It used to default to 30 fps, which — because any
+    /// `fps > 0.0` relabels the exported `meta` — silently rewrote every
+    /// sequence exported with the default config to claim 30 fps, and made
+    /// `meta.duration_ms` disagree with the frames actually written.
+    #[test]
+    fn test_default_export_config_does_not_retime_the_sequence() {
+        assert_eq!(
+            AnimExportConfig::default().fps,
+            0.0,
+            "the default config must inherit the sequence's rate"
+        );
+
+        let mut tmp = std::env::temp_dir();
+        tmp.push("oxigaf_animation_test_default_fps_inherit.json");
+
+        let seq = make_sequence(6, 4, 24.0);
+        export_animation_json(&seq, &tmp, &AnimExportConfig::default()).expect("export ok");
+        let loaded = load_animation_json(&tmp).expect("load ok");
+
+        assert!((loaded.meta.fps - 24.0).abs() < 1e-6, "fps was retimed");
+        // 6 frames at 24 fps is 250 ms; at the old 30 fps default it would
+        // have been written as 200 ms.
+        assert!(
+            (loaded.meta.duration_ms - 250.0).abs() < 1e-6,
+            "duration was retimed: {}",
+            loaded.meta.duration_ms
+        );
+
         let _ = fs::remove_file(&tmp);
     }
 
@@ -1371,13 +1700,98 @@ mod tests {
         let mut frame = make_frame(0, 0.0, n);
         frame.sh_coefficients = vec![0.1f32; n * 12]; // degree 1
         let seq = AnimationSequence::new(vec![frame], 30.0).expect("ok");
-        export_animation_json(&seq, &tmp).expect("export ok");
+        export_animation_json(&seq, &tmp, &AnimExportConfig::default()).expect("export ok");
         let loaded = load_animation_json(&tmp).expect("load ok");
         assert!(loaded.meta.has_sh);
         assert_eq!(loaded.meta.sh_degree, 1);
         assert_eq!(loaded.frames[0].sh_coefficients.len(), n * 12);
 
         let _ = fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn test_export_json_excludes_sh_when_include_sh_false() {
+        let mut tmp = std::env::temp_dir();
+        tmp.push("oxigaf_animation_test_no_sh_export.json");
+
+        let n = 3usize;
+        let mut frame = make_frame(0, 0.0, n);
+        frame.sh_coefficients = vec![0.5f32; n * 12];
+        let seq = AnimationSequence::new(vec![frame], 30.0).expect("ok");
+
+        let config = AnimExportConfig {
+            include_sh: false,
+            ..Default::default()
+        };
+        export_animation_json(&seq, &tmp, &config).expect("export ok");
+        let loaded = load_animation_json(&tmp).expect("load ok");
+
+        assert!(loaded.frames[0].sh_coefficients.is_empty());
+        assert!(!loaded.meta.has_sh);
+        assert_eq!(loaded.meta.sh_degree, 0);
+
+        let _ = fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn test_export_json_applies_precision_rounding() {
+        let mut tmp = std::env::temp_dir();
+        tmp.push("oxigaf_animation_test_precision_export.json");
+
+        let mut frame = make_frame(0, 0.0, 1);
+        frame.positions = vec![1.234_567_9, 0.0, 0.0];
+        let seq = AnimationSequence::new(vec![frame], 30.0).expect("ok");
+
+        let config = AnimExportConfig {
+            precision: 2,
+            ..Default::default()
+        };
+        export_animation_json(&seq, &tmp, &config).expect("export ok");
+        let loaded = load_animation_json(&tmp).expect("load ok");
+
+        assert!(
+            (loaded.frames[0].positions[0] - 1.23).abs() < 1e-6,
+            "got {}",
+            loaded.frames[0].positions[0]
+        );
+
+        let _ = fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn test_export_json_uses_config_fps_for_meta() {
+        let mut tmp = std::env::temp_dir();
+        tmp.push("oxigaf_animation_test_config_fps_export.json");
+
+        let seq = make_sequence(5, 10, 30.0);
+        let config = AnimExportConfig {
+            fps: 60.0,
+            ..Default::default()
+        };
+        export_animation_json(&seq, &tmp, &config).expect("export ok");
+        let loaded = load_animation_json(&tmp).expect("load ok");
+
+        assert!((loaded.meta.fps - 60.0).abs() < 1e-6);
+
+        let _ = fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn test_round_to_precision_zero_places() {
+        assert!((round_to_precision(1.7, 0) - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_round_to_precision_passes_through_non_finite() {
+        assert!(round_to_precision(f32::NAN, 4).is_nan());
+        assert_eq!(round_to_precision(f32::INFINITY, 4), f32::INFINITY);
+    }
+
+    #[test]
+    fn test_round_to_precision_large_precision_does_not_panic_or_overflow() {
+        // Must not panic, and must never turn a finite input into inf/NaN.
+        let r = round_to_precision(1.5, usize::MAX);
+        assert!(r.is_finite());
     }
 
     // --------------- format_animation_summary --------------------------------

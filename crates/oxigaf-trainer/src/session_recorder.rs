@@ -115,14 +115,30 @@ fn json_u32_field(key: &str, value: u32) -> String {
     format!("\"{}\":{}", key, value)
 }
 
-/// Format a JSON f64 field: `"key": 0.001` (6 decimal places).
+/// Format a JSON f64 field: `"key":value`.
+///
+/// Non-finite values (`NaN`/`±Inf` — which routinely occur in a diverging
+/// training run, exactly the run whose record is most worth inspecting)
+/// serialize to `null`, since Rust's `NaN`/`inf` literals are not valid
+/// JSON tokens and would otherwise produce a file no conforming JSON
+/// reader can parse. Finite values use `{:?}` (Debug) rather than a fixed
+/// 6-decimal format so small magnitudes (e.g. a learning rate of `1e-9`)
+/// survive instead of rounding to `0.000000`.
 fn json_f64_field(key: &str, value: f64) -> String {
-    format!("\"{}\":{:.6}", key, value)
+    if value.is_finite() {
+        format!("\"{key}\":{value:?}")
+    } else {
+        format!("\"{key}\":null")
+    }
 }
 
-/// Format a JSON f32 field: `"key": 0.012345` (6 decimal places).
+/// Format a JSON f32 field: `"key":value`. See [`json_f64_field`].
 fn json_f32_field(key: &str, value: f32) -> String {
-    format!("\"{}\":{:.6}", key, value)
+    if value.is_finite() {
+        format!("\"{key}\":{value:?}")
+    } else {
+        format!("\"{key}\":null")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -490,11 +506,19 @@ impl SessionRecord {
     /// Session duration in seconds.
     ///
     /// Returns `0.0` if [`finish`](Self::finish) has not been called yet.
+    /// Uses a saturating subtraction: both timestamps come from
+    /// `SystemTime::now()`, which is not monotonic — an NTP step or manual
+    /// clock adjustment during a long training run could otherwise make
+    /// `end_timestamp_ms < start_timestamp_ms`, underflowing the `u64`
+    /// subtraction (a panic in debug builds, a ~584-million-year wraparound
+    /// in release).
     pub fn duration_secs(&self) -> f64 {
         if self.end_timestamp_ms == 0 {
             return 0.0;
         }
-        (self.end_timestamp_ms - self.start_timestamp_ms) as f64 / 1000.0
+        self.end_timestamp_ms
+            .saturating_sub(self.start_timestamp_ms) as f64
+            / 1000.0
     }
 }
 
@@ -639,8 +663,15 @@ impl SessionRecorder {
         let _ = writeln!(
             out,
             "║    Host      : {:<34}║",
-            if r.hardware.hostname.len() > 34 {
-                r.hardware.hostname[..34].to_string()
+            // Truncate by character count, not byte index: `hostname`
+            // comes from the `$HOSTNAME`/`$COMPUTERNAME` environment
+            // variable and can contain multi-byte UTF-8, and slicing by
+            // byte index panics if the cut point isn't a char boundary.
+            // Character-based truncation also fixes the column alignment,
+            // since `{:<34}` pads by character count while `.len()`
+            // measures bytes.
+            if r.hardware.hostname.chars().count() > 34 {
+                r.hardware.hostname.chars().take(34).collect::<String>()
             } else {
                 r.hardware.hostname.clone()
             }
@@ -690,8 +721,12 @@ impl SessionRecorder {
             let _ = writeln!(
                 out,
                 "║  Notes       : {:<34}║",
-                if r.notes.len() > 34 {
-                    format!("{}…", &r.notes[..33])
+                // Character-based truncation (see the hostname comment
+                // above) — `r.notes` is a public field, so it may contain
+                // multi-byte UTF-8 (e.g. a 12-character Japanese note is
+                // 36 bytes, which would panic slicing at byte 33).
+                if r.notes.chars().count() > 34 {
+                    format!("{}…", r.notes.chars().take(33).collect::<String>())
                 } else {
                     r.notes.clone()
                 }
@@ -906,6 +941,54 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // json_f64_field / json_f32_field
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_json_f32_field_nan_serializes_to_null_not_nan_literal() {
+        // Regression: `format!("{:.6}", f32::NAN)` produces `NaN`, which is
+        // not a valid JSON token and would make the output unparseable by
+        // any conforming reader — exactly the diverging-run record you
+        // most want to be able to load.
+        let out = json_f32_field("grad_norm", f32::NAN);
+        assert_eq!(out, "\"grad_norm\":null");
+    }
+
+    #[test]
+    fn test_json_f32_field_infinity_serializes_to_null_not_inf_literal() {
+        let out = json_f32_field("grad_norm", f32::INFINITY);
+        assert_eq!(out, "\"grad_norm\":null");
+        let out_neg = json_f32_field("grad_norm", f32::NEG_INFINITY);
+        assert_eq!(out_neg, "\"grad_norm\":null");
+    }
+
+    #[test]
+    fn test_json_f64_field_small_magnitude_survives_round_trip() {
+        // Regression: the old `{:.6}` format rendered a learning rate of
+        // 1e-9 as "0.000000", destroying the value. The serialized number
+        // must now parse back to (approximately) the original value
+        // instead of rounding to zero.
+        let out = json_f64_field("learning_rate_position", 1e-9);
+        let value_str = out
+            .strip_prefix("\"learning_rate_position\":")
+            .expect("expected key prefix");
+        let parsed: f64 = value_str.parse().expect("must be a valid JSON number");
+        assert!(
+            (parsed - 1e-9).abs() < 1e-15,
+            "expected ~1e-9, got {parsed} (raw: {value_str})"
+        );
+        assert_ne!(parsed, 0.0, "value must not have rounded to zero");
+    }
+
+    #[test]
+    fn test_json_f64_field_finite_value_is_valid_json_number() {
+        let out = json_f64_field("duration_secs", 12.5);
+        let value_str = out.split(':').nth(1).expect("has a value part");
+        assert!(
+            value_str.parse::<f64>().is_ok(),
+            "value {value_str} must parse as a JSON number"
+        );
+    }
 
     #[test]
     fn test_hardware_info_detect() {
@@ -982,6 +1065,21 @@ mod tests {
         record.finish();
         // After finish: duration should be non-negative
         assert!(record.duration_secs() >= 0.0);
+    }
+
+    #[test]
+    fn test_session_record_duration_secs_clock_moved_backwards_no_panic() {
+        // Regression: `duration_secs` used to subtract two plain `u64`
+        // timestamps with no ordering guarantee. Both come from
+        // `SystemTime::now()`, which is not monotonic, so an NTP step
+        // during a long run could make `end < start` — this used to panic
+        // in debug builds ("attempt to subtract with overflow") and wrap
+        // to ~584 million years in release.
+        let mut record = SessionRecord::new(SessionConfigSnapshot::default());
+        record.start_timestamp_ms = 10_000;
+        record.end_timestamp_ms = 5_000; // clock moved backwards
+        let duration = record.duration_secs();
+        assert_eq!(duration, 0.0, "saturating_sub should floor at 0");
     }
 
     #[test]
@@ -1071,6 +1169,36 @@ mod tests {
             "summary should contain Session ID header"
         );
         assert!(summary.contains("PSNR"), "summary should report best PSNR");
+    }
+
+    #[test]
+    fn test_recorder_format_summary_multibyte_notes_and_hostname_no_panic() {
+        // Regression: `format_summary` used to truncate `notes`/`hostname`
+        // by BYTE index (`&s[..33]` / `&s[..34]`), which panics with "byte
+        // index N is not a char boundary" whenever the cut point lands
+        // inside a multi-byte UTF-8 character. `notes` is a public field
+        // and `hostname` comes from an environment variable, so either can
+        // contain non-ASCII. A 2-ASCII-character prefix followed by
+        // 3-byte-per-character CJK text is constructed so neither the
+        // notes cut point (byte 33) nor the hostname cut point (byte 34)
+        // lands on a character boundary (boundaries fall at `2 + 3k`,
+        // which is congruent to 2 mod 3, while 33 mod 3 = 0 and 34 mod 3 = 1).
+        let mut recorder = SessionRecorder::new(SessionConfigSnapshot::default());
+        recorder.record_step(make_snapshot(0, 22.0, 0.5));
+        recorder.finish();
+        let long_multibyte = "AB\u{65e5}\u{672c}\u{8a9e}\u{306e}\u{30c6}\u{30b9}\u{30c8}\u{30ce}\u{30fc}\u{30c8}\u{3067}\u{3059}";
+        assert!(
+            long_multibyte.len() > 34,
+            "fixture must exceed the truncation threshold"
+        );
+        recorder.record.notes = long_multibyte.to_string();
+        recorder.record.hardware.hostname = long_multibyte.to_string();
+
+        // Must not panic.
+        let summary = recorder.format_summary();
+        assert!(!summary.is_empty());
+        assert!(summary.contains("Notes"));
+        assert!(summary.contains("Host"));
     }
 
     #[test]

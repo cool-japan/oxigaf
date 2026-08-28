@@ -143,7 +143,48 @@ pub fn compute_tangents(points: &[(f32, f32)]) -> Vec<f32> {
 ///
 /// `points` must be sorted by increasing x. `x` is clamped to the domain of
 /// `points` before evaluation.
+///
+/// This recomputes the Fritsch-Carlson tangents (two heap allocations, see
+/// [`compute_tangents`]) on every call. When evaluating the same `points`
+/// repeatedly (e.g. building a LUT), compute the tangents once and use
+/// [`monotone_cubic_interp_with_tangents`] instead -- this is exactly what
+/// [`ToneCurve::evaluate`] does internally.
 pub fn monotone_cubic_interp(points: &[(f32, f32)], x: f32) -> f32 {
+    let n = points.len();
+    if n == 0 {
+        return x.clamp(0.0, 1.0);
+    }
+    if n == 1 {
+        return points[0].1.clamp(0.0, 1.0);
+    }
+
+    let x0 = points[0].0;
+    let x1 = points[n - 1].0;
+
+    // Clamp to domain (avoids computing tangents at all for out-of-domain x).
+    if x <= x0 {
+        return points[0].1.clamp(0.0, 1.0);
+    }
+    if x >= x1 {
+        return points[n - 1].1.clamp(0.0, 1.0);
+    }
+
+    let tangents = compute_tangents(points);
+    monotone_cubic_interp_with_tangents(points, &tangents, x)
+}
+
+/// Evaluate a monotone cubic Hermite spline at `x`, using tangents already
+/// computed by [`compute_tangents`] for these exact `points`.
+///
+/// `points` must be sorted by increasing x, and `tangents` must be
+/// `compute_tangents(points)` (or equal to it); `x` is clamped to the
+/// domain of `points` before evaluation. If `tangents.len() != points.len()`
+/// this falls back to [`monotone_cubic_interp`], which recomputes them.
+///
+/// Prefer this over [`monotone_cubic_interp`] whenever the same `points`
+/// are evaluated at many `x` values, to avoid recomputing the tangents (and
+/// their two heap allocations) on every call.
+pub fn monotone_cubic_interp_with_tangents(points: &[(f32, f32)], tangents: &[f32], x: f32) -> f32 {
     let n = points.len();
     if n == 0 {
         return x.clamp(0.0, 1.0);
@@ -163,7 +204,9 @@ pub fn monotone_cubic_interp(points: &[(f32, f32)], x: f32) -> f32 {
         return points[n - 1].1.clamp(0.0, 1.0);
     }
 
-    let tangents = compute_tangents(points);
+    if tangents.len() != n {
+        return monotone_cubic_interp(points, x);
+    }
 
     // Binary search for the interval.
     let mut lo = 0usize;
@@ -211,6 +254,14 @@ pub fn monotone_cubic_interp(points: &[(f32, f32)], x: f32) -> f32 {
 pub struct ToneCurve {
     /// Control points sorted by input value.  All values in [0, 1].
     pub points: Vec<(f32, f32)>,
+    /// Fritsch-Carlson tangents for `points`, cached at construction time
+    /// so [`Self::evaluate`] never has to recompute them (and their two
+    /// heap allocations) on every call -- see [`compute_tangents`]. Kept in
+    /// sync with `points` by every constructor; [`Self::evaluate`] falls
+    /// back to recomputing on the fly if the lengths ever disagree (which
+    /// can only happen if `points`, a public field, is mutated directly
+    /// after construction).
+    tangents: Vec<f32>,
 }
 
 impl ToneCurve {
@@ -252,14 +303,39 @@ impl ToneCurve {
             }
         }
 
-        Ok(Self { points })
+        Ok(Self::from_validated_points(points))
+    }
+
+    /// Build a `ToneCurve` from points already known to satisfy `new`'s
+    /// invariants (non-empty, at least 2 points, all coordinates in
+    /// `[0, 1]`, strictly increasing in x), computing and caching the
+    /// Fritsch-Carlson tangents once.
+    ///
+    /// Only called with points that either passed `new`'s runtime checks
+    /// already, or are fixed literals whose validity is obvious by
+    /// construction (`identity`, `s_curve`, `lift_gamma_gain`). Debug
+    /// builds assert the invariants so a future change to one of those
+    /// constructors that breaks them is caught by tests instead of
+    /// silently producing wrong interpolation.
+    fn from_validated_points(points: Vec<(f32, f32)>) -> Self {
+        debug_assert!(!points.is_empty(), "ToneCurve must have at least one point");
+        debug_assert!(
+            points.windows(2).all(|w| w[1].0 > w[0].0),
+            "ToneCurve control points must be strictly increasing in x"
+        );
+        debug_assert!(
+            points
+                .iter()
+                .all(|&(x, y)| (0.0..=1.0).contains(&x) && (0.0..=1.0).contains(&y)),
+            "ToneCurve control points must lie in [0, 1]^2"
+        );
+        let tangents = compute_tangents(&points);
+        Self { points, tangents }
     }
 
     /// Identity curve: passes each value unchanged.
     pub fn identity() -> Self {
-        Self {
-            points: vec![(0.0, 0.0), (1.0, 1.0)],
-        }
+        Self::from_validated_points(vec![(0.0, 0.0), (1.0, 1.0)])
     }
 
     /// S-shaped tone curve for contrast enhancement.
@@ -274,9 +350,7 @@ impl ToneCurve {
         let c = contrast * 0.15;
         let p1 = (0.25_f32, (0.25 - c).clamp(0.0, 1.0));
         let p2 = (0.75_f32, (0.75 + c).clamp(0.0, 1.0));
-        Self {
-            points: vec![(0.0, 0.0), p1, (0.5, 0.5), p2, (1.0, 1.0)],
-        }
+        Self::from_validated_points(vec![(0.0, 0.0), p1, (0.5, 0.5), p2, (1.0, 1.0)])
     }
 
     /// Lift-gamma-gain tone curve.
@@ -304,7 +378,7 @@ impl ToneCurve {
             })
             .collect();
 
-        Self { points }
+        Self::from_validated_points(points)
     }
 
     /// Evaluate the tone curve at `x`.
@@ -313,7 +387,16 @@ impl ToneCurve {
     /// to [0, 1].
     pub fn evaluate(&self, x: f32) -> f32 {
         let x = x.clamp(0.0, 1.0);
-        monotone_cubic_interp(&self.points, x)
+        if self.tangents.len() == self.points.len() {
+            monotone_cubic_interp_with_tangents(&self.points, &self.tangents, x)
+        } else {
+            // Defensive fallback: `tangents` is kept in sync with `points`
+            // by every constructor, but `points` is a public field, so
+            // guard against a caller mutating it directly and leaving the
+            // cache stale rather than risk an out-of-bounds index or a
+            // wrong result below.
+            monotone_cubic_interp(&self.points, x)
+        }
     }
 
     /// Pre-compute a 256-entry lookup table for fast image processing.
@@ -710,9 +793,24 @@ pub fn curve_contrast(curve: &ToneCurve) -> f32 {
 /// Invert a tone curve by swapping `(x, y)` → `(y, x)` on every control point.
 ///
 /// # Errors
-/// Returns [`ToneCurveError::NotMonotone`] if the inverted points are not
-/// strictly increasing (i.e., the original curve is not strictly monotone in y).
+/// Returns [`ToneCurveError::NotMonotone`] if the original curve is not
+/// strictly monotone in y (increasing or decreasing).
 pub fn invert_curve(curve: &ToneCurve) -> Result<ToneCurve, ToneCurveError> {
+    // `ToneCurve::new` sorts its input by x before checking monotonicity.
+    // Naively swapping (x, y) -> (y, x) and handing the result straight to
+    // `new` would let that sort silently re-order a source curve whose y
+    // values are not monotone into something that passes `new`'s x-only
+    // check without being a real inverse (e.g. [(0,0),(0.5,0.8),(1,0.4)]
+    // swaps to [(0,0),(0.8,0.5),(0.4,1)], which sorts by x to
+    // [(0,0),(0.4,1),(0.8,0.5)] -- strictly increasing in x, but not the
+    // inverse of anything). So check strict monotonicity in y on the
+    // original, already x-sorted, points first.
+    let strictly_increasing = curve.points.windows(2).all(|w| w[1].1 > w[0].1);
+    let strictly_decreasing = curve.points.windows(2).all(|w| w[1].1 < w[0].1);
+    if !strictly_increasing && !strictly_decreasing {
+        return Err(ToneCurveError::NotMonotone);
+    }
+
     let inverted: Vec<(f32, f32)> = curve.points.iter().map(|&(x, y)| (y, x)).collect();
     ToneCurve::new(inverted)
 }
@@ -877,6 +975,47 @@ mod tests {
         };
         assert_eq!(curve.points[0].0, 0.0);
         assert_eq!(curve.points[2].0, 1.0);
+    }
+
+    #[test]
+    fn tone_curve_tangents_len_matches_points() {
+        // Invariant every constructor must uphold for the cache in
+        // `evaluate` to actually be used (see `ToneCurve::tangents`).
+        let curves: Vec<ToneCurve> = vec![
+            ToneCurve::identity(),
+            ToneCurve::s_curve(0.3),
+            ToneCurve::lift_gamma_gain(0.0, 1.0, 1.0),
+            ToneCurve::new(vec![(0.0, 0.0), (1.0, 1.0)]).expect("valid ToneCurve"),
+        ];
+        for curve in &curves {
+            assert_eq!(curve.tangents.len(), curve.points.len());
+        }
+    }
+
+    #[test]
+    fn tone_curve_evaluate_matches_uncached_interp() {
+        // Regression test for the tangent-caching optimization: `evaluate`
+        // (which uses the cached tangents) must produce the same result as
+        // the free function that recomputes tangents fresh on every call.
+        let curves: Vec<ToneCurve> = vec![
+            ToneCurve::identity(),
+            ToneCurve::s_curve(0.8),
+            ToneCurve::lift_gamma_gain(0.1, 1.4, 1.05),
+            ToneCurve::new(vec![(0.0, 0.0), (0.3, 0.1), (0.6, 0.9), (1.0, 1.0)])
+                .expect("valid ToneCurve"),
+        ];
+
+        for curve in &curves {
+            for i in 0..=20 {
+                let x = i as f32 / 20.0;
+                let cached = curve.evaluate(x);
+                let fresh = monotone_cubic_interp(&curve.points, x);
+                assert!(
+                    (cached - fresh).abs() < 1e-6,
+                    "cached evaluate({x}) = {cached} but fresh interp = {fresh}"
+                );
+            }
+        }
     }
 
     // ── ToneCurve::identity ─────────────────────────────────────────────────
@@ -1297,6 +1436,31 @@ mod tests {
     fn invert_curve_s_curve() {
         // The s_curve passes through (0,0), (0.5,0.5), (1,1) so it's invertible.
         let c = ToneCurve::s_curve(0.5);
+        let inv = invert_curve(&c);
+        assert!(inv.is_ok(), "{:?}", inv.err());
+    }
+
+    #[test]
+    fn invert_curve_rejects_non_monotone_y() {
+        // Regression test: a curve whose y goes up then down must be
+        // rejected, not silently "inverted" into an unrelated curve via
+        // `ToneCurve::new`'s sort-by-x-then-check (see the comment on
+        // `invert_curve`). `ToneCurve::new` itself only requires x to be
+        // monotone, so this is a valid curve to construct.
+        let c = ToneCurve::new(vec![(0.0, 0.0), (0.5, 0.8), (1.0, 0.4)])
+            .expect("valid ToneCurve: only x needs to be monotone");
+        let result = invert_curve(&c);
+        assert!(
+            matches!(result, Err(ToneCurveError::NotMonotone)),
+            "expected NotMonotone, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn invert_curve_accepts_strictly_decreasing_y() {
+        // A strictly decreasing curve is a valid function to invert, even
+        // though `ToneCurve` itself only requires x-monotonicity.
+        let c = ToneCurve::new(vec![(0.0, 1.0), (0.5, 0.5), (1.0, 0.0)]).expect("valid ToneCurve");
         let inv = invert_curve(&c);
         assert!(inv.is_ok(), "{:?}", inv.err());
     }

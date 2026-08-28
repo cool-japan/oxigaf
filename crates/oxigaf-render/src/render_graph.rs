@@ -48,6 +48,21 @@ pub enum RenderGraphError {
     /// A resource is listed in both reads and writes for the same pass.
     #[error("Resource '{0}' declared as both read and write in pass '{1}'")]
     ReadWriteConflict(String, String),
+
+    /// Two different passes both write the same resource. `PassDesc.writes`
+    /// is documented as an exclusive write, so a second writer is rejected
+    /// rather than silently overriding the first in the writer index (which
+    /// would point every dependency edge and `ResourceLifetime.written_by`
+    /// at the wrong producer).
+    #[error("Resource '{res}' is written by both pass '{first}' and pass '{second}'")]
+    DuplicateWrite {
+        /// Name of the resource written twice.
+        res: String,
+        /// Name of the pass that wrote it first (execution/registration order).
+        first: String,
+        /// Name of the pass that wrote it again.
+        second: String,
+    },
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -471,10 +486,21 @@ impl RenderGraph {
         }
 
         // ── 2. Build resource → writer index map ────────────────────────────
-        // Maps resource name → index of the pass that writes it.
+        // Maps resource name → index of the pass that writes it. Each
+        // resource must have exactly one writer (see `PassDesc::writes`'s
+        // docs): silently letting a second writer overwrite the map entry
+        // would point every dependency edge and the resource's eventual
+        // `ResourceLifetime.written_by` at the wrong producer.
         let mut resource_writer: HashMap<&str, usize> = HashMap::new();
         for (idx, pass) in self.passes.iter().enumerate() {
             for w in &pass.writes {
+                if let Some(&first_idx) = resource_writer.get(w.name()) {
+                    return Err(RenderGraphError::DuplicateWrite {
+                        res: w.name().to_owned(),
+                        first: self.passes[first_idx].name.clone(),
+                        second: pass.name.clone(),
+                    });
+                }
                 resource_writer.insert(w.name(), idx);
             }
         }
@@ -613,7 +639,17 @@ impl RenderGraph {
 // Standard 3DGS render graph
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Build a standard 3D Gaussian Splatting render graph for avatar rendering.
+/// Build an illustrative 3D Gaussian Splatting render graph for avatar rendering.
+///
+/// This is a simplified, five-pass sketch of the data flow in a 3DGS
+/// forward+backward pass, intended as a worked example of the
+/// [`RenderGraph`] API (compilation, topological ordering, resource
+/// lifetimes) -- it is **not** a literal description of the real GPU
+/// pipeline. The actual rasterizer builds its pipelines via
+/// `pipeline::RasterPipelines`, which creates substantially more than five
+/// GPU pipelines, and nothing in this crate currently drives rendering
+/// through a [`CompiledRenderGraph`]. Treat the pass/resource names below as
+/// representative, not authoritative.
 ///
 /// The graph contains five passes:
 ///
@@ -624,97 +660,99 @@ impl RenderGraph {
 /// | 3 | rasterize_fwd   | Rasterize | color, depth, transmittance               | sorted_keys, sorted_values, tile_ranges   |
 /// | 4 | rasterize_bwd   | Compute   | grad_positions, grad_scales, grad_colors  | color, depth, transmittance               |
 /// | 5 | output          | Present   | —                                         | color                                     |
-pub fn build_standard_3dgs_graph(width: u32, height: u32) -> RenderGraph {
+///
+/// `tile_counts`, `keys`, `values`, `sorted_keys`, `sorted_values` and the
+/// gradient buffers are inherently per-Gaussian (not per-pixel) data, so
+/// they are sized by `num_gaussians` rather than `width * height`; only the
+/// framebuffer-shaped resources (`color`, `depth`, `transmittance`,
+/// `tile_ranges`) are sized by the image dimensions.
+///
+/// # Errors
+///
+/// Returns an error if two of the hardcoded resource or pass names below
+/// were to collide (this would indicate a bug in this function itself,
+/// since every name here is a distinct literal).
+pub fn build_standard_3dgs_graph(
+    width: u32,
+    height: u32,
+    num_gaussians: u32,
+) -> Result<RenderGraph, RenderGraphError> {
     let mut g = RenderGraph::new();
+    let n = num_gaussians.max(1);
 
     // ── Resources ────────────────────────────────────────────────────────────
-    // Intermediate buffers — use R32f as a generic "u32 / f32 data" format.
-    let _ = g.add_resource(ResourceDesc::new(
-        "tile_counts",
-        ResourceFormat::R32f,
-        width,
-        height,
-    ));
-    let _ = g.add_resource(ResourceDesc::new(
-        "keys",
-        ResourceFormat::R32f,
-        width,
-        height,
-    ));
-    let _ = g.add_resource(ResourceDesc::new(
-        "values",
-        ResourceFormat::R32f,
-        width,
-        height,
-    ));
-    let _ = g.add_resource(ResourceDesc::new(
-        "sorted_keys",
-        ResourceFormat::R32f,
-        width,
-        height,
-    ));
-    let _ = g.add_resource(ResourceDesc::new(
+    // Per-Gaussian buffers — use R32f as a generic "u32 / f32 data" format,
+    // sized as a 1-D buffer of `num_gaussians` elements (not width*height).
+    g.add_resource(ResourceDesc::new("tile_counts", ResourceFormat::R32f, n, 1))?;
+    g.add_resource(ResourceDesc::new("keys", ResourceFormat::R32f, n, 1))?;
+    g.add_resource(ResourceDesc::new("values", ResourceFormat::R32f, n, 1))?;
+    g.add_resource(ResourceDesc::new("sorted_keys", ResourceFormat::R32f, n, 1))?;
+    g.add_resource(ResourceDesc::new(
         "sorted_values",
         ResourceFormat::R32f,
-        width,
-        height,
-    ));
-    let _ = g.add_resource(ResourceDesc::new(
+        n,
+        1,
+    ))?;
+
+    // Per-tile buffer: sized by the image dimensions (a stand-in for the
+    // real tile grid, which would additionally depend on tile size).
+    g.add_resource(ResourceDesc::new(
         "tile_ranges",
         ResourceFormat::Rg16f,
         width,
         height,
-    ));
+    ))?;
 
-    // Output textures.
-    let _ = g.add_resource(ResourceDesc::new(
+    // Output textures — genuinely per-pixel.
+    g.add_resource(ResourceDesc::new(
         "color",
         ResourceFormat::Rgba8,
         width,
         height,
-    ));
-    let _ = g.add_resource(ResourceDesc::new(
+    ))?;
+    g.add_resource(ResourceDesc::new(
         "depth",
         ResourceFormat::Depth32f,
         width,
         height,
-    ));
-    let _ = g.add_resource(ResourceDesc::new(
+    ))?;
+    g.add_resource(ResourceDesc::new(
         "transmittance",
         ResourceFormat::R32f,
         width,
         height,
-    ));
+    ))?;
 
-    // Gradient outputs.
-    let _ = g.add_resource(ResourceDesc::new(
+    // Gradient outputs — per-Gaussian (position/scale/colour gradients),
+    // not per-pixel.
+    g.add_resource(ResourceDesc::new(
         "grad_positions",
         ResourceFormat::Rgba32f,
-        width,
-        height,
-    ));
-    let _ = g.add_resource(ResourceDesc::new(
+        n,
+        1,
+    ))?;
+    g.add_resource(ResourceDesc::new(
         "grad_scales",
         ResourceFormat::Rgba32f,
-        width,
-        height,
-    ));
-    let _ = g.add_resource(ResourceDesc::new(
+        n,
+        1,
+    ))?;
+    g.add_resource(ResourceDesc::new(
         "grad_colors",
         ResourceFormat::Rgba32f,
-        width,
-        height,
-    ));
+        n,
+        1,
+    ))?;
 
     // ── Passes ───────────────────────────────────────────────────────────────
-    let _ = g.add_pass(
+    g.add_pass(
         PassDesc::new("preprocess", PassType::Compute)
             .write("tile_counts")
             .write("keys")
             .write("values")
             .with_gpu_time(500),
-    );
-    let _ = g.add_pass(
+    )?;
+    g.add_pass(
         PassDesc::new("sort", PassType::Compute)
             .read("tile_counts")
             .read("keys")
@@ -723,8 +761,8 @@ pub fn build_standard_3dgs_graph(width: u32, height: u32) -> RenderGraph {
             .write("sorted_values")
             .write("tile_ranges")
             .with_gpu_time(2000),
-    );
-    let _ = g.add_pass(
+    )?;
+    g.add_pass(
         PassDesc::new("rasterize_fwd", PassType::Rasterize)
             .read("sorted_keys")
             .read("sorted_values")
@@ -733,8 +771,8 @@ pub fn build_standard_3dgs_graph(width: u32, height: u32) -> RenderGraph {
             .write("depth")
             .write("transmittance")
             .with_gpu_time(3000),
-    );
-    let _ = g.add_pass(
+    )?;
+    g.add_pass(
         PassDesc::new("rasterize_bwd", PassType::Compute)
             .read("color")
             .read("depth")
@@ -743,14 +781,14 @@ pub fn build_standard_3dgs_graph(width: u32, height: u32) -> RenderGraph {
             .write("grad_scales")
             .write("grad_colors")
             .with_gpu_time(5000),
-    );
-    let _ = g.add_pass(
+    )?;
+    g.add_pass(
         PassDesc::new("output", PassType::Present)
             .read("color")
             .with_gpu_time(100),
-    );
+    )?;
 
-    g
+    Ok(g)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -983,7 +1021,7 @@ mod tests {
     // ── Test 17: build_standard_3dgs_graph compiles without error ─────────────
     #[test]
     fn test_standard_3dgs_graph_compiles() {
-        let g = build_standard_3dgs_graph(1920, 1080);
+        let g = build_standard_3dgs_graph(1920, 1080, 100_000).expect("graph construction");
         let result = g.compile();
         assert!(result.is_ok(), "compile failed: {:?}", result.err());
     }
@@ -991,8 +1029,53 @@ mod tests {
     // ── Test 18: build_standard_3dgs_graph has 5 passes ──────────────────────
     #[test]
     fn test_standard_3dgs_graph_five_passes() {
-        let g = build_standard_3dgs_graph(1920, 1080);
+        let g = build_standard_3dgs_graph(1920, 1080, 100_000).expect("graph construction");
         assert_eq!(g.num_passes(), 5);
+    }
+
+    // ── Test 18b: per-Gaussian resources are sized by num_gaussians ──────────
+    #[test]
+    fn test_standard_3dgs_graph_per_gaussian_sizing() {
+        let g = build_standard_3dgs_graph(1920, 1080, 12_345).expect("graph construction");
+        let keys = g
+            .resource(&ResourceId::new("keys"))
+            .expect("keys resource must exist");
+        assert_eq!(
+            keys.width, 12_345,
+            "per-Gaussian buffers must be sized by num_gaussians"
+        );
+        assert_eq!(keys.height, 1);
+
+        let color = g
+            .resource(&ResourceId::new("color"))
+            .expect("color resource must exist");
+        assert_eq!(
+            color.width, 1920,
+            "per-pixel buffers must still be sized by width/height"
+        );
+        assert_eq!(color.height, 1080);
+    }
+
+    // ── Test 18c: duplicate writes are rejected at compile time ──────────────
+    #[test]
+    fn test_compile_rejects_duplicate_write() {
+        let mut g = RenderGraph::new();
+        g.add_resource(ResourceDesc::new("shared", ResourceFormat::Rgba8, 64, 64))
+            .unwrap();
+        g.add_pass(PassDesc::new("first", PassType::Compute).write("shared"))
+            .unwrap();
+        g.add_pass(PassDesc::new("second", PassType::Compute).write("shared"))
+            .unwrap();
+
+        let err = g.compile().unwrap_err();
+        match err {
+            RenderGraphError::DuplicateWrite { res, first, second } => {
+                assert_eq!(res, "shared");
+                assert_eq!(first, "first");
+                assert_eq!(second, "second");
+            }
+            other => panic!("expected DuplicateWrite, got {other:?}"),
+        }
     }
 
     // ── Test 19: passes_reading returns correct passes ────────────────────────
@@ -1069,7 +1152,7 @@ mod tests {
     // ── Test 25: 3DGS execution order ─────────────────────────────────────────
     #[test]
     fn test_standard_3dgs_execution_order() {
-        let g = build_standard_3dgs_graph(800, 600);
+        let g = build_standard_3dgs_graph(800, 600, 50_000).expect("graph construction");
         let compiled = g.compile().unwrap();
         let order = &compiled.execution_order;
         // preprocess must come before sort, sort before rasterize_fwd, etc.

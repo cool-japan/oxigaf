@@ -2,13 +2,22 @@
 name = "oxigaf-render"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/oxigaf-render"
 description = "Differentiable 3D Gaussian Splatting rasterizer (wgpu)"
 readme = "README.md"
 keywords = ["rendering", "gaussian-splatting", "3d", "gpu", "rasterization"]
 categories = ["rendering", "graphics", "multimedia"]
+
+[package.metadata.docs.rs]
+# `gpu_debug` gates `Rasterizer::debug_snapshot` (see rasterizer.rs); listed
+# so it renders on docs.rs, mirroring the other six crates.
+features = ["gpu_debug"]
+rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 wgpu = { workspace = true }
@@ -23,7 +32,7 @@ tracing = { workspace = true }
 
 safetensors = { workspace = true }
 
-oxigaf-flame = { version = "0.1.1", path = "../oxigaf-flame" }
+oxigaf-flame = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

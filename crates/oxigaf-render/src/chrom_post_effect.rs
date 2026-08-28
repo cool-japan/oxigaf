@@ -220,9 +220,17 @@ pub fn shift_channel(
 
 /// Apply barrel/pincushion lens distortion to a f32 RGB image.
 ///
-/// For each output pixel the undistorted source coordinate is computed using the
-/// Brown–Conrady model `r_dst = r_src × (1 + k1·r² + k2·r⁴)`. The image centre
-/// is taken as `(width/2, height/2)`.
+/// The Brown–Conrady model defines the *forward* (undistorted → distorted)
+/// mapping `r_dst = r_src × (1 + k1·r_src² + k2·r_src⁴)`. For each output
+/// (distorted-space) pixel this function needs the *inverse* — which
+/// source radius produced this destination radius — and approximates it in
+/// one step as `r_src ≈ r_dst / (1 + k1·r_dst² + k2·r_dst⁴)` (substituting
+/// `r_dst` for the unknown `r_src` inside the correction term). This is
+/// exact only when `k1`/`k2` are small; for strong distortion or when exact
+/// convergence matters, use [`crate::lens_distortion::undistort_point_iterative`],
+/// which Newton-iterates to the true inverse instead. The image centre is
+/// taken as `((width - 1) / 2, (height - 1) / 2)` (pixel-index convention,
+/// matching e.g. OpenCV's `cx`/`cy`).
 ///
 /// Pixels outside the source image boundary are clamped to the edge.
 ///
@@ -382,10 +390,12 @@ pub fn apply_radial_chromatic_aberration(
 
     let cx = center[0] * (width as f32 - 1.0);
     let cy = center[1] * (height as f32 - 1.0);
-    // Half-diagonal as normalisation radius.
-    let hnorm = ((width as f32 * 0.5).powi(2) + (height as f32 * 0.5).powi(2))
-        .sqrt()
-        .max(1.0);
+    // Half-diagonal as normalisation radius, derived from the same
+    // pixel-index centre (`cx`, `cy`) used above rather than a separate
+    // `width * 0.5` pixel-extent quantity — mixing the two conventions
+    // meant `r` never quite reached the value a corner pixel should map to.
+    // Matches `apply_barrel_distortion` and `compute_radial_distances`.
+    let hnorm = (cx * cx + cy * cy).sqrt().max(1.0);
 
     let mut out = img.to_vec();
 
@@ -1092,6 +1102,39 @@ mod tests {
         let out = apply_radial_chromatic_aberration(&img, 10, 8, 0.1, [0.5, 0.5])
             .expect("radial CA failed");
         assert_eq!(out.len(), img.len());
+    }
+
+    // ── 35b. apply_radial_chromatic_aberration: r reaches exactly 1.0 at the
+    //         farthest corner (consistent centre/normalisation convention) ────
+
+    #[test]
+    fn test_radial_ca_corner_reaches_full_normalized_radius() {
+        // Regression for mixing a (width-1)-based centre with a
+        // width*0.5-based normalisation radius: with `hnorm` derived from
+        // the same (width-1)-based `cx`/`cy` as the centre, a centred
+        // effect's normalised radius r is *exactly* 1.0 at the farthest
+        // corner (odd width/height put the centre exactly on a pixel, so
+        // this is exact, not approximate). At strength=1.0 the blue
+        // channel's pull-inward scale `(1 - strength*r).max(0.0)` is then
+        // exactly 0 at the corner, collapsing its sample position to
+        // exactly the image centre. Under the pre-fix mismatched
+        // normalisation, r at the corner was strictly < 1.0, so this exact
+        // collapse never happened and the corner kept some of its own
+        // (unpulled) blue value instead.
+        let w = 11usize;
+        let h = 7usize;
+        let img = make_rgb_gradient(w, h);
+        let out = apply_radial_chromatic_aberration(&img, w, h, 1.0, [0.5, 0.5])
+            .expect("radial CA failed");
+
+        let center_blue = img[((h / 2) * w + (w / 2)) * 3 + 2];
+        let corner_out_blue = out[2]; // pixel (0,0), blue channel
+        assert!(
+            (corner_out_blue - center_blue).abs() < 1e-4,
+            "at strength=1.0 the farthest corner's blue channel should be \
+             pulled exactly to the image centre's blue value ({center_blue}), \
+             got {corner_out_blue}"
+        );
     }
 
     // ── 36. apply_radial_chromatic_aberration: green unchanged at centre ───────

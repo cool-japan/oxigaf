@@ -100,6 +100,12 @@ pub enum InterpolantKind {
 
     /// Linear stochastic:
     /// α(t) = 1 − t,  β(t) = t,  γ(t) = σ · √(t·(1−t))
+    ///
+    /// `γ'(t) = σ·(1−2t) / (2√(t(1−t)))` is genuinely unbounded as `t → 0`
+    /// or `t → 1` (γ itself is pinned to exactly 0 at both endpoints by the
+    /// boundary condition, but its slope there diverges). See
+    /// [`si_eval_coefficients`] for how the returned derivative is kept
+    /// finite near the boundary.
     LinearStochastic { sigma: f32 },
 
     /// Trigonometric (Flow Matching cosine schedule, deterministic):
@@ -114,10 +120,17 @@ pub enum InterpolantKind {
     /// α(t) = (1−t)²,  β(t) = t²,  γ(t) = 2·t·(1−t)
     Polynomial,
 
-    /// VP-SDE (DDPM-family):
-    /// β_schedule(s) = β_min + (β_max − β_min)·s
-    /// ᾱ_t = exp(−∫₀ᵗ β(s) ds)
-    /// α(t) = √(ᾱ_t),  β(t) = 0,  γ(t) = √(1 − ᾱ_t)
+    /// VP-SDE (DDPM-family), re-parameterised into this module's `[0, 1]`
+    /// convention (`t=0` = source/noise `x₀`, `t=1` = data `x₁` — the
+    /// reverse of DDPM's own `s=0` clean / `s=1` noise). With `s = 1 − t`
+    /// and `β_schedule(s) = β_min + (β_max − β_min)·s`,
+    /// `ᾱ_s = exp(−∫₀ˢ β(u) du)`:
+    /// `α(t) = √(1 − ᾱ_(1−t))` (on `x₀`), `β(t) = √ᾱ_(1−t)` (on `x₁`),
+    /// `γ(t) = 0` (no separate bridge noise — `x₀` already plays that role,
+    /// matching the standard VP-SDE marginal `x_s = √ᾱ_s·data + √(1−ᾱ_s)·ε`).
+    /// This satisfies the same boundary conditions as every other kind
+    /// (α(0)=1,β(0)=0,γ(0)=0; α(1)=0,β(1)=1,γ(1)=0) — an earlier revision
+    /// instead fixed `β(t) ≡ 0`, so `x₁` never entered the interpolant.
     VpSde { beta_min: f32, beta_max: f32 },
 
     /// Custom schedule via look-up tables sampled at t = 0, 0.1, …, 1.0.
@@ -181,6 +194,12 @@ fn vp_gamma(t: f32, beta_min: f32, beta_max: f32) -> f32 {
 // Core coefficient evaluation
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Floor applied to the `t(1-t)` radicand when computing
+/// [`InterpolantKind::LinearStochastic`]'s `γ'(t)`, so the derivative stays
+/// finite (bounded by `σ / (2·√FLOOR)`) instead of either diverging to
+/// infinity or being silently truncated to exactly `0.0` near `t = 0, 1`.
+const LINEAR_STOCHASTIC_GAMMA_DOT_FLOOR: f32 = 1e-6;
+
 /// Evaluate α(t), β(t), γ(t), α'(t), β'(t), γ'(t) for the chosen schedule.
 ///
 /// Returns [`StochasticInterpolantError::InvalidTimestep`] if `t ∉ [0, 1]`.
@@ -207,11 +226,16 @@ pub fn si_eval_coefficients(
             let t1mt = (t * (1.0 - t)).max(0.0);
             let gamma = sigma * t1mt.sqrt();
             // γ'(t) = σ · d/dt √(t(1−t)) = σ · (1 − 2t) / (2√(t(1−t)))
-            let gamma_dot = if t1mt > 1e-10 {
-                sigma * (1.0 - 2.0 * t) / (2.0 * t1mt.sqrt())
-            } else {
-                0.0
-            };
+            //
+            // This diverges as t(1-t) -> 0 (t -> 0 or 1). Floor the radicand
+            // rather than special-casing the whole expression to exactly
+            // 0.0: a large, correctly-signed finite value is a strictly
+            // better velocity target near the endpoints than a flat 0,
+            // which would claim the interpolant has no noise-dependence
+            // there at all (untrue — it just has γ pinned to 0 at that
+            // exact instant, not a zero slope).
+            let denom_sqrt = t1mt.max(LINEAR_STOCHASTIC_GAMMA_DOT_FLOOR).sqrt();
+            let gamma_dot = sigma * (1.0 - 2.0 * t) / (2.0 * denom_sqrt);
             Ok(SiCoefficients {
                 alpha: 1.0 - t,
                 beta: t,
@@ -265,33 +289,41 @@ pub fn si_eval_coefficients(
             let (bmin, bmax) = (*beta_min, *beta_max);
             let eps = 1e-4_f32;
 
-            let alpha = vp_alpha(t, bmin, bmax);
-            let gamma = vp_gamma(t, bmin, bmax);
+            // α(t) = √(1 − ᾱ_(1−t)) — coefficient on x₀ (noise endpoint).
+            let alpha_fn = |tt: f32| vp_gamma(1.0 - tt, bmin, bmax);
+            // β(t) = √ᾱ_(1−t) — coefficient on x₁ (data endpoint).
+            let beta_fn = |tt: f32| vp_alpha(1.0 - tt, bmin, bmax);
 
-            // Finite-difference derivatives
+            let alpha = alpha_fn(t);
+            let beta = beta_fn(t);
+            // No separate bridge noise term: x₀ already plays that role.
+            let gamma = 0.0;
+
+            // Finite-difference derivatives, same one-sided/central scheme
+            // used by the other variants in this match.
             let alpha_dot = if t < eps {
-                (vp_alpha(t + eps, bmin, bmax) - vp_alpha(t, bmin, bmax)) / eps
+                (alpha_fn(t + eps) - alpha_fn(t)) / eps
             } else if t > 1.0 - eps {
-                (vp_alpha(t, bmin, bmax) - vp_alpha(t - eps, bmin, bmax)) / eps
+                (alpha_fn(t) - alpha_fn(t - eps)) / eps
             } else {
-                (vp_alpha(t + eps, bmin, bmax) - vp_alpha(t - eps, bmin, bmax)) / (2.0 * eps)
+                (alpha_fn(t + eps) - alpha_fn(t - eps)) / (2.0 * eps)
             };
 
-            let gamma_dot = if t < eps {
-                (vp_gamma(t + eps, bmin, bmax) - vp_gamma(t, bmin, bmax)) / eps
+            let beta_dot = if t < eps {
+                (beta_fn(t + eps) - beta_fn(t)) / eps
             } else if t > 1.0 - eps {
-                (vp_gamma(t, bmin, bmax) - vp_gamma(t - eps, bmin, bmax)) / eps
+                (beta_fn(t) - beta_fn(t - eps)) / eps
             } else {
-                (vp_gamma(t + eps, bmin, bmax) - vp_gamma(t - eps, bmin, bmax)) / (2.0 * eps)
+                (beta_fn(t + eps) - beta_fn(t - eps)) / (2.0 * eps)
             };
 
             Ok(SiCoefficients {
                 alpha,
-                beta: 0.0,
+                beta,
                 gamma,
                 alpha_dot,
-                beta_dot: 0.0,
-                gamma_dot,
+                beta_dot,
+                gamma_dot: 0.0,
             })
         }
 
@@ -822,9 +854,13 @@ pub fn si_linspace(a: f32, b: f32, n: usize) -> Vec<f32> {
 /// α(1) ≈ 0, β(1) ≈ 1, γ(1) ≈ 0
 /// ```
 ///
-/// VP-SDE is treated separately because it uses γ(t) as its stochastic component
-/// (β = 0 always); its boundary conditions are α(0) ≈ 1, γ(0) ≈ 0, α(1) ≈ 0,
-/// γ(1) ≈ 1.
+/// Every [`InterpolantKind`] — including [`InterpolantKind::VpSde`] — is
+/// checked against the same conditions; VP-SDE's α/β are re-parameterised
+/// specifically so that they hold (see that variant's docs). An earlier
+/// revision special-cased VP-SDE with a different boundary structure
+/// (β≡0, γ(1)≈1) to paper over an implementation that put the data
+/// coefficient at a permanent zero; that special case is gone now that the
+/// implementation itself satisfies the general contract.
 ///
 /// # Errors
 ///
@@ -834,31 +870,6 @@ pub fn si_check_boundary_conditions(
     kind: &InterpolantKind,
     eps: f32,
 ) -> Result<(), StochasticInterpolantError> {
-    // VP-SDE has a different boundary structure (β≡0, γ(1)≈1)
-    if let InterpolantKind::VpSde { beta_min, beta_max } = kind {
-        let c0 = si_eval_coefficients(kind, 0.0)?;
-        let c1 = si_eval_coefficients(kind, 1.0)?;
-
-        let check = |name: &str, got: f32, want: f32| -> Result<(), StochasticInterpolantError> {
-            if (got - want).abs() > eps {
-                Err(StochasticInterpolantError::InvalidConfig {
-                    reason: format!(
-                        "VP-SDE boundary violation: {name}={got:.6}, want {want:.6} (beta_min={beta_min}, beta_max={beta_max})"
-                    ),
-                })
-            } else {
-                Ok(())
-            }
-        };
-
-        check("alpha(0)", c0.alpha, 1.0)?;
-        check("gamma(0)", c0.gamma, 0.0)?;
-        check("alpha(1)", c1.alpha, 0.0)?;
-        // gamma(1) ≈ 1 for VP-SDE
-        check("gamma(1)", c1.gamma, 1.0)?;
-        return Ok(());
-    }
-
     let c0 = si_eval_coefficients(kind, 0.0)?;
     let c1 = si_eval_coefficients(kind, 1.0)?;
 
@@ -1100,6 +1111,39 @@ mod tests {
         let c1 = si_eval_coefficients(&kind, 1.0).unwrap();
         assert!(c0.gamma.abs() < TOL, "gamma(0) must be 0");
         assert!(c1.gamma.abs() < TOL, "gamma(1) must be 0");
+    }
+
+    /// Regression test: `gamma_dot` used to be silently truncated to exactly
+    /// `0.0` at the endpoints (where the true derivative is unbounded)
+    /// rather than reporting a large, correctly-signed finite value.
+    #[test]
+    fn test_linear_stochastic_gamma_dot_finite_and_signed_near_boundary() {
+        let kind = InterpolantKind::LinearStochastic { sigma: 1.0 };
+        let c0 = si_eval_coefficients(&kind, 0.0).unwrap();
+        let c1 = si_eval_coefficients(&kind, 1.0).unwrap();
+        assert!(
+            c0.gamma_dot.is_finite(),
+            "gamma_dot(0) must be finite, got {}",
+            c0.gamma_dot
+        );
+        assert!(
+            c1.gamma_dot.is_finite(),
+            "gamma_dot(1) must be finite, got {}",
+            c1.gamma_dot
+        );
+        // gamma = sigma*sqrt(t(1-t)) is rising just after t=0 and falling
+        // just before t=1, so its slope must be large and positive at 0,
+        // large and negative at 1 — not the old flat 0.0 in either case.
+        assert!(
+            c0.gamma_dot > 10.0,
+            "gamma_dot(0) should be large and positive, got {}",
+            c0.gamma_dot
+        );
+        assert!(
+            c1.gamma_dot < -10.0,
+            "gamma_dot(1) should be large and negative, got {}",
+            c1.gamma_dot
+        );
     }
 
     // ── si_eval_coefficients: TrigonometricStochastic ─────────────────────────
@@ -1604,7 +1648,12 @@ mod tests {
             "alpha(0) should be ~1: {}",
             c.alpha
         );
-        assert!(c.gamma.abs() < 0.01, "gamma(0) should be ~0: {}", c.gamma);
+        assert!(c.beta.abs() < 0.01, "beta(0) should be ~0: {}", c.beta);
+        assert!(
+            c.gamma.abs() < 1e-6,
+            "gamma(0) should be exactly 0: {}",
+            c.gamma
+        );
     }
 
     #[test]
@@ -1615,7 +1664,16 @@ mod tests {
         };
         let c = si_eval_coefficients(&kind, 1.0).unwrap();
         assert!(c.alpha < 0.1, "alpha(1) should be ~0: {}", c.alpha);
-        assert!(c.gamma > 0.9, "gamma(1) should be ~1: {}", c.gamma);
+        // Regression: this used to assert gamma(1) ~ 1 (VP-SDE's old,
+        // special-cased boundary structure). Under the fixed
+        // parameterisation gamma is identically 0, and it is beta — the
+        // coefficient on x1, the data endpoint — that reaches ~1 at t=1.
+        assert!(c.beta > 0.9, "beta(1) should be ~1: {}", c.beta);
+        assert!(
+            c.gamma.abs() < 1e-6,
+            "gamma(1) should be exactly 0: {}",
+            c.gamma
+        );
     }
 
     #[test]
@@ -1633,6 +1691,30 @@ mod tests {
                 c.alpha_dot
             );
         }
+    }
+
+    /// Regression test for the core VP-SDE bug: `beta` used to be fixed at
+    /// 0, so `x1` (the data / target sample) never influenced `x_t` at any
+    /// timestep and the interpolant was pure noise regardless of `t`. Near
+    /// `t=1`, `x_t` must now be dominated by `x1`.
+    #[test]
+    fn test_vpsde_data_enters_x_t_near_t1() {
+        let kind = InterpolantKind::VpSde {
+            beta_min: 0.1,
+            beta_max: 20.0,
+        };
+        let coeffs = si_eval_coefficients(&kind, 1.0).unwrap();
+        // x0 is far from x1; under the old bug (beta ≡ 0) x_t would equal
+        // alpha(1) * 100 ≈ 0.0066 * 100 ≈ 0.66, nowhere near x1 = 7.0.
+        let x0 = vec![100.0_f32];
+        let x1 = vec![7.0_f32];
+        let noise = vec![0.0_f32];
+        let x_t = si_interpolate(&x0, &x1, &noise, &coeffs).unwrap();
+        assert!(
+            (x_t[0] - 7.0).abs() < 0.1,
+            "x_t at t=1 should equal x1 (data), got {}",
+            x_t[0]
+        );
     }
 
     // ── si_compute_stats ──────────────────────────────────────────────────────
@@ -1856,9 +1938,11 @@ mod tests {
             beta_min: 0.1,
             beta_max: 20.0,
         };
-        // VP-SDE has its own boundary conditions (handled separately)
+        // VP-SDE now goes through the same general boundary check as every
+        // other kind (see si_check_boundary_conditions docs). eps=0.05
+        // accommodates this schedule's finite beta_max not driving ᾱ all
+        // the way to exactly 0/1 at the endpoints.
         let result = si_check_boundary_conditions(&kind, 0.05);
-        // Should succeed with the VP-SDE specific checks
         assert!(result.is_ok(), "VP-SDE boundary check failed: {:?}", result);
     }
 

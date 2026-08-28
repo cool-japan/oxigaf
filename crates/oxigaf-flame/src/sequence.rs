@@ -57,22 +57,40 @@ pub struct FlameSequence {
 enum SequenceSource {
     /// All frames loaded in memory
     Memory(Vec<FlameParams>),
-    /// Load from JSON file on demand
+    /// Parsed JSON sequence held in memory; each frame is validated and
+    /// converted to `FlameParams` lazily, on access.
+    ///
+    /// The source file is read and parsed exactly once (in `from_json`);
+    /// unlike a naive "lazy" design that re-reads and re-parses the whole
+    /// file on every single frame access, only the (cheap) `FrameJson` ->
+    /// `FlameParams` conversion is deferred to access time.
     JsonFile {
-        path: PathBuf,
+        frames: Vec<FrameJson>,
         metadata: SequenceMetadata,
     },
-    /// Load from NPZ file on demand
-    #[allow(dead_code)]
+    /// Decompressed NPZ arrays held in memory; each frame's `FlameParams`
+    /// is constructed lazily, on access. As with `JsonFile`, the NPZ file
+    /// itself is opened and decompressed exactly once (in `from_npz`).
+    ///
+    /// Only [`FlameSequence::from_npz`] constructs this, and that
+    /// constructor exists only under the `npz` feature — without it the
+    /// other `from_npz` is a stub that returns an error before any source
+    /// is built. The variant is therefore gated on the same feature rather
+    /// than carried (and suppressed with `#[allow(dead_code)]`) in default
+    /// builds, where it is genuinely unreachable and would otherwise force
+    /// every `SequenceSource` match to handle a state that cannot occur.
+    #[cfg(feature = "npz")]
     NpzFile {
-        path: PathBuf,
+        shape: ndarray::Array2<f32>,
+        expression: ndarray::Array2<f32>,
+        pose: ndarray::Array2<f32>,
+        translation: Box<Option<ndarray::Array2<f32>>>,
         metadata: SequenceMetadata,
     },
     /// Load from directory of per-frame files
     Directory {
         path: PathBuf,
         file_pattern: String,
-        #[allow(dead_code)]
         metadata: SequenceMetadata,
     },
 }
@@ -187,10 +205,13 @@ impl FlameSequence {
                 fps: metadata.fps,
             })
         } else {
-            // Lazy loading for large sequences
+            // Lazy loading for large sequences: the parsed frames stay
+            // resident (they were already fully parsed above, into
+            // `sequence_data.frames`), so per-frame access below never
+            // re-reads or re-parses the source file.
             Ok(Self {
                 source: SequenceSource::JsonFile {
-                    path: path.to_path_buf(),
+                    frames: sequence_data.frames,
                     metadata: metadata.clone(),
                 },
                 cache: LruCache::new(DEFAULT_CACHE_SIZE),
@@ -219,126 +240,46 @@ impl FlameSequence {
     ///
     /// Requires the "npz" feature to be enabled.
     #[cfg(feature = "npz")]
-    #[allow(clippy::too_many_lines)]
     pub fn from_npz(path: &Path) -> Result<Self, FlameError> {
-        use ndarray_npy::NpzReader;
-        use std::fs::File;
-
         tracing::info!("Loading FLAME sequence from NPZ: {}", path.display());
 
-        let file = File::open(path).map_err(|e| FlameError::IoError {
-            source: e,
-            path: path.to_path_buf(),
-        })?;
-
-        let mut npz = NpzReader::new(file)
-            .map_err(|e| FlameError::InvalidParams(format!("Failed to open NPZ file: {e}")))?;
-
-        // Load shape array
-        let shape_arr: ndarray::Array2<f32> =
-            npz.by_name("shape").map_err(|e| FlameError::NpzLoad {
-                name: "shape".to_string(),
-                source: e,
-            })?;
-
-        // Load expression array (try both "expression" and "expr" keys)
-        let expression_arr: ndarray::Array2<f32> = npz
-            .by_name("expression")
-            .or_else(|_| npz.by_name("expr"))
-            .map_err(|e| FlameError::NpzLoad {
-                name: "expression/expr".to_string(),
-                source: e,
-            })?;
-
-        // Load pose array
-        let pose_arr: ndarray::Array2<f32> =
-            npz.by_name("pose").map_err(|e| FlameError::NpzLoad {
-                name: "pose".to_string(),
-                source: e,
-            })?;
-
-        // Optional translation array
-        let translation_arr: Option<ndarray::Array2<f32>> = npz.by_name("translation").ok();
-
-        // Validate shapes
-        let num_frames = shape_arr.nrows();
-        if expression_arr.nrows() != num_frames {
-            return Err(FlameError::ShapeMismatch {
-                name: "expression".to_string(),
-                expected: format!("{num_frames} frames"),
-                got: format!("{} frames", expression_arr.nrows()),
-            });
-        }
-        if pose_arr.nrows() != num_frames {
-            return Err(FlameError::ShapeMismatch {
-                name: "pose".to_string(),
-                expected: format!("{num_frames} frames"),
-                got: format!("{} frames", pose_arr.nrows()),
-            });
-        }
-        if let Some(ref trans) = translation_arr {
-            if trans.nrows() != num_frames {
-                return Err(FlameError::ShapeMismatch {
-                    name: "translation".to_string(),
-                    expected: format!("{num_frames} frames"),
-                    got: format!("{} frames", trans.nrows()),
-                });
-            }
-            if trans.ncols() != 3 {
-                return Err(FlameError::ShapeMismatch {
-                    name: "translation".to_string(),
-                    expected: "3 columns".to_string(),
-                    got: format!("{} columns", trans.ncols()),
-                });
-            }
-        }
-
-        let metadata = SequenceMetadata {
-            num_frames,
-            fps: None, // NPZ doesn't typically store FPS metadata
-            n_shape: shape_arr.ncols(),
-            n_expression: expression_arr.ncols(),
-            n_pose: pose_arr.ncols(),
-        };
+        let arrays = NpzArrays::read(path)?;
+        let metadata = arrays.validated_metadata()?;
+        let num_frames = metadata.num_frames;
+        let fps = metadata.fps;
 
         // For small sequences, load all into memory
         // For large sequences (>1000 frames), use lazy loading
         if num_frames <= 1000 {
-            let mut frames = Vec::with_capacity(num_frames);
-            for i in 0..num_frames {
-                let shape = shape_arr.row(i).to_vec();
-                let expression = expression_arr.row(i).to_vec();
-                let pose = pose_arr.row(i).to_vec();
-                let translation = if let Some(ref trans) = translation_arr {
-                    [trans[[i, 0]], trans[[i, 1]], trans[[i, 2]]]
-                } else {
-                    [0.0, 0.0, 0.0]
-                };
-
-                frames.push(FlameParams {
+            Ok(Self {
+                source: SequenceSource::Memory(arrays.into_frames()),
+                cache: LruCache::new(DEFAULT_CACHE_SIZE),
+                num_frames,
+                fps,
+            })
+        } else {
+            // Lazy loading for large sequences: the decompressed arrays
+            // stay resident (this is the same data an eager load would
+            // hold), so per-frame access below never re-opens or
+            // re-decompresses the NPZ file.
+            let NpzArrays {
+                shape,
+                expression,
+                pose,
+                translation,
+                fps: _,
+            } = arrays;
+            Ok(Self {
+                source: SequenceSource::NpzFile {
                     shape,
                     expression,
                     pose,
-                    translation,
-                });
-            }
-
-            Ok(Self {
-                source: SequenceSource::Memory(frames),
-                cache: LruCache::new(DEFAULT_CACHE_SIZE),
-                num_frames,
-                fps: None,
-            })
-        } else {
-            // Lazy loading for large sequences
-            Ok(Self {
-                source: SequenceSource::NpzFile {
-                    path: path.to_path_buf(),
-                    metadata: metadata.clone(),
+                    translation: Box::new(translation),
+                    metadata,
                 },
                 cache: LruCache::new(DEFAULT_CACHE_SIZE),
                 num_frames,
-                fps: None,
+                fps,
             })
         }
     }
@@ -380,16 +321,17 @@ impl FlameSequence {
             )));
         }
 
-        // Load first frame to get metadata
+        // Load first frame to determine per-frame dimensions (bootstrap --
+        // no `SequenceMetadata` exists yet to validate against).
         let first_frame_path = dir.join(pattern.replace("{}", "0").replace("{:04}", "0000"));
-        let first_params = load_frame_from_file(&first_frame_path)?;
+        let first_frame = parse_frame_file(&first_frame_path)?;
 
         let metadata = SequenceMetadata {
             num_frames,
             fps,
-            n_shape: first_params.shape.len(),
-            n_expression: first_params.expression.len(),
-            n_pose: first_params.pose.len(),
+            n_shape: first_frame.shape.len(),
+            n_expression: first_frame.expression.len(),
+            n_pose: first_frame.pose.len(),
         };
 
         Ok(Self {
@@ -544,19 +486,31 @@ impl FlameSequence {
             .map(|&idx| {
                 let params = match &self.source {
                     SequenceSource::Memory(frames) => frames[idx].clone(),
-                    SequenceSource::JsonFile { path, metadata } => {
-                        load_frame_from_json(path, idx, metadata)?
+                    SequenceSource::JsonFile { frames, metadata } => {
+                        frame_from_json_frames(frames, idx, metadata)?
                     }
-                    SequenceSource::NpzFile { path, metadata } => {
-                        load_frame_from_npz(path, idx, metadata)?
-                    }
+                    #[cfg(feature = "npz")]
+                    SequenceSource::NpzFile {
+                        shape,
+                        expression,
+                        pose,
+                        translation,
+                        metadata,
+                    } => lookup_frame_from_npz(
+                        shape,
+                        expression,
+                        pose,
+                        translation.as_ref().as_ref(),
+                        idx,
+                        metadata,
+                    )?,
                     SequenceSource::Directory {
                         path,
                         file_pattern,
-                        metadata: _,
+                        metadata,
                     } => {
                         let frame_path = format_frame_path(path, file_pattern, idx);
-                        load_frame_from_file(&frame_path)?
+                        load_frame_from_file(&frame_path, metadata)?
                     }
                 };
                 Ok((idx, params))
@@ -614,19 +568,31 @@ impl FlameSequence {
         // Load from source
         let params = match &self.source {
             SequenceSource::Memory(frames) => frames[frame_idx].clone(),
-            SequenceSource::JsonFile { path, metadata } => {
-                load_frame_from_json(path, frame_idx, metadata)?
+            SequenceSource::JsonFile { frames, metadata } => {
+                frame_from_json_frames(frames, frame_idx, metadata)?
             }
-            SequenceSource::NpzFile { path, metadata } => {
-                load_frame_from_npz(path, frame_idx, metadata)?
-            }
+            #[cfg(feature = "npz")]
+            SequenceSource::NpzFile {
+                shape,
+                expression,
+                pose,
+                translation,
+                metadata,
+            } => lookup_frame_from_npz(
+                shape,
+                expression,
+                pose,
+                translation.as_ref().as_ref(),
+                frame_idx,
+                metadata,
+            )?,
             SequenceSource::Directory {
                 path,
                 file_pattern,
-                metadata: _,
+                metadata,
             } => {
                 let frame_path = format_frame_path(path, file_pattern, frame_idx);
-                load_frame_from_file(&frame_path)?
+                load_frame_from_file(&frame_path, metadata)?
             }
         };
 
@@ -666,17 +632,15 @@ impl FlameSequence {
         let params_0 = self.get_frame(frame_0)?.clone();
         let params_1 = self.get_frame(frame_1)?.clone();
 
-        // Linear interpolation: params = (1-t) * params_0 + t * params_1
-        Ok(FlameParams {
-            shape: lerp_vec(&params_0.shape, &params_1.shape, t),
-            expression: lerp_vec(&params_0.expression, &params_1.expression, t),
-            pose: lerp_vec(&params_0.pose, &params_1.pose, t),
-            translation: [
-                (1.0 - t) * params_0.translation[0] + t * params_1.translation[0],
-                (1.0 - t) * params_0.translation[1] + t * params_1.translation[1],
-                (1.0 - t) * params_0.translation[2] + t * params_1.translation[2],
-            ],
-        })
+        // Delegate to `FlameParams::lerp`: shape/expression/translation are
+        // interpolated linearly and pose via quaternion slerp (axis-angle ->
+        // quaternion -> slerp -> axis-angle), which keeps rotational paths
+        // on the rotation manifold -- a naive component-wise lerp of
+        // axis-angle vectors does not (e.g. it can silently cancel a
+        // near-pi rotation to zero rotation at t=0.5). This also validates
+        // that `params_0` and `params_1` have matching shape/expression/
+        // pose lengths instead of silently truncating to the shorter one.
+        params_0.lerp(&params_1, t)
     }
 
     /// Get an iterator over all frames (with caching)
@@ -756,75 +720,195 @@ fn frame_json_to_params(
     })
 }
 
-/// Load a single frame from JSON file
-fn load_frame_from_json(
-    path: &Path,
+/// Look up and validate a single frame from an already-parsed, in-memory
+/// JSON frame list (see [`SequenceSource::JsonFile`]).
+///
+/// Unlike the old per-frame loader this performs no file I/O and no JSON
+/// parsing -- both happen exactly once, in `from_json`.
+fn frame_from_json_frames(
+    frames: &[FrameJson],
     frame_idx: usize,
     metadata: &SequenceMetadata,
 ) -> Result<FlameParams, FlameError> {
-    let json_str = std::fs::read_to_string(path).map_err(|e| FlameError::IoError {
-        source: e,
-        path: path.to_path_buf(),
+    let frame = frames.get(frame_idx).ok_or_else(|| {
+        FlameError::index_out_of_bounds("FlameSequence::get_frame", frame_idx, frames.len())
     })?;
-
-    let sequence_data: SequenceJson = serde_json::from_str(&json_str)
-        .map_err(|e| FlameError::InvalidParams(format!("Failed to parse JSON sequence: {e}")))?;
-
-    if frame_idx >= sequence_data.frames.len() {
-        return Err(FlameError::index_out_of_bounds(
-            "load_frame_from_json",
-            frame_idx,
-            sequence_data.frames.len(),
-        ));
-    }
-
-    frame_json_to_params(sequence_data.frames[frame_idx].clone(), metadata)
+    frame_json_to_params(frame.clone(), metadata)
 }
 
-/// Load a single frame from NPZ file
+/// The raw arrays of an NPZ sequence file, read exactly once.
+///
+/// [`FlameSequence::from_npz`] used to do all of reading, validating and
+/// converting inline, which is what earned it a `#[allow(clippy::too_many_lines)]`.
+/// The three phases are separated here instead: [`NpzArrays::read`] does the
+/// I/O and decompression, [`NpzArrays::validated_metadata`] checks the array
+/// geometry agrees frame-for-frame, and [`NpzArrays::into_frames`] materialises
+/// the eager (small-sequence) representation. The lazy representation keeps
+/// these same arrays alive inside [`SequenceSource::NpzFile`].
 #[cfg(feature = "npz")]
-fn load_frame_from_npz(
-    path: &Path,
+struct NpzArrays {
+    shape: ndarray::Array2<f32>,
+    expression: ndarray::Array2<f32>,
+    pose: ndarray::Array2<f32>,
+    translation: Option<ndarray::Array2<f32>>,
+    fps: Option<f32>,
+}
+
+#[cfg(feature = "npz")]
+impl NpzArrays {
+    /// Open `path` and decompress every array the sequence format defines.
+    ///
+    /// This is the only place the file is touched: both the eager and the
+    /// lazy sequence representations are built from the result.
+    fn read(path: &Path) -> Result<Self, FlameError> {
+        use ndarray_npy::NpzReader;
+        use std::fs::File;
+
+        let file = File::open(path).map_err(|e| FlameError::IoError {
+            source: e,
+            path: path.to_path_buf(),
+        })?;
+
+        let mut npz = NpzReader::new(file)
+            .map_err(|e| FlameError::InvalidParams(format!("Failed to open NPZ file: {e}")))?;
+
+        // Load shape array
+        let shape: ndarray::Array2<f32> =
+            npz.by_name("shape").map_err(|e| FlameError::NpzLoad {
+                name: "shape".to_string(),
+                source: e,
+            })?;
+
+        // Load expression array (try both "expression" and "expr" keys)
+        let expression: ndarray::Array2<f32> = npz
+            .by_name("expression")
+            .or_else(|_| npz.by_name("expr"))
+            .map_err(|e| FlameError::NpzLoad {
+                name: "expression/expr".to_string(),
+                source: e,
+            })?;
+
+        // Load pose array
+        let pose: ndarray::Array2<f32> = npz.by_name("pose").map_err(|e| FlameError::NpzLoad {
+            name: "pose".to_string(),
+            source: e,
+        })?;
+
+        // Optional translation array
+        let translation: Option<ndarray::Array2<f32>> = npz.by_name("translation").ok();
+
+        // Optional scalar `fps` metadata. Numpy scalars round-trip as
+        // either a 1-element 1-D array or a genuine 0-D array depending on
+        // how they were saved, so both forms are tried.
+        let fps: Option<f32> = {
+            let one_d: Result<ndarray::Array1<f32>, _> = npz.by_name("fps");
+            if let Ok(arr) = one_d {
+                arr.first().copied()
+            } else {
+                let zero_d: Result<ndarray::Array0<f32>, _> = npz.by_name("fps");
+                zero_d.ok().map(ndarray::Array0::into_scalar)
+            }
+        };
+
+        Ok(Self {
+            shape,
+            expression,
+            pose,
+            translation,
+            fps,
+        })
+    }
+
+    /// Check that every array describes the same number of frames, then
+    /// derive the sequence metadata from their column counts.
+    ///
+    /// `shape` defines the frame count; `expression` and `pose` must match it
+    /// row-for-row, and `translation` (when present) must additionally be
+    /// exactly three columns wide.
+    fn validated_metadata(&self) -> Result<SequenceMetadata, FlameError> {
+        let num_frames = self.shape.nrows();
+        if self.expression.nrows() != num_frames {
+            return Err(FlameError::ShapeMismatch {
+                name: "expression".to_string(),
+                expected: format!("{num_frames} frames"),
+                got: format!("{} frames", self.expression.nrows()),
+            });
+        }
+        if self.pose.nrows() != num_frames {
+            return Err(FlameError::ShapeMismatch {
+                name: "pose".to_string(),
+                expected: format!("{num_frames} frames"),
+                got: format!("{} frames", self.pose.nrows()),
+            });
+        }
+        if let Some(ref trans) = self.translation {
+            if trans.nrows() != num_frames {
+                return Err(FlameError::ShapeMismatch {
+                    name: "translation".to_string(),
+                    expected: format!("{num_frames} frames"),
+                    got: format!("{} frames", trans.nrows()),
+                });
+            }
+            if trans.ncols() != 3 {
+                return Err(FlameError::ShapeMismatch {
+                    name: "translation".to_string(),
+                    expected: "3 columns".to_string(),
+                    got: format!("{} columns", trans.ncols()),
+                });
+            }
+        }
+
+        Ok(SequenceMetadata {
+            num_frames,
+            fps: self.fps,
+            n_shape: self.shape.ncols(),
+            n_expression: self.expression.ncols(),
+            n_pose: self.pose.ncols(),
+        })
+    }
+
+    /// Materialise every frame eagerly, for sequences small enough that
+    /// holding the whole `Vec<FlameParams>` is cheaper than keeping the
+    /// arrays and rebuilding a frame per access.
+    ///
+    /// Only call after [`Self::validated_metadata`] has succeeded: the row
+    /// indexing here relies on the frame counts already agreeing.
+    fn into_frames(self) -> Vec<FlameParams> {
+        let num_frames = self.shape.nrows();
+        let mut frames = Vec::with_capacity(num_frames);
+        for i in 0..num_frames {
+            let translation = self.translation.as_ref().map_or([0.0, 0.0, 0.0], |trans| {
+                [trans[[i, 0]], trans[[i, 1]], trans[[i, 2]]]
+            });
+            frames.push(FlameParams {
+                shape: self.shape.row(i).to_vec(),
+                expression: self.expression.row(i).to_vec(),
+                pose: self.pose.row(i).to_vec(),
+                translation,
+            });
+        }
+        frames
+    }
+}
+
+/// Look up and validate a single frame from already-decompressed NPZ
+/// arrays (see [`SequenceSource::NpzFile`]).
+///
+/// Unlike the old per-frame loader this performs no file I/O and no NPZ
+/// decompression -- both happen exactly once, in `from_npz`.
+#[cfg(feature = "npz")]
+fn lookup_frame_from_npz(
+    shape_arr: &ndarray::Array2<f32>,
+    expression_arr: &ndarray::Array2<f32>,
+    pose_arr: &ndarray::Array2<f32>,
+    translation_arr: Option<&ndarray::Array2<f32>>,
     frame_idx: usize,
     metadata: &SequenceMetadata,
 ) -> Result<FlameParams, FlameError> {
-    use ndarray_npy::NpzReader;
-    use std::fs::File;
-
-    let file = File::open(path).map_err(|e| FlameError::IoError {
-        source: e,
-        path: path.to_path_buf(),
-    })?;
-
-    let mut npz = NpzReader::new(file)
-        .map_err(|e| FlameError::InvalidParams(format!("Failed to open NPZ file: {e}")))?;
-
-    // Load arrays
-    let shape_arr: ndarray::Array2<f32> =
-        npz.by_name("shape").map_err(|e| FlameError::NpzLoad {
-            name: "shape".to_string(),
-            source: e,
-        })?;
-
-    let expression_arr: ndarray::Array2<f32> = npz
-        .by_name("expression")
-        .or_else(|_| npz.by_name("expr"))
-        .map_err(|e| FlameError::NpzLoad {
-            name: "expression/expr".to_string(),
-            source: e,
-        })?;
-
-    let pose_arr: ndarray::Array2<f32> = npz.by_name("pose").map_err(|e| FlameError::NpzLoad {
-        name: "pose".to_string(),
-        source: e,
-    })?;
-
-    let translation_arr: Option<ndarray::Array2<f32>> = npz.by_name("translation").ok();
-
     // Validate frame index
     if frame_idx >= shape_arr.nrows() {
         return Err(FlameError::index_out_of_bounds(
-            "load_frame_from_npz",
+            "FlameSequence::get_frame",
             frame_idx,
             shape_arr.nrows(),
         ));
@@ -834,7 +918,7 @@ fn load_frame_from_npz(
     let shape = shape_arr.row(frame_idx).to_vec();
     let expression = expression_arr.row(frame_idx).to_vec();
     let pose = pose_arr.row(frame_idx).to_vec();
-    let translation = if let Some(ref trans) = translation_arr {
+    let translation = if let Some(trans) = translation_arr {
         [
             trans[[frame_idx, 0]],
             trans[[frame_idx, 1]],
@@ -875,34 +959,35 @@ fn load_frame_from_npz(
     })
 }
 
-/// Load a single frame from NPZ file (feature not enabled)
-#[cfg(not(feature = "npz"))]
-fn load_frame_from_npz(
-    _path: &Path,
-    _frame_idx: usize,
-    _metadata: &SequenceMetadata,
-) -> Result<FlameParams, FlameError> {
-    Err(FlameError::InvalidParams(
-        "NPZ support not enabled. Enable the 'npz' feature flag.".to_string(),
-    ))
-}
-
-/// Load a single frame from individual file
-fn load_frame_from_file(path: &Path) -> Result<FlameParams, FlameError> {
+/// Parse a single per-frame JSON file into a `FrameJson`, without dimension
+/// validation.
+///
+/// Used to bootstrap [`SequenceMetadata`] from the first frame in
+/// [`FlameSequence::from_directory`], before a `SequenceMetadata` exists to
+/// validate against. Per-frame access afterward goes through
+/// [`load_frame_from_file`], which validates dimensions.
+fn parse_frame_file(path: &Path) -> Result<FrameJson, FlameError> {
     let json_str = std::fs::read_to_string(path).map_err(|e| FlameError::IoError {
         source: e,
         path: path.to_path_buf(),
     })?;
 
-    let frame: FrameJson = serde_json::from_str(&json_str)
-        .map_err(|e| FlameError::InvalidParams(format!("Failed to parse frame JSON: {e}")))?;
+    serde_json::from_str(&json_str)
+        .map_err(|e| FlameError::InvalidParams(format!("Failed to parse frame JSON: {e}")))
+}
 
-    Ok(FlameParams {
-        shape: frame.shape,
-        expression: frame.expression,
-        pose: frame.pose,
-        translation: frame.translation.unwrap_or([0.0, 0.0, 0.0]),
-    })
+/// Load and validate a single frame from an individual per-frame file,
+/// checking its dimensions against the sequence's [`SequenceMetadata`] --
+/// the same validation the JSON and NPZ sequence formats already apply.
+/// Without this, a directory of per-frame files with inconsistent
+/// coefficient counts would load without error and surface later as
+/// silently wrong-length parameter vectors.
+fn load_frame_from_file(
+    path: &Path,
+    metadata: &SequenceMetadata,
+) -> Result<FlameParams, FlameError> {
+    let frame = parse_frame_file(path)?;
+    frame_json_to_params(frame, metadata)
 }
 
 /// Format frame path from pattern
@@ -915,14 +1000,6 @@ fn format_frame_path(dir: &Path, pattern: &str, frame_idx: usize) -> PathBuf {
         pattern.to_string()
     };
     dir.join(filename)
-}
-
-/// Linear interpolation between two vectors
-fn lerp_vec(a: &[f32], b: &[f32], t: f32) -> Vec<f32> {
-    a.iter()
-        .zip(b.iter())
-        .map(|(&a_i, &b_i)| (1.0 - t) * a_i + t * b_i)
-        .collect()
 }
 
 #[cfg(test)]
@@ -1334,6 +1411,136 @@ mod tests {
         assert!((frame_500.expression[0] - 500.0).abs() < 1e-5);
     }
 
+    /// Regression: `from_npz` was one 143-line function carrying
+    /// `#[allow(clippy::too_many_lines)]`; its read / validate / convert
+    /// phases are now `NpzArrays::read`, `validated_metadata` and
+    /// `into_frames`. The geometry checks in the middle phase had no direct
+    /// coverage, so a mis-split could have dropped them silently.
+    #[cfg(feature = "npz")]
+    #[test]
+    fn test_npz_rejects_mismatched_array_geometry() {
+        use ndarray::Array2;
+        use ndarray_npy::NpzWriter;
+        use std::fs::File;
+
+        fn write_npz(
+            path: &std::path::Path,
+            expr_rows: usize,
+            translation: Option<Array2<f32>>,
+        ) -> Result<(), FlameError> {
+            let shape_data: Array2<f32> = Array2::zeros((4, 10));
+            let expr_data: Array2<f32> = Array2::zeros((expr_rows, 5));
+            let pose_data: Array2<f32> = Array2::zeros((4, 6));
+
+            let file = File::create(path).expect("test: file creation should succeed");
+            let mut npz = NpzWriter::new(file);
+            npz.add_array("shape", &shape_data)
+                .expect("test: array write should succeed");
+            npz.add_array("expression", &expr_data)
+                .expect("test: array write should succeed");
+            npz.add_array("pose", &pose_data)
+                .expect("test: array write should succeed");
+            if let Some(trans) = translation {
+                npz.add_array("translation", &trans)
+                    .expect("test: array write should succeed");
+            }
+            npz.finish().expect("test: npz write should succeed");
+            FlameSequence::from_npz(path).map(|_| ())
+        }
+
+        let temp_dir = TempDir::new().expect("test: temp dir creation should succeed");
+
+        // expression has fewer frames than shape.
+        let err = write_npz(&temp_dir.path().join("rows.npz"), 3, None)
+            .expect_err("test: mismatched frame counts must be rejected");
+        assert!(
+            matches!(&err, FlameError::ShapeMismatch { name, .. } if name == "expression"),
+            "expected a ShapeMismatch on `expression`, got {err:?}"
+        );
+
+        // translation is present but is not 3 columns wide.
+        let err = write_npz(
+            &temp_dir.path().join("cols.npz"),
+            4,
+            Some(Array2::zeros((4, 2))),
+        )
+        .expect_err("test: a non-3-column translation must be rejected");
+        assert!(
+            matches!(&err, FlameError::ShapeMismatch { name, .. } if name == "translation"),
+            "expected a ShapeMismatch on `translation`, got {err:?}"
+        );
+
+        // The same arrays with consistent geometry load fine.
+        write_npz(
+            &temp_dir.path().join("ok.npz"),
+            4,
+            Some(Array2::zeros((4, 3))),
+        )
+        .expect("test: consistent geometry should load");
+    }
+
+    /// Regression: `SequenceSource::NpzFile` is now `#[cfg(feature = "npz")]`
+    /// rather than always-present-and-`#[allow(dead_code)]`. That variant is
+    /// only reachable above the 1000-frame lazy-loading threshold, so this
+    /// pins that the eager path (below the threshold) and the lazy path
+    /// (above it) still return the same parameters for the same data.
+    #[cfg(feature = "npz")]
+    #[test]
+    fn test_npz_eager_and_lazy_paths_agree() {
+        use ndarray::Array2;
+        use ndarray_npy::NpzWriter;
+        use std::fs::File;
+
+        fn write_and_load(path: &std::path::Path, num_frames: usize) -> FlameSequence {
+            let shape_data: Array2<f32> =
+                Array2::from_shape_fn((num_frames, 4), |(i, j)| (i * 4 + j) as f32);
+            let expr_data: Array2<f32> =
+                Array2::from_shape_fn((num_frames, 3), |(i, j)| (i + j) as f32 * 0.5);
+            let pose_data: Array2<f32> = Array2::from_shape_fn((num_frames, 6), |(i, _)| i as f32);
+            let trans_data: Array2<f32> =
+                Array2::from_shape_fn((num_frames, 3), |(i, j)| (i as f32) - (j as f32));
+
+            let file = File::create(path).expect("test: file creation should succeed");
+            let mut npz = NpzWriter::new(file);
+            for (name, arr) in [
+                ("shape", &shape_data),
+                ("expression", &expr_data),
+                ("pose", &pose_data),
+                ("translation", &trans_data),
+            ] {
+                npz.add_array(name, arr)
+                    .expect("test: array write should succeed");
+            }
+            npz.finish().expect("test: npz write should succeed");
+            FlameSequence::from_npz(path).expect("test: npz load should succeed")
+        }
+
+        let temp_dir = TempDir::new().expect("test: temp dir creation should succeed");
+        // 1000 frames or fewer => eager `Memory`; more => lazy `NpzFile`.
+        let mut eager = write_and_load(&temp_dir.path().join("eager.npz"), 1000);
+        let mut lazy = write_and_load(&temp_dir.path().join("lazy.npz"), 1001);
+
+        for idx in [0usize, 1, 499, 999] {
+            let a = eager
+                .get_frame(idx)
+                .expect("test: eager frame should be available")
+                .clone();
+            let b = lazy
+                .get_frame(idx)
+                .expect("test: lazy frame should be available");
+            assert_eq!(a.shape, b.shape, "frame {idx}: shape differs");
+            assert_eq!(
+                a.expression, b.expression,
+                "frame {idx}: expression differs"
+            );
+            assert_eq!(a.pose, b.pose, "frame {idx}: pose differs");
+            assert_eq!(
+                a.translation, b.translation,
+                "frame {idx}: translation differs"
+            );
+        }
+    }
+
     #[cfg(not(feature = "npz"))]
     #[test]
     fn test_npz_feature_disabled() {
@@ -1347,5 +1554,187 @@ mod tests {
         } else {
             panic!("Expected InvalidParams error");
         }
+    }
+
+    #[test]
+    fn test_lazy_json_no_reread_after_load() {
+        // Regression test for lazy JSON loading re-reading and re-parsing
+        // the whole file on every single frame access. If that regresses,
+        // this test fails because the source file is deleted right after
+        // loading, before any frame is accessed.
+        let temp_dir = TempDir::new().expect("test: temp dir creation should succeed");
+        let json_path = temp_dir.path().join("large_sequence.json");
+
+        let frames: Vec<FrameJson> = (0..1200)
+            .map(|i| FrameJson {
+                shape: vec![i as f32; 10],
+                expression: vec![i as f32 * 2.0; 5],
+                pose: vec![i as f32 * 3.0; 6],
+                translation: Some([i as f32, 0.0, 0.0]),
+            })
+            .collect();
+        let sequence_json = SequenceJson {
+            fps: Some(30.0),
+            frames,
+        };
+        let json_str =
+            serde_json::to_string(&sequence_json).expect("test: JSON serialization should succeed");
+        fs::write(&json_path, json_str).expect("test: file operation should succeed");
+
+        let mut seq =
+            FlameSequence::from_json(&json_path).expect("test: sequence loading should succeed");
+        assert_eq!(
+            seq.num_frames(),
+            1200,
+            "should pick lazy mode (>1000 frames)"
+        );
+
+        // Remove the source file: lazy mode must have parsed it exactly
+        // once, during `from_json` above, and must not touch it again.
+        fs::remove_file(&json_path).expect("test: file removal should succeed");
+
+        seq.prefetch(0..1200)
+            .expect("test: prefetch should succeed after source file removal");
+        let frame_999 = seq
+            .get_frame(999)
+            .expect("test: frame access should succeed after source file removal");
+        assert!((frame_999.shape[0] - 999.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_interpolate_pose_slerp_near_pi_wrap() {
+        // Two frames whose single-joint pose sits on opposite sides of the
+        // +/-pi branch cut for axis-angle rotation about Z. A naive
+        // component-wise lerp of (0,0,3.10) and (0,0,-3.10) at t=0.5 gives
+        // (0,0,0) -- i.e. NO rotation -- which is wrong: the two rotations
+        // are actually close together (~5 degrees apart) on the rotation
+        // manifold, on the far side from identity, so the correctly
+        // interpolated rotation angle is close to pi, not 0.
+        let frame_0 = FlameParams {
+            shape: vec![],
+            expression: vec![],
+            pose: vec![0.0, 0.0, 3.10],
+            translation: [0.0, 0.0, 0.0],
+        };
+        let frame_1 = FlameParams {
+            shape: vec![],
+            expression: vec![],
+            pose: vec![0.0, 0.0, -3.10],
+            translation: [0.0, 0.0, 0.0],
+        };
+        let mut seq = FlameSequence::from_memory(vec![frame_0, frame_1], None);
+
+        let interp = seq
+            .interpolate(0.5)
+            .expect("test: interpolation should succeed");
+        let angle = (interp.pose[0] * interp.pose[0]
+            + interp.pose[1] * interp.pose[1]
+            + interp.pose[2] * interp.pose[2])
+            .sqrt();
+        assert!(
+            angle > 3.0,
+            "expected interpolated rotation angle near pi, got {angle} (pose={:?})",
+            interp.pose
+        );
+    }
+
+    #[test]
+    fn test_interpolate_mismatched_lengths_errors() {
+        // `from_memory` performs no cross-frame dimension validation, so
+        // two frames with different shape-vector lengths can end up
+        // adjacent in a sequence. `interpolate` must reject this rather
+        // than silently truncating to the shorter vector (the old
+        // `lerp_vec`-based implementation did exactly that, via `zip`).
+        let frame_0 = create_test_params(0); // shape len 10
+        let mut frame_1 = create_test_params(1);
+        frame_1.shape = vec![1.0; 5]; // mismatched length
+        let mut seq = FlameSequence::from_memory(vec![frame_0, frame_1], None);
+
+        let result = seq.interpolate(0.5);
+        assert!(
+            result.is_err(),
+            "expected an error for mismatched shape lengths, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_directory_rejects_mismatched_frame_dimensions() {
+        let temp_dir = TempDir::new().expect("test: temp dir creation should succeed");
+
+        // Frame 0 establishes the sequence's dimensions (shape len 4).
+        let frame0 = FrameJson {
+            shape: vec![0.0; 4],
+            expression: vec![0.0; 2],
+            pose: vec![0.0; 3],
+            translation: Some([0.0, 0.0, 0.0]),
+        };
+        let json0 = serde_json::to_string(&frame0).expect("test: serialize");
+        fs::write(temp_dir.path().join("frame_0000.json"), json0)
+            .expect("test: file operation should succeed");
+
+        // Frame 1 has a DIFFERENT shape length -- this must be rejected
+        // rather than silently accepted. The `Directory` source previously
+        // performed no dimension validation at all, unlike the JSON and
+        // NPZ sources.
+        let frame1 = FrameJson {
+            shape: vec![0.0; 7],
+            expression: vec![0.0; 2],
+            pose: vec![0.0; 3],
+            translation: Some([0.0, 0.0, 0.0]),
+        };
+        let json1 = serde_json::to_string(&frame1).expect("test: serialize");
+        fs::write(temp_dir.path().join("frame_0001.json"), json1)
+            .expect("test: file operation should succeed");
+
+        let mut seq = FlameSequence::from_directory(temp_dir.path(), "frame_{:04}.json", 2, None)
+            .expect("test: from_directory should succeed (frame 0 sets the dimensions)");
+
+        // Frame 0 matches the established dimensions.
+        let f0 = seq.get_frame(0).expect("test: frame 0 should load");
+        assert_eq!(f0.shape.len(), 4);
+
+        // Frame 1's mismatched shape length must be rejected.
+        let result = seq.get_frame(1);
+        assert!(
+            result.is_err(),
+            "expected an error for mismatched directory frame dimensions"
+        );
+    }
+
+    #[cfg(feature = "npz")]
+    #[test]
+    fn test_npz_fps_roundtrip() {
+        use ndarray::{Array1, Array2};
+        use ndarray_npy::NpzWriter;
+        use std::fs::File;
+
+        let temp_dir = TempDir::new().expect("test: temp dir creation should succeed");
+        let npz_path = temp_dir.path().join("test_sequence_fps.npz");
+
+        let num_frames = 4;
+        let shape_data: Array2<f32> =
+            Array2::from_shape_fn((num_frames, 3), |(i, j)| (i + j) as f32);
+        let expr_data: Array2<f32> = Array2::from_shape_fn((num_frames, 2), |(_, _)| 0.0);
+        let pose_data: Array2<f32> = Array2::from_shape_fn((num_frames, 3), |(_, _)| 0.0);
+        let fps_data: Array1<f32> = Array1::from_vec(vec![24.0]);
+
+        let file = File::create(&npz_path).expect("test: file creation should succeed");
+        let mut npz = NpzWriter::new(file);
+        npz.add_array("shape", &shape_data)
+            .expect("test: array write should succeed");
+        npz.add_array("expression", &expr_data)
+            .expect("test: array write should succeed");
+        npz.add_array("pose", &pose_data)
+            .expect("test: array write should succeed");
+        npz.add_array("fps", &fps_data)
+            .expect("test: array write should succeed");
+        npz.finish().expect("test: npz write should succeed");
+
+        let seq = FlameSequence::from_npz(&npz_path).expect("test: npz load should succeed");
+        assert_eq!(
+            seq.fps(),
+            Some(24.0),
+            "fps array in the NPZ file should be read, not defaulted to None"
+        );
     }
 }

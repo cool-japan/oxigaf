@@ -188,6 +188,36 @@ impl LossComputer {
         }
     }
 
+    /// The weights of the objective this computer reports.
+    ///
+    /// Anything differentiating that objective — notably
+    /// [`crate::image_gradient::photometric_pixel_gradient`] — must read the
+    /// config from here rather than from `TrainingConfig::loss`: the trainer's
+    /// `loss_computer` is a public field, so a caller may install a computer
+    /// built from a *different* [`LossConfig`].
+    pub fn config(&self) -> &LossConfig {
+        &self.config
+    }
+
+    /// The separable Gaussian window this computer's SSIM term uses.
+    ///
+    /// Exposed for the same reason as [`config`](Self::config): the adjoint
+    /// must convolve with the identical window, and rebuilding it from
+    /// constants at the call site is how the two silently drift apart.
+    pub fn ssim_kernel(&self) -> &[f32] {
+        &self.ssim_kernel
+    }
+
+    /// The per-scale MS-SSIM weights this computer reports with.
+    ///
+    /// A computer built by [`with_ms_ssim_weights`](Self::with_ms_ssim_weights)
+    /// does *not* use [`DEFAULT_MS_SSIM_WEIGHTS`](Self::DEFAULT_MS_SSIM_WEIGHTS);
+    /// hardcoding those in the gradient re-introduces a reported-vs-optimised
+    /// mismatch.
+    pub fn ms_ssim_weights(&self) -> &[f32; 5] {
+        &self.ms_ssim_weights
+    }
+
     /// Evaluate all loss terms.
     ///
     /// * `rendered` / `targets` — lists of images (one per view), each a flat
@@ -216,8 +246,77 @@ impl LossComputer {
     /// * `mesh` — optional FLAME mesh.
     /// * `view_directions` — camera view directions for view-weighted normal loss.
     /// * `gradients` — gradient buffer for gradient penalty computation.
+    ///
+    /// LPIPS is NOT computed by this method (it requires a loaded VGG
+    /// network, which `LossComputer` has no weights path to load here) —
+    /// `LossOutput::lpips` is always `0.0` and `w_lpips` has no effect.
+    /// Use [`compute_with_lpips`](Self::compute_with_lpips) with an
+    /// externally-computed LPIPS value to include that term. If
+    /// `config.w_lpips > 0`, a `tracing::warn!` is emitted once per call so
+    /// this omission is visible rather than silently reading as
+    /// "lpips=0.0000" in logs.
     #[allow(clippy::too_many_arguments)]
     pub fn compute_with_options(
+        &self,
+        rendered: &[Vec<f32>],
+        targets: &[Vec<f32>],
+        width: usize,
+        height: usize,
+        model: &GaussianModel,
+        mesh: Option<&Mesh>,
+        view_directions: Option<&[[f32; 3]]>,
+        gradients: Option<&[f32]>,
+    ) -> LossOutput {
+        if self.config.w_lpips > 0.0 {
+            tracing::warn!(
+                w_lpips = self.config.w_lpips,
+                "LossComputer::compute/compute_with_options: w_lpips > 0 but LPIPS is \
+                 not computed by this method (it requires a loaded LPIPS/VGG network). \
+                 Use LossComputer::compute_with_lpips with an externally-computed LPIPS \
+                 value, or LpipsLossComputer::compute, to include the perceptual term."
+            );
+        }
+        self.compute_core(
+            rendered,
+            targets,
+            width,
+            height,
+            model,
+            mesh,
+            view_directions,
+            gradients,
+        )
+    }
+
+    /// Compute loss with externally computed LPIPS value.
+    #[allow(clippy::too_many_arguments)]
+    pub fn compute_with_lpips(
+        &self,
+        rendered: &[Vec<f32>],
+        targets: &[Vec<f32>],
+        width: usize,
+        height: usize,
+        model: &GaussianModel,
+        mesh: Option<&Mesh>,
+        lpips_value: f32,
+    ) -> LossOutput {
+        // Uses `compute_core` directly (bypassing `compute`/
+        // `compute_with_options`) since LPIPS IS accounted for below —
+        // going through those would spuriously emit the "LPIPS not
+        // computed" warning even though this method does compute it.
+        let mut output =
+            self.compute_core(rendered, targets, width, height, model, mesh, None, None);
+        output.lpips = lpips_value;
+        output.total += self.config.w_lpips * lpips_value;
+        output
+    }
+
+    /// Shared implementation behind [`compute_with_options`](Self::compute_with_options)
+    /// and [`compute_with_lpips`](Self::compute_with_lpips): computes every
+    /// term except LPIPS (always `0.0` here — callers add it afterward if
+    /// they have one).
+    #[allow(clippy::too_many_arguments)]
+    fn compute_core(
         &self,
         rendered: &[Vec<f32>],
         targets: &[Vec<f32>],
@@ -254,12 +353,12 @@ impl LossComputer {
             0.0
         };
 
-        // LPIPS is computed externally (requires neural network)
-        let lpips = 0.0; // Will be set by caller if using LPIPS
+        // LPIPS is computed externally; see this method's callers.
+        let lpips = 0.0;
 
         // ---- regularisation losses -----------------------------------------
         let pos_reg = position_reg(model);
-        let sc_reg = scale_reg(model);
+        let sc_reg = scale_reg_with_max(model, cfg.w_scale_reg_max_scale);
         let op_reg = opacity_reg(model);
 
         // Normal consistency with optional view weighting
@@ -297,24 +396,6 @@ impl LossComputer {
             total,
         }
     }
-
-    /// Compute loss with externally computed LPIPS value.
-    #[allow(clippy::too_many_arguments)]
-    pub fn compute_with_lpips(
-        &self,
-        rendered: &[Vec<f32>],
-        targets: &[Vec<f32>],
-        width: usize,
-        height: usize,
-        model: &GaussianModel,
-        mesh: Option<&Mesh>,
-        lpips_value: f32,
-    ) -> LossOutput {
-        let mut output = self.compute(rendered, targets, width, height, model, mesh);
-        output.lpips = lpips_value;
-        output.total += self.config.w_lpips * lpips_value;
-        output
-    }
 }
 
 // ===========================================================================
@@ -337,9 +418,44 @@ pub fn l1_loss(pred: &[f32], target: &[f32]) -> f32 {
 /// Structural dissimilarity (1 − SSIM) using an 11×11 Gaussian window.
 ///
 /// `kernel` is the pre-computed 1-D Gaussian kernel (separable).
+///
+/// Returns `0.0` (the value for two IDENTICAL images, since this is a
+/// dissimilarity) when `pred`/`target` are shorter than `width*height*3` —
+/// this is a documented contract callers rely on, not merely a default;
+/// changing it to a `Result` or to `1.0` would ripple into every caller.
+/// A `tracing::warn!` is emitted instead so the degenerate case is visible
+/// in logs rather than silently reading as "perfect structural match".
+/// Concretely pinned by `tests/loss_tests.rs::ssim_too_small_returns_zero`
+/// (asserts `loss == 0.0`) — that test (outside this crate module) must be
+/// updated in the same change as this contract, should it ever change.
 pub fn ssim_loss(pred: &[f32], target: &[f32], width: usize, height: usize, kernel: &[f32]) -> f32 {
     if pred.len() < width * height * 3 || target.len() < width * height * 3 {
+        tracing::warn!(
+            pred_len = pred.len(),
+            target_len = target.len(),
+            expected_len = width * height * 3,
+            width,
+            height,
+            "ssim_loss: pred/target shorter than width*height*3 — returning 0.0 \
+             (dissimilarity, i.e. reported as a PERFECT match) rather than computing SSIM"
+        );
         return 0.0;
+    }
+
+    // An image smaller than the window is still *computable* — replicate
+    // padding clamps the taps that fall outside — but every window then sees
+    // mostly duplicated border pixels, so the result stops being SSIM in any
+    // meaningful sense.  This is a caller mistake (a kernel built for a
+    // different resolution), not a degenerate buffer, so it is surfaced rather
+    // than silently absorbed.  Use [`ssim_loss_checked`] to get it as an error.
+    if !ssim_window_fits(width, height, kernel.len()) {
+        tracing::warn!(
+            width,
+            height,
+            kernel_taps = kernel.len(),
+            "ssim_loss: image smaller than the SSIM window — every window is \
+             dominated by replicate padding; result is not a meaningful SSIM"
+        );
     }
 
     let mut ssim_total = 0.0_f32;
@@ -354,6 +470,59 @@ pub fn ssim_loss(pred: &[f32], target: &[f32], width: usize, height: usize, kern
 
     // Return *dissimilarity*: 1 − mean SSIM.
     1.0 - ssim_total / 3.0
+}
+
+/// Whether an image is large enough to hold the SSIM window on both axes.
+///
+/// A zero-tap kernel never fits: `ssim_channel` would then produce all-zero
+/// means and report a constant, meaningless score.
+pub fn ssim_window_fits(width: usize, height: usize, kernel_taps: usize) -> bool {
+    kernel_taps > 0 && width >= kernel_taps && height >= kernel_taps
+}
+
+/// [`ssim_loss`] with the API-level validation its lenient contract cannot do.
+///
+/// [`ssim_loss`] must keep returning `0.0` for undersized buffers (a contract
+/// its callers rely on) and must keep *computing* for images smaller than the
+/// window.  Neither is right for a new caller, which almost always wants to
+/// hear about the mismatch instead.  This wrapper reports:
+///
+/// * [`TrainerError::ImageDimensionMismatch`] — `pred`/`target` shorter than
+///   `width·height·3`.
+/// * [`TrainerError::ParameterOutOfRange`] — the window does not fit
+///   (see [`ssim_window_fits`]).
+///
+/// # Errors
+///
+/// See above; on success the returned value is exactly [`ssim_loss`]'s.
+pub fn ssim_loss_checked(
+    pred: &[f32],
+    target: &[f32],
+    width: usize,
+    height: usize,
+    kernel: &[f32],
+) -> Result<f32, TrainerError> {
+    let expected = width * height * 3;
+    if pred.len() < expected {
+        return Err(TrainerError::ImageDimensionMismatch {
+            expected,
+            actual: pred.len(),
+        });
+    }
+    if target.len() < expected {
+        return Err(TrainerError::ImageDimensionMismatch {
+            expected,
+            actual: target.len(),
+        });
+    }
+    if !ssim_window_fits(width, height, kernel.len()) {
+        return Err(TrainerError::ParameterOutOfRange {
+            param: "ssim window".into(),
+            value: format!("{width}x{height} image, {} taps", kernel.len()),
+            expected: "width >= taps and height >= taps, taps > 0".into(),
+        });
+    }
+    Ok(ssim_loss(pred, target, width, height, kernel))
 }
 
 // ---------------------------------------------------------------------------
@@ -400,7 +569,21 @@ fn ssim_channel(pred: &Array2<f32>, target: &Array2<f32>, kernel: &[f32]) -> f32
 }
 
 /// 1-D Gaussian kernel (normalised to sum = 1).
+///
+/// `sigma` is clamped to a tiny positive value: at `sigma == 0` the centre tap
+/// evaluates `exp(-0/0)` → `NaN`, which would poison every SSIM score computed
+/// with the window rather than degenerating to the intended `[1.0]` impulse.
+/// A `size` of `0` yields an empty kernel (see [`ssim_window_fits`]); the
+/// normalisation is skipped so it cannot divide by a zero sum.
 pub fn gaussian_kernel_1d(size: usize, sigma: f32) -> Vec<f32> {
+    // Small enough to act as an impulse, large enough that `2σ²` does not
+    // underflow to zero and re-create the `0/0` at the centre tap.
+    const MIN_SIGMA: f32 = 1e-6;
+    let sigma = if sigma.is_finite() && sigma > MIN_SIGMA {
+        sigma
+    } else {
+        MIN_SIGMA
+    };
     let centre = (size as f32 - 1.0) / 2.0;
     let mut kernel: Vec<f32> = (0..size)
         .map(|i| {
@@ -409,8 +592,10 @@ pub fn gaussian_kernel_1d(size: usize, sigma: f32) -> Vec<f32> {
         })
         .collect();
     let sum: f32 = kernel.iter().sum();
-    for v in &mut kernel {
-        *v /= sum;
+    if sum > 0.0 && sum.is_finite() {
+        for v in &mut kernel {
+            *v /= sum;
+        }
     }
     kernel
 }
@@ -479,6 +664,19 @@ fn convolve_separable(image: &Array2<f32>, kernel: &[f32]) -> Array2<f32> {
 ///
 /// # Returns
 /// MS-SSIM dissimilarity (1 - MS-SSIM), in range [0, 2].
+///
+/// Returns `0.0` (the value for two IDENTICAL images, since this is a
+/// dissimilarity) when the image is too small for multi-scale (`width <
+/// 16 || height < 16`) or when `pred`/`target` are shorter than
+/// `width*height*3` — this is a documented contract callers rely on, not
+/// merely a default. A `tracing::warn!` is emitted in both cases so the
+/// degenerate result is visible in logs rather than silently reading as
+/// "perfect structural match". Concretely pinned by three tests in
+/// `tests/loss_tests.rs` (outside this crate module, so they must be
+/// updated in the same change as this contract, should it ever change):
+/// `ms_ssim_small_image_returns_zero`,
+/// `ms_ssim_mismatched_buffer_size_returns_zero`, and
+/// `ms_ssim_empty_image`.
 pub fn ms_ssim_loss(
     pred: &[f32],
     target: &[f32],
@@ -488,10 +686,25 @@ pub fn ms_ssim_loss(
 ) -> f32 {
     if width < 16 || height < 16 {
         // Image too small for multi-scale
+        tracing::warn!(
+            width,
+            height,
+            "ms_ssim_loss: image smaller than the 16x16 multi-scale minimum — \
+             returning 0.0 (dissimilarity, i.e. reported as a PERFECT match)"
+        );
         return 0.0;
     }
 
     if pred.len() < width * height * 3 || target.len() < width * height * 3 {
+        tracing::warn!(
+            pred_len = pred.len(),
+            target_len = target.len(),
+            expected_len = width * height * 3,
+            width,
+            height,
+            "ms_ssim_loss: pred/target shorter than width*height*3 — returning 0.0 \
+             (dissimilarity, i.e. reported as a PERFECT match) rather than computing MS-SSIM"
+        );
         return 0.0;
     }
 
@@ -893,7 +1106,14 @@ pub fn sanitize_gradients(gradients: &mut [f32]) -> usize {
 /// # Arguments
 /// * `view_images` - Rendered images from multiple views `[N][H*W*3]`.
 /// * `view_depths` - Depth maps for each view `[N][H*W]`.
-/// * `view_poses` - Camera poses (4x4 matrices, flattened) for each view.
+/// * `view_poses` - Camera poses for each view: 4x4 matrices, ROW-MAJOR
+///   flattened (index `4*row + col`), so translation is `[m[3], m[7],
+///   m[11]]` and the bottom row `[m[12], m[13], m[14], m[15]]` must be
+///   `[0, 0, 0, 1]`. A column-major matrix (translation in `m[12..15]`
+///   instead) will fail the internal rigid-inverse orthonormality check
+///   for any pose with a non-identity rotation and fall back silently to
+///   an identity relative transform; a debug build additionally asserts
+///   on the bottom-row layout to catch a mismatched convention early.
 /// * `intrinsics` - Camera intrinsics (fx, fy, cx, cy).
 /// * `width` - Image width.
 /// * `height` - Image height.
@@ -1053,6 +1273,17 @@ struct Mat4 {
 
 impl Mat4 {
     fn from_array(arr: &[f32; 16]) -> Self {
+        debug_assert!(
+            arr[12].abs() < 1e-4
+                && arr[13].abs() < 1e-4
+                && arr[14].abs() < 1e-4
+                && (arr[15] - 1.0).abs() < 1e-4,
+            "Mat4::from_array expects a ROW-MAJOR 4x4 matrix with bottom row \
+             [0,0,0,1] at indices 12..16; got {:?}. A column-major matrix \
+             would put its translation there instead of at [3,7,11] — \
+             check the caller's layout.",
+            &arr[12..16]
+        );
         Self { data: *arr }
     }
 
@@ -1064,7 +1295,14 @@ impl Mat4 {
         }
     }
 
-    /// Simple 4x4 matrix inverse (assumes valid camera matrix).
+    /// Rigid-transform 4x4 matrix inverse: `[R | t] -> [R^T | -R^T * t]`.
+    ///
+    /// Valid ONLY for a rigid transform where `R` (the upper-left 3x3
+    /// block) is an orthonormal rotation — no scale or shear. Returns
+    /// `None` when `R^T R` is not (approximately) the identity, since the
+    /// closed-form rigid inverse would then be wrong; callers should treat
+    /// `None` as "cannot reliably invert this matrix" rather than
+    /// silently receiving a garbage transform.
     fn try_inverse(&self) -> Option<Self> {
         // For camera matrices, we can use the fact that they're typically
         // [R | t] form where R is 3x3 rotation and t is translation.
@@ -1082,6 +1320,27 @@ impl Mat4 {
         let r20 = m[8];
         let r21 = m[9];
         let r22 = m[10];
+
+        // Validate orthonormality: R^T R must be (approximately) the
+        // identity. A non-orthonormal R — scale, shear, or a
+        // column-major matrix mistaken for row-major — would make the
+        // rigid-inverse formula below silently wrong.
+        let rtr00 = r00 * r00 + r10 * r10 + r20 * r20;
+        let rtr11 = r01 * r01 + r11 * r11 + r21 * r21;
+        let rtr22 = r02 * r02 + r12 * r12 + r22 * r22;
+        let rtr01 = r00 * r01 + r10 * r11 + r20 * r21;
+        let rtr02 = r00 * r02 + r10 * r12 + r20 * r22;
+        let rtr12 = r01 * r02 + r11 * r12 + r21 * r22;
+        const ORTHONORMAL_EPS: f32 = 1e-3;
+        let orthonormal = (rtr00 - 1.0).abs() < ORTHONORMAL_EPS
+            && (rtr11 - 1.0).abs() < ORTHONORMAL_EPS
+            && (rtr22 - 1.0).abs() < ORTHONORMAL_EPS
+            && rtr01.abs() < ORTHONORMAL_EPS
+            && rtr02.abs() < ORTHONORMAL_EPS
+            && rtr12.abs() < ORTHONORMAL_EPS;
+        if !orthonormal {
+            return None;
+        }
 
         // Extract translation
         let tx = m[3];
@@ -1162,17 +1421,91 @@ pub fn position_reg(model: &GaussianModel) -> f32 {
     sum / model.len() as f32
 }
 
-/// Mean squared scale (in log-space) — penalises extreme scales.
+/// World-space scale (post-`exp()`) above which a Gaussian's scale on a
+/// given axis is considered "oversized" by [`scale_reg`].
+///
+/// Chosen well above both the typical initial world-scale
+/// (`exp(-5.0) ≈ 0.0067`, `InitConfig::initial_scale`'s default) and
+/// `DensityConfig::split_scale_threshold` (0.01, a different, density-
+/// control notion of "large" used to choose split vs. clone), so ordinary
+/// growth during optimisation on a FLAME head spanning roughly 0.2 world
+/// units is not fought, while pathological/runaway scales still incur a
+/// penalty.
+///
+/// This is the **default** for [`LossConfig::w_scale_reg_max_scale`], which is
+/// what [`LossComputer`] actually consults; use [`scale_reg_with_max`] to
+/// evaluate the term at a configured threshold.
+pub const MAX_REASONABLE_WORLD_SCALE: f32 = 0.05;
+
+/// Penalises oversized Gaussians at the **default** threshold
+/// [`MAX_REASONABLE_WORLD_SCALE`].
+///
+/// Prefer [`scale_reg_with_max`] wherever a [`LossConfig`] is in hand: this
+/// convenience form ignores [`LossConfig::w_scale_reg_max_scale`].
 pub fn scale_reg(model: &GaussianModel) -> f32 {
+    scale_reg_with_max(model, MAX_REASONABLE_WORLD_SCALE)
+}
+
+/// Penalises oversized Gaussians: `mean(relu(exp(scale) - max_scale)²)`
+/// over all axes and Gaussians, where `scale` is stored in LOG space (see
+/// `GaussianAttributes::scale`).
+///
+/// This is asymmetric by design: undersized Gaussians — the regime the
+/// model actually lives in, since world-space scales are typically `<<
+/// 1.0` — are NOT penalised; only Gaussians whose exponentiated
+/// (world-space) scale exceeds the threshold pay a cost, growing
+/// quadratically with the excess. A symmetric `mean(scale²)` penalty (the
+/// previous implementation) instead minimises log-scale toward `0.0`,
+/// i.e. toward a 1.0 world-unit scale — enormous for a FLAME head — which
+/// applies a constant outward pressure fighting the photometric loss for
+/// every ordinarily-sized Gaussian.
+///
+/// A non-finite or negative `max_scale` would make every Gaussian oversized
+/// (or `NaN`-poison the whole loss), so it is clamped to `0.0` here;
+/// [`LossConfig::validate`] rejects such a configuration up front.
+pub fn scale_reg_with_max(model: &GaussianModel, max_scale: f32) -> f32 {
     if model.is_empty() {
         return 0.0;
     }
+    let max_scale = if max_scale.is_finite() {
+        max_scale.max(0.0)
+    } else {
+        0.0
+    };
+    let excess = |log_s: f32| (log_s.exp() - max_scale).max(0.0);
     let sum: f32 = model
         .gaussians
         .iter()
-        .map(|g| g.scale[0] * g.scale[0] + g.scale[1] * g.scale[1] + g.scale[2] * g.scale[2])
+        .map(|g| {
+            let e0 = excess(g.scale[0]);
+            let e1 = excess(g.scale[1]);
+            let e2 = excess(g.scale[2]);
+            e0 * e0 + e1 * e1 + e2 * e2
+        })
         .sum();
     sum / (model.len() as f32 * 3.0)
+}
+
+/// `∂scale_reg_with_max/∂log_s` for one axis.
+///
+/// `d/dlog_s relu(e^{log_s} − m)² = 2·relu(e^{log_s} − m)·e^{log_s}`; inside the
+/// clamp (`e^{log_s} ≤ m`) the term is exactly zero.  Exposed so the trainer's
+/// analytic parameter gradient cannot drift from the reported loss the way the
+/// old symmetric `mean(log_s²)` derivative did.
+#[inline]
+pub fn scale_reg_axis_gradient(log_s: f32, max_scale: f32) -> f32 {
+    let max_scale = if max_scale.is_finite() {
+        max_scale.max(0.0)
+    } else {
+        0.0
+    };
+    let world = log_s.exp();
+    let excess = world - max_scale;
+    if excess > 0.0 {
+        2.0 * excess * world
+    } else {
+        0.0
+    }
 }
 
 /// Opacity regularisation: penalises intermediate opacities to encourage
@@ -1199,6 +1532,13 @@ pub fn opacity_reg(model: &GaussianModel) -> f32 {
 /// Normal consistency: mean (1 − dot(Gaussian z-axis, mesh normal)).
 ///
 /// The Gaussian's local z-axis is derived from its rotation quaternion.
+///
+/// `model.face_indices` / `model.barycentric` shorter than `model.gaussians`,
+/// or `mesh.normals` shorter than a referenced face's vertex indices (both
+/// possible with a malformed/corrupted checkpoint, since all three types
+/// have public fields), are handled by skipping the affected Gaussian
+/// rather than indexing out of bounds — matching
+/// [`normal_consistency_view_weighted`]'s guards.
 pub fn normal_consistency(model: &GaussianModel, mesh: &Mesh) -> f32 {
     if model.is_empty() {
         return 0.0;
@@ -1207,17 +1547,26 @@ pub fn normal_consistency(model: &GaussianModel, mesh: &Mesh) -> f32 {
     let mut count = 0_u32;
 
     for (i, g) in model.gaussians.iter().enumerate() {
-        let fi = model.face_indices[i] as usize;
+        let fi = model.face_indices.get(i).copied().unwrap_or(0) as usize;
         if fi >= mesh.faces.len() {
             continue;
         }
 
         // Interpolated mesh normal at binding point.
         let face = &mesh.faces[fi];
-        let bary = &model.barycentric[i];
-        let n0 = &mesh.normals[face[0] as usize];
-        let n1 = &mesh.normals[face[1] as usize];
-        let n2 = &mesh.normals[face[2] as usize];
+        let bary = model.barycentric.get(i).copied().unwrap_or([1.0, 0.0, 0.0]);
+        let n0_idx = face[0] as usize;
+        let n1_idx = face[1] as usize;
+        let n2_idx = face[2] as usize;
+        if n0_idx >= mesh.normals.len()
+            || n1_idx >= mesh.normals.len()
+            || n2_idx >= mesh.normals.len()
+        {
+            continue;
+        }
+        let n0 = &mesh.normals[n0_idx];
+        let n1 = &mesh.normals[n1_idx];
+        let n2 = &mesh.normals[n2_idx];
         let mesh_normal = (n0 * bary[0] + n1 * bary[1] + n2 * bary[2]).normalize();
 
         // Gaussian z-axis from quaternion (x,y,z,w).
@@ -1273,5 +1622,258 @@ mod tests {
         let k = gaussian_kernel_1d(11, 1.5);
         let sum: f32 = k.iter().sum();
         assert!((sum - 1.0).abs() < 1e-5);
+    }
+
+    // ── normal_consistency: out-of-bounds guards (panic regression) ──────────
+
+    #[test]
+    fn normal_consistency_handles_short_binding_arrays_without_panicking() {
+        use oxigaf_render::gaussian::{GaussianAttributes, GaussianModel};
+
+        // A model whose face_indices/barycentric arrays are SHORTER than
+        // its gaussians array — as could happen with a malformed
+        // checkpoint, since GaussianModel's fields are all public — must
+        // not panic; it should skip the ungoverned Gaussians instead.
+        let attr = GaussianAttributes {
+            position: [0.0; 3],
+            _pad0: 0.0,
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            scale: [0.0; 3],
+            opacity: 0.0,
+        };
+        let model = GaussianModel {
+            gaussians: vec![attr; 3],
+            sh_coeffs: Vec::new(),
+            sh_degree: 0,
+            face_indices: vec![0], // shorter than `gaussians` (len 3)
+            barycentric: vec![[1.0, 0.0, 0.0]], // also shorter
+            local_offsets: vec![[0.0; 3]; 3],
+            is_rigid: vec![false; 3],
+        };
+
+        let mesh = Mesh::new(
+            vec![
+                nalgebra::Point3::new(0.0, 0.0, 0.0),
+                nalgebra::Point3::new(1.0, 0.0, 0.0),
+                nalgebra::Point3::new(0.0, 1.0, 0.0),
+            ],
+            vec![[0, 1, 2]],
+        );
+
+        // Must not panic (previously indexed face_indices[i]/barycentric[i]
+        // unguarded).
+        let result = normal_consistency(&model, &mesh);
+        assert!(result.is_finite(), "result={result}");
+    }
+
+    // ── Mat4::try_inverse ─────────────────────────────────────────────────────
+
+    #[test]
+    fn mat4_try_inverse_identity_returns_some() {
+        let m = Mat4::identity();
+        assert!(m.try_inverse().is_some());
+    }
+
+    #[test]
+    fn mat4_try_inverse_rejects_non_orthonormal_rotation() {
+        // A scaled (non-orthonormal) rotation block must be rejected
+        // rather than silently inverted as if it were rigid — the
+        // closed-form [R^T | -R^T t] formula is only valid for a rigid
+        // (orthonormal-R) transform.
+        let mut data = [0.0f32; 16];
+        data[0] = 2.0;
+        data[5] = 2.0;
+        data[10] = 2.0;
+        data[15] = 1.0;
+        let m = Mat4 { data };
+        assert!(
+            m.try_inverse().is_none(),
+            "a scaled (non-orthonormal) rotation block should be rejected"
+        );
+    }
+
+    #[test]
+    fn mat4_try_inverse_valid_rotation_round_trips() {
+        // 90-degree rotation about Z plus a translation: R^T R = I, so
+        // this must invert correctly, i.e. M^-1 * M ≈ identity.
+        let m = Mat4 {
+            data: [
+                0.0, -1.0, 0.0, 5.0, //
+                1.0, 0.0, 0.0, -2.0, //
+                0.0, 0.0, 1.0, 3.0, //
+                0.0, 0.0, 0.0, 1.0,
+            ],
+        };
+        let inv = m.try_inverse().expect("valid rotation should invert");
+        let identity_check = inv * Mat4 { data: m.data };
+        for i in 0..4 {
+            for j in 0..4 {
+                let expected = if i == j { 1.0 } else { 0.0 };
+                let got = identity_check.data[i * 4 + j];
+                assert!(
+                    (got - expected).abs() < 1e-4,
+                    "M^-1 * M should be identity at [{i}][{j}]: expected {expected}, got {got}"
+                );
+            }
+        }
+    }
+
+    // ── scale_reg ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn scale_reg_penalizes_oversized_not_undersized() {
+        use oxigaf_render::gaussian::{GaussianAttributes, GaussianModel};
+
+        let make_model = |log_scale: f32| {
+            let attr = GaussianAttributes {
+                position: [0.0; 3],
+                _pad0: 0.0,
+                rotation: [0.0, 0.0, 0.0, 1.0],
+                scale: [log_scale; 3],
+                opacity: 0.0,
+            };
+            GaussianModel {
+                gaussians: vec![attr; 2],
+                sh_coeffs: Vec::new(),
+                sh_degree: 0,
+                face_indices: vec![0; 2],
+                barycentric: vec![[1.0, 0.0, 0.0]; 2],
+                local_offsets: vec![[0.0; 3]; 2],
+                is_rigid: vec![false; 2],
+            }
+        };
+
+        // A tiny world-space scale (log -5.0 → exp(-5)≈0.0067, the regime
+        // the model actually lives in per InitConfig::initial_scale) must
+        // NOT be penalised.
+        let tiny = scale_reg(&make_model(-5.0));
+        assert_eq!(
+            tiny, 0.0,
+            "undersized Gaussians should not be penalised, got {tiny}"
+        );
+
+        // A world-space scale of exactly 1.0 world unit (log 0.0) — huge
+        // for a FLAME head spanning ~0.2 units — must be penalised.
+        let huge = scale_reg(&make_model(0.0));
+        assert!(
+            huge > 0.0,
+            "oversized Gaussians should be penalised, got {huge}"
+        );
+    }
+
+    // ---- configurable scale-regularisation threshold (F289) ---------------
+
+    #[test]
+    fn scale_reg_threshold_is_configurable_and_matches_its_gradient() {
+        use oxigaf_render::gaussian::{GaussianAttributes, GaussianModel};
+
+        // e^-3 ≈ 0.0498, just inside the 0.05 default threshold.
+        let attr = GaussianAttributes {
+            position: [0.0; 3],
+            _pad0: 0.0,
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            scale: [-3.0; 3],
+            opacity: 0.0,
+        };
+        let model = GaussianModel {
+            gaussians: vec![attr; 2],
+            sh_coeffs: Vec::new(),
+            sh_degree: 0,
+            face_indices: vec![0; 2],
+            barycentric: vec![[1.0, 0.0, 0.0]; 2],
+            local_offsets: vec![[0.0; 3]; 2],
+            is_rigid: vec![false; 2],
+        };
+
+        // Inside the default clamp (0.05) the penalty is exactly zero.
+        assert_eq!(scale_reg_with_max(&model, MAX_REASONABLE_WORLD_SCALE), 0.0);
+        // A tighter threshold makes the same model oversized.
+        let tight = scale_reg_with_max(&model, 0.01);
+        assert!(tight > 0.0, "tighter threshold must charge: {tight}");
+        // `scale_reg` is the default-threshold convenience form.
+        assert_eq!(
+            scale_reg(&model),
+            scale_reg_with_max(&model, MAX_REASONABLE_WORLD_SCALE)
+        );
+
+        // The exposed per-axis derivative matches central differences.
+        let max_scale = 0.01_f32;
+        let log_s = -3.0_f32;
+        let eps = 1e-3_f32;
+        let value = |x: f32| ((x.exp() - max_scale).max(0.0)).powi(2);
+        let numeric = (value(log_s + eps) - value(log_s - eps)) / (2.0 * eps);
+        let analytic = scale_reg_axis_gradient(log_s, max_scale);
+        assert!(
+            (analytic - numeric).abs() / numeric.abs().max(1e-6) < 0.01,
+            "analytic {analytic} vs numeric {numeric}"
+        );
+        // Inside the clamp the derivative is exactly zero.
+        assert_eq!(scale_reg_axis_gradient(-6.0, max_scale), 0.0);
+        // A non-finite threshold degrades to 0.0 rather than poisoning the term.
+        assert!(scale_reg_with_max(&model, f32::NAN).is_finite());
+    }
+
+    // ---- SSIM window validation (F150) ------------------------------------
+
+    #[test]
+    fn ssim_window_fit_is_checked_at_the_api_level() {
+        let kernel = gaussian_kernel_1d(11, 1.5);
+        let (w, h) = (8_usize, 8_usize);
+        let pred = vec![0.5_f32; w * h * 3];
+        let target = vec![0.4_f32; w * h * 3];
+
+        assert!(!ssim_window_fits(w, h, kernel.len()));
+        assert!(ssim_window_fits(16, 16, kernel.len()));
+        assert!(!ssim_window_fits(16, 16, 0));
+
+        // The lenient form keeps its documented behaviour (it computes).
+        assert!(ssim_loss(&pred, &target, w, h, &kernel).is_finite());
+        // The checked form reports the mismatch instead.
+        assert!(ssim_loss_checked(&pred, &target, w, h, &kernel).is_err());
+        // ... and agrees with `ssim_loss` once the window fits.
+        let big = vec![0.5_f32; 16 * 16 * 3];
+        let big_t = vec![0.4_f32; 16 * 16 * 3];
+        let checked =
+            ssim_loss_checked(&big, &big_t, 16, 16, &kernel).expect("16x16 fits an 11-tap window");
+        assert_eq!(checked, ssim_loss(&big, &big_t, 16, 16, &kernel));
+
+        // Undersized buffers are an error here, not a silent "perfect match".
+        assert!(ssim_loss_checked(&pred, &target, 16, 16, &kernel).is_err());
+    }
+
+    #[test]
+    fn gaussian_kernel_survives_a_degenerate_sigma() {
+        // `sigma == 0` used to evaluate `exp(-0/0)` at the centre tap and
+        // return a NaN kernel, poisoning every SSIM score computed with it.
+        for sigma in [0.0_f32, -1.0, f32::NAN] {
+            let kernel = gaussian_kernel_1d(5, sigma);
+            assert!(
+                kernel.iter().all(|v| v.is_finite()),
+                "sigma {sigma} produced a non-finite kernel"
+            );
+            let sum: f32 = kernel.iter().sum();
+            assert!((sum - 1.0).abs() < 1e-6, "sigma {sigma} sum {sum}");
+        }
+        assert!(gaussian_kernel_1d(0, 1.5).is_empty());
+    }
+
+    // ---- LossComputer accessors (F140) ------------------------------------
+
+    #[test]
+    fn loss_computer_exposes_the_objective_it_reports() {
+        let custom = [0.5_f32, 0.5, 0.0, 0.0, 0.0];
+        let config = LossConfig {
+            w_ms_ssim: 1.0,
+            ..LossConfig::default()
+        };
+        let computer = LossComputer::with_ms_ssim_weights(config.clone(), custom);
+        assert_eq!(computer.ms_ssim_weights(), &custom);
+        assert_eq!(computer.config().w_ms_ssim, config.w_ms_ssim);
+        assert_eq!(computer.ssim_kernel().len(), 11);
+        // The stock computer keeps the paper weights.
+        assert_eq!(
+            LossComputer::new(config).ms_ssim_weights(),
+            &LossComputer::DEFAULT_MS_SSIM_WEIGHTS
+        );
     }
 }

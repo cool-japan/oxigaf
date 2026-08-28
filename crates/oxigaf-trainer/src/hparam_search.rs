@@ -562,32 +562,38 @@ impl HparamSearcher {
             step: 0,
         };
         self.next_trial_id += 1;
+        // Store the trial so `record_result` can find it by id later. Without
+        // this, every `record_result` call fell through to a `params:
+        // HashMap::new()` placeholder — the search never accumulated real
+        // hyperparameters and `best_trial()` was always empty.
+        self.history.record(trial.clone());
         Ok(trial)
     }
 
     /// Record the evaluation result for a trial.
     ///
-    /// Finds the trial in history and updates its score, or appends a new
-    /// placeholder record if the trial has not been stored yet.
-    pub fn record_result(&mut self, trial_id: usize, score: f32, step: usize) {
-        // Try to update an existing history entry.
+    /// Finds the trial (previously returned by [`suggest_next`](Self::suggest_next))
+    /// in history and updates its score.
+    ///
+    /// # Errors
+    /// Returns [`SearchError::TrialNotFound`] if no trial with `trial_id`
+    /// exists in history — e.g. it was never produced by `suggest_next`, or
+    /// `trial_id` is stale/incorrect.
+    pub fn record_result(
+        &mut self,
+        trial_id: usize,
+        score: f32,
+        step: usize,
+    ) -> Result<(), SearchError> {
         for trial in &mut self.history.trials {
             if trial.id == trial_id {
                 trial.score = Some(score);
                 trial.step = step;
                 self.history.update_best();
-                return;
+                return Ok(());
             }
         }
-        // No existing entry — store a placeholder so best tracking works.
-        let placeholder = Trial {
-            id: trial_id,
-            params: HashMap::new(),
-            score: Some(score),
-            step,
-        };
-        self.history.record(placeholder);
-        self.history.update_best();
+        Err(SearchError::TrialNotFound(trial_id))
     }
 
     /// Get the best trial seen so far.
@@ -743,9 +749,6 @@ impl HparamSearcher {
         let mut best_acq = f64::NEG_INFINITY;
         let mut best_params: Option<HashMap<String, f64>> = None;
 
-        // Pre-collect scored trials to avoid repeated allocation.
-        let scored_owned: Vec<Trial> = scored.iter().map(|t| (*t).clone()).collect();
-
         let defs: Vec<(String, HparamRange)> = self
             .space
             .params
@@ -753,30 +756,50 @@ impl HparamSearcher {
             .map(|p| (p.name.clone(), p.range.clone()))
             .collect();
 
+        // Precompute each scored trial's normalized parameter vector (in
+        // `defs` order) once, up front. This avoids both a full deep clone
+        // of every scored `Trial` (`scored` is already `Vec<&Trial>`, which
+        // serves this read-only pass directly) and, more importantly,
+        // replaces `NUM_CANDIDATES * scored.len() * defs.len()` repeated
+        // `HashMap<String, f64>::get` + `normalize_value` calls with a
+        // one-time `scored.len() * defs.len()` pass plus cheap positional
+        // slice indexing in the hot loop below.
+        let trial_vectors: Vec<(Vec<f64>, f32)> = scored
+            .iter()
+            .map(|t| {
+                let v: Vec<f64> = defs
+                    .iter()
+                    .map(|(name, range)| {
+                        let raw = t.params.get(name).copied().unwrap_or(0.0);
+                        range.normalize_value(raw)
+                    })
+                    .collect();
+                (v, t.score.unwrap_or(0.0))
+            })
+            .collect();
+
         for _ in 0..NUM_CANDIDATES {
-            // Sample candidate.
+            // Sample candidate, tracking both its raw params (for the
+            // return value) and its normalized vector (for distances).
             let mut cand_params = HashMap::new();
+            let mut cand_vector: Vec<f64> = Vec::with_capacity(defs.len());
             for (name, range) in &defs {
-                cand_params.insert(name.clone(), range.sample(&mut self.rng));
+                let v = range.sample(&mut self.rng);
+                cand_vector.push(range.normalize_value(v));
+                cand_params.insert(name.clone(), v);
             }
 
-            // Compute normalized L2 distance from candidate to each scored trial.
-            let mut distances: Vec<(f64, f32)> = scored_owned
+            // Normalized L2 distance from candidate to each scored trial.
+            let mut distances: Vec<(f64, f32)> = trial_vectors
                 .iter()
-                .map(|t| {
-                    let dist = defs
+                .map(|(tv, score)| {
+                    let dist = cand_vector
                         .iter()
-                        .map(|(name, range)| {
-                            let v_cand = cand_params.get(name).copied().unwrap_or(0.0);
-                            let v_trial = t.params.get(name).copied().unwrap_or(0.0);
-                            let n_cand = range.normalize_value(v_cand);
-                            let n_trial = range.normalize_value(v_trial);
-                            let diff = n_cand - n_trial;
-                            diff * diff
-                        })
+                        .zip(tv.iter())
+                        .map(|(a, b)| (a - b) * (a - b))
                         .sum::<f64>()
                         .sqrt();
-                    (dist, t.score.unwrap_or(0.0))
+                    (dist, *score)
                 })
                 .collect();
 
@@ -1012,21 +1035,65 @@ mod tests {
         );
         let mut searcher = HparamSearcher::new(space, SearchStrategy::Random, 0);
 
+        // suggest_next() now stores each trial in history itself, so no
+        // manual `searcher.history.record(..)` call is needed here.
         let t0 = searcher.suggest_next().unwrap();
         let t1 = searcher.suggest_next().unwrap();
         let t2 = searcher.suggest_next().unwrap();
 
-        searcher.history.record(t0.clone());
-        searcher.history.record(t1.clone());
-        searcher.history.record(t2.clone());
-
-        searcher.record_result(t0.id, 0.5, 10);
-        searcher.record_result(t1.id, 0.9, 20);
-        searcher.record_result(t2.id, 0.3, 30);
+        searcher.record_result(t0.id, 0.5, 10).unwrap();
+        searcher.record_result(t1.id, 0.9, 20).unwrap();
+        searcher.record_result(t2.id, 0.3, 30).unwrap();
 
         let best = searcher.best_trial().unwrap();
         assert_eq!(best.id, t1.id);
         assert!((best.score.unwrap() - 0.9).abs() < 1e-5);
+    }
+
+    // Regression test for the core bug: suggest_next() must store the
+    // trial (with its real sampled params) into history so record_result()
+    // updates that trial instead of falling back to an empty placeholder.
+    #[test]
+    fn test_suggest_then_record_preserves_params() {
+        let space = SearchSpace::new()
+            .add(
+                "lr",
+                HparamRange::Continuous {
+                    lo: 1e-4,
+                    hi: 1e-1,
+                    log_scale: false,
+                },
+            )
+            .add("batch", HparamRange::Discrete { lo: 4, hi: 32 });
+        let mut searcher = HparamSearcher::new(space.clone(), SearchStrategy::Random, 0);
+
+        let trial = searcher.suggest_next().unwrap();
+        searcher.record_result(trial.id, 0.42, 1).unwrap();
+
+        let best = searcher.best_trial().unwrap();
+        assert_eq!(best.id, trial.id);
+        assert_eq!(
+            best.params.len(),
+            space.num_params(),
+            "best trial's params should not be an empty placeholder: {:?}",
+            best.params
+        );
+        assert!((best.score.unwrap() - 0.42).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_record_result_unknown_trial_returns_error() {
+        let space = SearchSpace::new().add(
+            "lr",
+            HparamRange::Continuous {
+                lo: 1e-4,
+                hi: 1e-1,
+                log_scale: false,
+            },
+        );
+        let mut searcher = HparamSearcher::new(space, SearchStrategy::Random, 0);
+        let result = searcher.record_result(9999, 0.5, 0);
+        assert!(matches!(result, Err(SearchError::TrialNotFound(9999))));
     }
 
     #[test]
@@ -1069,8 +1136,7 @@ mod tests {
 
         // Only 1 scored trial — should still produce a trial (random fallback).
         let t = searcher.suggest_next().unwrap();
-        searcher.history.record(t.clone());
-        searcher.record_result(t.id, 0.5, 1);
+        searcher.record_result(t.id, 0.5, 1).unwrap();
 
         let next = searcher.suggest_next();
         assert!(next.is_ok(), "Bayesian fallback should succeed");
@@ -1094,8 +1160,7 @@ mod tests {
         // Feed 5 scored trials (>= 2*2=4).
         for score in [0.3f32, 0.6, 0.5, 0.7, 0.4] {
             let t = searcher.suggest_next().unwrap();
-            searcher.history.record(t.clone());
-            searcher.record_result(t.id, score, 1);
+            searcher.record_result(t.id, score, 1).unwrap();
         }
 
         // Now Bayesian should engage.
@@ -1121,8 +1186,7 @@ mod tests {
         assert!(summary_before.contains("scored=0"));
 
         let t = searcher.suggest_next().unwrap();
-        searcher.history.record(t.clone());
-        searcher.record_result(t.id, 0.77, 5);
+        searcher.record_result(t.id, 0.77, 5).unwrap();
 
         let summary_after = searcher.format_summary();
         assert!(

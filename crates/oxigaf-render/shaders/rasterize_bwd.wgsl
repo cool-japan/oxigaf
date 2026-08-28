@@ -3,13 +3,58 @@
 //
 // Purpose
 // ───────
-// Each workgroup (one tile, 16×16 threads) traverses the sorted Gaussian list
-// in reverse depth order, accumulating gradients for each Gaussian.  To reduce
-// global-memory atomic contention, per-Gaussian gradient contributions from all
-// 256 threads are first summed into workgroup shared-memory atomics, then a
-// single elected thread (local_invocation_index == 0) performs one global CAS
-// write per gradient slot per Gaussian.  This reduces DRAM CAS operations by
-// up to 256× compared to every thread writing to global memory directly.
+// Each workgroup owns one tile (16×16 = 256 threads) and walks that tile's
+// sorted Gaussian list in reverse depth order.  Every thread visits the SAME
+// Gaussian at the same loop iteration; threads whose pixel did not blend that
+// Gaussian in the forward pass simply contribute zero.  Per Gaussian the 256
+// per-pixel contributions are summed by a tree reduction in workgroup memory
+// and a single elected thread (local_invocation_index == 0) issues the global
+// CAS writes.
+//
+// Barrier / attribution uniformity  (do not "optimise" this away)
+// ───────────────────────────────────────────────────────────────
+// rasterize_fwd.wgsl stores a PER-PIXEL stopping sort index (k_stop) in
+// out_n_contrib.  Driving this loop with *that per-thread value* would give
+// every thread a different trip count, which
+//   (a) is undefined behaviour for the workgroupBarrier() calls in the loop
+//       body — WGSL requires barriers in workgroup-uniform control flow, and
+//       violating it hangs tile-based/mobile GPUs, and
+//   (b) would make the elected thread flush the workgroup totals onto whatever
+//       Gaussian *it* happened to be visiting, silently attributing the other
+//       255 threads' gradients to the wrong Gaussian.
+// Per-thread validity is therefore expressed as a mask (`contributes`), never
+// as a trip count or an early return.  For the same reason out-of-image threads
+// on edge tiles (resolutions that are not a multiple of 16) must not return:
+// they stay alive, hit every barrier, and contribute zero.
+//
+// What the loop bound IS allowed to be is the workgroup-wide MAXIMUM of those
+// per-pixel k_stop values: one number, identical in all 256 threads.  It is
+// computed by a max tree-reduction into wg_end and then read back through
+// `workgroupUniformLoad`, the WGSL builtin whose whole purpose is to yield a
+// value the uniformity analysis accepts as workgroup-uniform (a plain
+// `wg_end[0]` read is classified non-uniform and Naga rejects using it around a
+// barrier).  Skipping the tail is exactly equivalent to walking it: above the
+// tile-wide max, `contributes` is false in all 256 threads, so T, accum_color
+// and the reduction totals are all untouched and the flush is skipped anyway.
+//
+// Gradient reduction
+// ──────────────────
+// The 9 gradient components of all 256 threads are summed by a log2(256) = 8
+// step tree reduction over plain (non-atomic) workgroup memory, after which
+// thread 0 issues exactly 9 global CAS loops.  That is 9 DRAM CAS per Gaussian
+// per tile instead of 256×9.  The previous revision used 9 workgroup atomics
+// instead of the tree: 256-way same-address CAS contention is O(n²) in retries
+// (~2304 contended CAS per Gaussian), which the tree replaces with 8 barriers
+// and 8 conflict-free shared-memory steps.  Where subgroup operations are
+// available, `subgroupAdd` would shrink this further.
+//
+// Remaining cost, deliberately left in place: entries BELOW the tile-wide max
+// k_stop that this particular pixel skipped (its own k_stop is lower, or the
+// power/alpha tests rejected the Gaussian) still pay a full 8-step reduction.
+// Only a per-thread trip count could avoid that, and per (a)/(b) above it is not
+// available.  Such iterations flush nothing — Phase 3's all-zero test elides the
+// 9 global CAS round-trips — so the residual cost is shared-memory traffic, not
+// DRAM traffic.
 //
 // Bindings
 // ────────
@@ -37,13 +82,16 @@
 //
 // Math
 // ────
-// Reverse traversal computes:
-//   dL/dα = dL/dcolor · (T·c − accum/(1−α))
-//   T_prev = T / (1 − α)   (recovering pre-blend transmittance)
-//   dL/dc   = dL/dcolor · T · α
-//   dL/d(power) = dL/dα · α   (when alpha < 0.99 cap)
-//   dL/d(conic) from d(power)/d(conic)
-//   dL/d(mean2d) from d(power)/d(mean)
+// Reverse traversal computes, for each Gaussian k that the pixel blended:
+//   T_before = T_after / (1 − α)      (recovering pre-blend transmittance)
+//   dL/dα    = dL/dcolor · (T_before·c − C_behind)
+//              + (−T_final / (1 − α)) · (background · dL/dcolor)
+//   dL/dc    = dL/dcolor · T_before · α
+//   dL/d(power)  = dL/dα · α_raw      (zero when α is capped at 0.99)
+//   dL/d(conic), dL/d(mean2d) from d(power)/d(conic), d(power)/d(mean)
+// The background term is required because the forward pass finishes with
+// `color += T_final · background` (rasterize_fwd.wgsl), so every α influences
+// the loss through T_final as well as through its own blend weight.
 
 struct Uniforms {
     view: mat4x4<f32>,
@@ -60,6 +108,13 @@ struct Uniforms {
     _pad_bg: vec2<f32>,
     background: vec3<f32>,
     output_flags: u32,
+    // Declared to match the buffer layout the forward pass writes, and
+    // deliberately never read here: the early-termination decision was already
+    // taken by rasterize_fwd.wgsl using this same value, and its outcome
+    // reaches us as the per-pixel stopping index in out_n_contrib.  Re-testing
+    // `T < transmittance_threshold` during the reverse walk would double-apply
+    // the cut-off against a reconstructed T, and would silently disagree with
+    // the forward pass on the boundary Gaussian.
     transmittance_threshold: f32,
     tile_size: u32,
     _pad1: vec2<u32>,
@@ -86,46 +141,27 @@ fn sigmoid(x: f32) -> f32 {
     return 1.0 / (1.0 + exp(-x));
 }
 
-// ── Workgroup shared-memory gradient accumulators ─────────────────────────────
+// ── Workgroup gradient partials (one entry per thread, no atomics) ────────────
 //
-// Layout of wg_grad (9 slots, bitcast f32 CAS accumulation):
-//   [0] = grad_colors[gidx*3+0]   (∂L/∂color.r)
-//   [1] = grad_colors[gidx*3+1]   (∂L/∂color.g)
-//   [2] = grad_colors[gidx*3+2]   (∂L/∂color.b)
-//   [3] = grad_opacities[gidx]    (∂L/∂opacity)
-//   [4] = grad_means2d[gidx*2+0]  (∂L/∂mean.x)
-//   [5] = grad_means2d[gidx*2+1]  (∂L/∂mean.y)
-//   [6] = grad_conics[gidx*3+0]   (∂L/∂conic.a)
-//   [7] = grad_conics[gidx*3+1]   (∂L/∂conic.b)
-//   [8] = grad_conics[gidx*3+2]   (∂L/∂conic.c)
+// Packed so the tree reduction below is 2 vec4 adds + 1 scalar add per step:
+//   wg_grad_a[i] = (∂L/∂color.r, ∂L/∂color.g, ∂L/∂color.b, ∂L/∂opacity)
+//   wg_grad_b[i] = (∂L/∂mean.x,  ∂L/∂mean.y,  ∂L/∂conic.a, ∂L/∂conic.b)
+//   wg_grad_c[i] =  ∂L/∂conic.c
 //
-// Protocol per Gaussian:
-//   1. Thread 0 resets all 9 slots to 0.
-//   2. workgroupBarrier() — all threads see the cleared values.
-//   3. Every thread that has a nonzero contribution does a CAS-loop into
-//      workgroup atomic slots (fast: no DRAM round-trip).
-//   4. workgroupBarrier() — all CAS loops complete.
-//   5. Thread 0 issues 9 CAS-loops into global atomic buffers (one per slot).
-//   6. workgroupBarrier() — global writes complete before thread 0 resets for
-//      the next Gaussian.
-//
-// This reduces global DRAM CAS from 256×9 to 9 per Gaussian.
-var<workgroup> wg_grad: array<atomic<u32>, 9u>;
+// Storage cost: 2 × 256 × 16 B + 256 × 4 B = 9216 B, plus wg_end's 1024 B for
+// a total of 10240 B — within the 16384 B
+// `max_compute_workgroup_storage_size` of the default WebGPU limits.
+var<workgroup> wg_grad_a: array<vec4<f32>, 256>;
+var<workgroup> wg_grad_b: array<vec4<f32>, 256>;
+var<workgroup> wg_grad_c: array<f32, 256>;
 
-/// CAS-loop accumulation into a workgroup atomic slot (bitcast f32 trick).
-fn wg_atomic_add_f32(slot: u32, val: f32) {
-    var old = atomicLoad(&wg_grad[slot]);
-    loop {
-        let nv  = bitcast<f32>(old) + val;
-        let res = atomicCompareExchangeWeak(&wg_grad[slot], old, bitcast<u32>(nv));
-        if res.exchanged { break; }
-        old = res.old_value;
-    }
-}
+// Scratch for the one-off max-reduction of the per-pixel stopping indices.
+// Written once before the main loop and never touched again, so it cannot race
+// with the per-Gaussian gradient reduction that reuses the same barriers.
+var<workgroup> wg_end: array<u32, 256>;
 
-// NOTE: WGSL prohibits passing ptr<storage,...> into functions.
-// Global atomic f32 accumulation is inlined at the call sites below using
-// the same CAS-loop trick as wg_atomic_add_f32.
+// NOTE: WGSL prohibits passing ptr<storage,...> into functions, so the global
+// atomic f32 accumulation is inlined at the call sites below using a CAS loop.
 
 @compute @workgroup_size(16, 16)
 fn rasterize_backward(
@@ -138,222 +174,220 @@ fn rasterize_backward(
     let W = u32(uniforms.viewport.x);
     let H = u32(uniforms.viewport.y);
 
-    if px >= W || py >= H {
-        return;
-    }
-
-    let pixel_idx = py * W + px;
+    // Do NOT return for out-of-image threads: the loop below contains
+    // workgroupBarrier() calls that all 256 threads must execute the same
+    // number of times.  Mask instead.
+    let in_bounds = px < W && py < H;
+    let pixel_idx = select(0u, py * W + px, in_bounds);
     let pixel_f = vec2<f32>(f32(px) + 0.5, f32(py) + 0.5);
 
     let tile_x = wid.x;
     let tile_y = wid.y;
     let tile_id = tile_y * uniforms.tile_grid.x + tile_x;
 
+    // Workgroup-uniform: derived from `wid` only.  `range_start` is the loop's
+    // lower bound directly; `range_end` bounds the per-thread `effective_end`
+    // that the max-reduction below turns into the uniform upper bound.
     let range = tile_ranges[tile_id];
     let range_start = range.x;
     let range_end = range.y;
 
-    let dL_dpixel = grad_output[pixel_idx];
-    let dL_dcolor_out = dL_dpixel.xyz;
-
+    let dL_dcolor_out = grad_output[pixel_idx].xyz;
     let final_T = out_transmittance[pixel_idx];
-    let n_contrib_total = out_n_contrib[pixel_idx];
+    // Forward adds `T_final * background`; every α feeds the loss through it.
+    let bg_dot_dpixel = dot(uniforms.background, dL_dcolor_out);
 
-    // Reconstruct transmittance in reverse order
+    // `out_n_contrib` holds the absolute stopping sort index (k_stop) written by
+    // the forward shader, NOT a count. Entries at or beyond it were never
+    // blended by this pixel, so this thread contributes zero for them.
+    let effective_end = min(out_n_contrib[pixel_idx], range_end);
+    let has_work = in_bounds && effective_end > range_start;
+
+    // ── Workgroup-uniform upper bound for the reverse walk ────────────────
+    // Each thread proposes its own exclusive end (range_start when it has no
+    // work at all, so it can never raise the max); the maximum over the
+    // workgroup is the highest sort index ANY pixel of this tile blended.
+    // Every entry above it was skipped by all 256 threads, so walking it would
+    // leave T, accum_color and the reduction totals untouched and flush
+    // nothing — dropping those iterations is observationally identical.
+    wg_end[lid_flat] = select(range_start, effective_end, has_work);
+    workgroupBarrier();
+    for (var stride = 128u; stride > 0u; stride = stride >> 1u) {
+        if lid_flat < stride {
+            wg_end[lid_flat] = max(wg_end[lid_flat], wg_end[lid_flat + stride]);
+        }
+        workgroupBarrier();
+    }
+    // `workgroupUniformLoad` both synchronises and returns a value that WGSL's
+    // uniformity analysis treats as workgroup-uniform — the prerequisite for
+    // using it as the trip count of a loop whose body contains barriers.
+    let tile_end = workgroupUniformLoad(&wg_end[0]);
+
+    // Reconstruct transmittance in reverse order.
     var T = final_T;
     var accum_color = vec3<f32>(0.0);
 
-    // Reverse traversal – only iterate over entries the forward pass actually
-    // processed. n_contrib_total now stores the absolute stopping sort index
-    // (k_stop) written by the forward shader, NOT a count.
-    let effective_end = n_contrib_total;
-    if effective_end <= range_start {
-        return;
-    }
+    var k = tile_end;
+    while k > range_start {
+        k -= 1u;
 
-    for (var k_rev = 0u; k_rev < (effective_end - range_start); k_rev++) {
-        let k = effective_end - 1u - k_rev;
         let gaussian_idx = sort_values[k];
         let mean = means2d[gaussian_idx];
         let conic = conics[gaussian_idx];
+        let raw_opacity = opacities[gaussian_idx];
 
         let d = pixel_f - mean;
         let power = -0.5 * (conic.x * d.x * d.x + 2.0 * conic.y * d.x * d.y + conic.z * d.y * d.y);
-
-        if power > 0.0 || power < -4.0 {
-            // ── Workgroup sync for Gaussians skipped by all threads ───────
-            // We still need barriers for the per-Gaussian accumulation protocol.
-            // Reset and flush with zero contribution from this thread.
-            if lid_flat == 0u {
-                atomicStore(&wg_grad[0], 0u);
-                atomicStore(&wg_grad[1], 0u);
-                atomicStore(&wg_grad[2], 0u);
-                atomicStore(&wg_grad[3], 0u);
-                atomicStore(&wg_grad[4], 0u);
-                atomicStore(&wg_grad[5], 0u);
-                atomicStore(&wg_grad[6], 0u);
-                atomicStore(&wg_grad[7], 0u);
-                atomicStore(&wg_grad[8], 0u);
-            }
-            workgroupBarrier();
-            // (no thread writes anything — all contributions are zero)
-            workgroupBarrier();
-            // (thread 0 writes nothing to global — slots are zero)
-            workgroupBarrier();
-            continue;
-        }
-
-        let alpha_raw = sigmoid(opacities[gaussian_idx]) * exp(power);
+        let sig = sigmoid(raw_opacity);
+        let alpha_raw = sig * exp(power);
         let alpha = min(alpha_raw, 0.99);
 
-        if alpha < 1.0 / 255.0 {
-            // Same barrier protocol for skipped Gaussians.
-            if lid_flat == 0u {
-                atomicStore(&wg_grad[0], 0u);
-                atomicStore(&wg_grad[1], 0u);
-                atomicStore(&wg_grad[2], 0u);
-                atomicStore(&wg_grad[3], 0u);
-                atomicStore(&wg_grad[4], 0u);
-                atomicStore(&wg_grad[5], 0u);
-                atomicStore(&wg_grad[6], 0u);
-                atomicStore(&wg_grad[7], 0u);
-                atomicStore(&wg_grad[8], 0u);
+        // Same rejection tests the forward shader applied, plus this thread's
+        // own early-termination bound.  Written as an accept-test rather than
+        // the forward's `power > 0.0 || power < -4.0` reject-test: the two agree
+        // on every finite `power`, and differ only when `power` is NaN, where
+        // both of the forward's comparisons are false so it does NOT skip.  A
+        // NaN here contributes zero instead of poisoning the whole tile's
+        // reduction with a NaN that the elected thread would then CAS into the
+        // global gradient buffers.
+        let contributes = has_work
+            && k < effective_end
+            && power <= 0.0
+            && power >= -4.0
+            && alpha >= 1.0 / 255.0;
+
+        var dL_dc = vec3<f32>(0.0);
+        var dL_dopacity = 0.0;
+        var dL_dmean = vec2<f32>(0.0);
+        var dL_dconic = vec3<f32>(0.0);
+
+        if contributes {
+            // Recover T before this Gaussian was blended.
+            T /= (1.0 - alpha);
+
+            let c = colors[gaussian_idx].xyz;
+
+            // dL/dα: blend term + background term (through T_final).
+            let dL_dalpha = dot(dL_dcolor_out, T * c - accum_color / (1.0 - alpha + 1e-7))
+                + (-final_T / (1.0 - alpha)) * bg_dot_dpixel;
+
+            dL_dc = dL_dcolor_out * T * alpha;
+
+            // Colour seen behind this Gaussian (T is now T_before).
+            accum_color += alpha * T * c;
+
+            // When α is capped at 0.99 the cap has zero derivative, so both
+            // dL/d(power) and dL/d(opacity) must be zeroed.
+            let capped = alpha_raw >= 0.99;
+            let dsig = sig * (1.0 - sig);
+            dL_dopacity = select(dL_dalpha * exp(power) * dsig, 0.0, capped);
+            let dL_dpower = select(dL_dalpha * alpha_raw, 0.0, capped);
+
+            // d(power)/d(mean.x) = conic.x*d.x + conic.y*d.y
+            // (power = -0.5·Q, dQ/d(d.x) = 2·(conic.x·d.x + conic.y·d.y),
+            //  d(d.x)/d(mean.x) = -1, so the two sign flips cancel.)
+            dL_dmean = vec2<f32>(
+                dL_dpower * (conic.x * d.x + conic.y * d.y),
+                dL_dpower * (conic.y * d.x + conic.z * d.y),
+            );
+
+            // d(power)/d(conic.x) = -0.5·d.x², d/d(conic.y) = -d.x·d.y,
+            // d/d(conic.z) = -0.5·d.y².
+            dL_dconic = vec3<f32>(
+                dL_dpower * (-0.5) * d.x * d.x,
+                dL_dpower * (-1.0) * d.x * d.y,
+                dL_dpower * (-0.5) * d.y * d.y,
+            );
+        }
+
+        // ── Phase 1: every thread publishes its partial (overwrite, no reset) ──
+        wg_grad_a[lid_flat] = vec4<f32>(dL_dc, dL_dopacity);
+        wg_grad_b[lid_flat] = vec4<f32>(dL_dmean, dL_dconic.x, dL_dconic.y);
+        wg_grad_c[lid_flat] = dL_dconic.z;
+        workgroupBarrier();
+
+        // ── Phase 2: tree reduction, 256 → 1 in log2(256) = 8 conflict-free
+        //             steps. `stride` is workgroup-uniform, so the barrier at
+        //             the end of the body stays in uniform control flow. ──────
+        for (var stride = 128u; stride > 0u; stride = stride >> 1u) {
+            if lid_flat < stride {
+                wg_grad_a[lid_flat] += wg_grad_a[lid_flat + stride];
+                wg_grad_b[lid_flat] += wg_grad_b[lid_flat + stride];
+                wg_grad_c[lid_flat] += wg_grad_c[lid_flat + stride];
             }
             workgroupBarrier();
-            workgroupBarrier();
-            workgroupBarrier();
-            continue;
         }
 
-        // Recover T before this Gaussian was blended
-        T /= (1.0 - alpha);
+        // ── Phase 3: thread 0 flushes the tile totals to global atomics ───────
+        // All 256 pixel contributions for THIS Gaussian (the same Gaussian in
+        // every thread, which is what makes the flush valid) are now in slot 0.
+        // Every thread reads it — a shared-memory broadcast, and slot 0 is not
+        // written again until the next iteration — so the cheap all-zero test
+        // below stays branch-uniform. The adds are inlined CAS loops because
+        // WGSL forbids ptr<storage> as a function argument.
+        let tot_a = wg_grad_a[0u];
+        let tot_b = wg_grad_b[0u];
+        let tot_c = wg_grad_c[0u];
+        // Gaussians past every pixel's k_stop, or rejected by the power/alpha
+        // tests in all 256 threads, sum to exactly zero — skip their 9 global
+        // CAS round-trips entirely.
+        let any_nonzero = any(tot_a != vec4<f32>(0.0))
+            || any(tot_b != vec4<f32>(0.0))
+            || tot_c != 0.0;
 
-        let c = colors[gaussian_idx].xyz;
-
-        // dL/d(alpha) for this Gaussian
-        let dL_dalpha = dot(dL_dcolor_out, T * c - accum_color / (1.0 - alpha + 1e-7));
-
-        // dL/d(color) for this Gaussian
-        let dL_dc = dL_dcolor_out * T * alpha;
-
-        // Accumulate color seen after this point (T is T_before_this_gaussian)
-        accum_color += alpha * T * c;
-
-        // dL/d(opacity) through sigmoid
-        // When alpha is capped at 0.99 (alpha_raw >= 0.99), the cap has zero
-        // derivative so both dL_dpower and dL_dopacity must be zeroed.
-        let sig = sigmoid(opacities[gaussian_idx]);
-        let dsig = sig * (1.0 - sig);
-        let dL_dopacity = select(dL_dalpha * exp(power) * dsig, 0.0, alpha_raw >= 0.99);
-
-        // dL/d(power) - true gradient of loss w.r.t. power
-        let dL_dpower = select(dL_dalpha * alpha_raw, 0.0, alpha_raw >= 0.99);
-
-        // dL/d(mean2d): d(power)/d(mean.x) = conic.x * d.x + conic.y * d.y
-        // (derivation: power = -0.5 * Q, d(Q)/d(d.x) = 2*(conic.x*d.x + conic.y*d.y),
-        //  d(power)/d(d.x) = -(conic.x*d.x + conic.y*d.y), d(d.x)/d(mean.x) = -1)
-        let dL_dx = dL_dpower * (conic.x * d.x + conic.y * d.y);
-        let dL_dy = dL_dpower * (conic.y * d.x + conic.z * d.y);
-
-        // dL/d(conic): d(power)/d(conic.x) = -0.5 * d.x^2
-        let dL_dconic_a = dL_dpower * (-0.5) * d.x * d.x;
-        let dL_dconic_b = dL_dpower * (-1.0) * d.x * d.y;  // -0.5 * 2.0 = -1.0
-        let dL_dconic_c = dL_dpower * (-0.5) * d.y * d.y;
-
-        // ── Phase 1: Reset workgroup accumulators (thread 0) ──────────────
-        if lid_flat == 0u {
-            atomicStore(&wg_grad[0], 0u);
-            atomicStore(&wg_grad[1], 0u);
-            atomicStore(&wg_grad[2], 0u);
-            atomicStore(&wg_grad[3], 0u);
-            atomicStore(&wg_grad[4], 0u);
-            atomicStore(&wg_grad[5], 0u);
-            atomicStore(&wg_grad[6], 0u);
-            atomicStore(&wg_grad[7], 0u);
-            atomicStore(&wg_grad[8], 0u);
-        }
-        workgroupBarrier();
-
-        // ── Phase 2: All threads accumulate into workgroup atomics ────────
-        wg_atomic_add_f32(0u, dL_dc.x);
-        wg_atomic_add_f32(1u, dL_dc.y);
-        wg_atomic_add_f32(2u, dL_dc.z);
-        wg_atomic_add_f32(3u, dL_dopacity);
-        wg_atomic_add_f32(4u, dL_dx);
-        wg_atomic_add_f32(5u, dL_dy);
-        wg_atomic_add_f32(6u, dL_dconic_a);
-        wg_atomic_add_f32(7u, dL_dconic_b);
-        wg_atomic_add_f32(8u, dL_dconic_c);
-        workgroupBarrier();
-
-        // ── Phase 3: Thread 0 flushes workgroup totals to global atomics ──
-        // All 256 pixel contributions for this Gaussian are now summed in
-        // wg_grad; inlined CAS loops (WGSL forbids ptr<storage> as fn args).
-        if lid_flat == 0u {
-            // slot 0 → grad_colors[gaussian_idx*3+0]
+        if lid_flat == 0u && any_nonzero {
+            // grad_colors[gaussian_idx*3 + 0..2]
             {
-                let wg_val = bitcast<f32>(atomicLoad(&wg_grad[0]));
                 let gidx = gaussian_idx * 3u + 0u;
                 var old0 = atomicLoad(&grad_colors[gidx]);
-                loop { let nv = bitcast<f32>(old0) + wg_val; let res = atomicCompareExchangeWeak(&grad_colors[gidx], old0, bitcast<u32>(nv)); if res.exchanged { break; } old0 = res.old_value; }
+                loop { let nv = bitcast<f32>(old0) + tot_a.x; let res = atomicCompareExchangeWeak(&grad_colors[gidx], old0, bitcast<u32>(nv)); if res.exchanged { break; } old0 = res.old_value; }
             }
-            // slot 1 → grad_colors[gaussian_idx*3+1]
             {
-                let wg_val = bitcast<f32>(atomicLoad(&wg_grad[1]));
                 let gidx = gaussian_idx * 3u + 1u;
                 var old1 = atomicLoad(&grad_colors[gidx]);
-                loop { let nv = bitcast<f32>(old1) + wg_val; let res = atomicCompareExchangeWeak(&grad_colors[gidx], old1, bitcast<u32>(nv)); if res.exchanged { break; } old1 = res.old_value; }
+                loop { let nv = bitcast<f32>(old1) + tot_a.y; let res = atomicCompareExchangeWeak(&grad_colors[gidx], old1, bitcast<u32>(nv)); if res.exchanged { break; } old1 = res.old_value; }
             }
-            // slot 2 → grad_colors[gaussian_idx*3+2]
             {
-                let wg_val = bitcast<f32>(atomicLoad(&wg_grad[2]));
                 let gidx = gaussian_idx * 3u + 2u;
                 var old2 = atomicLoad(&grad_colors[gidx]);
-                loop { let nv = bitcast<f32>(old2) + wg_val; let res = atomicCompareExchangeWeak(&grad_colors[gidx], old2, bitcast<u32>(nv)); if res.exchanged { break; } old2 = res.old_value; }
+                loop { let nv = bitcast<f32>(old2) + tot_a.z; let res = atomicCompareExchangeWeak(&grad_colors[gidx], old2, bitcast<u32>(nv)); if res.exchanged { break; } old2 = res.old_value; }
             }
-            // slot 3 → grad_opacities[gaussian_idx]
+            // grad_opacities[gaussian_idx]
             {
-                let wg_val = bitcast<f32>(atomicLoad(&wg_grad[3]));
                 let gidx = gaussian_idx;
                 var old3 = atomicLoad(&grad_opacities[gidx]);
-                loop { let nv = bitcast<f32>(old3) + wg_val; let res = atomicCompareExchangeWeak(&grad_opacities[gidx], old3, bitcast<u32>(nv)); if res.exchanged { break; } old3 = res.old_value; }
+                loop { let nv = bitcast<f32>(old3) + tot_a.w; let res = atomicCompareExchangeWeak(&grad_opacities[gidx], old3, bitcast<u32>(nv)); if res.exchanged { break; } old3 = res.old_value; }
             }
-            // slot 4 → grad_means2d[gaussian_idx*2+0]
+            // grad_means2d[gaussian_idx*2 + 0..1]
             {
-                let wg_val = bitcast<f32>(atomicLoad(&wg_grad[4]));
                 let gidx = gaussian_idx * 2u + 0u;
                 var old4 = atomicLoad(&grad_means2d[gidx]);
-                loop { let nv = bitcast<f32>(old4) + wg_val; let res = atomicCompareExchangeWeak(&grad_means2d[gidx], old4, bitcast<u32>(nv)); if res.exchanged { break; } old4 = res.old_value; }
+                loop { let nv = bitcast<f32>(old4) + tot_b.x; let res = atomicCompareExchangeWeak(&grad_means2d[gidx], old4, bitcast<u32>(nv)); if res.exchanged { break; } old4 = res.old_value; }
             }
-            // slot 5 → grad_means2d[gaussian_idx*2+1]
             {
-                let wg_val = bitcast<f32>(atomicLoad(&wg_grad[5]));
                 let gidx = gaussian_idx * 2u + 1u;
                 var old5 = atomicLoad(&grad_means2d[gidx]);
-                loop { let nv = bitcast<f32>(old5) + wg_val; let res = atomicCompareExchangeWeak(&grad_means2d[gidx], old5, bitcast<u32>(nv)); if res.exchanged { break; } old5 = res.old_value; }
+                loop { let nv = bitcast<f32>(old5) + tot_b.y; let res = atomicCompareExchangeWeak(&grad_means2d[gidx], old5, bitcast<u32>(nv)); if res.exchanged { break; } old5 = res.old_value; }
             }
-            // slot 6 → grad_conics[gaussian_idx*3+0]
+            // grad_conics[gaussian_idx*3 + 0..2]
             {
-                let wg_val = bitcast<f32>(atomicLoad(&wg_grad[6]));
                 let gidx = gaussian_idx * 3u + 0u;
                 var old6 = atomicLoad(&grad_conics[gidx]);
-                loop { let nv = bitcast<f32>(old6) + wg_val; let res = atomicCompareExchangeWeak(&grad_conics[gidx], old6, bitcast<u32>(nv)); if res.exchanged { break; } old6 = res.old_value; }
+                loop { let nv = bitcast<f32>(old6) + tot_b.z; let res = atomicCompareExchangeWeak(&grad_conics[gidx], old6, bitcast<u32>(nv)); if res.exchanged { break; } old6 = res.old_value; }
             }
-            // slot 7 → grad_conics[gaussian_idx*3+1]
             {
-                let wg_val = bitcast<f32>(atomicLoad(&wg_grad[7]));
                 let gidx = gaussian_idx * 3u + 1u;
                 var old7 = atomicLoad(&grad_conics[gidx]);
-                loop { let nv = bitcast<f32>(old7) + wg_val; let res = atomicCompareExchangeWeak(&grad_conics[gidx], old7, bitcast<u32>(nv)); if res.exchanged { break; } old7 = res.old_value; }
+                loop { let nv = bitcast<f32>(old7) + tot_b.w; let res = atomicCompareExchangeWeak(&grad_conics[gidx], old7, bitcast<u32>(nv)); if res.exchanged { break; } old7 = res.old_value; }
             }
-            // slot 8 → grad_conics[gaussian_idx*3+2]
             {
-                let wg_val = bitcast<f32>(atomicLoad(&wg_grad[8]));
                 let gidx = gaussian_idx * 3u + 2u;
                 var old8 = atomicLoad(&grad_conics[gidx]);
-                loop { let nv = bitcast<f32>(old8) + wg_val; let res = atomicCompareExchangeWeak(&grad_conics[gidx], old8, bitcast<u32>(nv)); if res.exchanged { break; } old8 = res.old_value; }
+                loop { let nv = bitcast<f32>(old8) + tot_c; let res = atomicCompareExchangeWeak(&grad_conics[gidx], old8, bitcast<u32>(nv)); if res.exchanged { break; } old8 = res.old_value; }
             }
         }
+        // Keeps the next iteration's Phase 1 stores from racing thread 0's
+        // reads of slot 0.
         workgroupBarrier();
     }
 }

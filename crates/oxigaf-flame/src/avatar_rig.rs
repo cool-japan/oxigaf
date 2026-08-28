@@ -688,7 +688,11 @@ impl FlameRigParams {
 ///
 /// # Errors
 ///
-/// Propagates any errors from [`AvatarRig::evaluate`] or the delta-add methods.
+/// Propagates any errors from [`AvatarRig::evaluate`] or the delta-add
+/// methods — in particular, [`RigError::DimensionMismatch`] if
+/// `base_params.expression.len() != rig.expression_dim` or
+/// `base_params.pose.len() != rig.pose_dim`. Mismatched lengths are never
+/// silently truncated.
 pub fn apply_rig_to_params(
     rig: &AvatarRig,
     base_params: &FlameRigParams,
@@ -696,16 +700,8 @@ pub fn apply_rig_to_params(
     let (expr_delta, pose_delta) = rig.evaluate()?;
 
     let mut result = base_params.clone();
-
-    // Expression delta may be shorter/longer than base; use min-length addition
-    for (base_val, &delta_val) in result.expression.iter_mut().zip(expr_delta.iter()) {
-        *base_val += delta_val;
-    }
-
-    // Pose delta
-    for (base_val, &delta_val) in result.pose.iter_mut().zip(pose_delta.iter()) {
-        *base_val += delta_val;
-    }
+    result.add_expression_delta(&expr_delta)?;
+    result.add_pose_delta(&pose_delta)?;
 
     Ok(result)
 }
@@ -778,13 +774,30 @@ impl RigAnimation {
     /// - `t >= last_keyframe.time` uses the last keyframe.
     /// - Otherwise linearly interpolates between the two surrounding keyframes.
     ///
+    /// This is a pure function of `t` (and the animation's keyframes/rig
+    /// definition): every control is reset to its default before each
+    /// evaluation, so a control that is absent from the selected keyframe(s)
+    /// always falls back to its default rather than to whatever value a
+    /// previous `evaluate_at` call happened to leave on the rig.
+    ///
     /// # Errors
     ///
+    /// Returns [`RigError::InvalidConfig`] if `t` is not finite.
     /// Returns errors from rig evaluation or keyframe lookup.
     pub fn evaluate_at(&mut self, t: f32) -> Result<(Vec<f32>, Vec<f32>), RigError> {
+        if !t.is_finite() {
+            return Err(RigError::InvalidConfig(format!(
+                "evaluation time must be finite, got {t}"
+            )));
+        }
         if self.keyframes.is_empty() {
             return Err(RigError::EmptyRig);
         }
+
+        // Reset every control to its default first so this call cannot be
+        // influenced by state a previous `evaluate_at` (or `set`) call left
+        // on the rig — see `test_rig_animation_evaluate_at_is_order_independent`.
+        self.rig.reset_all();
 
         // First keyframe boundary
         if t <= self.keyframes[0].time {
@@ -800,9 +813,15 @@ impl RigAnimation {
             return self.rig.evaluate();
         }
 
-        // Find surrounding keyframes
+        // Find surrounding keyframes. `t` is finite and strictly between the
+        // first and last keyframe times here (both boundary cases above
+        // returned already), and keyframes are kept sorted by `add_keyframe`,
+        // so `next_idx` is guaranteed to be in `1..=last_idx`; the
+        // `saturating_sub`/`min` below are defensive belt-and-suspenders
+        // against that invariant ever being violated.
         let next_idx = self.keyframes.partition_point(|k| k.time <= t);
-        let prev_idx = next_idx - 1;
+        let prev_idx = next_idx.saturating_sub(1).min(last_idx);
+        let next_idx = next_idx.min(last_idx);
 
         let kf_prev = self.keyframes[prev_idx].clone();
         let kf_next = self.keyframes[next_idx].clone();
@@ -916,8 +935,9 @@ pub fn compute_rig_stats(rig: &AvatarRig) -> Result<RigStats, RigError> {
 ///
 /// # Errors
 ///
-/// - [`RigError::InvalidConfig`] if `n_frames == 0` or `rig` lacks `mouth_open`.
+/// - [`RigError::InvalidConfig`] if `n_frames == 0`.
 /// - [`RigError::InvalidControlValue`] if `mouth_open_amp` is non-finite.
+/// - [`RigError::UnknownControl`] if `rig` lacks a `mouth_open` control.
 pub fn generate_talking_animation(
     rig: AvatarRig,
     n_frames: usize,
@@ -1436,6 +1456,22 @@ mod tests {
         assert!(result.pose[6] > 0.0);
     }
 
+    #[test]
+    fn test_apply_rig_to_params_dimension_mismatch_errors() {
+        // `apply_rig_to_params` is documented to propagate `DimensionMismatch`
+        // rather than silently truncating a mis-sized `base_params`.
+        let rig = standard_face_rig(50); // expression_dim=50, pose_dim=15
+        let undersized_expr = FlameRigParams::neutral(10, 15);
+        let err = apply_rig_to_params(&rig, &undersized_expr)
+            .expect_err("shorter expression base must error, not truncate");
+        assert!(matches!(err, RigError::DimensionMismatch { .. }));
+
+        let undersized_pose = FlameRigParams::neutral(50, 3);
+        let err = apply_rig_to_params(&rig, &undersized_pose)
+            .expect_err("shorter pose base must error, not truncate");
+        assert!(matches!(err, RigError::DimensionMismatch { .. }));
+    }
+
     // -----------------------------------------------------------------------
     // RigAnimation tests
     // -----------------------------------------------------------------------
@@ -1533,6 +1569,74 @@ mod tests {
         let mut anim = RigAnimation::new(rig);
         let result = anim.evaluate_at(0.5);
         assert!(matches!(result, Err(RigError::EmptyRig)));
+    }
+
+    #[test]
+    fn test_rig_animation_evaluate_at_nan_time_errors() {
+        let rig = standard_face_rig(50);
+        let mut anim = RigAnimation::new(rig);
+        anim.add_keyframe(RigKeyframe {
+            time: 0.0,
+            control_values: vec![("smile".to_owned(), 1.0)],
+        })
+        .expect("add kf 0");
+        anim.add_keyframe(RigKeyframe {
+            time: 1.0,
+            control_values: vec![("smile".to_owned(), -1.0)],
+        })
+        .expect("add kf 1");
+
+        // Must return an error, not panic (previously an arithmetic
+        // underflow / index-out-of-bounds panic on `usize` subtraction).
+        let result = anim.evaluate_at(f32::NAN);
+        assert!(matches!(result, Err(RigError::InvalidConfig(_))));
+
+        let result = anim.evaluate_at(f32::INFINITY);
+        assert!(matches!(result, Err(RigError::InvalidConfig(_))));
+    }
+
+    #[test]
+    fn test_rig_animation_evaluate_at_is_order_independent() {
+        // Regression test: `evaluate_at` must be a pure function of `t` and
+        // must not leak state between calls. Keyframe 0 sets only "smile";
+        // keyframe 1 sets only "mouth_open". Evaluating at t=0.9 first (which
+        // used to pin "mouth_open" on the rig) must not change the result of
+        // a later `evaluate_at(0.1)`.
+        fn build_anim() -> RigAnimation {
+            let rig = standard_face_rig(50);
+            let mut anim = RigAnimation::new(rig);
+            anim.add_keyframe(RigKeyframe {
+                time: 0.0,
+                control_values: vec![("smile".to_owned(), 1.0)],
+            })
+            .expect("add kf 0");
+            anim.add_keyframe(RigKeyframe {
+                time: 1.0,
+                control_values: vec![("mouth_open".to_owned(), 1.0)],
+            })
+            .expect("add kf 1");
+            anim
+        }
+
+        let mut fresh = build_anim();
+        let (fresh_expr, fresh_pose) = fresh.evaluate_at(0.1).expect("evaluate_at 0.1 (fresh)");
+
+        let mut warmed = build_anim();
+        warmed
+            .evaluate_at(0.9)
+            .expect("evaluate_at 0.9 (warm-up call)");
+        let (warmed_expr, warmed_pose) = warmed
+            .evaluate_at(0.1)
+            .expect("evaluate_at 0.1 (after warm-up)");
+
+        assert_eq!(fresh_expr.len(), warmed_expr.len());
+        for (a, b) in fresh_expr.iter().zip(warmed_expr.iter()) {
+            assert!((a - b).abs() < 1e-6, "expression mismatch: {a} vs {b}");
+        }
+        assert_eq!(fresh_pose.len(), warmed_pose.len());
+        for (a, b) in fresh_pose.iter().zip(warmed_pose.iter()) {
+            assert!((a - b).abs() < 1e-6, "pose mismatch: {a} vs {b}");
+        }
     }
 
     // -----------------------------------------------------------------------

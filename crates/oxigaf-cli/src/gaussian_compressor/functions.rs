@@ -2,10 +2,21 @@
 //!
 //! 🤖 Generated with [SplitRS](https://github.com/cool-japan/splitrs)
 
+use rayon::prelude::*;
+
 use super::types::{
     CompressedScene, CompressionConfig, CompressionStats, CompressorError, DecompressedScene,
-    GcSceneSlices, KMeansConfig, QuantizedAttribute, ScenePruningConfig,
+    GcSceneSlices, KMeansConfig, PositionClustering, QuantizedAttribute, ScenePruningConfig,
 };
+
+/// Fixed PRNG seed used by [`gc_compress`] for k-means position clustering.
+///
+/// Compression must be reproducible: the same scene and the same
+/// [`CompressionConfig`] have to produce byte-identical output, so the
+/// k-means++ seeding inside `gc_compress` cannot draw entropy from the
+/// environment. Callers that want a different clustering can drive
+/// [`gc_kmeans_positions`] directly with their own `rng_state`.
+const GC_CLUSTERING_SEED: u64 = 0x5DEE_CE66_D3D8_1F1D;
 
 #[inline]
 fn sigmoid(x: f32) -> f32 {
@@ -139,10 +150,14 @@ pub fn gc_compute_prune_mask(
         let keep_count = (kept_indices.len() as f32 * config.preserve_top_fraction).ceil() as usize;
         if keep_count < kept_indices.len() {
             let mut sorted = kept_indices.clone();
+            // `sigmoid` is strictly monotonic, so comparing raw opacity
+            // logits descending yields the identical order as comparing
+            // activated (sigmoid'd) opacities, without an `exp()` call per
+            // comparison.
             sorted.sort_by(|&a, &b| {
-                let oa = sigmoid(opacities[a]);
-                let ob = sigmoid(opacities[b]);
-                ob.partial_cmp(&oa).unwrap_or(std::cmp::Ordering::Equal)
+                opacities[b]
+                    .partial_cmp(&opacities[a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
             });
             for &idx in &sorted[keep_count..] {
                 mask[idx] = false;
@@ -154,9 +169,9 @@ pub fn gc_compute_prune_mask(
         if kept.len() > target {
             let mut sorted = kept.clone();
             sorted.sort_by(|&a, &b| {
-                let oa = sigmoid(opacities[a]);
-                let ob = sigmoid(opacities[b]);
-                ob.partial_cmp(&oa).unwrap_or(std::cmp::Ordering::Equal)
+                opacities[b]
+                    .partial_cmp(&opacities[a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
             });
             for &idx in &sorted[target..] {
                 mask[idx] = false;
@@ -204,10 +219,13 @@ pub fn gc_prune_to_topn(opacities: &[f32], n: usize) -> Result<Vec<usize>, Compr
     }
     let keep = n.min(total);
     let mut indices: Vec<usize> = (0..total).collect();
+    // See `gc_compute_prune_mask`: compare raw logits, not `sigmoid`-activated
+    // values — the ordering is identical since `sigmoid` is monotonic, but
+    // this way sorting costs zero `exp()` calls instead of O(n log n) of them.
     indices.sort_by(|&a, &b| {
-        let oa = sigmoid(opacities[a]);
-        let ob = sigmoid(opacities[b]);
-        ob.partial_cmp(&oa).unwrap_or(std::cmp::Ordering::Equal)
+        opacities[b]
+            .partial_cmp(&opacities[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
     });
     indices.truncate(keep);
     Ok(indices)
@@ -280,6 +298,21 @@ pub fn gc_kmeans_plus_plus_init(
 /// Run k-means clustering on 3D positions.
 ///
 /// Returns `(cluster_centers: Vec<f32> [K×3], assignments: Vec<usize> [N])`.
+///
+/// # Convergence
+/// Lloyd's algorithm runs for at most `config.n_iterations` iterations,
+/// stopping early once the largest per-centre shift drops below
+/// `config.tolerance`. Two distinct outcomes are *not* treated the same:
+/// - `config.n_iterations == 0` (a degenerate configuration — the loop body
+///   never runs, so convergence is impossible by construction) is a hard
+///   error: [`CompressorError::KMeansNoConvergence`].
+/// - Exhausting a *positive* iteration budget without the shift dropping
+///   below `tolerance` is not an error — real k-means runs are not
+///   guaranteed to converge within any fixed budget, and the centers/
+///   assignments found so far are still a valid (if not fully settled)
+///   clustering. This case logs a `tracing::warn!` and returns `Ok` with
+///   the best result found, rather than promoting ordinary non-convergence
+///   to a hard failure.
 pub fn gc_kmeans_positions(
     positions: &[f32],
     config: &KMeansConfig,
@@ -318,18 +351,28 @@ pub fn gc_kmeans_positions(
     let mut assignments = vec![0usize; n];
     let mut converged = false;
     for _iter in 0..config.n_iterations {
-        for (i, assignment) in assignments.iter_mut().enumerate().take(n) {
-            let mut best_dist = f32::MAX;
-            let mut best_k = 0usize;
-            for ci in 0..k {
-                let d = sq_dist3(positions, i * 3, &centers, ci * 3);
-                if d < best_dist {
-                    best_dist = d;
-                    best_k = ci;
+        // Assignment step: each point's nearest centre is independent of
+        // every other point's, so this O(n*k) scan (the dominant cost per
+        // iteration) is parallelised across points. The centroid-update step
+        // below stays serial: it accumulates into shared per-cluster sums in
+        // a fixed order, which keeps floating-point results deterministic
+        // (a parallel reduction would sum in a different, run-dependent
+        // order) and its own cost is only O(n), not the bottleneck.
+        assignments
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(i, assignment)| {
+                let mut best_dist = f32::MAX;
+                let mut best_k = 0usize;
+                for ci in 0..k {
+                    let d = sq_dist3(positions, i * 3, &centers, ci * 3);
+                    if d < best_dist {
+                        best_dist = d;
+                        best_k = ci;
+                    }
                 }
-            }
-            *assignment = best_k;
-        }
+                *assignment = best_k;
+            });
         let mut new_centers = vec![0.0f32; k * 3];
         let mut counts = vec![0usize; k];
         for i in 0..n {
@@ -366,8 +409,22 @@ pub fn gc_kmeans_positions(
             break;
         }
     }
-    if !converged && config.n_iterations == 0 {
-        return Err(CompressorError::KMeansNoConvergence);
+    if !converged {
+        if config.n_iterations == 0 {
+            return Err(CompressorError::KMeansNoConvergence);
+        }
+        // Ran every requested iteration without the max centre shift dropping
+        // below `tolerance`. This is not necessarily a problem (k-means is
+        // best-effort and this is still the best clustering found), so it is
+        // not promoted to a hard error here — but the caller should know,
+        // since previously this state was indistinguishable from a clean
+        // convergence.
+        tracing::warn!(
+            "k-means position clustering did not converge within {} iteration(s) (tolerance \
+             {}); returning the best centers/assignments found so far.",
+            config.n_iterations,
+            config.tolerance,
+        );
     }
     Ok((centers, assignments))
 }
@@ -395,13 +452,21 @@ pub fn gc_cluster_residuals(
             got: assignments.len(),
         });
     }
+    if centers.is_empty() || !centers.len().is_multiple_of(3) {
+        return Err(CompressorError::InvalidConfig(format!(
+            "centers must be a non-empty flat array of 3D points (length a multiple of 3), got \
+             length {}",
+            centers.len()
+        )));
+    }
     let k = centers.len() / 3;
     let mut residuals = vec![0.0f32; n * 3];
     for i in 0..n {
         let ci = assignments[i];
         if ci >= k {
+            // `k` is >= 1 here (guarded above), so this never subtracts.
             return Err(CompressorError::DimensionMismatch {
-                expected: k - 1,
+                expected: k,
                 got: ci,
             });
         }
@@ -413,7 +478,33 @@ pub fn gc_cluster_residuals(
 }
 /// Compress an entire Gaussian scene.
 ///
-/// Performs pruning, optional position clustering, and per-attribute quantization.
+/// Performs pruning, optional position clustering, and per-attribute
+/// quantization.
+///
+/// # Position clustering
+/// With `config.use_position_clustering`, positions are run through k-means
+/// (see [`gc_kmeans_positions`]) and what gets quantized is each Gaussian's
+/// **residual** from its assigned centre. The codebook and the per-Gaussian
+/// assignment are persisted on [`CompressedScene::position_clustering`], so
+/// [`gc_decompress`] can rebuild absolute positions exactly. Residuals span
+/// a fraction of the scene's extent, so a fixed bit width resolves them far
+/// more finely than absolute coordinates — the accuracy win that pays for
+/// the codebook plus one index per Gaussian.
+///
+/// Clustering is deterministic: it seeds k-means from a fixed internal
+/// constant, never from the environment, so the same scene and config always
+/// compress to the same bytes. `kmeans.n_clusters` is clamped down to the number
+/// of Gaussians that survived pruning (k-means needs at least one point per
+/// centre); a zero `n_clusters` or `n_iterations` is rejected as
+/// [`CompressorError::InvalidConfig`], since neither can produce a
+/// clustering.
+///
+/// # Pruning provenance
+/// Pruning happens *before* quantization, so compressed row `j` is the j-th
+/// survivor, not original row `j`. The mapping is recorded on
+/// [`CompressedScene::kept_indices`] (ascending original indices) so callers
+/// — [`gc_compute_stats`] in particular — can realign survivors with their
+/// originals.
 pub fn gc_compress(
     slices: GcSceneSlices<'_>,
     config: &CompressionConfig,
@@ -478,11 +569,6 @@ pub fn gc_compress(
         .filter_map(|(&v, &keep)| if keep { Some(v) } else { None })
         .collect();
     let kept_sh_dc = gc_apply_mask_flat(sh_dc, &prune_mask, 3)?;
-    let kept_sh_rest_k = if n_rest_per_gaussian == 0 {
-        1
-    } else {
-        n_rest_per_gaussian
-    };
     let kept_sh_rest = if n_rest_per_gaussian > 0 {
         gc_apply_mask_flat(sh_rest, &prune_mask, n_rest_per_gaussian)?
     } else {
@@ -492,13 +578,85 @@ pub fn gc_compress(
     if n_kept == 0 {
         return Err(CompressorError::EmptyScene);
     }
-    let final_positions = if config.use_position_clustering && n_kept >= config.kmeans.n_clusters {
-        let mut rng = 0xDEAD_BEEF_u64;
+    // Record which ORIGINAL Gaussian each survivor came from. Both
+    // `gc_apply_mask_flat` and the `kept_opacities` filter above walk the
+    // mask in index order, so survivor `j` is original `kept_indices[j]` and
+    // the list is ascending. `gc_compute_stats` needs exactly this to
+    // compare a survivor's dequantized value against the right original.
+    let mut kept_indices: Vec<u32> = Vec::with_capacity(n_kept);
+    for (i, &keep) in prune_mask.iter().enumerate() {
+        if keep {
+            let idx = u32::try_from(i).map_err(|_| {
+                CompressorError::InvalidConfig(format!(
+                    "Gaussian index {i} exceeds the u32 index space used by \
+                     CompressedScene::kept_indices"
+                ))
+            })?;
+            kept_indices.push(idx);
+        }
+    }
+    // Position clustering: quantize residuals from a k-means codebook rather
+    // than absolute coordinates, and persist the codebook + assignments so
+    // decompression can undo it. (An earlier version quantized the residuals
+    // but had nowhere to store the codebook, so `gc_decompress` handed the
+    // residuals back as world positions and the scene silently collapsed
+    // toward the origin; a later version disabled the feature outright with
+    // a warning. Both are gone: `CompressedScene` now carries the codebook.)
+    let (final_positions, position_clustering) = if config.use_position_clustering {
+        let requested_k = config.kmeans.n_clusters;
+        if requested_k == 0 {
+            return Err(CompressorError::InvalidConfig(
+                "use_position_clustering is enabled but kmeans.n_clusters is 0: a codebook needs \
+                 at least one centre"
+                    .to_string(),
+            ));
+        }
+        if config.kmeans.n_iterations == 0 {
+            return Err(CompressorError::InvalidConfig(
+                "use_position_clustering is enabled but kmeans.n_iterations is 0: Lloyd's \
+                 algorithm would never run, so no clustering could be produced"
+                    .to_string(),
+            ));
+        }
+        // k-means needs at least one point per centre. A scene can easily
+        // have fewer survivors than the (deliberately generous) default
+        // codebook size, so clamp instead of failing.
+        let k = requested_k.min(n_kept);
+        if k < requested_k {
+            tracing::warn!(
+                "position clustering: reducing k from {} to {}, the number of Gaussians \
+                 surviving pruning",
+                requested_k,
+                k,
+            );
+        }
+        let kmeans_config = KMeansConfig {
+            n_clusters: k,
+            ..config.kmeans.clone()
+        };
+        let mut rng_state = GC_CLUSTERING_SEED;
         let (centers, assignments) =
-            gc_kmeans_positions(&kept_positions, &config.kmeans, &mut rng)?;
-        gc_cluster_residuals(&kept_positions, &assignments, &centers)?
+            gc_kmeans_positions(&kept_positions, &kmeans_config, &mut rng_state)?;
+        let residuals = gc_cluster_residuals(&kept_positions, &assignments, &centers)?;
+        let mut assignments_u32: Vec<u32> = Vec::with_capacity(assignments.len());
+        for &assignment in &assignments {
+            let idx = u32::try_from(assignment).map_err(|_| {
+                CompressorError::InvalidConfig(format!(
+                    "cluster index {assignment} exceeds the u32 index space used by \
+                     PositionClustering::assignments"
+                ))
+            })?;
+            assignments_u32.push(idx);
+        }
+        (
+            residuals,
+            Some(PositionClustering {
+                centers,
+                assignments: assignments_u32,
+            }),
+        )
     } else {
-        kept_positions.clone()
+        (kept_positions, None)
     };
     let q_positions = QuantizedAttribute::quantize(&final_positions, config.position_precision)?;
     let q_rotations = QuantizedAttribute::quantize(&kept_rotations, config.rotation_precision)?;
@@ -510,7 +668,6 @@ pub fn gc_compress(
     } else {
         QuantizedAttribute::quantize(&[], config.sh_rest_precision)?
     };
-    let _ = kept_sh_rest_k;
     Ok(CompressedScene {
         positions: q_positions,
         rotations: q_rotations,
@@ -520,12 +677,18 @@ pub fn gc_compress(
         sh_rest: q_sh_rest,
         n_gaussians: n_kept,
         n_sh_rest: n_rest_per_gaussian,
+        position_clustering,
+        kept_indices,
         compression_config: config.clone(),
     })
 }
 /// Decompress a compressed scene back to f32 arrays.
+///
+/// Positions go through [`CompressedScene::reconstruct_positions`], which
+/// adds the k-means centre back onto each residual when the scene was
+/// compressed with position clustering.
 pub fn gc_decompress(scene: &CompressedScene) -> Result<DecompressedScene, CompressorError> {
-    let positions = scene.positions.dequantize();
+    let positions = scene.reconstruct_positions()?;
     let rotations = scene.rotations.dequantize();
     let scales = scene.scales.dequantize();
     let opacities = scene.opacities.dequantize();
@@ -542,7 +705,59 @@ pub fn gc_decompress(scene: &CompressedScene) -> Result<DecompressedScene, Compr
         n_gaussians: n,
     })
 }
+/// Root-mean-square error between two f32 slices, truncated to the shorter length.
+fn rmse(a: &[f32], b: &[f32]) -> f32 {
+    let len = a.len().min(b.len());
+    if len == 0 {
+        return 0.0;
+    }
+    let mse: f32 = a[..len]
+        .iter()
+        .zip(b[..len].iter())
+        .map(|(&x, &y)| (x - y) * (x - y))
+        .sum::<f32>()
+        / len as f32;
+    mse.sqrt()
+}
+/// Gather the rows named by `kept_indices` out of a flat N×`k` array.
+///
+/// Returns `None` when `data` is too short to hold every requested row —
+/// the caller must then fall back rather than compare against a truncated,
+/// silently misaligned reference.
+fn gather_rows(data: &[f32], kept_indices: &[u32], k: usize) -> Option<Vec<f32>> {
+    let mut out = Vec::with_capacity(kept_indices.len().saturating_mul(k));
+    for &idx in kept_indices {
+        let start = (idx as usize).checked_mul(k)?;
+        let end = start.checked_add(k)?;
+        if end > data.len() {
+            return None;
+        }
+        out.extend_from_slice(&data[start..end]);
+    }
+    Some(out)
+}
 /// Compute compression statistics comparing original arrays to a compressed scene.
+///
+/// `position_quantization_rmse`/`opacity_quantization_rmse` are only
+/// meaningful when each compressed value is compared against the *same*
+/// Gaussian it came from. `gc_compress` prunes Gaussians (by opacity
+/// threshold, scale bounds, and/or top-N/fraction truncation) *before*
+/// quantizing, so compressed row `j` is the j-th SURVIVOR, not original
+/// index `j` — and with `preserve_top_fraction`/`target_n_gaussians` the
+/// survivors are not even a prefix of the originals.
+///
+/// [`CompressedScene::kept_indices`] records the survivor→original mapping,
+/// so both RMSEs are computed exactly: each survivor is compared against
+/// `original[kept_indices[j]]`. Positions go through
+/// [`CompressedScene::reconstruct_positions`], so a clustered scene is
+/// measured on rebuilt world positions rather than on raw residuals.
+///
+/// The `NaN` fallback survives for scenes not produced by `gc_compress`: if
+/// `kept_indices` is missing/malformed or the supplied originals are too
+/// short to contain every kept index, and the counts show pruning happened,
+/// the RMSEs are `NaN` with a `tracing::warn!` rather than a misleading,
+/// index-misaligned number. When nothing was pruned, survivor `j` provably
+/// *is* original `j`, so the direct comparison is used.
 pub fn gc_compute_stats(
     original_positions: &[f32],
     original_opacities: &[f32],
@@ -563,32 +778,53 @@ pub fn gc_compute_stats(
     let compressed_mb = scene.compressed_bytes() as f32 / (1024.0 * 1024.0);
     let uncompressed_mb = scene.uncompressed_bytes() as f32 / (1024.0 * 1024.0);
     let compression_ratio = scene.compression_ratio();
-    let deq_positions = scene.positions.dequantize();
-    let pos_len = deq_positions.len().min(original_positions.len());
-    let pos_rmse = if pos_len > 0 {
-        let mse: f32 = deq_positions[..pos_len]
-            .iter()
-            .zip(original_positions[..pos_len].iter())
-            .map(|(&a, &b)| (a - b) * (a - b))
-            .sum::<f32>()
-            / pos_len as f32;
-        mse.sqrt()
-    } else {
-        0.0
-    };
+
+    let deq_positions = scene.reconstruct_positions()?;
     let deq_opacities = scene.opacities.dequantize();
-    let op_len = deq_opacities.len().min(original_opacities.len());
-    let op_rmse = if op_len > 0 {
-        let mse: f32 = deq_opacities[..op_len]
-            .iter()
-            .zip(original_opacities[..op_len].iter())
-            .map(|(&a, &b)| (a - b) * (a - b))
-            .sum::<f32>()
-            / op_len as f32;
-        mse.sqrt()
+
+    // Exact path: realign every survivor with the original it came from.
+    let realigned = if scene.kept_indices.len() == n_after {
+        match (
+            gather_rows(original_positions, &scene.kept_indices, 3),
+            gather_rows(original_opacities, &scene.kept_indices, 1),
+        ) {
+            (Some(ref_positions), Some(ref_opacities)) => Some((ref_positions, ref_opacities)),
+            _ => None,
+        }
     } else {
-        0.0
+        None
     };
+
+    let (pos_rmse, op_rmse) = match realigned {
+        Some((ref_positions, ref_opacities)) => (
+            rmse(&deq_positions, &ref_positions),
+            rmse(&deq_opacities, &ref_opacities),
+        ),
+        // Nothing was pruned, so survivor j is original j and the direct
+        // comparison is already aligned.
+        None if n_after == n_before => (
+            rmse(&deq_positions, original_positions),
+            rmse(&deq_opacities, original_opacities),
+        ),
+        None => {
+            // Deliberately reports the two counts rather than a subtraction:
+            // this branch is also reached when the supplied originals are
+            // SHORTER than the compressed scene, where a "pruned" count
+            // would render as a nonsensical zero.
+            tracing::warn!(
+                "gc_compute_stats: the compressed scene holds {} Gaussian(s) but {} original(s) \
+                 were supplied, and the survivor→original mapping \
+                 (CompressedScene::kept_indices) is missing, the wrong length, or names indices \
+                 past those originals — so survivors cannot be realigned. \
+                 position_quantization_rmse/opacity_quantization_rmse are reported as NaN rather \
+                 than a misleading, index-misaligned comparison.",
+                n_after,
+                n_before,
+            );
+            (f32::NAN, f32::NAN)
+        }
+    };
+
     Ok(CompressionStats {
         n_gaussians_before: n_before,
         n_gaussians_after: n_after,
@@ -638,4 +874,631 @@ pub fn gc_format_config(config: &CompressionConfig) -> String {
         config.pruning.max_log_scale,
         config.pruning.min_log_scale,
     )
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+//
+// `gaussian_compressor::tests` (declared in mod.rs, sibling to this module)
+// covers the pipeline end-to-end; these are focused regression tests for the
+// specific bugs fixed in this file, living here since this module has no
+// sibling test file of its own before this change.
+
+#[cfg(test)]
+mod tests {
+    use super::super::types::QuantizationPrecision;
+    use super::*;
+
+    /// `(positions, rotations, scales, opacities, sh_dc, sh_rest)`.
+    type SceneTuple = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>);
+
+    fn make_scene(n: usize) -> SceneTuple {
+        let positions: Vec<f32> = (0..n)
+            .flat_map(|i| {
+                let f = i as f32;
+                [f * 0.37 - 5.0, f * 0.19 + 2.0, f * 0.53 - 1.0]
+            })
+            .collect();
+        let rotations: Vec<f32> = (0..n).flat_map(|_| [0.0f32, 0.0, 0.0, 1.0]).collect();
+        let scales: Vec<f32> = (0..n).flat_map(|_| [-1.0f32, -1.0, -1.0]).collect();
+        let opacities: Vec<f32> = (0..n).map(|i| 2.0 - (i as f32) * 0.001).collect();
+        let sh_dc: Vec<f32> = (0..n).flat_map(|_| [0.1f32, 0.2, 0.3]).collect();
+        let sh_rest: Vec<f32> = Vec::new();
+        (positions, rotations, scales, opacities, sh_dc, sh_rest)
+    }
+
+    fn full_precision_config() -> CompressionConfig {
+        CompressionConfig {
+            position_precision: QuantizationPrecision::Full,
+            rotation_precision: QuantizationPrecision::Full,
+            scale_precision: QuantizationPrecision::Full,
+            opacity_precision: QuantizationPrecision::Full,
+            sh_dc_precision: QuantizationPrecision::Full,
+            sh_rest_precision: QuantizationPrecision::Full,
+            pruning: ScenePruningConfig {
+                opacity_threshold: 0.0,
+                max_log_scale: 100.0,
+                min_log_scale: -100.0,
+                target_n_gaussians: None,
+                preserve_top_fraction: 1.0,
+            },
+            use_position_clustering: false,
+            kmeans: KMeansConfig {
+                n_clusters: 4,
+                n_iterations: 20,
+                tolerance: 1e-4,
+            },
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // gc_cluster_residuals: empty/malformed centers must error, not panic
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cluster_residuals_empty_centers_is_error_not_panic() {
+        let positions = vec![1.0f32, 2.0, 3.0];
+        let assignments = vec![0usize];
+        let centers: Vec<f32> = vec![];
+        let result = gc_cluster_residuals(&positions, &assignments, &centers);
+        assert!(
+            matches!(result, Err(CompressorError::InvalidConfig(_))),
+            "expected InvalidConfig, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn cluster_residuals_centers_not_multiple_of_3_is_error() {
+        let positions = vec![1.0f32, 2.0, 3.0];
+        let assignments = vec![0usize];
+        let centers: Vec<f32> = vec![0.0, 0.0]; // length 2, not a multiple of 3
+        let result = gc_cluster_residuals(&positions, &assignments, &centers);
+        assert!(matches!(result, Err(CompressorError::InvalidConfig(_))));
+    }
+
+    #[test]
+    fn cluster_residuals_out_of_range_assignment_is_error_not_underflow_panic() {
+        let positions = vec![1.0f32, 2.0, 3.0];
+        let assignments = vec![5usize]; // only 1 center (k=1) exists
+        let centers = vec![0.0f32, 0.0, 0.0];
+        let result = gc_cluster_residuals(&positions, &assignments, &centers);
+        assert!(matches!(
+            result,
+            Err(CompressorError::DimensionMismatch {
+                expected: 1,
+                got: 5
+            })
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // gc_compress: use_position_clustering must never corrupt positions
+    // -----------------------------------------------------------------------
+
+    fn compress_slices(
+        scene: &SceneTuple,
+        config: &CompressionConfig,
+    ) -> Result<CompressedScene, CompressorError> {
+        let (pos, rot, scl, op, shd, shr) = scene;
+        gc_compress(
+            GcSceneSlices {
+                positions: pos,
+                rotations: rot,
+                scales: scl,
+                opacities: op,
+                sh_dc: shd,
+                sh_rest: shr,
+                n_rest_per_gaussian: 0,
+            },
+            config,
+        )
+    }
+
+    #[test]
+    fn compress_with_position_clustering_does_not_corrupt_positions() {
+        // Regression for the critical bug: positions used to be replaced by
+        // near-zero k-means residuals with nowhere to store the centers, so
+        // decompression silently returned a scene collapsed toward the
+        // origin. The codebook is now persisted, so with Full (lossless)
+        // precision decompressed positions must match the originals.
+        let n = 40usize;
+        let scene_data = make_scene(n);
+        let mut config = full_precision_config();
+        config.use_position_clustering = true;
+        config.kmeans.n_clusters = 4;
+
+        let scene = compress_slices(&scene_data, &config).expect("compress with clustering");
+        let decomp = gc_decompress(&scene).expect("decompress");
+        assert_eq!(decomp.n_gaussians, n);
+        assert_eq!(decomp.positions.len(), scene_data.0.len());
+        for (a, b) in decomp.positions.iter().zip(scene_data.0.iter()) {
+            assert!(
+                (a - b).abs() < 1e-3,
+                "position corrupted by clustering: {a} vs {b}"
+            );
+        }
+    }
+
+    #[test]
+    fn compress_with_position_clustering_persists_a_real_codebook() {
+        // The feature must actually do something: a codebook of the requested
+        // size, one assignment per Gaussian, and stored positions that are
+        // residuals (small) rather than absolute coordinates (large).
+        let n = 40usize;
+        let scene_data = make_scene(n);
+        let mut config = full_precision_config();
+        config.use_position_clustering = true;
+        config.kmeans.n_clusters = 4;
+
+        let scene = compress_slices(&scene_data, &config).expect("compress with clustering");
+        let clustering = scene
+            .position_clustering
+            .as_ref()
+            .expect("clustering must be persisted, not discarded");
+        assert_eq!(clustering.n_clusters(), 4);
+        assert_eq!(clustering.centers.len(), 4 * 3);
+        assert_eq!(clustering.assignments.len(), n);
+        assert!(clustering.assignments.iter().all(|&a| (a as usize) < 4));
+
+        let residuals = scene.positions.dequantize();
+        let max_abs_position = scene_data.0.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let max_abs_residual = residuals.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        assert!(
+            max_abs_residual < max_abs_position * 0.5,
+            "stored values should be residuals (max |r| = {max_abs_residual}) not absolute \
+             positions (max |p| = {max_abs_position})"
+        );
+    }
+
+    #[test]
+    fn position_clustering_sharpens_byte_precision_positions() {
+        // The point of residual coding: at a fixed bit width, residuals from
+        // a codebook resolve far more finely than absolute coordinates.
+        let n = 64usize;
+        let positions: Vec<f32> = (0..n)
+            .flat_map(|i| {
+                let (base, j) = if i < n / 2 {
+                    (-100.0f32, i as f32)
+                } else {
+                    (100.0f32, (i - n / 2) as f32)
+                };
+                [base + j * 0.01, base + j * 0.02, base + j * 0.03]
+            })
+            .collect();
+        let rotations: Vec<f32> = (0..n).flat_map(|_| [0.0f32, 0.0, 0.0, 1.0]).collect();
+        let scales = vec![-1.0f32; n * 3];
+        let opacities = vec![3.0f32; n];
+        let sh_dc = vec![0.1f32; n * 3];
+        let scene_data = (
+            positions.clone(),
+            rotations,
+            scales,
+            opacities.clone(),
+            sh_dc,
+            Vec::new(),
+        );
+
+        let mut plain = full_precision_config();
+        plain.position_precision = QuantizationPrecision::Byte;
+        let plain_scene = compress_slices(&scene_data, &plain).expect("compress unclustered");
+        let plain_stats = gc_compute_stats(&positions, &opacities, &plain_scene).expect("stats");
+
+        let mut clustered = plain.clone();
+        clustered.use_position_clustering = true;
+        clustered.kmeans.n_clusters = 2;
+        let clustered_scene = compress_slices(&scene_data, &clustered).expect("compress clustered");
+        let clustered_stats =
+            gc_compute_stats(&positions, &opacities, &clustered_scene).expect("stats");
+
+        assert!(
+            clustered_stats.position_quantization_rmse
+                < plain_stats.position_quantization_rmse * 0.25,
+            "clustering should sharply reduce position error: clustered {} vs plain {}",
+            clustered_stats.position_quantization_rmse,
+            plain_stats.position_quantization_rmse
+        );
+    }
+
+    #[test]
+    fn clustering_payload_counts_toward_compressed_bytes() {
+        let n = 40usize;
+        let scene_data = make_scene(n);
+        let plain = full_precision_config();
+        let plain_scene = compress_slices(&scene_data, &plain).expect("compress");
+
+        let mut clustered = plain.clone();
+        clustered.use_position_clustering = true;
+        clustered.kmeans.n_clusters = 4;
+        let clustered_scene = compress_slices(&scene_data, &clustered).expect("compress clustered");
+        let clustering = clustered_scene
+            .position_clustering
+            .as_ref()
+            .expect("clustering");
+        // 4 centres → a one-byte codebook index per Gaussian.
+        assert_eq!(clustering.index_byte_width(), 1);
+        assert_eq!(clustering.byte_size(), 4 * 3 * 4 + n);
+        assert_eq!(
+            clustered_scene.compressed_bytes(),
+            plain_scene.compressed_bytes() + clustering.byte_size(),
+            "the codebook and indices are payload and must be accounted for"
+        );
+    }
+
+    #[test]
+    fn clustering_is_deterministic_across_runs() {
+        // gc_compress seeds k-means from a fixed constant, never from the
+        // environment: identical input plus identical config must produce an
+        // identical codebook, or compression stops being reproducible.
+        let scene_data = make_scene(50);
+        let mut config = full_precision_config();
+        config.use_position_clustering = true;
+        config.kmeans.n_clusters = 5;
+        let first = compress_slices(&scene_data, &config).expect("compress");
+        let second = compress_slices(&scene_data, &config).expect("compress again");
+        let (a, b) = (
+            first.position_clustering.as_ref().expect("clustering"),
+            second.position_clustering.as_ref().expect("clustering"),
+        );
+        assert_eq!(a.centers, b.centers);
+        assert_eq!(a.assignments, b.assignments);
+        assert_eq!(first.positions.dequantize(), second.positions.dequantize());
+    }
+
+    #[test]
+    fn clustering_clamps_k_to_the_surviving_gaussian_count() {
+        // The default codebook (256) is far larger than this scene; k-means
+        // needs one point per centre, so k must clamp rather than error.
+        let n = 5usize;
+        let scene_data = make_scene(n);
+        let mut config = full_precision_config();
+        config.use_position_clustering = true;
+        config.kmeans.n_clusters = 256;
+        let scene = compress_slices(&scene_data, &config).expect("compress with clamped k");
+        let clustering = scene.position_clustering.as_ref().expect("clustering");
+        assert_eq!(clustering.n_clusters(), n);
+    }
+
+    #[test]
+    fn clustering_with_zero_clusters_is_invalid_config() {
+        let scene_data = make_scene(10);
+        let mut config = full_precision_config();
+        config.use_position_clustering = true;
+        config.kmeans.n_clusters = 0;
+        let result = compress_slices(&scene_data, &config);
+        assert!(
+            matches!(result, Err(CompressorError::InvalidConfig(_))),
+            "expected InvalidConfig naming the empty codebook"
+        );
+    }
+
+    #[test]
+    fn clustering_with_zero_iterations_is_invalid_config() {
+        // Must surface as a *config* error, not as a bare KMeansNoConvergence
+        // that reads like an algorithm failure.
+        let scene_data = make_scene(10);
+        let mut config = full_precision_config();
+        config.use_position_clustering = true;
+        config.kmeans.n_clusters = 2;
+        config.kmeans.n_iterations = 0;
+        let result = compress_slices(&scene_data, &config);
+        assert!(
+            matches!(result, Err(CompressorError::InvalidConfig(_))),
+            "expected InvalidConfig naming n_iterations, not KMeansNoConvergence"
+        );
+    }
+
+    #[test]
+    fn decompress_rejects_out_of_range_cluster_assignment() {
+        let n = 20usize;
+        let scene_data = make_scene(n);
+        let mut config = full_precision_config();
+        config.use_position_clustering = true;
+        config.kmeans.n_clusters = 2;
+        let mut scene = compress_slices(&scene_data, &config).expect("compress");
+        if let Some(clustering) = scene.position_clustering.as_mut() {
+            clustering.assignments[0] = 999;
+        }
+        let result = gc_decompress(&scene);
+        assert!(
+            matches!(
+                result,
+                Err(CompressorError::DimensionMismatch {
+                    expected: 2,
+                    got: 999
+                })
+            ),
+            "a corrupt codebook index must be an error, not an out-of-bounds panic"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // gc_kmeans_positions: correctness after parallelising the assignment step
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn kmeans_positions_parallel_assignment_matches_expected_shape() {
+        let n = 60usize;
+        // Two well-separated clusters (all points exactly coincide within
+        // each cluster), so k-means++ init is *guaranteed* to seed one
+        // centre in each cluster regardless of RNG state: any point sharing
+        // a location with an already-chosen centre has distance exactly 0,
+        // so it carries zero weight in the roulette-wheel seed selection.
+        let positions: Vec<f32> = (0..n)
+            .flat_map(|i| {
+                if i % 2 == 0 {
+                    [0.0f32, 0.0, 0.0]
+                } else {
+                    [100.0f32, 100.0, 100.0]
+                }
+            })
+            .collect();
+        let config = KMeansConfig {
+            n_clusters: 2,
+            n_iterations: 20,
+            tolerance: 1e-4,
+        };
+        let mut rng = 42u64;
+        let (centers, assignments) =
+            gc_kmeans_positions(&positions, &config, &mut rng).expect("kmeans");
+        assert_eq!(centers.len(), 2 * 3);
+        assert_eq!(assignments.len(), n);
+        let cluster_of_0 = assignments[0];
+        let cluster_of_1 = assignments[1];
+        assert_ne!(
+            cluster_of_0, cluster_of_1,
+            "well-separated clusters must not merge"
+        );
+        for (i, &a) in assignments.iter().enumerate() {
+            let expected = if i % 2 == 0 {
+                cluster_of_0
+            } else {
+                cluster_of_1
+            };
+            assert_eq!(a, expected, "point {i} assigned to the wrong cluster");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // gc_compute_stats: honest realignment behaviour
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn compute_stats_exact_rmse_when_nothing_pruned() {
+        let n = 30usize;
+        let (pos, rot, scl, op, shd, shr) = make_scene(n);
+        let config = full_precision_config(); // opacity_threshold 0.0: everything kept
+        let scene = gc_compress(
+            GcSceneSlices {
+                positions: &pos,
+                rotations: &rot,
+                scales: &scl,
+                opacities: &op,
+                sh_dc: &shd,
+                sh_rest: &shr,
+                n_rest_per_gaussian: 0,
+            },
+            &config,
+        )
+        .expect("compress");
+        assert_eq!(scene.n_gaussians, n, "nothing should be pruned here");
+        let stats = gc_compute_stats(&pos, &op, &scene).expect("stats");
+        assert!(
+            stats.position_quantization_rmse < 1e-4,
+            "Full precision + no pruning should round-trip near-exactly, got {}",
+            stats.position_quantization_rmse
+        );
+        assert!(!stats.position_quantization_rmse.is_nan());
+        assert!(!stats.opacity_quantization_rmse.is_nan());
+    }
+
+    /// A scene whose survivors are a *non-contiguous* subset: opacity is high
+    /// on odd indices, low on even ones, and each Gaussian sits at a distinct
+    /// position. `preserve_top_fraction = 0.5` therefore keeps exactly the
+    /// odd indices — the case where index-order emission and opacity-order
+    /// selection disagree, so any realignment mistake shows up as a huge RMSE
+    /// instead of passing by luck.
+    fn interleaved_prune_scene(n: usize) -> (Vec<f32>, Vec<f32>, CompressionConfig) {
+        let positions: Vec<f32> = (0..n)
+            .flat_map(|i| {
+                let f = i as f32;
+                [f, f * 2.0, f * 3.0]
+            })
+            .collect();
+        let opacities: Vec<f32> = (0..n)
+            .map(|i| if i.is_multiple_of(2) { 1.0f32 } else { 5.0 })
+            .collect();
+        let mut config = full_precision_config();
+        config.pruning.preserve_top_fraction = 0.5;
+        (positions, opacities, config)
+    }
+
+    #[test]
+    fn compute_stats_exact_rmse_under_pruning_realigns_survivors() {
+        // Regression: this used to zip dequantized survivor j against
+        // original index j regardless of which Gaussians pruning kept, then
+        // (after that was spotted) gave up and reported NaN. Neither is
+        // needed: CompressedScene::kept_indices records the mapping, so the
+        // RMSE is computed exactly.
+        let n = 40usize;
+        let (positions, opacities, config) = interleaved_prune_scene(n);
+        let rotations: Vec<f32> = (0..n).flat_map(|_| [0.0f32, 0.0, 0.0, 1.0]).collect();
+        let scales = vec![-1.0f32; n * 3];
+        let sh_dc = vec![0.0f32; n * 3];
+        let scene = gc_compress(
+            GcSceneSlices {
+                positions: &positions,
+                rotations: &rotations,
+                scales: &scales,
+                opacities: &opacities,
+                sh_dc: &sh_dc,
+                sh_rest: &[],
+                n_rest_per_gaussian: 0,
+            },
+            &config,
+        )
+        .expect("compress");
+        assert_eq!(scene.n_gaussians, n / 2, "top half by opacity is kept");
+        let expected_kept: Vec<u32> = (0..n as u32).filter(|i| !i.is_multiple_of(2)).collect();
+        assert_eq!(
+            scene.kept_indices, expected_kept,
+            "kept_indices must name the surviving ORIGINAL indices, ascending"
+        );
+
+        let stats = gc_compute_stats(&positions, &opacities, &scene).expect("stats");
+        assert!(
+            !stats.position_quantization_rmse.is_nan(),
+            "pruning no longer defeats RMSE computation"
+        );
+        assert!(
+            stats.position_quantization_rmse < 1e-4,
+            "Full precision round-trips exactly once survivors are realigned, got {}",
+            stats.position_quantization_rmse
+        );
+        assert!(stats.opacity_quantization_rmse < 1e-4);
+
+        // Sanity check that the assertion above is load-bearing: the naive
+        // survivor-j-vs-original-j comparison it replaces is wildly wrong.
+        let naive = rmse(
+            &scene.reconstruct_positions().expect("positions"),
+            &positions,
+        );
+        assert!(
+            naive > 1.0,
+            "test scene must make misalignment visible, naive RMSE was {naive}"
+        );
+    }
+
+    #[test]
+    fn compute_stats_rmse_is_nan_when_the_survivor_mapping_is_unusable() {
+        // Defensive path for a CompressedScene not built by gc_compress (its
+        // fields are public): with pruning evident from the counts but no
+        // usable kept_indices, report NaN rather than a misleading,
+        // index-misaligned number.
+        let n = 40usize;
+        let (positions, opacities, config) = interleaved_prune_scene(n);
+        let rotations: Vec<f32> = (0..n).flat_map(|_| [0.0f32, 0.0, 0.0, 1.0]).collect();
+        let scales = vec![-1.0f32; n * 3];
+        let sh_dc = vec![0.0f32; n * 3];
+        let mut scene = gc_compress(
+            GcSceneSlices {
+                positions: &positions,
+                rotations: &rotations,
+                scales: &scales,
+                opacities: &opacities,
+                sh_dc: &sh_dc,
+                sh_rest: &[],
+                n_rest_per_gaussian: 0,
+            },
+            &config,
+        )
+        .expect("compress");
+        assert!(
+            scene.n_gaussians < n,
+            "pruning should have removed something"
+        );
+        scene.kept_indices.clear();
+        let stats = gc_compute_stats(&positions, &opacities, &scene).expect("stats");
+        assert!(
+            stats.position_quantization_rmse.is_nan(),
+            "RMSE must be NaN (honest 'cannot realign') rather than a misleading number"
+        );
+        assert!(stats.opacity_quantization_rmse.is_nan());
+    }
+
+    #[test]
+    fn compute_stats_rmse_is_nan_when_kept_indices_exceed_the_originals() {
+        // Same guard, different failure: the mapping is present and the right
+        // length, but the caller passed originals too short to contain the
+        // named indices, so gathering would silently truncate.
+        let n = 40usize;
+        let (positions, opacities, config) = interleaved_prune_scene(n);
+        let rotations: Vec<f32> = (0..n).flat_map(|_| [0.0f32, 0.0, 0.0, 1.0]).collect();
+        let scales = vec![-1.0f32; n * 3];
+        let sh_dc = vec![0.0f32; n * 3];
+        let scene = gc_compress(
+            GcSceneSlices {
+                positions: &positions,
+                rotations: &rotations,
+                scales: &scales,
+                opacities: &opacities,
+                sh_dc: &sh_dc,
+                sh_rest: &[],
+                n_rest_per_gaussian: 0,
+            },
+            &config,
+        )
+        .expect("compress");
+        let truncated_positions = &positions[..(n / 4) * 3];
+        let truncated_opacities = &opacities[..n / 4];
+        let stats =
+            gc_compute_stats(truncated_positions, truncated_opacities, &scene).expect("stats");
+        assert!(stats.position_quantization_rmse.is_nan());
+        assert!(stats.opacity_quantization_rmse.is_nan());
+    }
+
+    #[test]
+    fn compute_stats_realigns_clustered_positions_not_residuals() {
+        // With clustering the stored positions are residuals; the RMSE must
+        // be measured on reconstructed world positions.
+        let n = 40usize;
+        let (positions, opacities, mut config) = interleaved_prune_scene(n);
+        config.use_position_clustering = true;
+        config.kmeans.n_clusters = 4;
+        let rotations: Vec<f32> = (0..n).flat_map(|_| [0.0f32, 0.0, 0.0, 1.0]).collect();
+        let scales = vec![-1.0f32; n * 3];
+        let sh_dc = vec![0.0f32; n * 3];
+        let scene = gc_compress(
+            GcSceneSlices {
+                positions: &positions,
+                rotations: &rotations,
+                scales: &scales,
+                opacities: &opacities,
+                sh_dc: &sh_dc,
+                sh_rest: &[],
+                n_rest_per_gaussian: 0,
+            },
+            &config,
+        )
+        .expect("compress");
+        assert!(scene.position_clustering.is_some());
+        let stats = gc_compute_stats(&positions, &opacities, &scene).expect("stats");
+        assert!(
+            stats.position_quantization_rmse < 1e-3,
+            "clustered + Full precision must still round-trip, got {}",
+            stats.position_quantization_rmse
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Sigmoid-free sort comparators still select the correct top-opacity set
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn prune_to_topn_selects_highest_opacity_indices() {
+        let opacities = vec![0.1f32, 5.0, -3.0, 2.0, 0.0];
+        let top2 = gc_prune_to_topn(&opacities, 2).expect("topn");
+        assert_eq!(
+            top2,
+            vec![1, 3],
+            "expected indices 1 (5.0) and 3 (2.0) in that order"
+        );
+    }
+
+    #[test]
+    fn compute_prune_mask_preserve_top_fraction_keeps_highest_opacity() {
+        let opacities = vec![5.0f32, 1.0, 4.0, 0.5];
+        let log_scales = vec![-1.0f32; 4 * 3];
+        let config = ScenePruningConfig {
+            opacity_threshold: 0.0,
+            max_log_scale: 100.0,
+            min_log_scale: -100.0,
+            target_n_gaussians: None,
+            preserve_top_fraction: 0.5, // keep top 2 of 4
+        };
+        let mask = gc_compute_prune_mask(&opacities, &log_scales, &config).expect("mask");
+        // Highest two opacities are index 0 (5.0) and index 2 (4.0).
+        assert!(mask[0] && mask[2]);
+        assert!(!mask[1] && !mask[3]);
+    }
 }

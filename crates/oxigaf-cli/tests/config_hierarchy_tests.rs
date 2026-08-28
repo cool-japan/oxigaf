@@ -263,9 +263,18 @@ gpu_index = 3
     Ok(())
 }
 
+/// An explicitly named `--config <path>` that does not exist is an error, not
+/// a silent fall-back to the defaults.
+///
+/// The test used to be called `test_nonexistent_config_file_uses_defaults`
+/// while asserting the exact opposite of its name, so anyone scanning the
+/// suite for the loader's behaviour read it backwards. The default
+/// `oxigaf.toml` is the one path allowed to be missing — a user who did not
+/// ask for a specific file gets the defaults — and that case is covered by
+/// `test_default_config_loads`.
 #[test]
 #[serial]
-fn test_nonexistent_config_file_uses_defaults() -> Result<()> {
+fn test_nonexistent_explicit_config_file_is_an_error() -> Result<()> {
     cleanup_env_vars();
     let test_dir = get_temp_test_dir("nonexistent_config_test");
 
@@ -273,7 +282,30 @@ fn test_nonexistent_config_file_uses_defaults() -> Result<()> {
 
     // Should fail because the file doesn't exist and it's not "oxigaf.toml"
     let result = load_hierarchical_config(Some(&config_path), None);
-    assert!(result.is_err());
+    assert!(
+        result.is_err(),
+        "an explicitly named missing config file must fail, not fall back to defaults"
+    );
+
+    cleanup_test_dir(&test_dir);
+    Ok(())
+}
+
+/// The counterpart the misnamed test above implied: the *default*
+/// `oxigaf.toml` may be absent, and the loader then uses the built-in
+/// defaults rather than failing.
+#[test]
+#[serial]
+fn test_missing_default_config_file_uses_defaults() -> Result<()> {
+    cleanup_env_vars();
+    let test_dir = get_temp_test_dir("missing_default_config_test");
+
+    let config_path = test_dir.join("oxigaf.toml");
+    assert!(!config_path.exists());
+
+    let config = load_hierarchical_config(Some(&config_path), None)?;
+    assert_eq!(config.training.total_iterations, 15_000);
+    assert_eq!(config.training.image_size, 512);
 
     cleanup_test_dir(&test_dir);
     Ok(())

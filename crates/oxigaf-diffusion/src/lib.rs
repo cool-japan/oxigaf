@@ -7,67 +7,62 @@
 //!
 //! ## Cargo Features
 //!
-//! This crate supports the following feature flags:
+//! This crate supports the following feature flags (see `Cargo.toml`'s
+//! `[features]` section, which this list mirrors):
 //!
-//! - **`default`** = `["accelerate", "flash_attention"]`:
-//!   Default features for CPU-only inference with optimizations
+//! - **`default`** = `[]`:
+//!   No optional features on by default, keeping a plain `cargo build`
+//!   minimal (CPU-only, no flash attention).
 //!
-//! - **`accelerate`**:
-//!   Uses platform-native BLAS/LAPACK for CPU tensor operations
-//!   - macOS: Accelerate framework
-//!   - Linux: OpenBLAS or Intel MKL
-//!
-//! - **`cuda`** (platform-specific):
-//!   Enables NVIDIA GPU acceleration via CUDA
-//!   - Requires CUDA toolkit installed
-//!   - Not available on macOS
-//!
-//! - **`metal`** (platform-specific):
-//!   Enables Apple Silicon GPU acceleration via Metal
-//!   - macOS only
-//!   - Optimized for M1/M2/M3 chips
-//!
-//! - **`flash_attention`** (enabled by default):
+//! - **`flash_attention`** (off by default):
 //!   Memory-efficient attention with O(N) complexity instead of O(N²)
 //!   - Reduces memory usage by 2-4× for large images
 //!   - Tiled computation for better cache locality
+//!   - Gates the `flash_attention` module and its re-exports (`FlashAttention`,
+//!     `flash_attention`, `flash_attention_with_config`, ...); `unet.rs`
+//!     constructs a `FlashAttention` when `DiffusionConfig::use_flash_attention`
+//!     is set.
 //!
-//! - **`mixed_precision`** (planned, not yet implemented):
-//!   FP16/BF16 inference for reduced memory usage
-//!   - Faster on GPUs with Tensor Cores
-//!   - Lower memory footprint
+//! - **`mixed_precision`**:
+//!   The [`mixed_precision`] module (FP32 ↔ BF16/FP16 conversion and
+//!   simulation utilities) is unconditionally compiled either way; this flag
+//!   only changes the *default* value of `MixedPrecisionConfig::mode` (to
+//!   `BFloat16` instead of `Float32`) — see the module's own docs for
+//!   details on what is (and, as of this writing, is not) wired into the
+//!   inference path.
+//!
+//! - **`gpu_debug`**:
+//!   Enables NaN/Inf debug hooks (`DebugConfig::default()` sets `enabled =
+//!   true` when this feature is active).
+//!
+//! Platform-specific GPU/BLAS backends (`accelerate`, `metal`, `cuda`) are
+//! **not** feature flags of this crate — support for them was removed. To
+//! enable one, configure the `candle-core`/`candle-nn` dependency directly in
+//! your own `Cargo.toml`, e.g. via the COOLJAPAN `oxicandle-core` fork:
+//! ```toml
+//! candle-core = { package = "oxicandle-core", version = "0.11.0", features = ["accelerate"] }  # macOS BLAS
+//! candle-core = { package = "oxicandle-core", version = "0.11.0", features = ["metal"] }       # macOS GPU
+//! candle-core = { package = "oxicandle-core", version = "0.11.0", features = ["cuda"] }        # NVIDIA GPU
+//! ```
 //!
 //! Example usage:
 //! ```toml
 //! # In Cargo.toml
-//! # For CPU-only with flash attention
-//! oxigaf-diffusion = { version = "0.1", default-features = true }
+//! # CPU-only, minimal build (the default)
+//! oxigaf-diffusion = { version = "0.1" }
 //!
-//! # For Apple Silicon with Metal acceleration
-//! oxigaf-diffusion = { version = "0.1", features = ["metal", "flash_attention"] }
-//!
-//! # For NVIDIA GPU with CUDA
-//! oxigaf-diffusion = { version = "0.1", features = ["cuda", "flash_attention"] }
+//! # With flash attention
+//! oxigaf-diffusion = { version = "0.1", features = ["flash_attention"] }
 //! ```
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 #![cfg_attr(not(test), deny(clippy::expect_used))]
-// Test code frequently builds configs via Default then overrides individual
-// fields to exercise validation with intentionally invalid values.  The
-// struct-update syntax is more verbose and would obscure the intent of those
-// tests; allowing the lint here is cleaner than scattering hundreds of local
-// suppressions across test blocks.
-#![allow(clippy::field_reassign_with_default)]
-// Range-contains in assertions: `x >= lo && x <= hi` reads more clearly in
-// validation messages / asserts than `(lo..=hi).contains(&x)`.
-#![allow(clippy::manual_range_contains)]
-// Arithmetic expressions like `1 * 256 * 4` appear in test code to document
-// the component factors (batch × heads × …).  The identity factor makes
-// the structure explicit and is intentional.
-#![allow(clippy::identity_op)]
-// `too_many_arguments` on internal test helpers that encode full attention
-// layouts; grouping into a struct would hide the individual dimensions.
-#![allow(clippy::too_many_arguments)]
+// This crate carries no `allow(clippy::...)` attributes, crate-level or local.
+// It used to blanket-allow `field_reassign_with_default`, `manual_range_contains`
+// and `identity_op` on the theory that hundreds of test blocks depended on
+// them; when the suppressions were finally lifted the whole crate produced
+// nine hits, all mechanical. Keep it that way: fix the lint rather than
+// re-adding a suppression.
 
 pub mod adaptive_sampling;
 pub mod attention;
@@ -336,9 +331,23 @@ pub use classifier_guidance::{
 };
 
 // Re-exports
-pub use clip::ClipImageEncoder;
-pub use config::DiffusionConfig;
-pub use pipeline::{MultiViewDiffusionPipeline, MultiViewOutput};
+//
+// `AttentionSpec` bundles the head geometry with the kernel selection
+// (`AttentionBackend`, from `config`) that `CrossAttention::with_spec` and
+// `MultiViewSpatialTransformer` consume; `SpatialTransformerSpec` bundles an
+// `AttentionSpec` with the rest of one transformer stage's geometry.
+// `mask_to_bias_tensor` converts an `attention_masking::AttentionMask` into
+// the additive bias tensor `CrossAttention::forward_masked` accepts. All
+// four were previously reachable only via their defining module's full
+// path.
+pub use attention::{
+    mask_to_bias_tensor, AttentionSpec, CrossAttention, MultiViewSpatialTransformer,
+    MultiViewTransformerBlock, SpatialTransformerSpec,
+};
+pub use camera::{timestep_embedding, CameraEmbedding, TimestepEmbedding};
+pub use clip::{build_clip_encoder, ClipImageEncoder, ClipVisionConfig};
+pub use config::{AttentionBackend, DiffusionConfig};
+pub use pipeline::{MultiViewDiffusionPipeline, MultiViewOutput, SessionRequest};
 pub use scheduler::{DdimScheduler, PredictionType};
 pub use step_scheduler::{
     compare_step_counts, recommend_inference_steps, DdimStepScheduler, StepCountComparison,
@@ -349,12 +358,26 @@ pub use upsampler::{LatentUpsampler, UpsamplerMode};
 pub use vae::Vae;
 
 // Sliced attention exports
+//
+// NOTE: as of this writing, nothing in `unet.rs` or `pipeline.rs` selects
+// `SlicedAttention` — there is no config switch analogous to
+// `DiffusionConfig::use_flash_attention` for it, so this memory-optimization
+// path (chunked attention scores to trade compute for peak memory) is
+// exercised only by this module's own tests. Wiring it in requires adding an
+// attention-backend selector to `DiffusionConfig` and dispatching on it in
+// `attention.rs`; consider that a prerequisite before relying on this type
+// to actually reduce memory in a real pipeline run.
 pub use sliced_attention::{SlicedAttention, SlicedAttentionConfig};
 
 // Flash attention exports (only when feature is enabled)
+// Note: `DEFAULT_SCORE_MATRIX_BUDGET` is the score-matrix size below which
+// `FlashAttention::forward` falls back to the plain kernel; it is exported so
+// callers can reason about (or reproduce) that threshold without duplicating
+// the constant.
 #[cfg(feature = "flash_attention")]
 pub use flash_attention::{
     flash_attention, flash_attention_with_config, FlashAttention, FlashAttentionConfig,
+    DEFAULT_SCORE_MATRIX_BUDGET,
 };
 
 // Debug hooks re-exports
@@ -383,7 +406,11 @@ pub use batch_gen::{
 };
 
 // Streaming inference re-exports
-pub use streaming::{StreamingConfig, StreamingInference, StreamingIterator, StreamingStep};
+// Note: `StreamingInputs` carries the conditioning tensors a real (model-backed)
+// streaming run needs, so it belongs on the crate root next to the engine types.
+pub use streaming::{
+    StreamingConfig, StreamingInference, StreamingInputs, StreamingIterator, StreamingStep,
+};
 
 // Style transfer re-exports
 pub use style_transfer::{
@@ -393,9 +420,13 @@ pub use style_transfer::{
 };
 
 // Sequential VAE re-exports
+// Note: the `*_streaming` variants are the ones that actually hold peak memory
+// at `O(chunk_size · H · W)` — the non-streaming `encode_sequential` /
+// `decode_sequential` still accumulate every view in the returned value.
 pub use sequential_vae::{
-    batch_memory_bytes, decode_sequential, encode_sequential, memory_reduction_ratio,
-    peak_memory_bytes, DecodedViews, EncodedViews, SequentialVaeConfig,
+    batch_memory_bytes, decode_sequential, decode_sequential_streaming, encode_sequential,
+    encode_sequential_streaming, memory_reduction_ratio, peak_memory_bytes, DecodedViews,
+    EncodedViews, SequentialVaeConfig,
 };
 
 // Quantization re-exports
@@ -432,6 +463,16 @@ pub use weight_offload::{
     OffloadStrategy,
 };
 
+// Profiling re-exports
+//
+// `DiffusionProfiler` records per-layer timings (`LayerProfile`) around a
+// forward pass; the two `estimate_*_memory_bytes` helpers are pure functions
+// that supply the memory estimate `DiffusionProfiler::start_with_memory`
+// attaches to each record.
+pub use profiling::{
+    estimate_attention_memory_bytes, estimate_unet_memory_bytes, DiffusionProfiler, LayerProfile,
+};
+
 // Attention visualization re-exports
 pub use attention_viz::{
     apply_colormap, attention_map_to_image, format_attention_stats, heatmap_to_rgba,
@@ -440,9 +481,22 @@ pub use attention_viz::{
 };
 
 // Fused attention re-exports
+//
+// NOTE: same reachability gap as `sliced_attention` above — nothing in
+// `unet.rs` or `pipeline.rs` constructs a `FusedQKV` or calls
+// `scaled_dot_product_attention` on the default inference path; this is a
+// standalone, independently-tested fused-projection utility rather than
+// something the crate's own pipeline currently exercises.
+//
+// `scaled_dot_product_attention_with_scale` is the full form of
+// `scaled_dot_product_attention`: an explicit softmax scale (e.g.
+// `FusedAttentionConfig::scale`), optional causal masking, and optional
+// training-time attention dropout.
+// `HeadShape` carries the `(seq_q, seq_k, head_dim)` extents both take, and
+// has to travel with them.
 pub use fused_attention::{
-    fused_qkv_projection, scaled_dot_product_attention, softmax_over_dim, FusedAttentionConfig,
-    FusedQKV,
+    fused_qkv_projection, scaled_dot_product_attention, scaled_dot_product_attention_with_scale,
+    softmax_over_dim, FusedAttentionConfig, FusedQKV, HeadShape,
 };
 
 // Guidance rescaling re-exports
@@ -460,9 +514,14 @@ pub use guidance_rescaling::{
 };
 
 // ControlNet re-exports
+// Note: `ZeroConv` is the zero-initialised 1×1 injection projection used by
+// every ControlNet branch, and `MAX_INJECTION_LAYERS` is the hard bound that
+// `ControlNetConfig::injection_layers` entries are validated against; both are
+// part of the public ControlNet surface and are exported here so callers do
+// not have to reach into the `controlnet` module path.
 pub use controlnet::{
     apply_edge_enhancement, condition_images_from_multi_view, ControlFeature, ControlNetCondition,
-    ControlNetConfig, ControlNetProcessor, ControlSignalType,
+    ControlNetConfig, ControlNetProcessor, ControlSignalType, ZeroConv, MAX_INJECTION_LAYERS,
 };
 
 // Text conditioning re-exports
@@ -471,10 +530,18 @@ pub use text_conditioning::{
 };
 
 // Distillation loss re-exports
+// Note: `lpips_proxy_loss_planar` is the layout-aware form of
+// `lpips_proxy_loss` — it takes a `LatentDims` (`C × H × W`) and evaluates the
+// patch metric per channel plane instead of treating the flat buffer as one
+// square image; prefer it for real diffusion latents. `vp_coefficients`,
+// `edm_sigma`, `midpoint_alpha_cumprod` and `ddim_sample_at` are the
+// noise-schedule helpers progressive-distillation callers need to build their
+// own teacher/student steps.
 pub use distillation_loss::{
-    compute_distillation_loss, huber_loss, l2_distillation_loss, lpips_proxy_loss,
+    compute_distillation_loss, ddim_sample_at, edm_sigma, huber_loss, l2_distillation_loss,
+    lpips_proxy_loss, lpips_proxy_loss_planar, midpoint_alpha_cumprod, vp_coefficients,
     DistillationConfig, DistillationLossResult, DistillationMode, DistillationStep, EmaTeacher,
-    NoisePrediction, TeacherStudentPair,
+    LatentDims, NoisePrediction, TeacherStudentPair,
 };
 
 // Image preprocessing re-exports
@@ -485,6 +552,25 @@ pub use image_preprocessing::{
 };
 
 // Image editing re-exports
+//
+// NOTE: `image_editing` exposes two parallel, overlapping APIs whose
+// similarly-named functions/types are easy to conflate:
+//   - The `EditLatent`-based API (`EditConfig`, `EditStats`, `EditMask`,
+//     `add_edit_noise`, `blend_with_mask`, `interpolate_edit_latents`,
+//     `edit_distance`, ...) from the module's top level.
+//   - The `sdedit` slice-based API (`ImageEditingConfig`, `SdeditStats`,
+//     `edit_add_noise`, `edit_blend_with_mask`, `edit_lerp_latents`,
+//     `edit_latent_distance`, ...) from the `image_editing::sdedit`
+//     submodule, following the standard DDPM/SDEdit alpha-bar
+//     forward-noising convention (see `edit_cosine_alpha_bars` /
+//     `edit_linear_alpha_bars`).
+// The two APIs are **not** interchangeable — their input layouts and
+// forward-process conventions differ — but they now share one error type,
+// `ImageEditingError` (there is no separate `sdedit`-only error enum), so a
+// caller mixing both needs only `?` at every fallible call and no
+// conversion between error types. Prefer the `sdedit` (`edit_*`-prefixed)
+// family for new code, and check each function's own rustdoc for its exact
+// forward-process convention before mixing the two.
 pub use image_editing::{
     add_edit_noise,
     apply_inpaint_mask,
@@ -513,14 +599,17 @@ pub use image_editing::{
     sample_edit_at_levels,
     sdedit_noise_step,
     sdedit_perturb,
+    // Mask-aware SDEdit: honours `EditConfig::use_mask` (plain
+    // `sdedit_perturb` ignores that field entirely).
+    sdedit_perturb_with_mask,
     EditConfig,
     EditHistory,
     EditLatent,
     EditMask,
     EditMode,
     EditStats,
-    // SDEdit slice-based API (sdedit submodule)
-    ImageEditError,
+    // SDEdit slice-based API (sdedit submodule); shares `ImageEditingError`
+    // with the `EditLatent`-based API below instead of its own error type.
     ImageEditingConfig,
     ImageEditingError,
     SdeditStats,
@@ -544,6 +633,7 @@ pub use latent_walk::{
     multi_direction_walk,
     random_walk,
     resample_path,
+    run_walk,
     sample_path,
     spherical_walk,
     // Direction type
@@ -618,11 +708,14 @@ pub use inversion::{
 };
 
 // Token merging re-exports
+// Note: `tome_merge_with_keys` is the entry point the ToMe paper actually
+// describes — the partition is decided by the attention *keys* rather than the
+// token values; `tome_merge` is the values-only convenience wrapper.
 pub use token_merging::{
     attention_speedup_factor, bipartite_soft_matching, compute_similarity_matrix,
     compute_tome_stats, merge_states_compatible, merge_tokens, progressive_merge,
-    progressive_unmerge, token_cosine_similarity, token_l2_norm, tome_merge, tome_unmerge,
-    unmerge_tokens, MergeMode, MergeState, ToMeConfig, ToMeStats, TokenMergeError,
+    progressive_unmerge, token_cosine_similarity, token_l2_norm, tome_merge, tome_merge_with_keys,
+    tome_unmerge, unmerge_tokens, MergeMode, MergeState, ToMeConfig, ToMeStats, TokenMergeError,
 };
 
 // Unconditional dropout re-exports
@@ -660,10 +753,11 @@ pub use uncond_dropout::{
 // with `latent_interp::LatentVector`; likewise `var_channel_statistics` avoids
 // clashing with `style_transfer::channel_statistics`.
 pub use image_variations::{
-    add_latent_noise, clamp_latent, compute_variation_stats, generate_variations,
-    interpolate_latents, latent_cosine_similarity, latent_distance, project_to_sphere,
-    rank_by_diversity, spherical_interpolate_latents, var_channel_statistics, ImageVariationConfig,
-    ImageVariationError, ImageVariationStats, VarLatentVector, VariationExplorer, VariationMode,
+    add_latent_noise, clamp_latent, compute_variation_stats, generate_guided_variations,
+    generate_variations, interpolate_latents, latent_cosine_similarity, latent_distance,
+    project_to_sphere, rank_by_diversity, spherical_interpolate_latents, var_channel_statistics,
+    ImageVariationConfig, ImageVariationError, ImageVariationStats, VarLatentVector,
+    VariationExplorer, VariationMode,
 };
 
 // Prompt weighting re-exports
@@ -696,11 +790,13 @@ pub use lora_adapter::{
 };
 
 // Score distillation re-exports
+// Note: `VsdState` owns the per-particle LoRA adapters that `vsd_gradient`
+// scores, so VSD callers need it alongside `VsdConfig`.
 pub use score_distillation::{
     add_sds_noise, annealed_timestep_range, backprop_sds_to_gaussians, classifier_free_guidance,
     clip_sds_gradient, compute_sds_step_stats, compute_weight, sample_timestep, sds_grad_norm,
     sds_gradient, sds_loss, vsd_gradient, ScoreDistillationError, ScoreWeighting, SdsConfig,
-    SdsNoiseSchedule, SdsStepStats, VsdConfig,
+    SdsNoiseSchedule, SdsStepStats, VsdConfig, VsdState,
 };
 
 // Multi-view consistency re-exports
@@ -738,10 +834,13 @@ pub use adaptive_sampling::{
 // Note: `SamplingNoiseSchedule` is used (instead of `NoiseSchedule`) to avoid
 // collision with `noise_schedule_analysis::NoiseSchedule` already exported above.
 // `sampler_apply_cfg` avoids collision with `cfg_guidance::apply_cfg`.
+// `dpm_step_size` is the log-SNR step size `h` that `dpm_plus_plus_2m_step`
+// consumes; callers driving that step themselves need it to carry the previous
+// step's `h` forward for the second-order correction.
 pub use multi_step_sampler::{
-    compute_timestep_schedule, ddim_step, dpm_plus_plus_2m_step, format_sampler_stats, plms_step,
-    predict_x0, sampler_apply_cfg, MultiStepSampler, MultiStepSamplerConfig, SamplerError,
-    SamplerKind, SamplingNoiseSchedule,
+    compute_timestep_schedule, ddim_step, dpm_plus_plus_2m_step, dpm_step_size,
+    format_sampler_stats, plms_step, predict_x0, sampler_apply_cfg, MultiStepSampler,
+    MultiStepSamplerConfig, SamplerError, SamplerKind, SamplingNoiseSchedule,
 };
 
 // Consistency model re-exports
@@ -892,3 +991,262 @@ pub use score_matching::{
     ScoreMatchingStats,
     SmWeighting,
 };
+
+// ---------------------------------------------------------------------------
+// Crate-root re-export regression tests
+// ---------------------------------------------------------------------------
+
+/// Pins the crate-root public surface for items that were previously reachable
+/// only through their defining module path.
+///
+/// Every item below is referenced through a `crate::…` path, so dropping (or
+/// forgetting to re-add) one of the corresponding `pub use` lines above becomes
+/// a compile error here instead of a silent breaking change for downstream
+/// callers.
+#[cfg(test)]
+mod crate_root_reexports {
+    /// `controlnet::{ZeroConv, MAX_INJECTION_LAYERS}`.
+    #[test]
+    fn controlnet_injection_items_are_reachable() {
+        assert_eq!(crate::MAX_INJECTION_LAYERS, 8);
+
+        let conv = crate::ZeroConv::zeros(2, 3);
+        assert!(conv.is_zero(), "a fresh ZeroConv is at its zero init");
+        assert_eq!(conv.in_channels(), 2);
+        assert_eq!(conv.out_channels(), 3);
+        assert_eq!(conv.project(&[1.0, 2.0]), vec![0.0, 0.0, 0.0]);
+    }
+
+    /// `distillation_loss::{vp_coefficients, edm_sigma, midpoint_alpha_cumprod,
+    /// ddim_sample_at}`.
+    #[test]
+    fn distillation_schedule_helpers_are_reachable() {
+        let (alpha, sigma) = crate::vp_coefficients(1.0);
+        assert!(
+            (alpha - 1.0).abs() < 1e-6,
+            "alpha at abar=1 is 1, got {alpha}"
+        );
+        assert!(sigma.abs() < 1e-6, "sigma at abar=1 is 0, got {sigma}");
+
+        // sigma = sqrt((1 - abar) / abar) = 1 at abar = 0.5.
+        let sigma_half = crate::edm_sigma(0.5);
+        assert!((sigma_half - 1.0).abs() < 1e-6, "got {sigma_half}");
+
+        let mid = crate::midpoint_alpha_cumprod(0.2, 0.8);
+        assert!(
+            mid > 0.2 && mid < 0.8,
+            "log-SNR midpoint lies between its endpoints, got {mid}"
+        );
+
+        // At abar = 1 the DDIM step reproduces x0 exactly (sigma = 0).
+        let x0 = [1.0_f32, -2.0, 3.0];
+        let eps = [10.0_f32, 10.0, 10.0];
+        assert_eq!(crate::ddim_sample_at(&x0, &eps, 1.0), vec![1.0, -2.0, 3.0]);
+    }
+
+    /// `distillation_loss::{lpips_proxy_loss_planar, LatentDims}`.
+    #[test]
+    fn planar_lpips_proxy_is_reachable() {
+        let dims = crate::LatentDims::new(2, 2, 2);
+        assert_eq!(dims.len(), 8);
+        assert!(!dims.is_empty());
+
+        let latent = vec![0.5_f32; 8];
+        let loss = crate::lpips_proxy_loss_planar(&latent, &latent, 2, dims)
+            .expect("identical planar latents must score");
+        assert!(loss.abs() < 1e-6, "self-distance must be 0, got {loss}");
+    }
+
+    /// `flash_attention::DEFAULT_SCORE_MATRIX_BUDGET` (feature-gated, so this
+    /// test is gated the same way as the `pub use` it guards).
+    #[cfg(feature = "flash_attention")]
+    #[test]
+    fn flash_attention_score_budget_is_reachable() {
+        assert_eq!(crate::DEFAULT_SCORE_MATRIX_BUDGET, 64 * 1024 * 1024);
+    }
+
+    /// `multi_step_sampler::dpm_step_size`.
+    #[test]
+    fn dpm_step_size_is_reachable() {
+        let schedule = crate::SamplingNoiseSchedule::cosine(10);
+
+        let h = crate::dpm_step_size(9, 5, &schedule)
+            .expect("an interior DPM++ step has a finite log-SNR step size");
+        assert!(h > 0.0, "denoising increases log-SNR, got h = {h}");
+
+        assert!(
+            crate::dpm_step_size(9, 0, &schedule).is_none(),
+            "the clean boundary (sigma = 0) has no finite step size"
+        );
+    }
+
+    /// `streaming::StreamingInputs` — constructing it needs three candle
+    /// tensors, so only the path is pinned here.
+    #[test]
+    fn streaming_inputs_type_is_reachable() {
+        let inputs: Option<crate::StreamingInputs> = None;
+        assert!(inputs.is_none());
+    }
+
+    /// `token_merging::tome_merge_with_keys`.
+    #[test]
+    fn tome_merge_with_keys_is_reachable() {
+        let tokens: Vec<f32> = (0..16).map(|x| x as f32).collect(); // 4 tokens x 4 dims
+        let keys: Vec<f32> = (0..8).map(|x| x as f32).collect(); // 4 tokens x 2 dims
+        let config = crate::ToMeConfig::default();
+
+        let (merged, state) = crate::tome_merge_with_keys(&tokens, &keys, 4, 4, 2, &config)
+            .expect("well-formed token/key tensors must merge");
+        assert_eq!(merged.len(), state.merged_n_tokens * 4);
+        assert_eq!(state.original_n_tokens, 4);
+    }
+
+    /// `image_editing::sdedit_perturb_with_mask`.
+    #[test]
+    fn sdedit_perturb_with_mask_is_reachable() {
+        let config = crate::EditConfig {
+            strength: 0.5,
+            n_timesteps: 10,
+            guidance_scale: 7.5,
+            use_mask: true,
+        };
+        let alpha_bars = crate::edit_linear_alpha_bars(10, 1e-4, 0.02);
+        let latent = vec![0.25_f32; 4];
+        // All-zero mask: every pixel is preserved, so the perturbation is a
+        // no-op even though noise was sampled.
+        let mask = crate::EditMask::new(2, 2, 0.0);
+        let mut rng_state = 7_u64;
+
+        let (out, t_start) = crate::sdedit_perturb_with_mask(
+            &latent,
+            &config,
+            &alpha_bars,
+            &mut rng_state,
+            Some(&mask),
+        )
+        .expect("masked SDEdit perturbation must succeed");
+
+        assert_eq!(t_start, 5, "t_start = floor(n_timesteps * strength)");
+        for (got, want) in out.iter().zip(latent.iter()) {
+            assert!(
+                (got - want).abs() < 1e-6,
+                "an all-zero mask preserves the latent: got {got}, want {want}"
+            );
+        }
+    }
+
+    /// `fused_attention::scaled_dot_product_attention_with_scale`.
+    #[test]
+    fn sdpa_with_scale_is_reachable() {
+        // One query, one key: softmax over a single logit is 1, so the output
+        // is exactly `v` regardless of the scale.
+        let out = crate::scaled_dot_product_attention_with_scale(
+            &[1.0],
+            &[1.0],
+            &[2.0],
+            crate::HeadShape::square(1, 1),
+            0.5,
+            false,
+            None,
+        )
+        .expect("single-position attention must succeed");
+        assert_eq!(out.len(), 1);
+        assert!((out[0] - 2.0).abs() < 1e-6, "got {}", out[0]);
+    }
+
+    /// `profiling::{DiffusionProfiler, LayerProfile,
+    /// estimate_attention_memory_bytes, estimate_unet_memory_bytes}`.
+    #[test]
+    fn profiling_items_are_reachable() {
+        let attention_bytes = crate::estimate_attention_memory_bytes(1, 4, 2, 8);
+        assert!(attention_bytes > 0);
+        assert!(crate::estimate_unet_memory_bytes(1, 4, 16, 2) > attention_bytes);
+
+        let mut profiler = crate::DiffusionProfiler::new();
+        profiler.start_with_memory("attn", attention_bytes);
+        assert!(profiler.stop("attn").is_some(), "a started layer stops");
+
+        let recorded: &[crate::LayerProfile] = profiler.profiles();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].name, "attn");
+        assert_eq!(recorded[0].estimated_memory_bytes, attention_bytes);
+    }
+
+    /// `sequential_vae::{encode_sequential_streaming, decode_sequential_streaming}`.
+    #[test]
+    fn sequential_vae_streaming_fns_are_reachable() {
+        let config = crate::SequentialVaeConfig::new(2, 4, 16, 16, 0.18215);
+        let images = vec![vec![0.5_f32; 3 * 16 * 16]; 3];
+
+        let mut encoded_chunk_sizes = Vec::new();
+        let encoded_total =
+            crate::encode_sequential_streaming(&images, &config, |chunk: Vec<Vec<f32>>| {
+                encoded_chunk_sizes.push(chunk.len());
+                Ok(())
+            })
+            .expect("streaming encode of well-formed images must succeed");
+        assert_eq!(encoded_total, 3);
+        assert_eq!(
+            encoded_chunk_sizes,
+            vec![2, 1],
+            "chunk_size = 2 splits 3 views as 2 + 1"
+        );
+
+        let encoded =
+            crate::encode_sequential(&images, &config).expect("batch encode must succeed");
+        let mut decoded_chunk_sizes = Vec::new();
+        let decoded_total =
+            crate::decode_sequential_streaming(&encoded, &config, |chunk: Vec<Vec<f32>>| {
+                decoded_chunk_sizes.push(chunk.len());
+                Ok(())
+            })
+            .expect("streaming decode of well-formed latents must succeed");
+        assert_eq!(decoded_total, 3);
+        assert_eq!(decoded_chunk_sizes, vec![2, 1]);
+    }
+
+    /// `score_distillation::VsdState` — building one allocates per-particle
+    /// LoRA adapters, so only the path is pinned here.
+    #[test]
+    fn vsd_state_type_is_reachable() {
+        let state: Option<crate::VsdState> = None;
+        assert!(state.is_none());
+    }
+
+    /// `config::AttentionBackend` and `attention::{AttentionSpec,
+    /// SpatialTransformerSpec, mask_to_bias_tensor}` — the only members of
+    /// their modules' public surface that were previously reachable solely
+    /// through the full `crate::config::…` / `crate::attention::…` path.
+    #[test]
+    fn attention_backend_and_spec_types_are_reachable() {
+        assert_eq!(
+            crate::AttentionBackend::default(),
+            crate::AttentionBackend::Standard
+        );
+        assert!(!crate::AttentionBackend::Standard.needs_flash_feature());
+        assert!(crate::AttentionBackend::Flash.needs_flash_feature());
+
+        let attention = crate::AttentionSpec::standard(8, 64);
+        assert_eq!(attention.heads, 8);
+        assert_eq!(attention.dim_head, 64);
+        assert_eq!(attention.backend, crate::AttentionBackend::Standard);
+
+        let transformer = crate::SpatialTransformerSpec {
+            in_channels: 320,
+            depth: 1,
+            context_dim: 1024,
+            ip_dim: 1024,
+            num_views: 4,
+            num_groups: 32,
+            use_linear_projection: false,
+            attention,
+        };
+        assert_eq!(transformer.attention.heads, 8);
+        assert_eq!(transformer.num_views, 4);
+
+        let mask = crate::full_mask(3);
+        let bias = crate::mask_to_bias_tensor(&mask, &candle_core::Device::Cpu)
+            .expect("an all-true mask must convert to a bias tensor");
+        assert_eq!(bias.dims(), &[1, 1, 3, 3]);
+    }
+}

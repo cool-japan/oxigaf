@@ -8,6 +8,8 @@ use std::fmt;
 
 use thiserror::Error;
 
+use crate::config::ProjectConfig;
+
 // ---------------------------------------------------------------------------
 // Error types
 // ---------------------------------------------------------------------------
@@ -16,11 +18,23 @@ use thiserror::Error;
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum PresetError {
     /// The requested preset name is not known.
-    #[error("unknown preset '{0}'. Run `oxigaf preset list` to see available presets.")]
+    #[error(
+        "unknown preset '{0}'. Available presets: quick, balanced, quality, research, \
+         production, portrait, video (aliases: fast, default, high, debug, prod, headshot, \
+         animation)."
+    )]
     UnknownPreset(String),
 
     /// An override string (key=value) could not be parsed or applied.
-    #[error("invalid override '{0}'. Expected key=value with a supported key name.")]
+    #[error(
+        "invalid override '{0}'. Expected key=value with one of the supported keys: \
+         num_iterations, warmup_iterations, position_lr, color_lr, opacity_lr, scale_lr, \
+         rotation_lr, densify_from_iter, densify_until_iter, densify_grad_threshold, \
+         opacity_reset_interval, max_gaussians, sh_degree, image_width, image_height, \
+         checkpoint_every, keep_last_n_checkpoints, log_every, tensorboard_enabled, verbose, \
+         lambda_l1, lambda_ssim, lambda_lpips, lambda_opacity, lambda_scale, batch_size, \
+         num_workers."
+    )]
     InvalidOverride(String),
 }
 
@@ -641,12 +655,48 @@ impl TrainingPreset {
         self.num_iterations as f32 / 1_000.0 * 2.5
     }
 
-    /// Rough estimated VRAM usage in MB.
+    /// Estimated VRAM usage in MB for training at this preset's settings.
     ///
-    /// Heuristic: `max_gaussians * 64 / 1_000_000`.
+    /// Delegates to [`crate::memory_estimator::estimate_memory`], which
+    /// accounts for Gaussian parameters (position/rotation/scale/opacity/SH,
+    /// sized by `sh_degree`), gradients, Adam optimizer state, and render
+    /// buffers at `image_width`x`image_height`. The previous heuristic
+    /// (`max_gaussians * 64 / 1_000_000`) assumed a flat 64 bytes/Gaussian
+    /// regardless of SH degree or resolution, which undercounted a
+    /// degree-3 Gaussian's true training footprint (~944 B: parameters +
+    /// gradients + two Adam moments) by roughly an order of magnitude.
     pub fn estimated_vram_mb(&self) -> u32 {
-        // Use u64 to avoid overflow before dividing.
-        ((self.max_gaussians as u64 * 64) / 1_000_000) as u32
+        let mem_config = crate::memory_estimator::MemEstimateConfig {
+            n_gaussians: self.max_gaussians as usize,
+            sh_degree: self.sh_degree.min(3),
+            render_width: self.image_width.max(1) as usize,
+            render_height: self.image_height.max(1) as usize,
+            use_ema: false,
+            use_optimizer: true,
+            n_render_views: self.batch_size.max(1),
+            // This estimate is about the 3DGS scene only, not the (much
+            // larger, separately-loaded) multi-view diffusion model.
+            diffusion_model_params: 0,
+            target_vram_bytes: usize::MAX,
+            fp16_optimizer: false,
+        };
+
+        match crate::memory_estimator::estimate_memory(&mem_config) {
+            Ok(estimate) => (estimate.total_gpu_bytes as u64 / (1024 * 1024)) as u32,
+            Err(_) => {
+                // Only reachable for a configuration the estimator rejects
+                // outright (e.g. sh_degree > 3 from a malformed
+                // `apply_override`, or a zero/oversized resolution) --
+                // none of the built-in presets hit this. Fall back to a
+                // direct per-Gaussian estimate rather than reporting 0.
+                let sh_coeffs = crate::memory_estimator::sh_coefficients(self.sh_degree.min(3));
+                // positions(3) + rotations(4) + scales(3) + opacity(1) + SH,
+                // each an f32 (4 bytes); x4 for parameters + gradients + two
+                // Adam moments.
+                let bytes_per_gaussian = (3 + 4 + 3 + 1 + sh_coeffs) as u64 * 4 * 4;
+                ((self.max_gaussians as u64 * bytes_per_gaussian) / (1024 * 1024)) as u32
+            }
+        }
     }
 
     /// Estimated output quality in the range `[0.0, 1.0]`.
@@ -668,6 +718,66 @@ impl TrainingPreset {
 
         // Weighted combination.
         0.40 * iter_score + 0.25 * sh_score + 0.20 * res_score + 0.15 * lpips_score
+    }
+
+    /// Apply this preset's hyper-parameters onto an existing
+    /// [`ProjectConfig`], overwriting only the fields this preset has an
+    /// opinion about.
+    ///
+    /// Call this on a fresh [`ProjectConfig::default`] (or as a layer
+    /// between defaults and the project's `oxigaf.toml`, e.g. from
+    /// `TrainArgs::profile`) so that file/env/CLI layers applied afterwards
+    /// can still override individual values.
+    ///
+    /// Not every preset field has a corresponding [`ProjectConfig`] field
+    /// yet: `warmup_iterations`, `tensorboard_enabled`, `verbose`,
+    /// `keep_last_n_checkpoints`, `batch_size`, and `num_workers` describe
+    /// concepts `ProjectConfig` does not currently track (TensorBoard
+    /// enablement, CLI verbosity, and dataloader batching are configured
+    /// elsewhere, or not at all). Those are intentionally left untouched
+    /// rather than force-fit into an unrelated field.
+    pub fn apply_to(&self, config: &mut ProjectConfig) {
+        let t = &mut config.training;
+        t.total_iterations = self.num_iterations;
+        // All built-in presets use image_width == image_height; ProjectConfig
+        // only models a single square `image_size`, so take the larger side
+        // if a future/overridden preset ever has an asymmetric resolution.
+        t.image_size = self.image_width.max(self.image_height);
+        t.opacity_reset_interval = self.opacity_reset_interval;
+
+        t.init.sh_degree = self.sh_degree;
+
+        t.optimizer.position_lr = self.position_lr;
+        t.optimizer.rotation_lr = self.rotation_lr;
+        t.optimizer.scale_lr = self.scale_lr;
+        t.optimizer.opacity_lr = self.opacity_lr;
+        // `color_lr` is the preset's name for the SH/color coefficient
+        // learning rate, i.e. ProjectConfig's `sh_lr`.
+        t.optimizer.sh_lr = self.color_lr;
+
+        t.density_control.start_iteration = self.densify_from_iter;
+        t.density_control.end_iteration = self.densify_until_iter;
+        t.density_control.grad_threshold = self.densify_grad_threshold;
+        t.density_control.max_gaussians = self.max_gaussians as usize;
+
+        t.loss.lambda_l1 = self.lambda_l1;
+        t.loss.lambda_ssim = self.lambda_ssim;
+        t.loss.lambda_lpips = self.lambda_lpips;
+        t.loss.lambda_opacity_reg = self.lambda_opacity;
+        t.loss.lambda_scale_reg = self.lambda_scale;
+
+        config.output.checkpoint_interval = self.checkpoint_every;
+        config.output.log_interval = self.log_every;
+    }
+}
+
+impl From<&TrainingPreset> for ProjectConfig {
+    /// Build a [`ProjectConfig`] starting from defaults with this preset
+    /// applied via [`TrainingPreset::apply_to`].
+    fn from(preset: &TrainingPreset) -> Self {
+        let mut config = ProjectConfig::default();
+        preset.apply_to(&mut config);
+        config
     }
 }
 
@@ -720,19 +830,37 @@ pub fn apply_override(
             };
         }};
     }
+    macro_rules! parse_usize {
+        ($field:ident) => {{
+            p.$field = raw
+                .parse::<usize>()
+                .map_err(|_| PresetError::InvalidOverride(key_value.to_string()))?;
+        }};
+    }
 
     match key {
         "num_iterations" => parse_u32!(num_iterations),
+        "warmup_iterations" => parse_u32!(warmup_iterations),
         "sh_degree" => parse_u32!(sh_degree),
         "image_width" => parse_u32!(image_width),
         "image_height" => parse_u32!(image_height),
         "max_gaussians" => parse_u32!(max_gaussians),
         "log_every" => parse_u32!(log_every),
+        "densify_from_iter" => parse_u32!(densify_from_iter),
+        "densify_until_iter" => parse_u32!(densify_until_iter),
+        "opacity_reset_interval" => parse_u32!(opacity_reset_interval),
+        "checkpoint_every" => parse_u32!(checkpoint_every),
+        "keep_last_n_checkpoints" => parse_usize!(keep_last_n_checkpoints),
+        "batch_size" => parse_usize!(batch_size),
+        "num_workers" => parse_usize!(num_workers),
         "tensorboard_enabled" => parse_bool!(tensorboard_enabled),
         "verbose" => parse_bool!(verbose),
         "lambda_l1" => parse_f32!(lambda_l1),
         "lambda_ssim" => parse_f32!(lambda_ssim),
         "lambda_lpips" => parse_f32!(lambda_lpips),
+        "lambda_opacity" => parse_f32!(lambda_opacity),
+        "lambda_scale" => parse_f32!(lambda_scale),
+        "densify_grad_threshold" => parse_f32!(densify_grad_threshold),
         "position_lr" => parse_f32!(position_lr),
         "color_lr" => parse_f32!(color_lr),
         "opacity_lr" => parse_f32!(opacity_lr),
@@ -1050,5 +1178,161 @@ mod tests {
                 p.name
             );
         }
+    }
+
+    // 21. estimated_vram_mb: the real memory-estimator-backed figure is far
+    // above the old flat-64-bytes/Gaussian heuristic for the `quality`
+    // preset (1M Gaussians, sh_degree=3), which the audit measured as
+    // undercounting VRAM by roughly an order of magnitude (64 MB reported
+    // vs. ~1 GB real). Assert against a threshold well above the old
+    // heuristic's output rather than an exact figure, since the estimator's
+    // internals may reasonably evolve.
+    #[test]
+    fn test_estimated_vram_reflects_real_footprint() {
+        let quality = TrainingPreset::get(&TrainingPresetName::Quality);
+        let old_heuristic_mb = (quality.max_gaussians as u64 * 64) / 1_000_000;
+        assert!(
+            u64::from(quality.estimated_vram_mb()) > old_heuristic_mb * 4,
+            "expected the real estimate ({} MB) to be well above the old \
+             flat-64-bytes/Gaussian heuristic ({} MB)",
+            quality.estimated_vram_mb(),
+            old_heuristic_mb
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // apply_to / From<&TrainingPreset> for ProjectConfig
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_preset_converts_to_valid_project_config() {
+        for preset in TrainingPreset::all() {
+            let config: crate::config::ProjectConfig = (&preset).into();
+            assert_eq!(config.training.total_iterations, preset.num_iterations);
+            assert_eq!(config.training.init.sh_degree, preset.sh_degree);
+            assert_eq!(config.training.image_size, preset.image_width);
+            assert_eq!(
+                config.training.density_control.max_gaussians,
+                preset.max_gaussians as usize
+            );
+            assert_eq!(config.output.checkpoint_interval, preset.checkpoint_every);
+            assert_eq!(config.output.log_interval, preset.log_every);
+            assert!(
+                config.validate().is_ok(),
+                "preset {} must convert to a valid ProjectConfig",
+                preset.name
+            );
+        }
+    }
+
+    #[test]
+    fn test_preset_apply_to_preserves_untouched_sections() {
+        // `apply_to` must not disturb [model]/[device], which presets have
+        // no opinion about.
+        let mut config = crate::config::ProjectConfig::default();
+        let default_model_path = config.model.flame_model_path.clone();
+        let preset = TrainingPreset::get(&TrainingPresetName::Research);
+        preset.apply_to(&mut config);
+        assert_eq!(config.model.flame_model_path, default_model_path);
+    }
+
+    #[test]
+    fn test_preset_apply_to_maps_optimizer_and_loss() {
+        let preset = TrainingPreset::get(&TrainingPresetName::Portrait);
+        let config: crate::config::ProjectConfig = (&preset).into();
+        assert!((config.training.optimizer.position_lr - preset.position_lr).abs() < 1e-9);
+        assert!((config.training.optimizer.sh_lr - preset.color_lr).abs() < 1e-9);
+        assert!((config.training.loss.lambda_opacity_reg - preset.lambda_opacity).abs() < 1e-9);
+        assert!((config.training.loss.lambda_scale_reg - preset.lambda_scale).abs() < 1e-9);
+        assert_eq!(
+            config.training.density_control.start_iteration,
+            preset.densify_from_iter
+        );
+        assert_eq!(
+            config.training.density_control.end_iteration,
+            preset.densify_until_iter
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // apply_override: previously-missing fields
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_apply_override_previously_missing_u32_fields() {
+        let base = TrainingPreset::get(&TrainingPresetName::Quick);
+        let r = apply_overrides(
+            &base,
+            &[
+                "warmup_iterations=1234",
+                "densify_from_iter=100",
+                "densify_until_iter=2000",
+                "opacity_reset_interval=999",
+                "checkpoint_every=555",
+            ],
+        )
+        .unwrap();
+        assert_eq!(r.warmup_iterations, 1234);
+        assert_eq!(r.densify_from_iter, 100);
+        assert_eq!(r.densify_until_iter, 2000);
+        assert_eq!(r.opacity_reset_interval, 999);
+        assert_eq!(r.checkpoint_every, 555);
+    }
+
+    #[test]
+    fn test_apply_override_previously_missing_usize_fields() {
+        let base = TrainingPreset::get(&TrainingPresetName::Quick);
+        let r = apply_overrides(
+            &base,
+            &[
+                "keep_last_n_checkpoints=7",
+                "batch_size=4",
+                "num_workers=16",
+            ],
+        )
+        .unwrap();
+        assert_eq!(r.keep_last_n_checkpoints, 7);
+        assert_eq!(r.batch_size, 4);
+        assert_eq!(r.num_workers, 16);
+    }
+
+    #[test]
+    fn test_apply_override_previously_missing_f32_fields() {
+        let base = TrainingPreset::get(&TrainingPresetName::Quick);
+        let r = apply_override(&base, "lambda_opacity=0.02").unwrap();
+        assert!((r.lambda_opacity - 0.02).abs() < 1e-6);
+        let r = apply_override(&r, "lambda_scale=0.03").unwrap();
+        assert!((r.lambda_scale - 0.03).abs() < 1e-6);
+        let r = apply_override(&r, "densify_grad_threshold=0.00025").unwrap();
+        assert!((r.densify_grad_threshold - 0.00025).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_invalid_override_error_lists_supported_keys() {
+        let base = TrainingPreset::get(&TrainingPresetName::Quick);
+        let err = apply_override(&base, "totally_bogus_key=1").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("num_iterations"),
+            "error should list supported keys: {msg}"
+        );
+        assert!(
+            msg.contains("batch_size"),
+            "error should list supported keys: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_unknown_preset_error_lists_real_names_not_a_missing_subcommand() {
+        let err = TrainingPresetName::from_str("bogus").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("oxigaf preset list"),
+            "error must not reference a subcommand that does not exist: {msg}"
+        );
+        assert!(
+            msg.contains("quality"),
+            "error should list real preset names: {msg}"
+        );
     }
 }

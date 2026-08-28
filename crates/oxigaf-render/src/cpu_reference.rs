@@ -44,11 +44,14 @@ pub struct CpuCamera {
 }
 
 /// Projected Gaussian in 2D screen space.
+///
+/// Deliberately carries no source-Gaussian index. One was stored here and read
+/// by nobody, held alive by `#[allow(dead_code)]`; the ordering it looked like
+/// it existed for is supplied by *position* in the projected vector instead —
+/// see the depth sort in [`CpuRasterizer::render`], which relies on these being
+/// pushed in ascending model index.
 #[derive(Debug, Clone)]
 struct ProjectedGaussian {
-    /// Gaussian index.
-    #[allow(dead_code)]
-    idx: usize,
     /// 2D mean (pixel coordinates).
     mean2d: na::Vector2<f32>,
     /// 2D conic matrix (inverse of covariance): [a, b, c] for [[a, b], [b, c]].
@@ -109,7 +112,18 @@ impl CpuRasterizer {
             }
         }
 
-        // Step 2: Sort by depth (front-to-back)
+        // Step 2: Sort by depth (front-to-back).
+        //
+        // GPU parity for equal depths: `shaders/tile_assign.wgsl` builds the
+        // key as `(tile_id, bitcast<u32>(depth))` with no index component, so
+        // two Gaussians at exactly the same depth in the same tile are ordered
+        // purely by the stability of the radix sort — i.e. by the order their
+        // pairs were emitted, which is ascending Gaussian index. `sort_by` is
+        // likewise a stable sort and `projected` is filled by the ascending
+        // `0..model.len()` loop above, so ties break by ascending model index
+        // on both sides. Do not switch this to `sort_unstable_by`: that would
+        // silently diverge from the GPU exactly on the coincident-depth case
+        // the CPU path exists to cross-check.
         projected.sort_by(|a, b| {
             a.depth
                 .partial_cmp(&b.depth)
@@ -117,7 +131,7 @@ impl CpuRasterizer {
         });
 
         // Step 3: Rasterize per-pixel (parallel)
-        let pixel_colors: Vec<[f32; 4]> = (0..num_pixels)
+        let pixel_results: Vec<([f32; 4], f32)> = (0..num_pixels)
             .into_par_iter()
             .map(|pixel_idx| {
                 let px = (pixel_idx % width as usize) as f32;
@@ -130,12 +144,12 @@ impl CpuRasterizer {
         let mut color_data = vec![0.0; num_pixels * 4];
         let mut depth_data = vec![0.0; num_pixels];
 
-        for (i, pixel_color) in pixel_colors.iter().enumerate() {
+        for (i, (pixel_color, pixel_depth)) in pixel_results.iter().enumerate() {
             color_data[i * 4] = pixel_color[0];
             color_data[i * 4 + 1] = pixel_color[1];
             color_data[i * 4 + 2] = pixel_color[2];
             color_data[i * 4 + 3] = pixel_color[3];
-            depth_data[i] = 0.0; // Depth accumulation not implemented yet
+            depth_data[i] = *pixel_depth;
         }
 
         Ok(CpuRenderOutput {
@@ -167,8 +181,14 @@ impl CpuRasterizer {
         // Transform to camera space
         let pos_cam = camera.view.transform_point(&na::Point3::from(pos));
 
-        // Cull if behind near plane
-        if pos_cam.z > -self.config.near_plane {
+        // Cull against near/far planes, mirroring shaders/preprocess.wgsl
+        // exactly (`let depth = -p_view.z; if depth <= near_plane || depth
+        // >= far_plane { cull }`), including its boundary strictness — a
+        // Gaussian sitting exactly on a clip plane is culled just like on
+        // the GPU, and Gaussians beyond `far_plane` are dropped here too
+        // (previously only the near plane was checked).
+        let depth = -pos_cam.z;
+        if depth <= self.config.near_plane || depth >= self.config.far_plane {
             return Ok(None);
         }
 
@@ -272,12 +292,11 @@ impl CpuRasterizer {
         let opacity = sigmoid(gaussian.opacity);
 
         Ok(Some(ProjectedGaussian {
-            idx,
             mean2d,
             conic,
             color,
             opacity,
-            depth: -pos_cam.z,
+            depth,
         }))
     }
 
@@ -288,7 +307,19 @@ impl CpuRasterizer {
         idx: usize,
         dir: na::Vector3<f32>,
     ) -> Result<na::Vector3<f32>, RenderError> {
-        let sh_degree = model.sh_degree.min(3);
+        // `GaussianModel::sh_degree` is an unvalidated plain `u32`. Silently
+        // clamping it to 3 while indexing with the *clamped* value would
+        // compute a stride (`sh_coeffs_per_gaussian`) that is smaller than
+        // the data's actual per-Gaussian layout whenever `sh_degree > 3`,
+        // so every Gaussian after the first would read coefficients
+        // belonging to a different Gaussian. Reject it outright instead.
+        if model.sh_degree > 3 {
+            return Err(RenderError::Rasterize(format!(
+                "unsupported SH degree {}: only degrees 0-3 are implemented",
+                model.sh_degree
+            )));
+        }
+        let sh_degree = model.sh_degree;
         let sh_coeffs_per_gaussian = ((sh_degree + 1) * (sh_degree + 1) * 3) as usize;
         let sh_start = idx * sh_coeffs_per_gaussian;
 
@@ -320,11 +351,21 @@ impl CpuRasterizer {
     }
 
     /// Blend Gaussians for a single pixel (front-to-back alpha compositing).
-    fn blend_pixel(&self, px: f32, py: f32, gaussians: &[ProjectedGaussian]) -> [f32; 4] {
+    ///
+    /// Returns `([r, g, b, alpha], depth)`. `depth` is the alpha-weighted
+    /// accumulated depth, mirroring `shaders/rasterize_fwd.wgsl` exactly:
+    /// the same per-Gaussian `weight = T * alpha` used for color is also
+    /// applied to `g.depth` inside the same loop
+    /// (`depth_acc += weight * wg_depth[b]` on the GPU side), with no
+    /// background contribution added to depth afterward — the GPU writes
+    /// `out_depth[pixel_idx] = depth_acc` directly, unlike color which gets
+    /// `color += T * background`.
+    fn blend_pixel(&self, px: f32, py: f32, gaussians: &[ProjectedGaussian]) -> ([f32; 4], f32) {
         let pixel_f = na::Vector2::new(px + 0.5, py + 0.5);
 
         let mut t = 1.0f32; // transmittance
         let mut color = na::Vector3::zeros();
+        let mut depth_acc = 0.0f32;
 
         for g in gaussians {
             if t < 1.0 / 255.0 {
@@ -349,10 +390,12 @@ impl CpuRasterizer {
 
             let weight = t * alpha;
             color += weight * g.color;
+            depth_acc += weight * g.depth;
             t *= 1.0 - alpha;
         }
 
-        // Add background
+        // Add background (color only — depth has no background term, as on
+        // the GPU).
         let bg = na::Vector3::new(
             self.config.background[0],
             self.config.background[1],
@@ -360,7 +403,7 @@ impl CpuRasterizer {
         );
         color += t * bg;
 
-        [color.x, color.y, color.z, 1.0 - t]
+        ([color.x, color.y, color.z, 1.0 - t], depth_acc)
     }
 }
 
@@ -509,9 +552,96 @@ mod tests {
         let rasterizer = CpuRasterizer::new(config);
 
         let gaussians = vec![];
-        let pixel = rasterizer.blend_pixel(0.0, 0.0, &gaussians);
+        let (pixel, depth) = rasterizer.blend_pixel(0.0, 0.0, &gaussians);
 
-        // Should return background color (black by default)
+        // Should return background color (black by default) and zero
+        // accumulated depth (no Gaussians contributed).
         assert_eq!(pixel, [0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(depth, 0.0);
+    }
+
+    #[test]
+    fn test_blend_pixel_depth_matches_weighted_sum() {
+        // Two exactly-overlapping, fully-opaque (post-clamp) Gaussians at
+        // the pixel center: depth_acc must equal sum(weight_i * depth_i)
+        // with weight_i = T_i * alpha_i, exactly mirroring
+        // shaders/rasterize_fwd.wgsl's `depth_acc += weight * wg_depth[b]`.
+        let config = RasterConfig::new().with_resolution(64, 64);
+        let rasterizer = CpuRasterizer::new(config);
+
+        let near = ProjectedGaussian {
+            mean2d: na::Vector2::new(10.5, 10.5),
+            conic: na::Vector3::new(10.0, 0.0, 10.0),
+            color: na::Vector3::new(1.0, 0.0, 0.0),
+            opacity: 1.0,
+            depth: 1.0,
+        };
+        let far = ProjectedGaussian {
+            mean2d: na::Vector2::new(10.5, 10.5),
+            conic: na::Vector3::new(10.0, 0.0, 10.0),
+            color: na::Vector3::new(0.0, 1.0, 0.0),
+            opacity: 1.0,
+            depth: 10.0,
+        };
+
+        let (_pixel, depth) = rasterizer.blend_pixel(10.0, 10.0, &[near, far]);
+
+        // Both Gaussians sit dead-center (power = 0) with opacity clamped
+        // to 0.99: weight_near = 1.0 * 0.99, weight_far = (1.0 - 0.99) * 0.99.
+        let expected = 0.99 * 1.0 + (0.01 * 0.99) * 10.0;
+        assert!(
+            (depth - expected).abs() < 1e-4,
+            "expected depth={expected}, got {depth}"
+        );
+        // The nearer Gaussian dominates because its weight (0.99) far
+        // exceeds the farther one's residual-transmittance weight (0.0099).
+        let near_contribution = 0.99 * 1.0;
+        assert!(
+            depth < near_contribution * 1.2,
+            "nearer Gaussian should dominate accumulated depth: depth={depth}"
+        );
+    }
+
+    #[test]
+    fn test_blend_pixel_depth_zero_when_pixel_uncovered() {
+        // A Gaussian far from the queried pixel contributes ~0 weight, so
+        // depth should stay at (approximately) zero rather than picking up
+        // a stray, uncontributed value.
+        let config = RasterConfig::new().with_resolution(64, 64);
+        let rasterizer = CpuRasterizer::new(config);
+
+        let g = ProjectedGaussian {
+            mean2d: na::Vector2::new(1000.5, 1000.5), // far outside the pixel
+            conic: na::Vector3::new(10.0, 0.0, 10.0),
+            color: na::Vector3::new(1.0, 0.0, 0.0),
+            opacity: 1.0,
+            depth: 42.0,
+        };
+
+        let (_pixel, depth) = rasterizer.blend_pixel(10.0, 10.0, &[g]);
+        assert_eq!(depth, 0.0, "uncovered pixel should have zero depth");
+    }
+
+    #[test]
+    fn test_eval_sh_rejects_degree_above_three() {
+        // A model claiming sh_degree > 3 must error out rather than
+        // silently clamp to 3 and read coefficients at the wrong stride.
+        let config = RasterConfig::new().with_resolution(4, 4);
+        let rasterizer = CpuRasterizer::new(config);
+        let model = GaussianModel {
+            gaussians: Vec::new(),
+            // Give it *some* coefficients so the failure is unambiguously
+            // about the degree check, not an out-of-bounds slice: degree-4
+            // stride would be (4+1)^2*3 = 75.
+            sh_coeffs: vec![0.0f32; 75],
+            sh_degree: 4,
+            face_indices: Vec::new(),
+            barycentric: Vec::new(),
+            local_offsets: Vec::new(),
+            is_rigid: Vec::new(),
+        };
+        let dir = na::Vector3::new(0.0, 0.0, 1.0);
+        let result = rasterizer.eval_sh(&model, 0, dir);
+        assert!(result.is_err(), "sh_degree > 3 must be rejected");
     }
 }

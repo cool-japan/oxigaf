@@ -95,15 +95,9 @@ mod tests {
             opacity: -10.0, // sigmoid(-10) ≈ 0
         };
 
-        let model = GaussianModel {
-            gaussians: vec![gaussian],
-            sh_coeffs: vec![0.5, 0.5, 0.5],
-            sh_degree: 0,
-            face_indices: vec![],
-            barycentric: vec![],
-            local_offsets: vec![],
-            is_rigid: vec![],
-        };
+        // `model_from_gaussians` sizes the FLAME binding arrays to the
+        // Gaussian count; a hand-written literal used to leave them empty.
+        let model = model_from_gaussians(vec![gaussian], vec![0.5, 0.5, 0.5], 0);
 
         let camera = create_test_camera((64, 64));
         let target = create_target_image((64, 64));
@@ -137,15 +131,9 @@ mod tests {
             opacity: 10.0, // sigmoid(10) ≈ 1
         };
 
-        let model = GaussianModel {
-            gaussians: vec![gaussian],
-            sh_coeffs: vec![0.5, 0.5, 0.5],
-            sh_degree: 0,
-            face_indices: vec![],
-            barycentric: vec![],
-            local_offsets: vec![],
-            is_rigid: vec![],
-        };
+        // `model_from_gaussians` sizes the FLAME binding arrays to the
+        // Gaussian count; a hand-written literal used to leave them empty.
+        let model = model_from_gaussians(vec![gaussian], vec![0.5, 0.5, 0.5], 0);
 
         let camera = create_test_camera((64, 64));
         let target = create_target_image((64, 64));
@@ -179,15 +167,9 @@ mod tests {
             opacity: 0.0, // sigmoid(0) = 0.5
         };
 
-        let model = GaussianModel {
-            gaussians: vec![gaussian],
-            sh_coeffs: vec![0.5, 0.5, 0.5],
-            sh_degree: 0,
-            face_indices: vec![],
-            barycentric: vec![],
-            local_offsets: vec![],
-            is_rigid: vec![],
-        };
+        // `model_from_gaussians` sizes the FLAME binding arrays to the
+        // Gaussian count; a hand-written literal used to leave them empty.
+        let model = model_from_gaussians(vec![gaussian], vec![0.5, 0.5, 0.5], 0);
 
         let camera = create_test_camera((64, 64));
         let target = create_target_image((64, 64));
@@ -227,15 +209,7 @@ mod tests {
 
         let sh_coeffs = vec![0.5; 9]; // 3 Gaussians × 3 channels
 
-        let model = GaussianModel {
-            gaussians,
-            sh_coeffs,
-            sh_degree: 0,
-            face_indices: vec![],
-            barycentric: vec![],
-            local_offsets: vec![],
-            is_rigid: vec![],
-        };
+        let model = model_from_gaussians(gaussians, sh_coeffs, 0);
 
         let camera = create_test_camera((64, 64));
         let target = create_target_image((64, 64));
@@ -283,15 +257,7 @@ mod tests {
 
         let sh_coeffs = vec![0.5; 9]; // 3 Gaussians × 3 channels
 
-        let model = GaussianModel {
-            gaussians,
-            sh_coeffs,
-            sh_degree: 0,
-            face_indices: vec![],
-            barycentric: vec![],
-            local_offsets: vec![],
-            is_rigid: vec![],
-        };
+        let model = model_from_gaussians(gaussians, sh_coeffs, 0);
 
         let camera = create_test_camera((64, 64));
         let target = create_target_image((64, 64));
@@ -316,9 +282,17 @@ mod tests {
     }
 
     /// GRADIENT VERIFICATION TEST: Compare analytical vs numerical opacity gradients.
+    ///
+    /// Not `#[ignore]`d: skips itself at runtime via `gpu_available()` when no
+    /// compatible GPU adapter is present, so it still runs (and gates CI) on
+    /// any machine that does have one. A blanket `#[ignore]` let the whole
+    /// suite report green without a single backward shader ever running.
     #[test]
-    #[ignore = "requires GPU hardware"]
     fn test_opacity_analytical_vs_numerical() {
+        if !gpu_available() {
+            return;
+        }
+
         let scene_config = TestSceneConfig {
             num_gaussians: 5,
             resolution: (64, 64),
@@ -366,9 +340,15 @@ mod tests {
     }
 
     /// Test opacity gradients across the full sigmoid range.
+    ///
+    /// Not `#[ignore]`d: skips itself at runtime via `gpu_available()` when no
+    /// compatible GPU adapter is present.
     #[test]
-    #[ignore = "requires GPU hardware"]
     fn test_opacity_gradients_sigmoid_range() {
+        if !gpu_available() {
+            return;
+        }
+
         // Test a range of opacity values (sigmoid input), excluding extreme values
         // where the sigmoid derivative is near-zero and single-entry median is unreliable
         let opacity_values = vec![-2.0, -1.0, 0.0, 1.0, 2.0];
@@ -382,15 +362,7 @@ mod tests {
                 opacity,
             };
 
-            let model = GaussianModel {
-                gaussians: vec![gaussian],
-                sh_coeffs: vec![0.5, 0.5, 0.5],
-                sh_degree: 0,
-                face_indices: vec![],
-                barycentric: vec![],
-                local_offsets: vec![],
-                is_rigid: vec![],
-            };
+            let model = model_from_gaussians(vec![gaussian], vec![0.5, 0.5, 0.5], 0);
 
             let camera = create_test_camera((64, 64));
             let target = create_target_image((64, 64));

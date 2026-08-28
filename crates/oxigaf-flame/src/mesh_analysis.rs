@@ -32,6 +32,12 @@ pub struct FaceQualityStats {
     pub mean_aspect_ratio: f32,
     /// Number of triangles with at least one interior angle greater than 90°.
     pub obtuse_count: usize,
+    /// Number of faces referencing a vertex index outside the mesh's vertex
+    /// count. These are skipped (treated as zero area / not obtuse / not
+    /// counted toward valence) rather than indexed, so a malformed mesh
+    /// produces a report instead of a panic; a nonzero count here means the
+    /// other face-level statistics undercount the true face list.
+    pub invalid_face_count: usize,
 }
 
 /// Statistics about vertex distribution.
@@ -98,6 +104,11 @@ impl MeshQualityReport {
             "  Obtuse triangles:   {}",
             self.face_stats.obtuse_count
         );
+        let _ = writeln!(
+            out,
+            "  Invalid faces (out-of-range idx): {}",
+            self.face_stats.invalid_face_count
+        );
 
         let _ = writeln!(out, "--- Vertex Statistics ---");
         let _ = writeln!(
@@ -141,10 +152,12 @@ impl MeshQualityReport {
     }
 
     /// Returns `true` if the mesh has critical structural problems:
-    /// degenerate faces, isolated vertices, or non-manifold topology.
+    /// degenerate faces, isolated vertices, non-manifold topology, or faces
+    /// referencing out-of-range vertex indices.
     #[must_use]
     pub fn has_critical_issues(&self) -> bool {
         self.face_stats.degenerate_count > 0
+            || self.face_stats.invalid_face_count > 0
             || self.vertex_stats.isolated_count > 0
             || !self.is_manifold
     }
@@ -178,14 +191,24 @@ fn has_duplicate_indices(face: &[u32; 3]) -> bool {
 ///
 /// Area of triangle `(v0, v1, v2)` = 0.5 × ‖(v1−v0) × (v2−v0)‖.
 /// Returns a `Vec<f32>` of length equal to `faces.len()`.
+///
+/// A face referencing a vertex index `>= vertices.len()` reports `0.0`
+/// (matching the existing degenerate-triangle convention) instead of
+/// panicking; the output stays aligned 1:1 with `faces` so callers that
+/// index by face position (e.g. [`compute_mesh_quality`]) remain correct.
 #[must_use]
 pub fn compute_face_areas(vertices: &[[f32; 3]], faces: &[[u32; 3]]) -> Vec<f32> {
+    let n = vertices.len();
     faces
         .iter()
         .map(|face| {
-            let v0 = vertices[face[0] as usize];
-            let v1 = vertices[face[1] as usize];
-            let v2 = vertices[face[2] as usize];
+            let (i0, i1, i2) = (face[0] as usize, face[1] as usize, face[2] as usize);
+            if i0 >= n || i1 >= n || i2 >= n {
+                return 0.0;
+            }
+            let v0 = vertices[i0];
+            let v1 = vertices[i1];
+            let v2 = vertices[i2];
             let e1 = [v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]];
             let e2 = [v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2]];
             let cross = [
@@ -202,15 +225,22 @@ pub fn compute_face_areas(vertices: &[[f32; 3]], faces: &[[u32; 3]]) -> Vec<f32>
 /// Compute the aspect ratio of every triangle in the mesh.
 ///
 /// Aspect ratio = `min_edge_length` / `max_edge_length`.
-/// Returns 1.0 for an equilateral triangle, 0.0 for a degenerate triangle.
+/// Returns 1.0 for an equilateral triangle, 0.0 for a degenerate triangle
+/// (including one referencing a vertex index `>= vertices.len()`, which
+/// carries no reliable geometry). The output stays aligned 1:1 with `faces`.
 #[must_use]
 pub fn compute_face_aspect_ratios(vertices: &[[f32; 3]], faces: &[[u32; 3]]) -> Vec<f32> {
+    let n = vertices.len();
     faces
         .iter()
         .map(|face| {
-            let v0 = vertices[face[0] as usize];
-            let v1 = vertices[face[1] as usize];
-            let v2 = vertices[face[2] as usize];
+            let (i0, i1, i2) = (face[0] as usize, face[1] as usize, face[2] as usize);
+            if i0 >= n || i1 >= n || i2 >= n {
+                return 0.0;
+            }
+            let v0 = vertices[i0];
+            let v1 = vertices[i1];
+            let v2 = vertices[i2];
 
             let edge_len_sq = |a: [f32; 3], b: [f32; 3]| -> f32 {
                 let dx = b[0] - a[0];
@@ -285,6 +315,9 @@ type EdgeValenceResult = (HashMap<(u32, u32), u32>, Vec<u32>, Vec<(u32, u32)>);
 
 /// Build edge occurrence map and per-vertex valence from a face list.
 /// Returns `(edge_count, valence, boundary_edges)`.
+///
+/// A vertex index `>= num_verts` is skipped in the valence count (there is
+/// no slot to record it in), rather than indexing `valence` out of bounds.
 fn build_edge_and_valence(faces: &[[u32; 3]], num_verts: usize) -> EdgeValenceResult {
     let mut edge_count: HashMap<(u32, u32), u32> = HashMap::with_capacity(faces.len() * 3);
     let mut valence = vec![0u32; num_verts];
@@ -295,7 +328,10 @@ fn build_edge_and_valence(faces: &[[u32; 3]], num_verts: usize) -> EdgeValenceRe
                 .or_insert(0) += 1;
         }
         for &idx in face {
-            valence[idx as usize] += 1;
+            let i = idx as usize;
+            if i < num_verts {
+                valence[i] += 1;
+            }
         }
     }
     let boundary_edges: Vec<(u32, u32)> = edge_count
@@ -326,15 +362,23 @@ fn area_stats(areas: &[f32]) -> (f32, f32, f32, f32) {
 }
 
 /// Count faces where at least one interior angle is obtuse (dot product < 0).
+///
+/// A face referencing a vertex index `>= vertices.len()` cannot have its
+/// angles evaluated and is not counted as obtuse (nor does it panic).
 fn count_obtuse_faces(vertices: &[[f32; 3]], faces: &[[u32; 3]]) -> usize {
+    let n = vertices.len();
     let sub = |p: [f32; 3], q: [f32; 3]| -> [f32; 3] { [p[0] - q[0], p[1] - q[1], p[2] - q[2]] };
     let dot = |p: [f32; 3], q: [f32; 3]| -> f32 { p[0] * q[0] + p[1] * q[1] + p[2] * q[2] };
     faces
         .iter()
         .filter(|face| {
-            let v0 = vertices[face[0] as usize];
-            let v1 = vertices[face[1] as usize];
-            let v2 = vertices[face[2] as usize];
+            let (i0, i1, i2) = (face[0] as usize, face[1] as usize, face[2] as usize);
+            if i0 >= n || i1 >= n || i2 >= n {
+                return false;
+            }
+            let v0 = vertices[i0];
+            let v1 = vertices[i1];
+            let v2 = vertices[i2];
             dot(sub(v1, v0), sub(v2, v0)) < 0.0
                 || dot(sub(v0, v1), sub(v2, v1)) < 0.0
                 || dot(sub(v0, v2), sub(v1, v2)) < 0.0
@@ -398,6 +442,15 @@ pub fn compute_mesh_quality(vertices: &[[f32; 3]], faces: &[[u32; 3]]) -> MeshQu
     // 4. Obtuse triangle count
     let obtuse_count = count_obtuse_faces(vertices, faces);
 
+    // 4b. Faces referencing a vertex index outside `vertices` -- skipped by
+    // `compute_face_areas`/`compute_face_aspect_ratios`/`count_obtuse_faces`/
+    // `build_edge_and_valence` rather than indexed, so surface the count
+    // here instead of leaving the discrepancy silent.
+    let invalid_face_count = faces
+        .iter()
+        .filter(|face| face.iter().any(|&idx| idx as usize >= num_verts))
+        .count();
+
     // 5. Euler characteristic: V - E + F
     let euler_characteristic = i32::try_from(num_verts).unwrap_or(i32::MAX)
         - i32::try_from(num_unique_edges).unwrap_or(i32::MAX)
@@ -407,6 +460,11 @@ pub fn compute_mesh_quality(vertices: &[[f32; 3]], faces: &[[u32; 3]]) -> MeshQu
     let mut warnings = Vec::new();
     if degenerate_count > 0 {
         warnings.push(format!("Degenerate faces: {degenerate_count}"));
+    }
+    if invalid_face_count > 0 {
+        warnings.push(format!(
+            "Faces referencing out-of-range vertex indices: {invalid_face_count}"
+        ));
     }
     if max_valence > 20 {
         warnings.push(format!("High valence vertex: {max_valence}"));
@@ -427,6 +485,7 @@ pub fn compute_mesh_quality(vertices: &[[f32; 3]], faces: &[[u32; 3]]) -> MeshQu
             min_aspect_ratio,
             mean_aspect_ratio,
             obtuse_count,
+            invalid_face_count,
         },
         vertex_stats: VertexQualityStats {
             total_vertices: num_verts,
@@ -740,5 +799,55 @@ mod tests {
         assert_eq!(report.face_stats.degenerate_count, 0);
         assert!(report.has_boundary);
         assert!(report.is_manifold);
+    }
+
+    // -----------------------------------------------------------------------
+    // Out-of-range face indices: reported, not panics
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compute_face_areas_out_of_range_face_reports_zero_and_keeps_alignment() {
+        let verts = equilateral_triangle_verts(); // 3 vertices (indices 0..2)
+        let faces = vec![[0u32, 1, 2], [0u32, 1, 99]]; // second face out of range
+        let areas = compute_face_areas(&verts, &faces);
+        assert_eq!(areas.len(), 2, "output must stay aligned with input faces");
+        assert!(
+            areas[0] > 0.0,
+            "first (valid) face should have nonzero area"
+        );
+        assert_eq!(
+            areas[1], 0.0,
+            "out-of-range face should report zero area, not panic"
+        );
+    }
+
+    #[test]
+    fn test_compute_face_aspect_ratios_out_of_range_face_reports_zero() {
+        let verts = equilateral_triangle_verts();
+        let faces = vec![[0u32, 1, 2], [5u32, 6, 7]];
+        let ratios = compute_face_aspect_ratios(&verts, &faces);
+        assert_eq!(ratios.len(), 2);
+        assert!((ratios[0] - 1.0).abs() < 1e-5);
+        assert_eq!(ratios[1], 0.0);
+    }
+
+    #[test]
+    fn test_compute_mesh_quality_out_of_range_face_does_not_panic() {
+        let verts = equilateral_triangle_verts();
+        // Second face references vertices 5 and 9, which do not exist.
+        let faces = vec![[0u32, 1, 2], [0u32, 5, 9]];
+        let report = compute_mesh_quality(&verts, &faces);
+        assert_eq!(report.face_stats.invalid_face_count, 1);
+        assert!(report.has_critical_issues());
+        let has_warn = report.warnings.iter().any(|w| w.contains("out-of-range"));
+        assert!(has_warn, "should warn about out-of-range face indices");
+    }
+
+    #[test]
+    fn test_compute_mesh_quality_all_valid_faces_zero_invalid_count() {
+        let (verts, faces) = tetrahedron();
+        let report = compute_mesh_quality(&verts, &faces);
+        assert_eq!(report.face_stats.invalid_face_count, 0);
+        assert!(!report.has_critical_issues());
     }
 }

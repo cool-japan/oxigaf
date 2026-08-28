@@ -51,6 +51,14 @@ pub enum DofError {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Configuration for depth-of-field post-processing.
+///
+/// This is a **simplified linear model**: the blur radius in pixels is a
+/// piecewise-linear function of how far a pixel's depth is from
+/// `focal_distance`, controlled solely by `focal_distance`, `focal_range`
+/// and `max_blur_radius` (see [`compute_coc`]). It does not model a real
+/// lens (no focal length, aperture, or sensor geometry) - for a
+/// physically-based thin-lens CoC model with aperture/f-stop and sensor-size
+/// support, see [`crate::depth_of_field`].
 #[derive(Debug, Clone)]
 pub struct DofConfig {
     /// Distance in world units where the image is perfectly sharp.
@@ -59,10 +67,6 @@ pub struct DofConfig {
     pub focal_range: f32,
     /// Maximum blur radius in pixels.
     pub max_blur_radius: f32,
-    /// f-stop number (lower = wider aperture = more blur, e.g. 1.4, 2.8, 5.6).
-    pub f_stop: f32,
-    /// Sensor width for CoC computation (in world units).
-    pub sensor_width: f32,
 }
 
 impl Default for DofConfig {
@@ -71,8 +75,6 @@ impl Default for DofConfig {
             focal_distance: 2.0,
             focal_range: 0.3,
             max_blur_radius: 15.0,
-            f_stop: 2.8,
-            sensor_width: 0.036,
         }
     }
 }
@@ -203,9 +205,16 @@ pub fn compute_coc(
     }
 
     if depth_map.len() != expected {
+        // `compute_coc` has no separate image buffer, so `image_len` here
+        // holds the *expected* pixel count (`image_width * image_height`)
+        // rather than an actual image buffer length. `depth_len` must still
+        // hold the depth buffer's actual length, per its field doc - the
+        // previous assignment had these two backwards (the actual depth
+        // length under `image_len`, the expected count under `depth_len`),
+        // which is doubly misleading in the rendered error message.
         return Err(DofError::SizeMismatch {
-            image_len: depth_map.len(),
-            depth_len: expected,
+            image_len: expected,
+            depth_len: depth_map.len(),
         });
     }
 
@@ -359,6 +368,13 @@ pub fn apply_dof(
 
     let mut output = vec![0.0_f32; expected_image];
 
+    // Hoisted out of the per-pixel loop: `channels` is fixed for the whole
+    // call, so a fresh `Vec` (heap allocation + deallocation) for every
+    // blurred pixel is pure overhead - a 1920×1080 render performs roughly
+    // two million such alloc/dealloc pairs on top of the O(W×H×r²) gather.
+    // Re-zeroed at the top of each blurred pixel instead.
+    let mut acc = vec![0.0_f32; channels];
+
     for py in 0..image_height {
         for px in 0..image_width {
             let pixel_idx = py * image_width + px;
@@ -376,7 +392,7 @@ pub fn apply_dof(
             let r_ceil = r.ceil() as isize;
             let r2 = r * r;
 
-            let mut acc = vec![0.0_f32; channels];
+            acc.fill(0.0);
             let mut weight_sum = 0.0_f32;
 
             let y_lo = (py as isize - r_ceil).max(0) as usize;
@@ -468,7 +484,6 @@ mod tests {
             focal_distance: 2.0,
             focal_range: 0.3,
             max_blur_radius: 15.0,
-            ..DofConfig::default()
         };
         let depth_map = vec![100.0_f32; 4];
         let coc = compute_coc(&depth_map, &cfg, 2, 2).expect("compute_coc failed");
@@ -487,7 +502,6 @@ mod tests {
             focal_distance: 2.0,
             focal_range: 0.4, // half_range = 0.2
             max_blur_radius: 10.0,
-            ..DofConfig::default()
         };
         // depth at exactly half_range away → normalised diff = 1.0 → coc = max
         let depth_map = vec![2.2_f32; 1];
@@ -514,7 +528,6 @@ mod tests {
             focal_distance: 1.0,
             focal_range: 0.1,
             max_blur_radius: 8.0,
-            ..DofConfig::default()
         };
         // Very far depth → clamped at max_blur_radius
         let depth_map = vec![999.0_f32; 1];
@@ -600,7 +613,6 @@ mod tests {
             focal_distance: 2.0,
             focal_range: 0.3,
             max_blur_radius: 15.0,
-            ..DofConfig::default()
         };
         let w = 4_usize;
         let h = 4_usize;
@@ -738,8 +750,6 @@ mod tests {
         assert!(approx_eq(cfg.focal_distance, 2.0, 1e-6));
         assert!(approx_eq(cfg.focal_range, 0.3, 1e-6));
         assert!(approx_eq(cfg.max_blur_radius, 15.0, 1e-6));
-        assert!(approx_eq(cfg.f_stop, 2.8, 1e-6));
-        assert!(approx_eq(cfg.sensor_width, 0.036, 1e-6));
     }
 
     #[test]
@@ -749,7 +759,6 @@ mod tests {
             focal_distance: 5.0,
             focal_range: 0.1,
             max_blur_radius: 5.0,
-            ..DofConfig::default()
         };
         let w = 6_usize;
         let h = 6_usize;
@@ -776,5 +785,30 @@ mod tests {
         let depth_map = vec![2.0_f32; 4];
         let result = apply_dof(&image, &depth_map, &cfg, DofKernelShape::Circular, 2, 2, 0);
         assert!(matches!(result, Err(DofError::ZeroChannels)));
+    }
+
+    #[test]
+    fn test_compute_coc_size_mismatch_reports_correct_fields() {
+        // Regression test: `image_len`/`depth_len` were previously swapped -
+        // `depth_len` (documented as "flat length of the depth buffer")
+        // must report the depth buffer's actual length, and `image_len`
+        // must report the expected pixel count (there is no separate image
+        // buffer in `compute_coc`).
+        let cfg = default_cfg();
+        let depth_map = vec![1.0_f32; 5]; // 3*2 = 6 expected, only 5 given
+        let result = compute_coc(&depth_map, &cfg, 3, 2);
+        match result {
+            Err(DofError::SizeMismatch {
+                image_len,
+                depth_len,
+            }) => {
+                assert_eq!(
+                    depth_len, 5,
+                    "depth_len must be the depth buffer's actual length"
+                );
+                assert_eq!(image_len, 6, "image_len must be the expected pixel count");
+            }
+            other => panic!("expected SizeMismatch, got {other:?}"),
+        }
     }
 }

@@ -2,13 +2,19 @@
 name = "oxigaf-trainer"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/oxigaf-trainer"
 description = "GAF optimization pipeline — iterative denoising distillation"
 readme = "README.md"
 keywords = ["training", "optimization", "3d", "gaussian-splatting", "ai"]
 categories = ["science", "algorithms", "graphics"]
+
+[package.metadata.docs.rs]
+rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 nalgebra = { workspace = true }
@@ -20,20 +26,27 @@ rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 wgpu = { workspace = true }
-bytemuck = { workspace = true }
 
 # Pure Rust deep learning for LPIPS
 candle-core = { workspace = true }
 candle-nn = { workspace = true }
 safetensors = { workspace = true }
 
-oxigaf-flame = { version = "0.1.1", path = "../oxigaf-flame" }
-oxigaf-diffusion = { version = "0.1.1", path = "../oxigaf-diffusion" }
-oxigaf-render = { version = "0.1.1", path = "../oxigaf-render" }
+oxigaf-flame = { workspace = true }
+oxigaf-diffusion = { workspace = true }
+oxigaf-render = { workspace = true }
+
+# Optional parallel processing. Not yet consumed by any src/ call site (see
+# data_parallel.rs's std::thread::scope and continual_learning.rs's EWC
+# Fisher update) — added so those can move onto rayon behind this feature;
+# `cargo machete` will flag it unused until that lands.
+rayon = { workspace = true, optional = true }
 
 [features]
 default = []
-torsh_integration = []
+# Enable parallel processing with rayon (currently unwired — see the
+# `rayon` dependency comment above)
+parallel = ["dep:rayon"]
 
 [dev-dependencies]
 approx = { workspace = true }

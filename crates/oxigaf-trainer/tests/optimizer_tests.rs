@@ -52,7 +52,9 @@ fn adam_converges_for_quadratic() {
         let mut gradients = Gradients::zeros(1, sh_channels);
         gradients.position[0] = grad;
 
-        optimizer.step(&mut model, &gradients, t);
+        optimizer
+            .step(&mut model, &gradients, t)
+            .expect("gradient shapes match the model");
     }
 
     // Should be close to 0
@@ -73,7 +75,9 @@ fn zero_gradient_no_change() {
     let gradients = Gradients::zeros(1, 3);
 
     for t in 1..=10 {
-        optimizer.step(&mut model, &gradients, t);
+        optimizer
+            .step(&mut model, &gradients, t)
+            .expect("gradient shapes match the model");
     }
 
     // Position should not change with zero gradients
@@ -240,7 +244,9 @@ fn constant_gradient_ema() {
     gradients.position[0] = constant_grad;
 
     for t in 1..=100 {
-        optimizer.step(&mut model, &gradients, t);
+        optimizer
+            .step(&mut model, &gradients, t)
+            .expect("gradient shapes match the model");
     }
 
     // After 100 steps, the first moment m should be close to the constant gradient

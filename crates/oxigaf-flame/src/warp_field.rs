@@ -365,7 +365,8 @@ pub fn build_vertex_adjacency(
 ///
 /// # Errors
 /// Returns [`WarpFieldError::DimensionMismatch`] if
-/// `adjacency.len() != field.num_vertices`.
+/// `adjacency.len() != field.num_vertices`, or if any neighbor index in
+/// `adjacency` is `>= field.num_vertices`.
 pub fn laplacian_smooth_warp_field(
     field: &WarpField,
     adjacency: &[Vec<usize>],
@@ -377,6 +378,20 @@ pub fn laplacian_smooth_warp_field(
             expected: field.num_vertices,
             got: adjacency.len(),
         });
+    }
+
+    // Validate every neighbor index up front, before any indexing happens.
+    // `adjacency` is caller-supplied and nothing else guarantees its entries
+    // are in range (e.g. it may have been built against a different,
+    // larger mesh); an out-of-range neighbor would otherwise panic on an
+    // out-of-bounds slice index deep inside the loop below.
+    for neighbors in adjacency {
+        if let Some(&bad) = neighbors.iter().find(|&&nb| nb >= field.num_vertices) {
+            return Err(WarpFieldError::DimensionMismatch {
+                expected: field.num_vertices,
+                got: bad + 1,
+            });
+        }
     }
 
     if iterations == 0 {
@@ -469,6 +484,11 @@ impl WarpMask {
     ///
     /// Seed vertices have hop distance `0` and therefore weight `1.0`.
     /// Vertices not reachable from any seed receive weight `0.0`.
+    ///
+    /// `sigma_hops` is clamped away from `0.0` internally (see the
+    /// `two_sigma_sq` computation below), so a zero (or otherwise
+    /// vanishingly small) `sigma_hops` degrades gracefully to a "seeds
+    /// only" mask instead of producing NaN weights.
     #[must_use]
     pub fn from_geodesic_distance(
         adjacency: &[Vec<usize>],
@@ -476,7 +496,15 @@ impl WarpMask {
         sigma_hops: f32,
     ) -> Self {
         let n = adjacency.len();
-        let two_sigma_sq = 2.0 * sigma_hops * sigma_hops;
+        // `sigma_hops == 0.0` (or a magnitude so small it underflows to 0.0
+        // once squared, e.g. ~1e-20) would otherwise make `two_sigma_sq`
+        // exactly 0.0, so the seed vertex's `-0.0*0.0 / 0.0` evaluates to
+        // NaN instead of the documented weight of 1.0. Clamping the
+        // denominator to a tiny positive value keeps `exp(-d^2/eps) == 1.0`
+        // at d == 0 (seeds) and drives it to (effectively) 0.0 for any
+        // d > 0, i.e. exactly the "seeds only" limit of the Gaussian
+        // falloff as sigma_hops -> 0.
+        let two_sigma_sq = (2.0 * sigma_hops * sigma_hops).max(f32::EPSILON);
         let mut hop_dist = vec![u32::MAX; n];
         let mut queue: VecDeque<usize> = VecDeque::new();
 
@@ -1079,6 +1107,33 @@ mod tests {
     }
 
     #[test]
+    fn test_warp_mask_geodesic_zero_sigma_no_nan() {
+        // `sigma_hops = 0.0` used to make `two_sigma_sq` exactly 0.0, so the
+        // seed vertex's `-0.0*0.0 / 0.0` evaluated to NaN instead of the
+        // documented weight of 1.0.
+        let faces = vec![0_u32, 1, 2];
+        let adj = build_vertex_adjacency(3, &faces).expect("ok");
+        let mask = WarpMask::from_geodesic_distance(&adj, &[0], 0.0);
+
+        assert!(
+            mask.weights.iter().all(|w| !w.is_nan()),
+            "sigma_hops = 0.0 must not produce NaN weights: {:?}",
+            mask.weights
+        );
+        assert!(
+            (mask.weights[0] - 1.0).abs() < 1e-5,
+            "seed vertex should have weight 1.0, got {}",
+            mask.weights[0]
+        );
+        for (i, &w) in mask.weights.iter().enumerate().skip(1) {
+            assert!(
+                w.abs() < 1e-5,
+                "non-seed vertex {i} should have weight ~0.0 when sigma_hops=0, got {w}"
+            );
+        }
+    }
+
+    #[test]
     fn test_warp_mask_apply_to_field() {
         let wf = WarpField::from_displacements(vec![2.0_f32, 0.0, 0.0, 4.0, 0.0, 0.0]).expect("ok");
         let mask = WarpMask::from_bool(&[true, false]);
@@ -1239,6 +1294,37 @@ mod tests {
         let wf = WarpField::new(3);
         let bad_adj: Vec<Vec<usize>> = vec![vec![], vec![]]; // only 2 entries
         let result = laplacian_smooth_warp_field(&wf, &bad_adj, 1, 0.5);
+        assert!(matches!(
+            result,
+            Err(WarpFieldError::DimensionMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn test_laplacian_smooth_out_of_range_neighbor_returns_err_not_panic() {
+        // `adjacency` has the right length (3 == field.num_vertices) but
+        // vertex 1's neighbor list references index 7, which is out of
+        // range. This used to panic on an out-of-bounds slice index
+        // (`current[21]` against a 9-element buffer) instead of returning
+        // an error.
+        let field = WarpField::new(3);
+        let adjacency = vec![vec![1], vec![0, 7], vec![1]];
+        let result = laplacian_smooth_warp_field(&field, &adjacency, 1, 0.5);
+        assert!(
+            matches!(result, Err(WarpFieldError::DimensionMismatch { .. })),
+            "out-of-range neighbor index should return Err, not panic: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_laplacian_smooth_out_of_range_neighbor_caught_even_with_zero_iterations() {
+        // The adjacency validation runs regardless of `iterations`, so a
+        // malformed adjacency list is rejected immediately rather than
+        // silently accepted as a no-op that only panics once a caller later
+        // raises `iterations` above 0.
+        let field = WarpField::new(3);
+        let adjacency = vec![vec![1], vec![0, 7], vec![1]];
+        let result = laplacian_smooth_warp_field(&field, &adjacency, 0, 0.5);
         assert!(matches!(
             result,
             Err(WarpFieldError::DimensionMismatch { .. })

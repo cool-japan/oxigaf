@@ -333,7 +333,10 @@ pub fn apply_ev(pixels: &mut [u8], ev: f32) -> Result<(), ExposureError> {
 /// `pixel_out = (pixel_in / 255)^(1 / gamma) * 255`.
 ///
 /// - `gamma = 1.0` — no change.
-/// - `gamma = 2.2` — standard sRGB decode (brightens the image).
+/// - `gamma = 2.2` — approximate sRGB **encode** (linear → display; raising
+///   to the `1/2.2` power brightens the image). To perform the sRGB
+///   **decode** (display → linear, which *darkens* the image) instead,
+///   pass `gamma = 1.0 / 2.2` so the exponent becomes `2.2`.
 /// - `gamma < 1.0` — darkens.
 pub fn apply_gamma_correction(pixels: &mut [u8], gamma: f32) -> Result<(), ExposureError> {
     if pixels.is_empty() {

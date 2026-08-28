@@ -228,7 +228,7 @@ fn bench_covariance(c: &mut Criterion) {
 
     let scale = Vec3::new(0.01, 0.02, 0.01);
     let rotation = Quat::from_euler(glam::EulerRot::XYZ, 0.1, 0.2, 0.3);
-    let view = Mat4::look_at_rh(Vec3::new(0.0, 0.0, 1.0), Vec3::ZERO, Vec3::Y);
+    let view = glam::camera::rh::view::look_at_mat4(Vec3::new(0.0, 0.0, 1.0), Vec3::ZERO, Vec3::Y);
     let focal = Vec2::new(500.0, 500.0);
     let p_view = Vec3::new(0.1, 0.1, 0.5);
 

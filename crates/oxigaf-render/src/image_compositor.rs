@@ -237,8 +237,14 @@ impl CompositingLayer {
 /// Configuration for the image compositor.
 #[derive(Debug, Clone)]
 pub struct CompositorConfig {
-    /// When `true`, pixel data is treated as already premultiplied by alpha.
-    /// Default: `false`.
+    /// When `true`, each layer's pixel data is treated as already
+    /// premultiplied by alpha: [`composite_image_layers`] un-premultiplies
+    /// it before compositing, since the Porter-Duff math in
+    /// [`apply_blend_mode`] / [`composite_over`] assumes straight alpha.
+    /// The composited output is always in straight-alpha form regardless
+    /// of this flag. Default: `false`. Only consumed by
+    /// [`composite_image_layers`] — the lower-level [`composite_over`] and
+    /// [`apply_blend_mode`] functions always assume straight alpha input.
     pub premultiplied_alpha: bool,
     /// Background RGBA colour filled before any layers are applied.
     /// Default: opaque black `[0, 0, 0, 255]`.
@@ -345,10 +351,10 @@ pub fn composite_over(
         let out_g = (src_g * src_a + dst_g * k) / denom;
         let out_b = (src_b * src_a + dst_b * k) / denom;
 
-        out.push((out_r.clamp(0.0, 1.0) * 255.0) as u8);
-        out.push((out_g.clamp(0.0, 1.0) * 255.0) as u8);
-        out.push((out_b.clamp(0.0, 1.0) * 255.0) as u8);
-        out.push((out_a.clamp(0.0, 1.0) * 255.0) as u8);
+        out.push((out_r.clamp(0.0, 1.0) * 255.0).round() as u8);
+        out.push((out_g.clamp(0.0, 1.0) * 255.0).round() as u8);
+        out.push((out_b.clamp(0.0, 1.0) * 255.0).round() as u8);
+        out.push((out_a.clamp(0.0, 1.0) * 255.0).round() as u8);
     }
 
     Ok(out)
@@ -412,10 +418,10 @@ pub fn apply_blend_mode(
         let out_g = (blended_g * src_a + dst_g * k) / denom;
         let out_b = (blended_b * src_a + dst_b * k) / denom;
 
-        out.push((out_r.clamp(0.0, 1.0) * 255.0) as u8);
-        out.push((out_g.clamp(0.0, 1.0) * 255.0) as u8);
-        out.push((out_b.clamp(0.0, 1.0) * 255.0) as u8);
-        out.push((out_a.clamp(0.0, 1.0) * 255.0) as u8);
+        out.push((out_r.clamp(0.0, 1.0) * 255.0).round() as u8);
+        out.push((out_g.clamp(0.0, 1.0) * 255.0).round() as u8);
+        out.push((out_b.clamp(0.0, 1.0) * 255.0).round() as u8);
+        out.push((out_a.clamp(0.0, 1.0) * 255.0).round() as u8);
     }
 
     Ok(out)
@@ -466,9 +472,24 @@ pub fn composite_image_layers(
         if !layer.visible {
             continue;
         }
+        // `apply_blend_mode`'s Porter-Duff math (and every `BlendMode`
+        // formula) assumes *straight* (non-premultiplied) alpha. If the
+        // caller has declared the layer data as already premultiplied,
+        // convert it to straight alpha first — otherwise the src*alpha
+        // multiply happens a second time, producing doubly-multiplied,
+        // over-dark output with no warning (the bug this branch fixes).
+        let straight_pixels;
+        let layer_pixels: &[u8] = if config.premultiplied_alpha {
+            let mut p = layer.pixels.clone();
+            unpremultiply_alpha(&mut p)?;
+            straight_pixels = p;
+            &straight_pixels
+        } else {
+            &layer.pixels
+        };
         acc = apply_blend_mode(
             &acc,
-            &layer.pixels,
+            layer_pixels,
             width,
             height,
             layer.blend_mode,
@@ -661,9 +682,9 @@ pub fn flatten_to_rgb(
         let out_g = g * a + bg_g * (1.0 - a);
         let out_b = b * a + bg_b * (1.0 - a);
 
-        out.push((out_r.clamp(0.0, 1.0) * 255.0) as u8);
-        out.push((out_g.clamp(0.0, 1.0) * 255.0) as u8);
-        out.push((out_b.clamp(0.0, 1.0) * 255.0) as u8);
+        out.push((out_r.clamp(0.0, 1.0) * 255.0).round() as u8);
+        out.push((out_g.clamp(0.0, 1.0) * 255.0).round() as u8);
+        out.push((out_b.clamp(0.0, 1.0) * 255.0).round() as u8);
     }
     Ok(out)
 }
@@ -966,6 +987,24 @@ mod tests {
     }
 
     #[test]
+    fn test_composite_over_opaque_top_is_identity() {
+        // Regression: truncating `(v * 255.0) as u8` instead of rounding
+        // could quantize an exact channel value like 200 down to 199 (the
+        // float round-trip 200/255*255 can land a hair under 200.0). A
+        // fully opaque top layer composited "over" anything must
+        // reproduce the top layer exactly, for every channel value.
+        let bottom = vec![10u8, 20u8, 30u8, 255u8];
+        for v in 0u8..=255 {
+            let top = vec![v, v, v, 255u8];
+            let result = composite_over(&bottom, &top, 1, 1, 1.0).expect("ok");
+            assert_eq!(
+                result, top,
+                "opaque composite_over should reproduce the top layer exactly for v={v}"
+            );
+        }
+    }
+
+    #[test]
     fn test_composite_over_half_alpha_blended() {
         // Both fully opaque bottom (128), top with alpha=128 (~50%)
         let bottom = vec![0u8, 0u8, 0u8, 255u8];
@@ -1091,6 +1130,106 @@ mod tests {
         let result = composite_image_layers(&[bottom, top_px_layer], 1, 1, &config).expect("ok");
         // Invisible top layer skipped → black remains
         assert_eq!(result[0], 0);
+    }
+
+    #[test]
+    fn test_composite_image_layers_premultiplied_alpha_respected() {
+        // A 50%-alpha white layer over an opaque black background. In
+        // *straight* alpha the layer's RGB is (255,255,255) regardless of
+        // its alpha; the same visual pixel stored *premultiplied* is
+        // (~128,~128,~128) at alpha=128. With `premultiplied_alpha: true`
+        // both must composite to (approximately) the same result.
+        let bottom_px = vec![0u8, 0u8, 0u8, 255u8];
+
+        let straight_layer =
+            CompositingLayer::new(vec![255u8, 255u8, 255u8, 128u8], 1, 1).expect("ok");
+        let straight_config = CompositorConfig {
+            premultiplied_alpha: false,
+            ..Default::default()
+        };
+        let straight_result = composite_image_layers(
+            &[
+                CompositingLayer::new(bottom_px.clone(), 1, 1).expect("ok"),
+                straight_layer,
+            ],
+            1,
+            1,
+            &straight_config,
+        )
+        .expect("ok");
+
+        let premul_layer =
+            CompositingLayer::new(vec![128u8, 128u8, 128u8, 128u8], 1, 1).expect("ok");
+        let premul_config = CompositorConfig {
+            premultiplied_alpha: true,
+            ..Default::default()
+        };
+        let premul_result = composite_image_layers(
+            &[
+                CompositingLayer::new(bottom_px, 1, 1).expect("ok"),
+                premul_layer,
+            ],
+            1,
+            1,
+            &premul_config,
+        )
+        .expect("ok");
+
+        for i in 0..3 {
+            let diff = (straight_result[i] as i32 - premul_result[i] as i32).abs();
+            assert!(
+                diff <= 3,
+                "channel {i}: straight={} premul={}",
+                straight_result[i],
+                premul_result[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_composite_image_layers_premultiplied_without_flag_is_darker() {
+        // Feeding premultiplied data through *without* setting the flag
+        // must double-apply the alpha multiply and produce a visibly
+        // darker (wrong) result than declaring the flag correctly.
+        let bottom_px = vec![0u8, 0u8, 0u8, 255u8];
+        let premul_pixels = vec![128u8, 128u8, 128u8, 128u8];
+
+        let wrong_config = CompositorConfig {
+            premultiplied_alpha: false, // WRONG: data is actually premultiplied
+            ..Default::default()
+        };
+        let wrong_result = composite_image_layers(
+            &[
+                CompositingLayer::new(bottom_px.clone(), 1, 1).expect("ok"),
+                CompositingLayer::new(premul_pixels.clone(), 1, 1).expect("ok"),
+            ],
+            1,
+            1,
+            &wrong_config,
+        )
+        .expect("ok");
+
+        let right_config = CompositorConfig {
+            premultiplied_alpha: true,
+            ..Default::default()
+        };
+        let right_result = composite_image_layers(
+            &[
+                CompositingLayer::new(bottom_px, 1, 1).expect("ok"),
+                CompositingLayer::new(premul_pixels, 1, 1).expect("ok"),
+            ],
+            1,
+            1,
+            &right_config,
+        )
+        .expect("ok");
+
+        assert!(
+            wrong_result[0] < right_result[0],
+            "mis-handled premultiplied data should be darker: wrong={} right={}",
+            wrong_result[0],
+            right_result[0]
+        );
     }
 
     // ── premultiply_alpha / unpremultiply_alpha ───────────────────────────

@@ -469,7 +469,11 @@ impl ProgressiveUnfreezeSchedule {
 /// Stateful manager for parameter freezing during training.
 ///
 /// Tracks the current training step and applies a `ProgressiveUnfreezeSchedule`
-/// if one is provided, automatically updating the freeze state as training progresses.
+/// if one is provided, automatically updating the freeze state as training
+/// progresses. Manual overrides from [`freeze`](ParameterFreezer::freeze) /
+/// [`unfreeze`](ParameterFreezer::unfreeze) take precedence over the
+/// schedule and persist across [`step`](ParameterFreezer::step) calls until
+/// [`clear_overrides`](ParameterFreezer::clear_overrides) is called.
 pub struct ParameterFreezer {
     /// Current freeze configuration.
     pub config: FreezeConfig,
@@ -477,6 +481,11 @@ pub struct ParameterFreezer {
     pub schedule: Option<ProgressiveUnfreezeSchedule>,
     /// Current training step counter.
     pub step: usize,
+    /// Manual freeze/unfreeze overrides applied via
+    /// [`freeze`](Self::freeze) / [`unfreeze`](Self::unfreeze). Re-applied
+    /// on top of the schedule's recomputed config on every
+    /// [`step`](Self::step) call, so they are not silently discarded.
+    overrides: HashMap<GaussianParamGroup, bool>,
 }
 
 impl ParameterFreezer {
@@ -486,6 +495,7 @@ impl ParameterFreezer {
             config,
             schedule: None,
             step: 0,
+            overrides: HashMap::new(),
         }
     }
 
@@ -495,16 +505,23 @@ impl ParameterFreezer {
             config,
             schedule: Some(schedule),
             step: 0,
+            overrides: HashMap::new(),
         }
     }
 
     /// Advance one training step.
     ///
-    /// If a schedule is present, the freeze config is updated to reflect
-    /// the state at the current step before incrementing the counter.
+    /// If a schedule is present, the freeze config is recomputed for the
+    /// current step; any manual overrides from [`freeze`](Self::freeze) /
+    /// [`unfreeze`](Self::unfreeze) are then re-applied on top, so they
+    /// persist across steps instead of being silently reverted by the next
+    /// schedule recomputation.
     pub fn step(&mut self) {
         if let Some(ref schedule) = self.schedule {
             self.config = schedule.freeze_config_at_step(self.step);
+        }
+        for (group, &frozen) in &self.overrides {
+            self.config.set_frozen(group.clone(), frozen);
         }
         self.step += 1;
     }
@@ -515,13 +532,28 @@ impl ParameterFreezer {
     }
 
     /// Force-freeze a parameter group, overriding the schedule.
+    ///
+    /// The override is re-applied on every subsequent [`step`](Self::step)
+    /// call until [`clear_overrides`](Self::clear_overrides) removes it.
     pub fn freeze(&mut self, group: GaussianParamGroup) {
-        self.config.set_frozen(group, true);
+        self.config.set_frozen(group.clone(), true);
+        self.overrides.insert(group, true);
     }
 
     /// Force-unfreeze a parameter group, overriding the schedule.
+    ///
+    /// The override is re-applied on every subsequent [`step`](Self::step)
+    /// call until [`clear_overrides`](Self::clear_overrides) removes it.
     pub fn unfreeze(&mut self, group: GaussianParamGroup) {
-        self.config.set_frozen(group, false);
+        self.config.set_frozen(group.clone(), false);
+        self.overrides.insert(group, false);
+    }
+
+    /// Remove all manual freeze/unfreeze overrides, letting the schedule
+    /// (if any) fully control freeze state again from the next
+    /// [`step`](Self::step) call.
+    pub fn clear_overrides(&mut self) {
+        self.overrides.clear();
     }
 
     /// Zero out gradients for all frozen groups.
@@ -694,11 +726,16 @@ pub fn frozen_compute_savings(mask: &FrozenMask) -> f32 {
     mask.frozen_count() as f32 / mask.len() as f32
 }
 
-/// Split a flat Gaussian model into labeled parameter groups.
+/// Return `(group, element_count)` pairs for the non-empty Gaussian
+/// parameter arrays, in canonical order.
 ///
-/// Returns `(GaussianParamGroup, size)` pairs for all non-empty arrays,
-/// preserving canonical group ordering.
-pub fn split_into_groups(
+/// This does NOT split, copy, or otherwise touch the underlying data — the
+/// six arrays are already separate; this only reports which are non-empty
+/// and how large each one is, so callers can label pre-partitioned
+/// gradient/parameter arrays without re-deriving the boundaries themselves.
+/// It was previously called `split_into_groups`, a name that promised a
+/// partitioning it never performed.
+pub fn non_empty_group_sizes(
     positions: &[f32],
     rotations: &[f32],
     scales: &[f32],
@@ -1189,6 +1226,45 @@ mod tests {
         assert!(!freezer.is_frozen(&GaussianParamGroup::Scales));
     }
 
+    // Regression test: a manual freeze() override must survive subsequent
+    // step() calls even when a schedule is attached, instead of being
+    // silently discarded the next time the schedule recomputes the config.
+    #[test]
+    fn test_parameter_freezer_override_persists_across_step() {
+        let groups = vec![GaussianParamGroup::Positions, GaussianParamGroup::Rotations];
+        let schedule = ProgressiveUnfreezeSchedule::uniform(groups, 1000, 0).expect("schedule");
+        let config = FreezeConfig::all_frozen();
+        let mut freezer = ParameterFreezer::with_schedule(config, schedule);
+
+        // Schedule unfreezes Positions at step 0.
+        freezer.step();
+        assert!(!freezer.is_frozen(&GaussianParamGroup::Positions));
+
+        // Force-freeze Positions despite the schedule saying it's trainable.
+        freezer.freeze(GaussianParamGroup::Positions);
+        assert!(freezer.is_frozen(&GaussianParamGroup::Positions));
+
+        // Further step() calls must NOT silently revert the override.
+        freezer.step();
+        assert!(
+            freezer.is_frozen(&GaussianParamGroup::Positions),
+            "manual freeze() override should survive step()"
+        );
+        freezer.step();
+        assert!(
+            freezer.is_frozen(&GaussianParamGroup::Positions),
+            "manual freeze() override should survive multiple step() calls"
+        );
+
+        // clear_overrides() restores schedule control.
+        freezer.clear_overrides();
+        freezer.step();
+        assert!(
+            !freezer.is_frozen(&GaussianParamGroup::Positions),
+            "clearing overrides should let the schedule control freeze state again"
+        );
+    }
+
     #[test]
     fn test_parameter_freezer_with_schedule_advances() {
         let groups = vec![GaussianParamGroup::Positions, GaussianParamGroup::Rotations];
@@ -1303,11 +1379,11 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // split_into_groups tests
+    // non_empty_group_sizes tests
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_split_into_groups_all_populated() {
+    fn test_non_empty_group_sizes_all_populated() {
         let positions = vec![0.0f32; 30]; // 10 gaussians * 3 coords
         let rotations = vec![0.0f32; 40]; // 10 * 4
         let scales = vec![0.0f32; 30]; // 10 * 3
@@ -1315,7 +1391,7 @@ mod tests {
         let sh_dc = vec![0.0f32; 30]; // 10 * 3
         let sh_rest = vec![0.0f32; 450]; // 10 * 45 (degree-3 SH)
 
-        let groups = split_into_groups(
+        let groups = non_empty_group_sizes(
             &positions, &rotations, &scales, &opacities, &sh_dc, &sh_rest,
         );
         assert_eq!(groups.len(), 6);
@@ -1326,11 +1402,11 @@ mod tests {
     }
 
     #[test]
-    fn test_split_into_groups_empty_excluded() {
+    fn test_non_empty_group_sizes_empty_excluded() {
         let positions = vec![0.0f32; 30];
         let sh_dc = vec![0.0f32; 30];
         // All other groups empty
-        let groups = split_into_groups(&positions, &[], &[], &[], &sh_dc, &[]);
+        let groups = non_empty_group_sizes(&positions, &[], &[], &[], &sh_dc, &[]);
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].0, GaussianParamGroup::Positions);
         assert_eq!(groups[1].0, GaussianParamGroup::ShDc);

@@ -22,7 +22,7 @@
 //!     0.0,
 //!     [0.0, 0.0, 0.0],
 //! );
-//! let bytes = to_binary(&[record]);
+//! let bytes = to_binary(&[record]).expect("encode failed");
 //! let parsed = from_binary(&bytes).expect("roundtrip failed");
 //! assert_eq!(parsed.len(), 1);
 //! ```
@@ -162,17 +162,11 @@ impl GaussianRecord {
     }
 
     /// Number of SH degrees inferred from `sh_rest.len()`:
-    /// 0 → degree 0, 8 → degree 1, 24 → degree 2, 48 → degree 3.
+    /// 0 → degree 0, 9 → degree 1, 24 → degree 2, 45 → degree 3.
     /// Unrecognised lengths map to degree 0.
     #[must_use]
     pub fn sh_degree(&self) -> usize {
-        match self.sh_rest.len() {
-            0 => 0,
-            8 => 1,
-            24 => 2,
-            48 => 3,
-            _ => 0,
-        }
+        degree_for_rest_len(self.sh_rest.len()).unwrap_or(0)
     }
 }
 
@@ -182,21 +176,51 @@ impl GaussianRecord {
 
 /// Number of `sh_rest` coefficients for a given SH degree.
 ///
+/// 3DGS convention: `((degree+1)² − 1) × 3` (DC term excluded — that's
+/// `sh_dc`). Matches `export_ply::PlyGaussian::n_rest_coeffs` and
+/// `info::sh_degree_from_rest`.
+///
 /// | degree | coefficients |
 /// |--------|-------------|
 /// | 0      | 0           |
-/// | 1      | 8           |
+/// | 1      | 9           |
 /// | 2      | 24          |
-/// | 3      | 48          |
+/// | 3      | 45          |
 /// | other  | 0           |
+///
+/// Only degrees 0–3 exist in the 3DGS convention (and in this format's
+/// header, whose `sh_degree` field is validated by [`from_binary`]), so any
+/// other degree maps to 0 rather than extrapolating the formula. Evaluating
+/// `((degree+1)² − 1) × 3` unguarded overflowed `usize` for a large
+/// attacker- or corruption-supplied header value (`degree = u32::MAX`
+/// squares to exactly 2⁶⁴), which panics in debug builds; the upper-bound
+/// guard below keeps this function total for every `usize`.
 #[must_use]
 pub fn sh_rest_size(degree: usize) -> usize {
-    match degree {
-        0 => 0,
-        1 => 8,
-        2 => 24,
-        3 => 48,
-        _ => 0,
+    if degree == 0 || degree > MAX_SH_DEGREE {
+        0
+    } else {
+        ((degree + 1) * (degree + 1) - 1) * 3
+    }
+}
+
+/// Highest SH degree the 3DGS convention (and hence this module's binary
+/// header and [`degree_for_rest_len`]) represents.
+const MAX_SH_DEGREE: usize = 3;
+
+/// Recognised SH degree (0–3) for an exact `sh_rest` length, or `None` if the
+/// length does not correspond to any degree in the 3DGS convention.
+///
+/// Inverse of [`sh_rest_size`], restricted to the four degrees this format
+/// recognises. Used internally to detect (rather than silently coerce to
+/// degree 0) an `sh_rest` length that doesn't fit the convention.
+fn degree_for_rest_len(len: usize) -> Option<usize> {
+    match len {
+        0 => Some(0),
+        9 => Some(1),
+        24 => Some(2),
+        45 => Some(3),
+        _ => None,
     }
 }
 
@@ -377,9 +401,12 @@ fn json_extract_value<'a>(obj: &'a str, key: &str) -> Option<&'a str> {
 fn parse_f32_array(s: &str) -> Result<Vec<f32>, ConvertError> {
     let trimmed = s.trim();
     if !trimmed.starts_with('[') || !trimmed.ends_with(']') {
+        // Truncate by chars, not bytes: a byte-index slice can land inside a
+        // multibyte UTF-8 sequence and panic on non-ASCII input (this is a
+        // public parser over untrusted JSON, so that input is expected).
+        let snippet: String = trimmed.chars().take(40).collect();
         return Err(ConvertError::ParseError(format!(
-            "expected JSON array, got: {}",
-            &trimmed[..trimmed.len().min(40)]
+            "expected JSON array, got: {snippet}"
         )));
     }
     let inner = &trimmed[1..trimmed.len() - 1];
@@ -647,8 +674,43 @@ fn push_f32(out: &mut Vec<u8>, v: f32) {
 ///   - sh_rest:   n × f32 (n determined by sh_degree in header)
 ///
 /// All values are stored as little-endian IEEE 754 f32.
-pub fn to_binary(records: &[GaussianRecord]) -> Vec<u8> {
-    let degree = records.first().map(|r| r.sh_degree()).unwrap_or(0);
+///
+/// The on-disk `sh_degree` is derived from the records themselves: every
+/// record must carry the same `sh_rest.len()`, and that length must
+/// correspond to a recognised SH degree (0, 9, 24, or 45 coefficients — see
+/// [`sh_rest_size`]). Earlier code derived the degree from `records.first()`
+/// alone and silently truncated-or-zero-padded every other record to match,
+/// which corrupted (dropped SH data from) any heterogeneous record set with
+/// no error and no warning.
+///
+/// # Errors
+/// Returns [`ConvertError::DimensionError`] if records disagree on
+/// `sh_rest.len()`, or [`ConvertError::InvalidFormat`] if the (consistent)
+/// length does not correspond to a supported SH degree.
+pub fn to_binary(records: &[GaussianRecord]) -> Result<Vec<u8>, ConvertError> {
+    let degree = match records.first() {
+        None => 0,
+        Some(first) => {
+            let expected_len = first.sh_rest.len();
+            for (idx, r) in records.iter().enumerate() {
+                if r.sh_rest.len() != expected_len {
+                    return Err(ConvertError::DimensionError {
+                        field: format!(
+                            "record {idx}: sh_rest.len() (must match record 0's length)"
+                        ),
+                        expected: expected_len,
+                        got: r.sh_rest.len(),
+                    });
+                }
+            }
+            degree_for_rest_len(expected_len).ok_or_else(|| {
+                ConvertError::InvalidFormat(format!(
+                    "sh_rest length {expected_len} does not correspond to a supported SH \
+                     degree (expected 0, 9, 24, or 45 coefficients)"
+                ))
+            })?
+        }
+    };
     let sh_extra = sh_rest_size(degree);
     // Fixed bytes per Gaussian (excluding sh_rest): 3+3+4+1+3 = 14 f32s = 56 bytes
     let bytes_per_record = 56 + sh_extra * 4;
@@ -673,14 +735,16 @@ pub fn to_binary(records: &[GaussianRecord]) -> Vec<u8> {
         for v in &r.sh_dc {
             push_f32(&mut out, *v);
         }
-        // Write exactly sh_extra coefficients, padding with 0 if short.
+        // Every record was validated above to have exactly `sh_extra`
+        // sh_rest coefficients, so `unwrap_or` here is an unreachable
+        // safety net, not a silent truncation/pad.
         for i in 0..sh_extra {
             let v = r.sh_rest.get(i).copied().unwrap_or(0.0);
             push_f32(&mut out, v);
         }
     }
 
-    out
+    Ok(out)
 }
 
 /// Parse a binary blob produced by [`to_binary`] into a [`Vec<GaussianRecord>`].
@@ -717,13 +781,26 @@ pub fn from_binary(data: &[u8]) -> Result<Vec<GaussianRecord>, ConvertError> {
 
     let num_gaussians = read_u32_le(data, 12)? as usize;
     let sh_degree = read_u32_le(data, 16)? as usize;
+    // Reject an out-of-range degree explicitly. `sh_rest_size` maps any
+    // unrecognised degree to 0, so without this check a header claiming
+    // e.g. degree 7 would be parsed as "no sh_rest coefficients at all" —
+    // every record silently stripped of its SH data and the record stride
+    // computed wrong, with no error.
+    if sh_degree > MAX_SH_DEGREE {
+        return Err(ConvertError::InvalidFormat(format!(
+            "unsupported SH degree in header: {sh_degree} (supported: 0..={MAX_SH_DEGREE})"
+        )));
+    }
     // flags at bytes 20–23 are reserved; read but ignore.
     let _flags = read_u32_le(data, 20)?;
 
     let sh_extra = sh_rest_size(sh_degree);
     // Fixed f32 fields per record: 3+3+4+1+3 = 14 → 56 bytes + sh_rest.
     let bytes_per_record = 56 + sh_extra * 4;
-    let expected_total = HEADER_SIZE + num_gaussians * bytes_per_record;
+    // Saturating: `num_gaussians` comes straight off disk, so on a 32-bit
+    // target a corrupt count could otherwise wrap this product to a small
+    // number and wave a truncated file through the length check below.
+    let expected_total = HEADER_SIZE.saturating_add(num_gaussians.saturating_mul(bytes_per_record));
 
     if data.len() < expected_total {
         return Err(ConvertError::ParseError(format!(
@@ -850,10 +927,18 @@ impl FileFormat {
 ///
 /// This is a convenience dispatcher that calls [`to_csv`], [`to_json`], or
 /// [`to_binary`] depending on `target_format`.
-pub fn convert(records: &[GaussianRecord], target_format: FileFormat) -> Vec<u8> {
+///
+/// # Errors
+/// Returns [`ConvertError`] if `target_format` is [`FileFormat::Binary`] and
+/// the records do not share a consistent, recognised `sh_rest` layout (see
+/// [`to_binary`]). CSV and JSON encoding never fail.
+pub fn convert(
+    records: &[GaussianRecord],
+    target_format: FileFormat,
+) -> Result<Vec<u8>, ConvertError> {
     match target_format {
-        FileFormat::Csv => to_csv(records),
-        FileFormat::Json => to_json(records),
+        FileFormat::Csv => Ok(to_csv(records)),
+        FileFormat::Json => Ok(to_json(records)),
         FileFormat::Binary => to_binary(records),
     }
 }
@@ -1082,13 +1167,13 @@ mod tests {
         let base = make_record(0.0, 0.0, 0.0);
         assert_eq!(base.sh_degree(), 0);
 
-        let d1 = base.clone().with_sh_rest(vec![0.0; 8]);
+        let d1 = base.clone().with_sh_rest(vec![0.0; 9]);
         assert_eq!(d1.sh_degree(), 1);
 
         let d2 = base.clone().with_sh_rest(vec![0.0; 24]);
         assert_eq!(d2.sh_degree(), 2);
 
-        let d3 = base.clone().with_sh_rest(vec![0.0; 48]);
+        let d3 = base.clone().with_sh_rest(vec![0.0; 45]);
         assert_eq!(d3.sh_degree(), 3);
 
         // Unrecognised length → degree 0.
@@ -1122,8 +1207,8 @@ mod tests {
     }
 
     #[test]
-    fn sh_rest_size_degree_1_is_8() {
-        assert_eq!(sh_rest_size(1), 8);
+    fn sh_rest_size_degree_1_is_9() {
+        assert_eq!(sh_rest_size(1), 9);
     }
 
     #[test]
@@ -1132,8 +1217,59 @@ mod tests {
     }
 
     #[test]
-    fn sh_rest_size_degree_3_is_48() {
-        assert_eq!(sh_rest_size(3), 48);
+    fn sh_rest_size_degree_3_is_45() {
+        assert_eq!(sh_rest_size(3), 45);
+    }
+
+    #[test]
+    fn sh_rest_size_unrecognised_degree_is_0() {
+        assert_eq!(sh_rest_size(4), 0);
+        assert_eq!(sh_rest_size(99), 0);
+    }
+
+    #[test]
+    fn sh_rest_size_is_total_over_every_usize() {
+        // Regression: the formula `((degree+1)² − 1) × 3` used to be applied
+        // to *any* non-zero degree. A header-supplied `degree` near
+        // `u32::MAX` squares past `usize::MAX`, which panics on overflow in
+        // debug builds instead of returning a value at all.
+        assert_eq!(sh_rest_size(u32::MAX as usize), 0);
+        assert_eq!(sh_rest_size(usize::MAX), 0);
+        assert_eq!(sh_rest_size(usize::MAX / 2), 0);
+    }
+
+    #[test]
+    fn from_binary_rejects_an_out_of_range_sh_degree_header() {
+        // Regression: `sh_rest_size` maps an unrecognised degree to 0, so a
+        // header claiming degree 4+ used to parse as "zero sh_rest
+        // coefficients" — silently dropping SH data and mis-striding every
+        // record — rather than reporting the unsupported degree.
+        let bytes = to_binary(&[make_record(1.0, 2.0, 3.0)]).expect("degree-0 record is valid");
+        for bad_degree in [4u32, 7, 99, u32::MAX] {
+            let mut corrupt = bytes.clone();
+            corrupt[16..20].copy_from_slice(&bad_degree.to_le_bytes());
+            let err = from_binary(&corrupt)
+                .expect_err("an out-of-range SH degree in the header must be rejected");
+            assert!(
+                matches!(err, ConvertError::InvalidFormat(ref m) if m.contains("SH degree")),
+                "unexpected error for degree {bad_degree}: {err:?}"
+            );
+        }
+        // The untouched header still round-trips.
+        assert_eq!(from_binary(&bytes).expect("valid blob").len(), 1);
+    }
+
+    #[test]
+    fn degree_for_rest_len_round_trips_sh_rest_size() {
+        for degree in 0..=3usize {
+            let len = sh_rest_size(degree);
+            assert_eq!(degree_for_rest_len(len), Some(degree));
+        }
+        assert_eq!(
+            degree_for_rest_len(5),
+            None,
+            "5 is not a valid SH rest length"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1214,6 +1350,21 @@ mod tests {
         assert!((parsed[1].position[2] - 5.0).abs() < 1e-4);
     }
 
+    #[test]
+    fn from_json_multibyte_non_array_value_does_not_panic() {
+        // Regression: `parse_f32_array`'s error path used to byte-slice the
+        // input at index 40 for its error snippet, which panics if byte 40
+        // lands inside a multibyte UTF-8 character. "position" here is a
+        // long non-array (non-`[...]`) multibyte string, which used to
+        // trigger exactly that panic; now it must return a clean ParseError.
+        let bad = "[\n  {\n    \"position\": \"X日本語テストです日本語テストです日本語テストです\",\n    \"log_scale\": [0.0, 0.0, 0.0],\n    \"rotation\": [0.0, 0.0, 0.0, 1.0],\n    \"opacity\": 0.0,\n    \"sh_dc\": [0.0, 0.0, 0.0],\n    \"sh_rest\": []\n  }\n]\n";
+        let result = from_json(bad.as_bytes());
+        assert!(
+            matches!(result, Err(ConvertError::ParseError(_))),
+            "expected ParseError (not a panic), got {result:?}"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Binary
     // -----------------------------------------------------------------------
@@ -1237,23 +1388,60 @@ mod tests {
     #[test]
     fn to_binary_size_is_correct_degree_0() {
         let records = vec![make_record(0.0, 0.0, 0.0), make_record(1.0, 2.0, 3.0)];
-        let bytes = to_binary(&records);
+        let bytes = to_binary(&records).expect("degree-0 records are valid");
         // 24 header + 2 * 56 bytes (14 f32s, no sh_rest)
         assert_eq!(bytes.len(), 24 + 2 * 56);
     }
 
     #[test]
     fn to_binary_size_is_correct_degree_1() {
-        let r = make_record(0.0, 0.0, 0.0).with_sh_rest(vec![0.0; 8]);
-        let bytes = to_binary(&[r]);
-        // 24 header + 1 * (56 + 8*4) = 24 + 88
-        assert_eq!(bytes.len(), 24 + 88);
+        let r = make_record(0.0, 0.0, 0.0).with_sh_rest(vec![0.0; 9]);
+        let bytes = to_binary(&[r]).expect("degree-1 record is valid");
+        // 24 header + 1 * (56 + 9*4) = 24 + 92
+        assert_eq!(bytes.len(), 24 + 92);
+    }
+
+    #[test]
+    fn to_binary_inconsistent_sh_rest_len_is_error() {
+        let r0 = make_record(0.0, 0.0, 0.0).with_sh_rest(vec![0.0; 9]);
+        let r1 = make_record(1.0, 1.0, 1.0).with_sh_rest(vec![0.0; 24]);
+        let result = to_binary(&[r0, r1]);
+        assert!(
+            matches!(result, Err(ConvertError::DimensionError { .. })),
+            "expected DimensionError, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn to_binary_unrecognised_sh_rest_len_is_error() {
+        // 5 is not 0/9/24/45 for any SH degree.
+        let r = make_record(0.0, 0.0, 0.0).with_sh_rest(vec![0.0; 5]);
+        let result = to_binary(&[r]);
+        assert!(
+            matches!(result, Err(ConvertError::InvalidFormat(_))),
+            "expected InvalidFormat, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn to_binary_never_silently_drops_sh_rest_coefficients() {
+        // Regression for the original bug: a real degree-3 record (45 rest
+        // coefficients) used to compute sh_degree()==0 (48 was the wrongly
+        // expected length) and silently write zero sh_rest floats. Now the
+        // full 45 coefficients must round-trip exactly.
+        let r = make_record(0.0, 0.0, 0.0).with_sh_rest((0..45).map(|i| i as f32 * 0.01).collect());
+        let bytes = to_binary(std::slice::from_ref(&r)).expect("degree-3 record is valid");
+        let parsed = from_binary(&bytes).expect("roundtrip should succeed");
+        assert_eq!(parsed[0].sh_rest.len(), 45);
+        for (a, b) in parsed[0].sh_rest.iter().zip(r.sh_rest.iter()) {
+            assert!((a - b).abs() < 1e-5);
+        }
     }
 
     #[test]
     fn from_binary_roundtrip_positions() {
         let records = vec![make_record(1.0, 2.0, 3.0), make_record(-4.0, 5.0, -6.0)];
-        let bytes = to_binary(&records);
+        let bytes = to_binary(&records).expect("degree-0 records are valid");
         let parsed = from_binary(&bytes).expect("roundtrip should succeed");
         assert_eq!(parsed.len(), 2);
         assert!((parsed[0].position[0] - 1.0).abs() < 1e-5);
@@ -1270,7 +1458,7 @@ mod tests {
             -0.7,
             [0.5, -0.5, 0.1],
         );
-        let bytes = to_binary(std::slice::from_ref(&r));
+        let bytes = to_binary(std::slice::from_ref(&r)).expect("degree-0 record is valid");
         let parsed = from_binary(&bytes).expect("roundtrip");
         let p = &parsed[0];
         assert!((p.opacity - r.opacity).abs() < 1e-5);
@@ -1280,7 +1468,7 @@ mod tests {
 
     #[test]
     fn from_binary_invalid_magic_is_error() {
-        let mut bytes = to_binary(&[make_record(0.0, 0.0, 0.0)]);
+        let mut bytes = to_binary(&[make_record(0.0, 0.0, 0.0)]).expect("degree-0 record is valid");
         // Corrupt the magic.
         bytes[0] = b'X';
         let result = from_binary(&bytes);
@@ -1294,7 +1482,7 @@ mod tests {
     fn from_binary_degree_0_no_sh_rest() {
         let r = make_record(1.0, 2.0, 3.0);
         assert_eq!(r.sh_rest.len(), 0);
-        let bytes = to_binary(&[r]);
+        let bytes = to_binary(&[r]).expect("degree-0 record is valid");
         let parsed = from_binary(&bytes).expect("should parse");
         assert_eq!(parsed[0].sh_rest.len(), 0);
     }
@@ -1324,7 +1512,7 @@ mod tests {
 
     #[test]
     fn file_format_from_magic_detects_binary() {
-        let bytes = to_binary(&[make_record(0.0, 0.0, 0.0)]);
+        let bytes = to_binary(&[make_record(0.0, 0.0, 0.0)]).expect("degree-0 record is valid");
         assert_eq!(FileFormat::from_magic(&bytes), FileFormat::Binary);
     }
 
@@ -1343,7 +1531,7 @@ mod tests {
     #[test]
     fn convert_binary_format_starts_with_magic() {
         let records = vec![make_record(0.0, 1.0, 2.0)];
-        let out = convert(&records, FileFormat::Binary);
+        let out = convert(&records, FileFormat::Binary).expect("degree-0 records are valid");
         assert!(
             out.starts_with(&BINARY_MAGIC),
             "binary output should start with OXIGAF01 magic"

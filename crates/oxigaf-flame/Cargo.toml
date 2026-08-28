@@ -2,13 +2,24 @@
 name = "oxigaf-flame"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/oxigaf-flame"
 description = "FLAME parametric head model — LBS, normal maps, mesh sampling"
 readme = "README.md"
 keywords = ["flame", "3d-model", "parametric", "head-model", "avatar"]
 categories = ["graphics", "algorithms", "science"]
+
+[package.metadata.docs.rs]
+# Not "full": that also enables `npz`, which activates ndarray-npy's `npz`
+# feature and pulls in the banned `zip` crate (see deny.toml's `wrappers`
+# exception for ndarray-npy, and the unwired-`npz` finding in this crate's
+# audit). Revisit once npz is reimplemented on oxiarc_archive.
+features = ["parallel"]
+rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
 default = []
@@ -16,15 +27,13 @@ default = []
 simd = []
 # Enable parallel processing with rayon
 parallel = ["dep:rayon"]
-# Enable safetensors support for model I/O
-safetensors = []
 # Enable NPZ file format support for sequences
 npz = ["ndarray-npy/npz"]
-# Enable all stable features (parallel, safetensors, npz)
+# Enable all stable features (parallel, npz)
 # Note: 'simd' requires nightly Rust and must be enabled explicitly
-full = ["parallel", "safetensors", "npz"]
+full = ["parallel", "npz"]
 # Enable everything including nightly-only SIMD (requires nightly Rust)
-full_nightly = ["simd", "parallel", "safetensors", "npz"]
+full_nightly = ["simd", "parallel", "npz"]
 
 [dependencies]
 nalgebra = { workspace = true }
@@ -36,10 +45,11 @@ rand = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Safetensors I/O is always available (io_safetensors.rs), not feature-gated.
 safetensors = { workspace = true }
 bytemuck = { workspace = true }
 chrono = { workspace = true }
-lru = "0.18"
+lru = { workspace = true }
 kiddo = { workspace = true }
 # Optional parallel processing
 rayon = { workspace = true, optional = true }

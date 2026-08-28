@@ -18,8 +18,12 @@ pub struct MipSplatConfig {
     /// will have their 3-D scale multiplied by a compensation factor so that
     /// their screen-space radius reaches this minimum.  Default: `0.3`.
     pub min_2d_radius_px: f32,
-    /// Maximum distance-based scale multiplier (currently reserved for future
-    /// distance-LOD extensions).  Default: `1.0`.
+    /// Ceiling for the distance-based LOD scale multiplier computed by
+    /// [`crate::compute_scale_compensation`] when `use_distance_lod` is set:
+    /// `camera_distance / reference_distance` is clamped to
+    /// `[1.0, max_distance_scale]`. Default: `1.0`, which makes the LOD term
+    /// a no-op (always `1.0`) even when `use_distance_lod` is `true` — raise
+    /// this above `1.0` to actually let distant Gaussians scale up.
     pub max_distance_scale: f32,
     /// Opacity ramp start: Gaussians with screen radius below this value will
     /// have their opacity linearly reduced.  Default: `0.5` px.
@@ -27,10 +31,13 @@ pub struct MipSplatConfig {
     /// Opacity ramp end: Gaussians with screen radius at or above this value
     /// retain full opacity.  Default: `2.0` px.
     pub opacity_ramp_max_px: f32,
-    /// Whether to apply distance-based LOD scaling (reserved for future use).
+    /// Whether [`crate::compute_scale_compensation`] applies the
+    /// distance-based LOD term at all (see `max_distance_scale` and
+    /// `reference_distance`).  Default: `false`.
     pub use_distance_lod: bool,
-    /// Reference distance at which 3-D scales are "correct" (no modification
-    /// applied).  Default: `1.0`.
+    /// Reference distance at which 3-D scales are considered "correct" (LOD
+    /// multiplier `1.0`); Gaussians farther than this are scaled up toward
+    /// `max_distance_scale` when `use_distance_lod` is set.  Default: `1.0`.
     pub reference_distance: f32,
 }
 impl MipSplatConfig {
@@ -95,7 +102,8 @@ pub struct AaStats {
 pub enum AaMethod {
     /// Fast Approximate Anti-Aliasing (luminance-space edge blending).
     Fxaa,
-    /// Simplified Morphological Anti-Aliasing (Roberts-cross edge detection).
+    /// Simplified Morphological Anti-Aliasing (3×3 Sobel gradient-magnitude
+    /// edge detection).
     Smaa,
     /// Temporal AA: blend current frame with a previous frame.
     Temporal {
@@ -137,6 +145,11 @@ pub struct AaConfig {
     pub edge_threshold_min: f32,
     /// FXAA: subpixel AA strength in `[0, 1]` (default `0.75`).
     pub subpixel_quality: f32,
-    /// FXAA: maximum search steps when walking along an edge (default `12`).
+    /// FXAA: contrast-run length, in texels checked in each direction along
+    /// a detected edge, required for full-strength blending (default `12`).
+    /// A run shorter than this — an isolated corner or speck rather than a
+    /// long, straight edge — is blended at a proportionally reduced
+    /// strength (down to 50%). See [`crate::apply_fxaa`] for the full
+    /// edge-length-search description.
     pub search_steps: usize,
 }

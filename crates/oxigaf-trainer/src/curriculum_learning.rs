@@ -250,11 +250,15 @@ impl DifficultyEstimator {
         }
     }
 
-    /// Assign difficulty based on camera elevation angle.
+    /// Assign difficulty based on camera elevation angle (pitch above/below
+    /// the horizon).
     ///
-    /// Frontal views (elevation ≈ 0) are easiest; profile views (elevation ≈ π/2)
-    /// are hardest.  The absolute angle is used so both tilted-up and tilted-down
-    /// cameras are treated symmetrically.
+    /// Frontal/eye-level views (elevation ≈ 0) are easiest; top-down or
+    /// bottom-up views (elevation ≈ ±π/2) are hardest.  The absolute angle is
+    /// used so both tilted-up and tilted-down cameras are treated
+    /// symmetrically.  This scores camera *pitch*; for *profile* (left/right,
+    /// azimuth-driven) difficulty — the "extreme profile views" the module
+    /// doc describes as hardest — see [`Self::from_azimuths`] instead.
     pub fn from_elevations(elevations: &[f32]) -> Self {
         let n = elevations.len();
         if n == 0 {
@@ -275,6 +279,34 @@ impl DifficultyEstimator {
         }
     }
 
+    /// Assign difficulty based on camera azimuth (yaw) angle.
+    ///
+    /// Frontal views (azimuth ≈ 0) are easiest; profile views
+    /// (azimuth ≈ ±π/2) are hardest — this is the "profile views" difficulty
+    /// advertised by the module-level documentation.  Unlike
+    /// [`Self::from_elevations`] (camera pitch), `azimuth` is the horizontal
+    /// angle in radians between the camera and the subject's forward-facing
+    /// direction, with `0` = looking directly at the face.
+    pub fn from_azimuths(azimuths: &[f32]) -> Self {
+        let n = azimuths.len();
+        if n == 0 {
+            return Self {
+                n_samples: 0,
+                difficulties: vec![],
+            };
+        }
+        // Map azimuth to difficulty: difficulty = |azimuth| / (π/2), clamped [0,1].
+        let half_pi = std::f32::consts::FRAC_PI_2;
+        let raw: Vec<f32> = azimuths
+            .iter()
+            .map(|a| (a.abs() / half_pi).clamp(0.0, 1.0))
+            .collect();
+        Self {
+            n_samples: n,
+            difficulties: raw,
+        }
+    }
+
     /// Returns the difficulty for sample `idx`.
     pub fn difficulty_of(&self, idx: usize) -> Result<f32, CurrLearningError> {
         self.difficulties
@@ -284,21 +316,31 @@ impl DifficultyEstimator {
     }
 
     /// Returns all sample indices sorted by difficulty from easy to hard.
+    ///
+    /// The index range is derived from `self.difficulties.len()` (not
+    /// `self.n_samples`, which is a separate, unenforced field on this
+    /// directly-constructible struct) so a mismatched `n_samples` can never
+    /// cause an out-of-bounds comparator panic; the comparator itself also
+    /// falls back to a neutral `0.5` via `.get()` as defense in depth.
     pub fn sorted_by_difficulty(&self) -> Vec<usize> {
-        let mut indices: Vec<usize> = (0..self.n_samples).collect();
+        let mut indices: Vec<usize> = (0..self.difficulties.len()).collect();
         indices.sort_by(|&a, &b| {
-            self.difficulties[a]
-                .partial_cmp(&self.difficulties[b])
-                .unwrap_or(std::cmp::Ordering::Equal)
+            let da = self.difficulties.get(a).copied().unwrap_or(0.5);
+            let db = self.difficulties.get(b).copied().unwrap_or(0.5);
+            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
         });
         indices
     }
 
-    /// Returns the sample index at percentile `p` in the sorted order.
+    /// Returns the sample index at percentile `p` in the sorted-by-difficulty
+    /// order (not merely its rank within that order).
     ///
-    /// `p = 0.0` → easiest sample; `p = 1.0` → hardest sample.
+    /// `p = 0.0` → the index of the easiest sample; `p = 1.0` → the index of
+    /// the hardest sample.
     pub fn percentile_index(&self, p: f32) -> usize {
-        curr_percentile_idx(self.n_samples, p)
+        let sorted = self.sorted_by_difficulty();
+        let rank = curr_percentile_idx(sorted.len(), p);
+        sorted.get(rank).copied().unwrap_or(0)
     }
 }
 
@@ -352,7 +394,22 @@ pub struct CurriculumSampler {
     estimator: DifficultyEstimator,
     sample_difficulties: Vec<SampleDifficulty>,
     current_step: usize,
-    n_activated: usize,
+    /// Difficulty-sorted sample order, rebuilt from `estimated_difficulty()`
+    /// (static difficulty fused with the observed loss EMA) every
+    /// `config.rescore_interval` steps by [`Self::advance`]. `sample_batch`
+    /// reads this cached order instead of re-sorting the whole dataset on
+    /// every call.
+    cached_order: Vec<usize>,
+    /// Per-sample `loss_ema`, mirrored from `sample_difficulties` on every
+    /// [`Self::update_losses`] call. `sample_batch` borrows this directly so
+    /// it never has to re-collect a fresh `Vec<f32>` of every sample's loss
+    /// from scratch on every call.
+    cached_losses: Vec<f32>,
+    /// Most recently reported model competence (e.g. validation PSNR, dB).
+    /// Consulted by [`CurriculumStrategy::CompetenceBased`]; `NEG_INFINITY`
+    /// until [`Self::update_psnr`] is called, so competence-based unlocking
+    /// safely defaults to "not yet competent".
+    current_psnr: f32,
 }
 
 impl CurriculumSampler {
@@ -385,16 +442,55 @@ impl CurriculumSampler {
                 SampleDifficulty::new(i, d)
             })
             .collect();
+        // Mirrors `sample_difficulties[i].loss_ema`; all start at 0.0, same
+        // as `SampleDifficulty::new`'s initial `loss_ema`.
+        let cached_losses = vec![0.0_f32; n];
 
-        let n_activated = n.max(1);
-
-        Ok(Self {
+        let mut sampler = Self {
             config,
             estimator,
             sample_difficulties,
             current_step: 0,
-            n_activated,
-        })
+            cached_order: Vec::new(),
+            cached_losses,
+            current_psnr: f32::NEG_INFINITY,
+        };
+        sampler.recompute_cached_order();
+
+        Ok(sampler)
+    }
+
+    /// Rebuild `cached_order` from each sample's *current* fused difficulty
+    /// (`SampleDifficulty::estimated_difficulty`, static difficulty combined
+    /// with the observed loss EMA) rather than the estimator's static-only
+    /// ordering. Called on construction and periodically by [`Self::advance`].
+    fn recompute_cached_order(&mut self) {
+        let mut indices: Vec<usize> = (0..self.sample_difficulties.len()).collect();
+        indices.sort_by(|&a, &b| {
+            let da = self.sample_difficulties[a].estimated_difficulty();
+            let db = self.sample_difficulties[b].estimated_difficulty();
+            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        self.cached_order = indices;
+    }
+
+    /// Cached difficulty-sorted sample order (see [`Self::recompute_cached_order`]).
+    pub(crate) fn cached_order(&self) -> &[usize] {
+        &self.cached_order
+    }
+
+    /// Record the model's most recently measured competence (e.g. validation
+    /// PSNR, dB). [`CurriculumStrategy::CompetenceBased`] unlocks the full,
+    /// unpaced dataset once this value reaches its configured `target_psnr`;
+    /// other strategies ignore it.
+    pub fn update_psnr(&mut self, psnr: f32) {
+        self.current_psnr = psnr;
+    }
+
+    /// Current tracked competence value (see [`Self::update_psnr`]), or
+    /// `f32::NEG_INFINITY` if it has never been set.
+    pub fn current_psnr(&self) -> f32 {
+        self.current_psnr
     }
 
     /// Return a batch of sample indices for the current training step.
@@ -404,29 +500,28 @@ impl CurriculumSampler {
             return Err(CurrLearningError::EmptyDataset);
         }
 
-        // During warmup the full dataset is available.
-        let sorted = if self.current_step < self.config.warmup_steps {
+        // During warmup the full dataset is available. Only `batch_size`
+        // entries are ever kept, so a partial shuffle (touching just
+        // `batch_size` positions) is used instead of a full Fisher-Yates
+        // pass over all `n` indices.
+        if self.current_step < self.config.warmup_steps {
             let mut all: Vec<usize> = (0..n).collect();
-            curr_shuffle(&mut all, rng_state);
-            return Ok(all.into_iter().take(self.config.batch_size).collect());
-        } else {
-            self.estimator.sorted_by_difficulty()
-        };
+            let k = self.config.batch_size.min(n);
+            curr_partial_shuffle(&mut all, k, rng_state);
+            return Ok(all[..k].to_vec());
+        }
 
+        let sorted = &self.cached_order;
         let pacing = self.current_pacing();
-        let losses: Vec<f32> = self
-            .sample_difficulties
-            .iter()
-            .map(|sd| sd.loss_ema)
-            .collect();
 
         curr_select_indices(
-            &sorted,
+            sorted,
             &self.estimator.difficulties,
-            &losses,
+            &self.cached_losses,
             self.config.batch_size,
             &self.config.strategy,
             pacing,
+            self.current_psnr,
             rng_state,
         )
     }
@@ -452,17 +547,33 @@ impl CurriculumSampler {
                 .get_mut(idx)
                 .ok_or(CurrLearningError::IndexOutOfBounds(idx))?;
             sd.update_loss(loss, step, decay);
+            let new_ema = sd.loss_ema;
+            // Disjoint field from `sample_difficulties`, so this is a fresh
+            // borrow of `self.cached_losses` only — keeps it mirroring the
+            // per-sample EMA without `sample_batch` ever re-collecting it.
+            if let Some(slot) = self.cached_losses.get_mut(idx) {
+                *slot = new_ema;
+            }
         }
         Ok(())
     }
 
     /// Advance to the next training step.
+    ///
+    /// Every `config.rescore_interval` steps this also rebuilds
+    /// `Self::cached_order` from each sample's fused difficulty
+    /// (`SampleDifficulty::estimated_difficulty`), so `rescore_interval` and
+    /// the loss-EMA history maintained by [`Self::update_losses`] actually
+    /// influence future sample selection instead of being purely observational.
     pub fn advance(&mut self) {
         self.current_step += 1;
-        // Update n_activated based on current pacing.
-        let pacing = self.current_pacing_at(self.current_step);
-        let n = self.estimator.n_samples;
-        self.n_activated = ((pacing * n as f32).ceil() as usize).clamp(1, n);
+        if self.config.rescore_interval > 0
+            && self
+                .current_step
+                .is_multiple_of(self.config.rescore_interval)
+        {
+            self.recompute_cached_order();
+        }
     }
 
     /// Current pacing value (fraction of dataset unlocked), in `[0, 1]`.
@@ -526,6 +637,7 @@ pub fn curr_compute_pacing(pacing_fn: &PacingFunction, step: usize, n_steps: usi
 /// to the curriculum strategy and current pacing.
 ///
 /// Returns [`CurrLearningError::EmptyDataset`] when `sorted_indices` is empty.
+#[allow(clippy::too_many_arguments)]
 pub fn curr_select_indices(
     sorted_indices: &[usize],
     difficulties: &[f32],
@@ -533,6 +645,7 @@ pub fn curr_select_indices(
     n_select: usize,
     strategy: &CurriculumStrategy,
     pacing: f32,
+    current_psnr: f32,
     rng_state: &mut u64,
 ) -> Result<Vec<usize>, CurrLearningError> {
     if sorted_indices.is_empty() {
@@ -619,9 +732,17 @@ pub fn curr_select_indices(
             sample_with_replacement(&pool, n_select, rng_state)
         }
 
-        CurriculumStrategy::CompetenceBased { .. } => {
-            // Use pacing to unlock increasingly difficult samples.
-            let n_unlocked = ((pacing_clamped * n_total as f32).ceil() as usize).clamp(1, n_total);
+        CurriculumStrategy::CompetenceBased { target_psnr } => {
+            // Until the tracked model competence (`current_psnr`) reaches
+            // `target_psnr`, samples unlock at the normal pacing rate (same
+            // window as `EasyFirst`). Once competence is reached, the full
+            // dataset -- including the hardest samples -- becomes available
+            // immediately, regardless of pacing.
+            let n_unlocked = if current_psnr >= *target_psnr {
+                n_total
+            } else {
+                ((pacing_clamped * n_total as f32).ceil() as usize).clamp(1, n_total)
+            };
             let pool: Vec<usize> = sorted_indices[..n_unlocked].to_vec();
             let _ = difficulties; // difficulties used for sorting externally
             sample_with_replacement(&pool, n_select, rng_state)
@@ -653,6 +774,26 @@ pub fn curr_shuffle(indices: &mut [usize], rng_state: &mut u64) {
     }
     for i in (1..n).rev() {
         let j = xorshift64(rng_state) as usize % (i + 1);
+        indices.swap(i, j);
+    }
+}
+
+/// Partially shuffle `indices` in-place so that positions `0..k` hold a
+/// uniformly random selection (without replacement) drawn from the whole
+/// slice, in a uniformly random order.
+///
+/// This performs only the first `k` steps of Fisher-Yates (`k` swaps) rather
+/// than a full pass over all `n` elements, which is significantly cheaper
+/// than [`curr_shuffle`] followed by `.take(k)` when `k << indices.len()`.
+fn curr_partial_shuffle(indices: &mut [usize], k: usize, rng_state: &mut u64) {
+    let n = indices.len();
+    let k = k.min(n);
+    for i in 0..k {
+        let span = n - i;
+        if span <= 1 {
+            break;
+        }
+        let j = i + (xorshift64(rng_state) as usize % span);
         indices.swap(i, j);
     }
 }
@@ -715,7 +856,7 @@ pub fn curr_compute_stats(sampler: &CurriculumSampler) -> CurriculumStats {
     let n_active = sampler.n_active_samples();
     let all_sd = sampler.all_sample_difficulties();
 
-    let sorted = sampler.estimator.sorted_by_difficulty();
+    let sorted = sampler.cached_order();
     let active_sorted: Vec<usize> = sorted.iter().take(n_active).copied().collect();
 
     let mean_difficulty_active = if active_sorted.is_empty() {
@@ -1000,6 +1141,41 @@ mod tests {
         assert!((est.difficulties[0] - 1.0).abs() < 1e-5);
     }
 
+    // ── DifficultyEstimator::from_azimuths ────────────────────────────────────
+
+    #[test]
+    fn test_estimator_from_azimuths_frontal_easy() {
+        // Azimuth 0 → frontal → difficulty 0.
+        let est = DifficultyEstimator::from_azimuths(&[0.0, std::f32::consts::FRAC_PI_2]);
+        assert!(
+            (est.difficulties[0] - 0.0).abs() < 1e-5,
+            "frontal should be 0"
+        );
+    }
+
+    #[test]
+    fn test_estimator_from_azimuths_profile_hard() {
+        // Azimuth π/2 → profile → difficulty 1.
+        let est = DifficultyEstimator::from_azimuths(&[0.0, std::f32::consts::FRAC_PI_2]);
+        assert!(
+            (est.difficulties[1] - 1.0).abs() < 1e-5,
+            "profile should be 1"
+        );
+    }
+
+    #[test]
+    fn test_estimator_from_azimuths_negative_symmetric() {
+        let est = DifficultyEstimator::from_azimuths(&[-std::f32::consts::FRAC_PI_2]);
+        assert!((est.difficulties[0] - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_estimator_from_azimuths_empty() {
+        let est = DifficultyEstimator::from_azimuths(&[]);
+        assert_eq!(est.n_samples, 0);
+        assert!(est.difficulties.is_empty());
+    }
+
     #[test]
     fn test_estimator_sorted_by_difficulty() {
         let scores = vec![0.9, 0.1, 0.5, 0.3];
@@ -1013,10 +1189,48 @@ mod tests {
     }
 
     #[test]
+    fn test_sorted_by_difficulty_mismatched_n_samples_does_not_panic() {
+        // Directly construct a DifficultyEstimator whose `n_samples`
+        // disagrees with `difficulties.len()` (bypassing the validated
+        // constructors, since both fields are `pub`) -- must not panic.
+        let est = DifficultyEstimator {
+            n_samples: 100,
+            difficulties: vec![0.9, 0.1, 0.5],
+        };
+        let sorted = est.sorted_by_difficulty();
+        assert_eq!(
+            sorted.len(),
+            3,
+            "must be derived from difficulties.len(), not n_samples"
+        );
+        for &idx in &sorted {
+            assert!(idx < 3);
+        }
+    }
+
+    #[test]
     fn test_estimator_percentile_index_boundaries() {
         let est = DifficultyEstimator::uniform(10);
         assert_eq!(est.percentile_index(0.0), 0);
         assert_eq!(est.percentile_index(1.0), 9);
+    }
+
+    #[test]
+    fn test_estimator_percentile_index_returns_sample_index_not_rank() {
+        // Scores are scrambled relative to sample index, so the hardest
+        // sample (highest score) is NOT at index (n - 1).
+        let scores = vec![0.9, 0.1, 0.5, 0.3]; // hardest sample is index 0
+        let est = DifficultyEstimator::from_scores(&scores).unwrap();
+        assert_eq!(
+            est.percentile_index(1.0),
+            0,
+            "must return the sample index of the hardest sample, not n-1"
+        );
+        assert_eq!(
+            est.percentile_index(0.0),
+            1,
+            "must return the sample index of the easiest sample"
+        );
     }
 
     #[test]
@@ -1168,6 +1382,93 @@ mod tests {
     }
 
     #[test]
+    fn test_update_psnr_and_accessor() {
+        let mut sampler = make_sampler(10, CurriculumStrategy::EasyFirst);
+        assert_eq!(sampler.current_psnr(), f32::NEG_INFINITY);
+        sampler.update_psnr(28.5);
+        assert!((sampler.current_psnr() - 28.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_sampler_competence_based_gated_by_update_psnr() {
+        let estimator = DifficultyEstimator::linear_sequence(100);
+        let config = CurrLearningConfig {
+            strategy: CurriculumStrategy::CompetenceBased { target_psnr: 25.0 },
+            pacing_function: PacingFunction::Linear,
+            n_total_steps: 10_000, // huge horizon -> pacing stays tiny at step 0
+            batch_size: 300,
+            ema_decay: 0.9,
+            warmup_steps: 0,
+            rescore_interval: 100,
+        };
+        let mut sampler = CurriculumSampler::new(config, estimator).unwrap();
+        let mut rng = 11u64;
+
+        // Before update_psnr: default current_psnr is NEG_INFINITY, so the
+        // model is never competent -> stays in the tiny paced-easy window.
+        let batch_before = sampler.sample_batch(&mut rng).unwrap();
+        assert!(
+            batch_before.iter().all(|&i| i < 50),
+            "not yet competent: should stay in the easy half"
+        );
+
+        // Report competence above target -> full dataset (including hard
+        // samples) should now be reachable, even though pacing is still tiny.
+        sampler.update_psnr(30.0);
+        let batch_after = sampler.sample_batch(&mut rng).unwrap();
+        assert!(
+            batch_after.iter().any(|&i| i >= 90),
+            "competent model should reach hard samples once update_psnr crosses target"
+        );
+    }
+
+    #[test]
+    fn test_advance_rescores_cached_order_at_interval() {
+        // Directly construct known static difficulties: sample 0 starts
+        // easier (0.1) than sample 1 (0.5).
+        let estimator = DifficultyEstimator {
+            n_samples: 2,
+            difficulties: vec![0.1, 0.5],
+        };
+        let config = CurrLearningConfig {
+            strategy: CurriculumStrategy::EasyFirst,
+            pacing_function: PacingFunction::Linear,
+            n_total_steps: 1000,
+            batch_size: 1,
+            ema_decay: 0.9,
+            warmup_steps: 0,
+            rescore_interval: 5,
+        };
+        let mut sampler = CurriculumSampler::new(config, estimator).unwrap();
+        assert_eq!(sampler.cached_order(), &[0, 1]);
+
+        // Feed a maximal observed loss for sample 0 so its *fused*
+        // (estimated) difficulty now exceeds sample 1's untouched static
+        // difficulty.
+        sampler.update_losses(&[0], &[10.0]).unwrap();
+
+        // Order must not change before the rescore interval is reached.
+        for _ in 0..4 {
+            sampler.advance();
+        }
+        assert_eq!(sampler.step(), 4);
+        assert_eq!(
+            sampler.cached_order(),
+            &[0, 1],
+            "order should not change before rescore_interval is reached"
+        );
+
+        // At step 5 (a multiple of rescore_interval), the order should flip.
+        sampler.advance();
+        assert_eq!(sampler.step(), 5);
+        assert_eq!(
+            sampler.cached_order(),
+            &[1, 0],
+            "sample 0's fused difficulty should now be highest after rescoring"
+        );
+    }
+
+    #[test]
     fn test_sampler_pacing_monotone_with_advance() {
         let mut sampler = make_sampler(100, CurriculumStrategy::EasyFirst);
         let mut prev = sampler.current_pacing();
@@ -1252,6 +1553,7 @@ mod tests {
             5,
             &CurriculumStrategy::EasyFirst,
             1.0,
+            0.0,
             &mut rng,
         )
         .unwrap();
@@ -1271,6 +1573,7 @@ mod tests {
             3,
             &CurriculumStrategy::EasyFirst,
             1.0,
+            0.0,
             &mut rng,
         );
         assert!(matches!(result, Err(CurrLearningError::EmptyDataset)));
@@ -1289,6 +1592,7 @@ mod tests {
             20,
             &CurriculumStrategy::HardFirst,
             0.1,
+            0.0,
             &mut rng,
         )
         .unwrap();
@@ -1327,6 +1631,56 @@ mod tests {
         let mut rng = 9999u64;
         curr_shuffle(&mut shuffled, &mut rng);
         assert_ne!(shuffled, original, "shuffled should differ from original");
+    }
+
+    // ── curr_partial_shuffle ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_partial_shuffle_produces_k_distinct_valid_indices() {
+        let mut indices: Vec<usize> = (0..50).collect();
+        let mut rng = 123u64;
+        curr_partial_shuffle(&mut indices, 5, &mut rng);
+        let head = &indices[..5];
+        // All values still in range and distinct (no duplication/loss).
+        let mut seen = std::collections::HashSet::new();
+        for &v in head {
+            assert!(v < 50);
+            assert!(seen.insert(v), "partial shuffle produced a duplicate: {v}");
+        }
+    }
+
+    #[test]
+    fn test_partial_shuffle_k_zero_is_noop() {
+        let original: Vec<usize> = (0..10).collect();
+        let mut indices = original.clone();
+        let mut rng = 7u64;
+        curr_partial_shuffle(&mut indices, 0, &mut rng);
+        assert_eq!(indices, original);
+    }
+
+    #[test]
+    fn test_partial_shuffle_k_equals_n_covers_full_permutation() {
+        let mut indices: Vec<usize> = (0..10).collect();
+        let mut rng = 99u64;
+        curr_partial_shuffle(&mut indices, 10, &mut rng);
+        let mut sorted = indices.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            sorted,
+            (0..10).collect::<Vec<usize>>(),
+            "must remain a permutation of 0..10"
+        );
+    }
+
+    #[test]
+    fn test_partial_shuffle_k_larger_than_n_is_clamped() {
+        let mut indices: Vec<usize> = (0..5).collect();
+        let mut rng = 55u64;
+        // Must not panic even though k > indices.len().
+        curr_partial_shuffle(&mut indices, 100, &mut rng);
+        let mut sorted = indices.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, (0..5).collect::<Vec<usize>>());
     }
 
     // ── curr_percentile_idx ───────────────────────────────────────────────────
@@ -1423,13 +1777,61 @@ mod tests {
         let strategy = CurriculumStrategy::SelfPaced {
             threshold_percentile: 0.7,
         };
-        let result =
-            curr_select_indices(&sorted, &difficulties, &losses, 3, &strategy, 1.0, &mut rng)
-                .unwrap();
+        let result = curr_select_indices(
+            &sorted,
+            &difficulties,
+            &losses,
+            3,
+            &strategy,
+            1.0,
+            0.0,
+            &mut rng,
+        )
+        .unwrap();
         // Result should contain some of the high-loss indices.
         assert!(!result.is_empty());
         let has_high = result.iter().any(|&i| i >= 7);
         assert!(has_high, "should select from high-loss samples");
+    }
+
+    #[test]
+    fn test_sampler_self_paced_batch_reflects_update_losses_via_cached_losses() {
+        // Regression: `CurriculumSampler::sample_batch` must read live
+        // `loss_ema` values through the `cached_losses` mirror, not a
+        // stale/empty snapshot, so `update_losses` actually influences
+        // SelfPaced selection end-to-end (not just when calling
+        // `curr_select_indices` directly with a hand-built losses slice).
+        let estimator = DifficultyEstimator::uniform(20);
+        let config = CurrLearningConfig {
+            strategy: CurriculumStrategy::SelfPaced {
+                threshold_percentile: 0.9,
+            },
+            pacing_function: PacingFunction::Linear,
+            n_total_steps: 1000,
+            batch_size: 5,
+            ema_decay: 0.9,
+            warmup_steps: 0,
+            rescore_interval: 1_000_000, // disabled: isolate the cached_losses path
+        };
+        let mut sampler = CurriculumSampler::new(config, estimator).unwrap();
+        // Sample 17 gets a very high loss; every other sample stays at 0.
+        sampler
+            .update_losses(&[17], &[MAX_REASONABLE_LOSS])
+            .unwrap();
+
+        let mut rng = 321u64;
+        let mut saw_17 = false;
+        for _ in 0..20 {
+            let batch = sampler.sample_batch(&mut rng).unwrap();
+            if batch.contains(&17) {
+                saw_17 = true;
+                break;
+            }
+        }
+        assert!(
+            saw_17,
+            "SelfPaced sample_batch should reach the high-loss sample via cached_losses"
+        );
     }
 
     // ── MixedPace strategy ────────────────────────────────────────────────────
@@ -1448,6 +1850,7 @@ mod tests {
             10,
             &strategy,
             0.5,
+            0.0,
             &mut rng,
         )
         .unwrap();
@@ -1463,10 +1866,72 @@ mod tests {
         let losses = vec![0.0; 50];
         let mut rng = 8u64;
         let strategy = CurriculumStrategy::CompetenceBased { target_psnr: 30.0 };
-        let result =
-            curr_select_indices(&sorted, &difficulties, &losses, 5, &strategy, 0.5, &mut rng)
-                .unwrap();
+        let result = curr_select_indices(
+            &sorted,
+            &difficulties,
+            &losses,
+            5,
+            &strategy,
+            0.5,
+            0.0,
+            &mut rng,
+        )
+        .unwrap();
         assert_eq!(result.len(), 5);
+    }
+
+    #[test]
+    fn test_competence_based_locked_stays_in_paced_easy_prefix() {
+        // Below target competence: behaves exactly like a paced EasyFirst
+        // window (n_unlocked derived from `pacing`, ignoring how close
+        // `current_psnr` is to `target_psnr`).
+        let sorted: Vec<usize> = (0..100).collect();
+        let difficulties: Vec<f32> = (0..100).map(|i| i as f32 / 99.0).collect();
+        let losses = vec![0.0; 100];
+        let mut rng = 3u64;
+        let strategy = CurriculumStrategy::CompetenceBased { target_psnr: 30.0 };
+        let result = curr_select_indices(
+            &sorted,
+            &difficulties,
+            &losses,
+            20,
+            &strategy,
+            0.1,
+            10.0, // current_psnr < target_psnr -> not yet competent
+            &mut rng,
+        )
+        .unwrap();
+        let avg = result.iter().sum::<usize>() as f32 / result.len() as f32;
+        assert!(
+            avg < 30.0,
+            "below target competence should stay in the paced easy prefix, avg={avg}"
+        );
+    }
+
+    #[test]
+    fn test_competence_based_unlocks_hard_samples_once_competent() {
+        let sorted: Vec<usize> = (0..100).collect();
+        let difficulties: Vec<f32> = (0..100).map(|i| i as f32 / 99.0).collect();
+        let losses = vec![0.0; 100];
+        let mut rng = 3u64;
+        let strategy = CurriculumStrategy::CompetenceBased { target_psnr: 30.0 };
+        // pacing stays tiny (0.1) -- only competence should unlock the full
+        // dataset here, proving `target_psnr` has a real effect.
+        let result = curr_select_indices(
+            &sorted,
+            &difficulties,
+            &losses,
+            300,
+            &strategy,
+            0.1,
+            35.0, // current_psnr >= target_psnr -> competent
+            &mut rng,
+        )
+        .unwrap();
+        assert!(
+            result.iter().any(|&i| i >= 90),
+            "a competent model should reach hard (high-index) samples regardless of pacing"
+        );
     }
 
     // ── Edge cases ────────────────────────────────────────────────────────────

@@ -269,26 +269,31 @@ fn blend_over(src: [f32; 4], dst: [f32; 4]) -> [f32; 4] {
     ]
 }
 
-// Multiply: out.rgb = src.rgb * dst.rgb, out.a = src.a + dst.a - src.a*dst.a
+// Multiply: blend colour is src.rgb * dst.rgb, then composited over dst
+// weighted by the source alpha (Porter-Duff source-over using the blended
+// colour as the "source" RGB) -- a fully transparent source must not
+// darken dst at all, and out.a must still be src.a + dst.a - src.a*dst.a
+// (which reusing `blend_over` here reproduces exactly: sa + da*(1-sa)).
 fn blend_multiply(src: [f32; 4], dst: [f32; 4]) -> [f32; 4] {
-    let out_a = src[3] + dst[3] - src[3] * dst[3];
-    [src[0] * dst[0], src[1] * dst[1], src[2] * dst[2], out_a]
+    let blended = [src[0] * dst[0], src[1] * dst[1], src[2] * dst[2], src[3]];
+    blend_over(blended, dst)
 }
 
-// Screen: out.rgb = 1 - (1-src.rgb)*(1-dst.rgb), alpha same as multiply
+// Screen: out.rgb = 1 - (1-src.rgb)*(1-dst.rgb), composited over dst
+// weighted by the source alpha; see `blend_multiply`.
 fn blend_screen(src: [f32; 4], dst: [f32; 4]) -> [f32; 4] {
-    let out_a = src[3] + dst[3] - src[3] * dst[3];
-    [
+    let blended = [
         1.0 - (1.0 - src[0]) * (1.0 - dst[0]),
         1.0 - (1.0 - src[1]) * (1.0 - dst[1]),
         1.0 - (1.0 - src[2]) * (1.0 - dst[2]),
-        out_a,
-    ]
+        src[3],
+    ];
+    blend_over(blended, dst)
 }
 
-// Overlay: if dst < 0.5 → 2*src*dst, else 1 - 2*(1-src)*(1-dst)
+// Overlay: if dst < 0.5 → 2*src*dst, else 1 - 2*(1-src)*(1-dst); composited
+// over dst weighted by the source alpha; see `blend_multiply`.
 fn blend_overlay(src: [f32; 4], dst: [f32; 4]) -> [f32; 4] {
-    let out_a = src[3] + dst[3] - src[3] * dst[3];
     let overlay_ch = |s: f32, d: f32| -> f32 {
         if d < 0.5 {
             2.0 * s * d
@@ -296,34 +301,37 @@ fn blend_overlay(src: [f32; 4], dst: [f32; 4]) -> [f32; 4] {
             1.0 - 2.0 * (1.0 - s) * (1.0 - d)
         }
     };
-    [
+    let blended = [
         overlay_ch(src[0], dst[0]),
         overlay_ch(src[1], dst[1]),
         overlay_ch(src[2], dst[2]),
-        out_a,
-    ]
+        src[3],
+    ];
+    blend_over(blended, dst)
 }
 
-// Add: clamp(src.rgb + dst.rgb, 0, 1), alpha same as Over
+// Add: clamp(src.rgb + dst.rgb, 0, 1), composited over dst weighted by the
+// source alpha; see `blend_multiply`.
 fn blend_add(src: [f32; 4], dst: [f32; 4]) -> [f32; 4] {
-    let out_a = src[3] + dst[3] - src[3] * dst[3];
-    [
+    let blended = [
         (src[0] + dst[0]).clamp(0.0, 1.0),
         (src[1] + dst[1]).clamp(0.0, 1.0),
         (src[2] + dst[2]).clamp(0.0, 1.0),
-        out_a,
-    ]
+        src[3],
+    ];
+    blend_over(blended, dst)
 }
 
-// Difference: |src.rgb - dst.rgb|, alpha same as Over
+// Difference: |src.rgb - dst.rgb|, composited over dst weighted by the
+// source alpha; see `blend_multiply`.
 fn blend_difference(src: [f32; 4], dst: [f32; 4]) -> [f32; 4] {
-    let out_a = src[3] + dst[3] - src[3] * dst[3];
-    [
+    let blended = [
         (src[0] - dst[0]).abs(),
         (src[1] - dst[1]).abs(),
         (src[2] - dst[2]).abs(),
-        out_a,
-    ]
+        src[3],
+    ];
+    blend_over(blended, dst)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -832,6 +840,52 @@ mod tests {
         assert_approx(out[1], 0.25, "g");
         assert_approx(out[2], 0.25, "b");
         assert_approx(out[3], 1.0, "a"); // 1 + 1 - 1*1
+    }
+
+    #[test]
+    fn test_blend_modes_respect_source_alpha() {
+        // Regression test: a fully transparent source (alpha == 0) must
+        // leave the destination completely unchanged in every non-`Over`
+        // blend mode, not fully overwrite it with the blended colour (the
+        // bug: these modes computed the blend from src.rgb/dst.rgb alone
+        // and used src.a only for the output alpha, never to weight rgb).
+        let dst = [0.4_f32, 0.8, 0.5, 0.6];
+        let transparent_src = [0.9_f32, 0.1, 0.2, 0.0];
+
+        for mode in [
+            BlendMode::Multiply,
+            BlendMode::Screen,
+            BlendMode::Overlay,
+            BlendMode::Add,
+            BlendMode::Difference,
+        ] {
+            let out = blend_pixels(transparent_src, dst, &mode);
+            assert_approx(out[0], dst[0], &format!("{mode:?} r"));
+            assert_approx(out[1], dst[1], &format!("{mode:?} g"));
+            assert_approx(out[2], dst[2], &format!("{mode:?} b"));
+            assert_approx(out[3], dst[3], &format!("{mode:?} a"));
+        }
+    }
+
+    #[test]
+    fn test_blend_multiply_partial_alpha_interpolates() {
+        // With a half-opaque source, the multiply result must sit strictly
+        // between the unblended destination and the fully-opaque blended
+        // colour (a proper lerp by source alpha) -- not jump straight to
+        // the fully-opaque blended result regardless of alpha.
+        let dst = [0.8_f32, 0.8, 0.8, 1.0];
+        let half_src = [0.2_f32, 0.2, 0.2, 0.5];
+        let out = blend_pixels(half_src, dst, &BlendMode::Multiply);
+        let full_blend = 0.2_f32 * 0.8; // src.rgb * dst.rgb, the fully-opaque case
+        let expected = dst[0] * 0.5 + full_blend * 0.5; // lerp(dst, blend, sa=0.5)
+        assert_approx(out[0], expected, "r");
+        assert!(
+            out[0] > full_blend && out[0] < dst[0],
+            "half-alpha multiply result {} should lie strictly between the full blend {} and dst {}",
+            out[0],
+            full_blend,
+            dst[0]
+        );
     }
 
     // ── 8. blend_pixels Add: clamped to [0,1] ────────────────────────────────

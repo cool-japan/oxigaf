@@ -657,8 +657,30 @@ pub fn pad_image(
     } = params;
     check_src(src, src_w, src_h)?;
     check_dst(dst_w, dst_h)?;
-    // Source must fit in destination at the given offset.
-    if offset_x + src_w > dst_w || offset_y + src_h > dst_h {
+    // Source must fit in destination at the given offset. Use checked
+    // arithmetic (mirroring `crop` above): an offset near u32::MAX must
+    // not silently wrap and pass this bounds check.
+    let x_end = offset_x
+        .checked_add(src_w)
+        .ok_or(ResizeError::CropOutOfBounds {
+            x: offset_x,
+            y: offset_y,
+            w: src_w,
+            h: src_h,
+            img_w: dst_w,
+            img_h: dst_h,
+        })?;
+    let y_end = offset_y
+        .checked_add(src_h)
+        .ok_or(ResizeError::CropOutOfBounds {
+            x: offset_x,
+            y: offset_y,
+            w: src_w,
+            h: src_h,
+            img_w: dst_w,
+            img_h: dst_h,
+        })?;
+    if x_end > dst_w || y_end > dst_h {
         return Err(ResizeError::CropOutOfBounds {
             x: offset_x,
             y: offset_y,
@@ -1189,6 +1211,32 @@ mod tests {
         let bg = [0; 4];
         // 4×4 src at offset (1,1) into 4×4 dst → doesn't fit.
         assert!(pad_image(&src, PadParams::new(4, 4, 4, 4, 1, 1), bg).is_err());
+    }
+
+    #[test]
+    fn pad_image_offset_x_overflow_rejected() {
+        // Regression: `offset_x + src_w` used unchecked u32 addition, so
+        // offset_x near u32::MAX wrapped around and passed the bounds
+        // check, leading to an out-of-bounds slice panic in the write
+        // loop. Must now be rejected cleanly.
+        let src = solid(1, 1, [255, 255, 255, 255]);
+        let bg = [0; 4];
+        let result = pad_image(&src, PadParams::new(1, 1, 4, 4, u32::MAX, 0), bg);
+        assert!(
+            matches!(result, Err(ResizeError::CropOutOfBounds { .. })),
+            "expected CropOutOfBounds, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn pad_image_offset_y_overflow_rejected() {
+        let src = solid(1, 1, [255, 255, 255, 255]);
+        let bg = [0; 4];
+        let result = pad_image(&src, PadParams::new(1, 1, 4, 4, 0, u32::MAX), bg);
+        assert!(
+            matches!(result, Err(ResizeError::CropOutOfBounds { .. })),
+            "expected CropOutOfBounds, got {result:?}"
+        );
     }
 
     // ── pad_to_square ─────────────────────────────────────────────────────────

@@ -3,6 +3,8 @@
 //! Implements axis-aligned bounding boxes (AABB) and a SAH-based BVH for
 //! frustum culling, sphere queries, and ray intersection tests.
 
+use crate::RenderError;
+
 /// Axis-aligned bounding box.
 #[derive(Debug, Clone, Copy)]
 pub struct Aabb {
@@ -146,6 +148,7 @@ const MAX_DEPTH: usize = 32;
 const NUM_SAH_BUCKETS: usize = 16;
 
 /// A node in the BVH tree.
+#[derive(Debug)]
 pub enum BvhNode {
     /// Leaf node holding a set of Gaussian indices.
     Leaf {
@@ -189,6 +192,7 @@ impl BvhNode {
 // ─── GaussianBvh ─────────────────────────────────────────────────────────────
 
 /// BVH over a set of Gaussians.
+#[derive(Debug)]
 pub struct GaussianBvh {
     root: Option<BvhNode>,
     /// Per-Gaussian AABBs stored alongside the tree for per-primitive leaf tests.
@@ -201,14 +205,26 @@ impl GaussianBvh {
     ///
     /// For each Gaussian the AABB is `center ± max_scale` where
     /// `max_scale = exp(scale[i]).max()`.
-    pub fn build(positions: &[[f32; 3]], scales: &[[f32; 3]]) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// [`RenderError::MismatchedBufferSizes`] if `scales.len() != positions.len()`.
+    /// An empty (but length-matched) input is not an error: it returns an
+    /// empty BVH for which every query correctly returns no results.
+    pub fn build(positions: &[[f32; 3]], scales: &[[f32; 3]]) -> Result<Self, RenderError> {
         let n = positions.len();
-        if n == 0 || scales.len() != n {
-            return Self {
+        if scales.len() != n {
+            return Err(RenderError::MismatchedBufferSizes {
+                expected: n,
+                actual: scales.len(),
+            });
+        }
+        if n == 0 {
+            return Ok(Self {
                 root: None,
                 primitive_aabbs: Vec::new(),
-                num_gaussians: n,
-            };
+                num_gaussians: 0,
+            });
         }
 
         // Compute per-Gaussian AABBs.
@@ -225,11 +241,11 @@ impl GaussianBvh {
         let mut indices: Vec<usize> = (0..n).collect();
         let root = build_recursive(&aabbs, &mut indices, 0);
 
-        Self {
+        Ok(Self {
             root: Some(root),
             primitive_aabbs: aabbs,
             num_gaussians: n,
-        }
+        })
     }
 
     /// Frustum cull: return Gaussian indices whose AABB overlaps the view frustum.
@@ -533,6 +549,15 @@ fn ray_query_recursive(
 ///
 /// Column-major layout: `m[col][row]` or equivalently the array is stored as
 /// `[col0_row0, col0_row1, col0_row2, col0_row3, col1_row0, ...]`.
+///
+/// **NDC z convention:** `view_proj` must be a wgpu/D3D-style right-handed
+/// projection with `z_ndc ∈ [0, 1]` (e.g. `glam::camera::rh::proj::directx`,
+/// which is what this crate's own camera path builder uses — see
+/// `camera_path.rs`). Gribb-Hartmann's near-plane derivation differs by NDC
+/// convention: OpenGL's `z_ndc ∈ [-1, 1]` gives `near = row3 + row2`, but for
+/// `z_ndc ∈ [0, 1]` the near half-space is simply `z_clip >= 0`, i.e.
+/// `near = row2` alone. Using the OpenGL form here would accept a band of
+/// geometry that is actually behind the true near plane.
 pub fn extract_frustum_planes(view_proj: &[[f32; 4]; 4]) -> [[f32; 4]; 6] {
     // view_proj is column-major: view_proj[col][row].
     // Row i of the matrix is: view_proj[0][i], view_proj[1][i], view_proj[2][i], view_proj[3][i].
@@ -555,7 +580,9 @@ pub fn extract_frustum_planes(view_proj: &[[f32; 4]; 4]) -> [[f32; 4]; 6] {
     let right = sub_planes(r3, r0); // row3 - row0
     let bottom = add_planes(r3, r1); // row3 + row1
     let top = sub_planes(r3, r1); // row3 - row1
-    let near = add_planes(r3, r2); // row3 + row2
+                                  // near = row2 alone: for z_ndc in [0, 1] (wgpu/D3D), the near half-space
+                                  // is z_clip >= 0, not the OpenGL-convention row3 + row2 (z_ndc in [-1,1]).
+    let near = r2;
     let far = sub_planes(r3, r2); // row3 - row2
 
     [
@@ -710,17 +737,35 @@ mod tests {
 
     #[test]
     fn test_bvh_build_empty() {
-        let bvh = GaussianBvh::build(&[], &[]);
+        let bvh =
+            GaussianBvh::build(&[], &[]).expect("empty (length-matched) build should succeed");
         assert_eq!(bvh.num_gaussians(), 0);
         assert_eq!(bvh.num_nodes(), 0);
         assert_eq!(bvh.depth(), 0);
     }
 
     #[test]
+    fn test_bvh_build_mismatched_lengths_errors() {
+        // Regression: a length mismatch must be reported as an error, not
+        // silently produce an empty-looking BVH indistinguishable from
+        // "everything is off-screen".
+        let positions = [[0.0f32, 0.0, 0.0], [1.0, 1.0, 1.0]];
+        let scales = [[0.0f32, 0.0, 0.0]]; // one short
+        let result = GaussianBvh::build(&positions, &scales);
+        match result {
+            Err(RenderError::MismatchedBufferSizes { expected, actual }) => {
+                assert_eq!(expected, 2);
+                assert_eq!(actual, 1);
+            }
+            other => panic!("expected MismatchedBufferSizes, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_bvh_build_single() {
         let positions = [[0.0f32, 0.0, 0.0]];
         let scales = [[0.0f32, 0.0, 0.0]]; // exp(0) = 1.0
-        let bvh = GaussianBvh::build(&positions, &scales);
+        let bvh = GaussianBvh::build(&positions, &scales).expect("BVH build failed");
         assert_eq!(bvh.num_gaussians(), 1);
         assert_eq!(bvh.num_nodes(), 1);
         assert_eq!(bvh.depth(), 1);
@@ -739,7 +784,7 @@ mod tests {
             .map(|i| [i as f32, (i % 10) as f32, (i / 10) as f32])
             .collect();
         let scales: Vec<[f32; 3]> = vec![[0.0f32, 0.0, 0.0]; n]; // scale = 1.0
-        let bvh = GaussianBvh::build(&positions, &scales);
+        let bvh = GaussianBvh::build(&positions, &scales).expect("BVH build failed");
         assert_eq!(bvh.num_gaussians(), n);
         assert!(bvh.num_nodes() > 1);
 
@@ -754,8 +799,54 @@ mod tests {
         let n = 1024usize;
         let positions: Vec<[f32; 3]> = (0..n).map(|i| [i as f32 * 0.001, 0.0, 0.0]).collect();
         let scales: Vec<[f32; 3]> = vec![[-5.0f32, -5.0, -5.0]; n]; // tiny scale
-        let bvh = GaussianBvh::build(&positions, &scales);
+        let bvh = GaussianBvh::build(&positions, &scales).expect("BVH build failed");
         assert!(bvh.depth() <= MAX_DEPTH + 1);
+    }
+
+    // ── extract_frustum_planes tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_extract_frustum_planes_near_plane_boundary() {
+        // Build a real wgpu/D3D-style (z_ndc in [0,1]) perspective
+        // projection -- the same construction this crate's own camera path
+        // builder uses (camera_path.rs) -- and check the near plane sits at
+        // the true near distance along the view-space -Z (forward) axis.
+        let fov_y = std::f32::consts::FRAC_PI_2;
+        let aspect = 1.0_f32;
+        let near = 1.0_f32;
+        let far = 100.0_f32;
+        let proj = glam::camera::rh::proj::directx::perspective(fov_y, aspect, near, far);
+        let flat = proj.to_cols_array();
+        let view_proj: [[f32; 4]; 4] = [
+            [flat[0], flat[1], flat[2], flat[3]],
+            [flat[4], flat[5], flat[6], flat[7]],
+            [flat[8], flat[9], flat[10], flat[11]],
+            [flat[12], flat[13], flat[14], flat[15]],
+        ];
+
+        let planes = extract_frustum_planes(&view_proj);
+        let [a, b, c, d] = planes[4]; // [left, right, bottom, top, near, far]
+        let signed_distance = |z: f32| a * 0.0 + b * 0.0 + c * z + d;
+
+        // A point at exactly the near distance sits on the boundary.
+        let on_boundary = signed_distance(-near);
+        assert!(
+            on_boundary.abs() < 1e-3,
+            "a point at exactly the near distance should lie on the near-plane \
+             boundary, got signed distance {on_boundary}"
+        );
+        // Further from the camera than `near` (deeper into the frustum): inside.
+        let just_inside = signed_distance(-(near + 0.1));
+        assert!(
+            just_inside > 0.0,
+            "a point just past the near plane should be inside, got {just_inside}"
+        );
+        // Closer to the camera than `near`: outside, must be culled.
+        let just_behind = signed_distance(-(near - 0.1));
+        assert!(
+            just_behind < 0.0,
+            "a point just behind the near plane should be outside, got {just_behind}"
+        );
     }
 
     // ── Frustum cull tests ────────────────────────────────────────────────────
@@ -789,7 +880,7 @@ mod tests {
             })
             .collect();
         let scales: Vec<[f32; 3]> = vec![[-4.0f32, -4.0, -4.0]; n]; // scale ≈ 0.018
-        let bvh = GaussianBvh::build(&positions, &scales);
+        let bvh = GaussianBvh::build(&positions, &scales).expect("BVH build failed");
         let planes = unit_cube_planes();
         let hits = bvh.frustum_cull(&planes);
         // All should be inside.
@@ -801,7 +892,7 @@ mod tests {
         // One Gaussian inside, one far outside.
         let positions = [[0.0f32, 0.0, 0.0], [100.0, 100.0, 100.0]];
         let scales = [[-4.0f32, -4.0, -4.0], [-4.0, -4.0, -4.0]];
-        let bvh = GaussianBvh::build(&positions, &scales);
+        let bvh = GaussianBvh::build(&positions, &scales).expect("BVH build failed");
         let planes = unit_cube_planes();
         let hits = bvh.frustum_cull(&planes);
         assert!(hits.contains(&0));
@@ -814,7 +905,7 @@ mod tests {
     fn test_sphere_query() {
         let positions = [[0.0f32, 0.0, 0.0], [10.0, 0.0, 0.0], [20.0, 0.0, 0.0]];
         let scales = [[-4.0f32, -4.0, -4.0]; 3];
-        let bvh = GaussianBvh::build(&positions, &scales);
+        let bvh = GaussianBvh::build(&positions, &scales).expect("BVH build failed");
 
         // Small sphere only around the first Gaussian.
         let hits = bvh.sphere_query([0.0, 0.0, 0.0], 1.0);
@@ -837,7 +928,7 @@ mod tests {
             [0.0, 10.0, 0.0], // off-axis
         ];
         let scales = [[-1.0f32, -1.0, -1.0]; 3]; // scale ≈ 0.368
-        let bvh = GaussianBvh::build(&positions, &scales);
+        let bvh = GaussianBvh::build(&positions, &scales).expect("BVH build failed");
 
         // Ray along x axis: should hit indices 0 and 1.
         let hits = bvh.ray_query([0.0, 0.0, 0.0], [1.0, 0.0, 0.0]);

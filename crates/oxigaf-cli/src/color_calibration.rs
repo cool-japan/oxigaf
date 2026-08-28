@@ -21,6 +21,28 @@ pub enum CalibrationError {
     EmptyInput,
 }
 
+/// Compute `width * height * 3` (the expected length of a flat interleaved
+/// RGB image buffer), guarding against `usize` overflow for adversarial or
+/// corrupt caller-supplied dimensions.
+///
+/// Without this, `width * height * 3` panics on overflow in a debug build
+/// and silently wraps in release — where the wrapped value can coincidence
+/// with `image.len()`, letting a mismatched-dimensions call through instead
+/// of being rejected.
+fn checked_rgb_len(
+    width: usize,
+    height: usize,
+    image_len: usize,
+) -> Result<usize, CalibrationError> {
+    width
+        .checked_mul(height)
+        .and_then(|v| v.checked_mul(3))
+        .ok_or(CalibrationError::DimensionMismatch {
+            expected: 0,
+            got: image_len,
+        })
+}
+
 // ───────────────────────────────── Macbeth ColorChecker patches ────────────
 
 /// Standard Macbeth ColorChecker patch reference values (linear sRGB).
@@ -288,7 +310,7 @@ pub fn cal_apply_ccm(
     height: usize,
     ccm: &CalibrationMatrix,
 ) -> Result<Vec<f32>, CalibrationError> {
-    let expected = width * height * 3;
+    let expected = checked_rgb_len(width, height, image.len())?;
     if image.len() != expected {
         return Err(CalibrationError::DimensionMismatch {
             expected,
@@ -429,7 +451,7 @@ pub fn cal_apply_white_balance(
     height: usize,
     wb: &WhiteBalance,
 ) -> Result<Vec<f32>, CalibrationError> {
-    let expected = width * height * 3;
+    let expected = checked_rgb_len(width, height, image.len())?;
     if image.len() != expected {
         return Err(CalibrationError::DimensionMismatch {
             expected,
@@ -513,7 +535,7 @@ pub fn cal_apply_gamma(
     height: usize,
     profile: &GammaProfile,
 ) -> Result<Vec<f32>, CalibrationError> {
-    let expected = width * height * 3;
+    let expected = checked_rgb_len(width, height, image.len())?;
     if image.len() != expected {
         return Err(CalibrationError::DimensionMismatch {
             expected,
@@ -536,7 +558,7 @@ pub fn cal_apply_gamma_inv(
     height: usize,
     profile: &GammaProfile,
 ) -> Result<Vec<f32>, CalibrationError> {
-    let expected = width * height * 3;
+    let expected = checked_rgb_len(width, height, image.len())?;
     if image.len() != expected {
         return Err(CalibrationError::DimensionMismatch {
             expected,
@@ -568,13 +590,40 @@ const SRGB_TO_XYZ: [f32; 9] = [
 ];
 
 /// CIE XYZ D65 → linear sRGB.
+///
+/// The exact (to f32 precision) matrix inverse of [`SRGB_TO_XYZ`], not an
+/// independently hand-copied literal — a previous version of this matrix
+/// carried fewer significant digits (3.240_479, -1.537_15, -0.498_535,
+/// -0.969_256, 1.875_992, 0.041_556, 0.055_648, -0.204_043, 1.057_311),
+/// which meant `cal_xyz_to_srgb(cal_srgb_to_xyz(rgb))` did not round-trip
+/// to full f32 precision. `test_xyz_to_srgb_is_precise_inverse_of_srgb_to_xyz`
+/// checks the product of the two matrices against the identity directly.
 const XYZ_TO_SRGB: [f32; 9] = [
-    3.240_479, -1.537_15, -0.498_535, -0.969_256, 1.875_992, 0.041_556, 0.055_648, -0.204_043,
-    1.057_311,
+    3.240_454_2,
+    -1.537_138_5,
+    -0.498_531_4,
+    -0.969_266,
+    1.876_010_8,
+    0.041_556_0,
+    0.055_643_4,
+    -0.204_025_9,
+    1.057_225_2,
 ];
 
 /// D65 white point in XYZ (normalised to Y = 1).
-const D65_XYZ: [f32; 3] = [0.950_456, 1.000_000, 1.088_906];
+///
+/// Derived directly from `SRGB_TO_XYZ`'s row sums — the XYZ that linear
+/// sRGB white `[1,1,1]` actually maps to under that matrix — rather than
+/// hand-copied as an independent literal. The two previously disagreed by
+/// ~1.4e-5 (X) / ~7.6e-5 (Z), which meant `cal_srgb_to_lab([1,1,1])` didn't
+/// map to exactly Lab(100, 0, 0). Deriving it from `SRGB_TO_XYZ` makes that
+/// impossible to drift out of sync again; `test_d65_xyz_matches_srgb_to_xyz_row_sums`
+/// guards the derivation itself.
+const D65_XYZ: [f32; 3] = [
+    SRGB_TO_XYZ[0] + SRGB_TO_XYZ[1] + SRGB_TO_XYZ[2],
+    SRGB_TO_XYZ[3] + SRGB_TO_XYZ[4] + SRGB_TO_XYZ[5],
+    SRGB_TO_XYZ[6] + SRGB_TO_XYZ[7] + SRGB_TO_XYZ[8],
+];
 
 /// Linear sRGB to CIE XYZ (D65).
 pub fn cal_srgb_to_xyz(rgb: [f32; 3]) -> [f32; 3] {
@@ -764,6 +813,18 @@ fn hue_angle(a_prime: f32, b: f32) -> f32 {
 
 // ─────────────────────────── Calibration statistics ────────────────────────
 
+/// Which perceptual colour-difference formula [`cal_evaluate`] uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DeltaEMetric {
+    /// CIE76 — simple Euclidean distance in Lab space. Cheap, but
+    /// perceptually non-uniform, especially for saturated colours.
+    Cie76,
+    /// CIEDE2000 — the current industry-standard perceptual metric for
+    /// colour-checker-style calibration work.
+    #[default]
+    Cie2000,
+}
+
 /// Quality statistics for a calibration.
 #[derive(Debug, Clone)]
 pub struct CalibrationStats {
@@ -774,12 +835,19 @@ pub struct CalibrationStats {
     pub per_patch_delta_e: Vec<f32>,
 }
 
-/// Evaluate calibration quality: apply CCM + WB to measured patches, compare to reference.
+/// Evaluate calibration quality: apply CCM then WB to measured patches,
+/// compare to reference, using `metric` for the per-patch colour distance.
+///
+/// CCM is applied *before* WB, matching how [`cal_solve_ccm`] fits `M`
+/// directly against raw (not white-balanced) measured patches — applying WB
+/// first would feed the CCM input it was never fit against, effectively
+/// double-correcting.
 pub fn cal_evaluate(
     measured: &[[f32; 3]],
     reference: &[[f32; 3]],
     ccm: &CalibrationMatrix,
     wb: &WhiteBalance,
+    metric: DeltaEMetric,
 ) -> Result<CalibrationStats, CalibrationError> {
     if measured.is_empty() {
         return Err(CalibrationError::EmptyInput);
@@ -796,14 +864,16 @@ pub fn cal_evaluate(
     let mut sum_sq_rgb = 0.0f32;
 
     for (m, r) in measured.iter().zip(reference.iter()) {
-        // Apply WB then CCM
-        let wb_applied = wb.apply(*m);
-        let corrected = ccm.apply(wb_applied);
+        // Apply CCM then WB (see doc comment above for why this order).
+        let ccm_applied = ccm.apply(*m);
+        let corrected = wb.apply(ccm_applied);
 
-        // Delta E 76 in Lab
         let lab_corrected = cal_srgb_to_lab(corrected);
         let lab_ref = cal_srgb_to_lab(*r);
-        let de = cal_delta_e_76(lab_corrected, lab_ref);
+        let de = match metric {
+            DeltaEMetric::Cie76 => cal_delta_e_76(lab_corrected, lab_ref),
+            DeltaEMetric::Cie2000 => cal_delta_e_2000(lab_corrected, lab_ref),
+        };
         per_patch_delta_e.push(de);
 
         // RMSE RGB
@@ -1059,6 +1129,21 @@ mod tests {
         assert!(cal_apply_ccm(&img, 0, 0, &ccm).is_err());
     }
 
+    #[test]
+    fn test_apply_ccm_huge_dimensions_do_not_overflow() {
+        // `width * height * 3` with these dimensions overflows `usize`
+        // (even on 64-bit); this must return a typed error instead of
+        // panicking (debug) or wrapping to a small, coincidentally-matching
+        // `expected` (release).
+        let img = vec![0.5f32, 0.5, 0.5];
+        let ccm = CalibrationMatrix::identity();
+        let result = cal_apply_ccm(&img, usize::MAX / 2, usize::MAX / 2, &ccm);
+        assert!(matches!(
+            result,
+            Err(CalibrationError::DimensionMismatch { .. })
+        ));
+    }
+
     // ── WhiteBalance ──────────────────────────────────────────────────────────
 
     #[test]
@@ -1252,10 +1337,34 @@ mod tests {
         let rgb = [0.3f32, 0.5, 0.7];
         let xyz = cal_srgb_to_xyz(rgb);
         let back = cal_xyz_to_srgb(xyz);
+        // `XYZ_TO_SRGB` is now the precise inverse of `SRGB_TO_XYZ` (not an
+        // independently hand-copied, lower-precision literal), so this
+        // round-trips far tighter than the original 1e-4 tolerance.
         assert!(
-            approx_eq_arr3(back, rgb, 1e-4),
+            approx_eq_arr3(back, rgb, 1e-5),
             "sRGB→XYZ→sRGB round-trip: {back:?}"
         );
+    }
+
+    #[test]
+    fn test_xyz_to_srgb_is_precise_inverse_of_srgb_to_xyz() {
+        // Multiply the two 3x3 matrices and check the product is the
+        // identity — a direct check that `XYZ_TO_SRGB` is the matrix
+        // inverse of `SRGB_TO_XYZ`, independent of any particular RGB
+        // sample.
+        let a = &SRGB_TO_XYZ;
+        let b = &XYZ_TO_SRGB;
+        for row in 0..3 {
+            for col in 0..3 {
+                let dot =
+                    a[row * 3] * b[col] + a[row * 3 + 1] * b[3 + col] + a[row * 3 + 2] * b[6 + col];
+                let expected = if row == col { 1.0 } else { 0.0 };
+                assert!(
+                    approx_eq(dot, expected, 1e-5),
+                    "SRGB_TO_XYZ * XYZ_TO_SRGB[{row}][{col}] = {dot}, expected {expected}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1310,15 +1419,40 @@ mod tests {
 
     #[test]
     fn test_srgb_to_lab_white() {
-        // Linear sRGB [1,1,1] → Lab approximately (100, 0, 0)
+        // Linear sRGB [1,1,1] → Lab exactly (100, 0, 0): `cal_srgb_to_xyz`
+        // maps white to precisely `D65_XYZ` (by construction: D65_XYZ is
+        // now derived from the same SRGB_TO_XYZ row sums), so every
+        // xyz[i]/D65_XYZ[i] ratio is exactly 1.0 and `lab_f(1.0) == 1.0`.
         let lab = cal_srgb_to_lab([1.0, 1.0, 1.0]);
         assert!(
-            approx_eq(lab[0], 100.0, 1.0),
-            "L* of linear white should be ~100, got {}",
+            approx_eq(lab[0], 100.0, 1e-3),
+            "L* of linear white should be 100, got {}",
             lab[0]
         );
-        assert!(lab[1].abs() < 1.0, "a* should be near 0, got {}", lab[1]);
-        assert!(lab[2].abs() < 1.0, "b* should be near 0, got {}", lab[2]);
+        assert!(lab[1].abs() < 1e-3, "a* should be 0, got {}", lab[1]);
+        assert!(lab[2].abs() < 1e-3, "b* should be 0, got {}", lab[2]);
+    }
+
+    #[test]
+    fn test_d65_xyz_matches_srgb_to_xyz_row_sums() {
+        // Guards the derivation itself, independent of how `D65_XYZ` is
+        // spelled (a const expression today, but this still catches a
+        // future edit to `SRGB_TO_XYZ` that isn't reflected here).
+        assert!(approx_eq(
+            D65_XYZ[0],
+            SRGB_TO_XYZ[0] + SRGB_TO_XYZ[1] + SRGB_TO_XYZ[2],
+            1e-7
+        ));
+        assert!(approx_eq(
+            D65_XYZ[1],
+            SRGB_TO_XYZ[3] + SRGB_TO_XYZ[4] + SRGB_TO_XYZ[5],
+            1e-7
+        ));
+        assert!(approx_eq(
+            D65_XYZ[2],
+            SRGB_TO_XYZ[6] + SRGB_TO_XYZ[7] + SRGB_TO_XYZ[8],
+            1e-7
+        ));
     }
 
     #[test]
@@ -1403,7 +1537,8 @@ mod tests {
         let patches: Vec<[f32; 3]> = vec![[0.2, 0.3, 0.4], [0.5, 0.1, 0.6], [0.1, 0.8, 0.2]];
         let ccm = CalibrationMatrix::identity();
         let wb = WhiteBalance::daylight();
-        let stats = cal_evaluate(&patches, &patches, &ccm, &wb).expect("should succeed");
+        let stats = cal_evaluate(&patches, &patches, &ccm, &wb, DeltaEMetric::Cie2000)
+            .expect("should succeed");
         assert!(
             approx_eq(stats.mean_delta_e, 0.0, 1e-3),
             "perfect match should have mean ΔE ≈ 0, got {}",
@@ -1416,7 +1551,7 @@ mod tests {
     fn test_evaluate_empty_input() {
         let ccm = CalibrationMatrix::identity();
         let wb = WhiteBalance::daylight();
-        assert!(cal_evaluate(&[], &[], &ccm, &wb).is_err());
+        assert!(cal_evaluate(&[], &[], &ccm, &wb, DeltaEMetric::Cie2000).is_err());
     }
 
     #[test]
@@ -1425,7 +1560,7 @@ mod tests {
         let refr: Vec<[f32; 3]> = vec![[0.5, 0.3, 0.1]];
         let ccm = CalibrationMatrix::identity();
         let wb = WhiteBalance::daylight();
-        assert!(cal_evaluate(&meas, &refr, &ccm, &wb).is_err());
+        assert!(cal_evaluate(&meas, &refr, &ccm, &wb, DeltaEMetric::Cie2000).is_err());
     }
 
     #[test]
@@ -1433,7 +1568,7 @@ mod tests {
         let patches: Vec<[f32; 3]> = vec![[0.1, 0.2, 0.3], [0.4, 0.5, 0.6], [0.7, 0.8, 0.5]];
         let ccm = CalibrationMatrix::identity();
         let wb = WhiteBalance::daylight();
-        let stats = cal_evaluate(&patches, &patches, &ccm, &wb).expect("ok");
+        let stats = cal_evaluate(&patches, &patches, &ccm, &wb, DeltaEMetric::Cie2000).expect("ok");
         assert_eq!(stats.per_patch_delta_e.len(), 3);
     }
 
@@ -1443,8 +1578,63 @@ mod tests {
         let refr: Vec<[f32; 3]> = vec![[0.5, 0.5, 0.5], [0.5, 0.5, 0.5], [0.5, 0.5, 0.5]];
         let ccm = CalibrationMatrix::identity();
         let wb = WhiteBalance::daylight();
-        let stats = cal_evaluate(&meas, &refr, &ccm, &wb).expect("ok");
+        let stats = cal_evaluate(&meas, &refr, &ccm, &wb, DeltaEMetric::Cie2000).expect("ok");
         assert!(stats.mean_delta_e > 0.0);
+    }
+
+    #[test]
+    fn test_evaluate_applies_ccm_before_wb() {
+        // Regression test for the CCM/WB composition order: with a
+        // non-diagonal CCM (R' = R + 0.5*G) and a non-identity WB
+        // (gains [1.5, 1.0, 1.0]), applying CCM-then-WB and WB-then-CCM to
+        // the same measured patch give different results — [0.6,0.4,0.3]
+        // vs [0.5,0.4,0.3] for measured=[0.2,0.4,0.3] — so this discriminates
+        // the two orders unambiguously.
+        let ccm = CalibrationMatrix {
+            m: [1.0, 0.5, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+        };
+        let wb = WhiteBalance {
+            gains: [1.5, 1.0, 1.0],
+        };
+        let measured = vec![[0.2f32, 0.4, 0.3]];
+        // Reference computed as CCM applied first, then WB — the order
+        // `cal_solve_ccm` fits against (raw measured -> reference).
+        let reference = vec![[0.6f32, 0.4, 0.3]];
+
+        let stats = cal_evaluate(&measured, &reference, &ccm, &wb, DeltaEMetric::Cie76)
+            .expect("should succeed");
+        assert!(
+            approx_eq(stats.mean_delta_e, 0.0, 1e-2),
+            "CCM should be applied before WB, giving ~0 error against a \
+             reference built the same way, got mean_delta_e = {}",
+            stats.mean_delta_e
+        );
+        assert!(approx_eq(stats.rmse_rgb, 0.0, 1e-5));
+    }
+
+    #[test]
+    fn test_evaluate_metric_selection_changes_result() {
+        // Distinct, moderately saturated Lab colours where CIE76 and
+        // CIEDE2000 disagree measurably (CIEDE2000's weighting functions
+        // are not a uniform rescaling of Euclidean Lab distance).
+        let measured = vec![[0.6f32, 0.1, 0.1], [0.1f32, 0.6, 0.1]];
+        let reference = vec![[0.1f32, 0.1, 0.6], [0.6f32, 0.1, 0.6]];
+        let ccm = CalibrationMatrix::identity();
+        let wb = WhiteBalance::daylight();
+
+        let cie76 = cal_evaluate(&measured, &reference, &ccm, &wb, DeltaEMetric::Cie76)
+            .expect("ok")
+            .mean_delta_e;
+        let cie2000 = cal_evaluate(&measured, &reference, &ccm, &wb, DeltaEMetric::Cie2000)
+            .expect("ok")
+            .mean_delta_e;
+
+        assert!(cie76 > 0.0 && cie2000 > 0.0);
+        assert!(
+            (cie76 - cie2000).abs() > 1e-3,
+            "Cie76 ({cie76}) and Cie2000 ({cie2000}) should generally disagree \
+             for saturated, clearly-different colours"
+        );
     }
 
     // ── cal_format_stats ──────────────────────────────────────────────────────

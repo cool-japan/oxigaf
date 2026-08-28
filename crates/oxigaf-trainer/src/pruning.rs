@@ -3,6 +3,7 @@
 //! Provides opacity-based, scale-based, radius-based, and random pruning strategies,
 //! along with mask combinatorics, schedule computation, and compact model extraction.
 
+use oxigaf_render::gaussian::GaussianModel;
 use thiserror::Error;
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -302,6 +303,17 @@ impl GaussianPruner {
         prune_large_gaussians(radii, self.config.max_screen_radius)
     }
 
+    /// Build a scale-based pruning mask using `config.min_scale_log`.
+    ///
+    /// Gaussians where every scale dimension satisfies
+    /// `exp(scale) < exp(config.min_scale_log)` are removed — i.e. the
+    /// linear-space threshold passed to [`prune_small_gaussians`] is
+    /// `exp(config.min_scale_log)`, matching this field's documented
+    /// formula.
+    pub fn prune_by_min_scale(&self, scales: &[f32]) -> Result<PruningMask, PruningError> {
+        prune_small_gaussians(scales, self.config.min_scale_log.exp())
+    }
+
     /// Build a combined mask: prune if opacity is too low OR screen radius is too large.
     pub fn prune_combined(
         &self,
@@ -400,6 +412,61 @@ pub fn random_prune(n: usize, keep_ratio: f32, seed: u64) -> Result<PruningMask,
     let keep = (0..n)
         .map(|_| xorshift64_f32(&mut state) < keep_ratio)
         .collect();
+    Ok(PruningMask { keep })
+}
+
+/// Prune the lowest-scoring fraction of Gaussians to reach `target_sparsity`.
+///
+/// `scores` is a per-Gaussian importance/quality score (higher = keep
+/// preferentially — e.g. an EMA of opacity or contribution to rendered
+/// loss). The `ceil(n * target_sparsity)` lowest-scoring Gaussians are
+/// pruned. This is the mask-producing counterpart
+/// [`PruningSchedule::sparsity_at_step`] / [`cubic_sparsity`] otherwise
+/// lack: those compute a target sparsity *fraction*, but every other
+/// mask-producing function in this module is threshold-based rather than
+/// rank-based, so without this there was no way to act on a scheduled
+/// sparsity target at all.
+///
+/// Runs in O(n) via [`slice::select_nth_unstable_by`] rather than a full
+/// O(n log n) sort, since only the lowest-`k` partition (not a total order)
+/// is needed.
+///
+/// # Errors
+/// - [`PruningError::EmptyModel`] if `scores` is empty.
+/// - [`PruningError::InvalidThreshold`] if `target_sparsity` is outside `[0, 1]`.
+pub fn prune_to_sparsity(
+    scores: &[f32],
+    target_sparsity: f32,
+) -> Result<PruningMask, PruningError> {
+    if scores.is_empty() {
+        return Err(PruningError::EmptyModel);
+    }
+    if !(0.0..=1.0).contains(&target_sparsity) {
+        return Err(PruningError::InvalidThreshold {
+            value: target_sparsity,
+        });
+    }
+    let n = scores.len();
+    let n_prune = (((n as f32) * target_sparsity).ceil() as usize).min(n);
+
+    if n_prune == 0 {
+        return Ok(PruningMask::new(n, true));
+    }
+    if n_prune == n {
+        return Ok(PruningMask::new(n, false));
+    }
+
+    // Partition (not fully sort) so the lowest `n_prune` scores land in the
+    // front partition, each paired with its original index.
+    let mut indexed: Vec<(usize, f32)> = scores.iter().copied().enumerate().collect();
+    indexed.select_nth_unstable_by(n_prune - 1, |a, b| {
+        a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let mut keep = vec![true; n];
+    for &(idx, _) in &indexed[..n_prune] {
+        keep[idx] = false;
+    }
     Ok(PruningMask { keep })
 }
 
@@ -512,6 +579,101 @@ pub fn apply_mask(
         out_opacities,
         out_sh,
     ))
+}
+
+/// Apply a pruning mask directly to a [`GaussianModel`], compacting every
+/// per-Gaussian buffer including the FLAME-binding side arrays
+/// (`face_indices`, `barycentric`, `local_offsets`, `is_rigid`) that
+/// [`apply_mask`] — which only knows about loose flat parameter arrays —
+/// cannot touch, so it alone cannot prune a real `GaussianModel` without
+/// desyncing those side arrays from the compacted Gaussians.
+///
+/// # Errors
+/// - [`PruningError::EmptyModel`] if the model has no Gaussians.
+/// - [`PruningError::SizeMismatch`] if `mask.len()`, `face_indices.len()`,
+///   `barycentric.len()`, `local_offsets.len()`, `is_rigid.len()`, or
+///   `sh_coeffs.len()` do not match the model's Gaussian count.
+pub fn apply_mask_to_model(
+    model: &GaussianModel,
+    mask: &PruningMask,
+) -> Result<GaussianModel, PruningError> {
+    let n = model.gaussians.len();
+    if n == 0 {
+        return Err(PruningError::EmptyModel);
+    }
+    if mask.len() != n {
+        return Err(PruningError::SizeMismatch {
+            positions: mask.len(),
+            expected: n,
+        });
+    }
+    if model.face_indices.len() != n {
+        return Err(PruningError::SizeMismatch {
+            positions: model.face_indices.len(),
+            expected: n,
+        });
+    }
+    if model.barycentric.len() != n {
+        return Err(PruningError::SizeMismatch {
+            positions: model.barycentric.len(),
+            expected: n,
+        });
+    }
+    if model.local_offsets.len() != n {
+        return Err(PruningError::SizeMismatch {
+            positions: model.local_offsets.len(),
+            expected: n,
+        });
+    }
+    if model.is_rigid.len() != n {
+        return Err(PruningError::SizeMismatch {
+            positions: model.is_rigid.len(),
+            expected: n,
+        });
+    }
+    let sh_per_gaussian = if model.sh_coeffs.is_empty() {
+        0
+    } else {
+        if !model.sh_coeffs.len().is_multiple_of(n) {
+            return Err(PruningError::SizeMismatch {
+                positions: model.sh_coeffs.len(),
+                expected: n,
+            });
+        }
+        model.sh_coeffs.len() / n
+    };
+
+    let kept = mask.keep_count();
+    let mut gaussians = Vec::with_capacity(kept);
+    let mut sh_coeffs = Vec::with_capacity(kept * sh_per_gaussian);
+    let mut face_indices = Vec::with_capacity(kept);
+    let mut barycentric = Vec::with_capacity(kept);
+    let mut local_offsets = Vec::with_capacity(kept);
+    let mut is_rigid = Vec::with_capacity(kept);
+
+    for i in 0..n {
+        if !mask.keep[i] {
+            continue;
+        }
+        gaussians.push(model.gaussians[i]);
+        if sh_per_gaussian > 0 {
+            sh_coeffs.extend_from_slice(&model.sh_coeffs[i * sh_per_gaussian..][..sh_per_gaussian]);
+        }
+        face_indices.push(model.face_indices[i]);
+        barycentric.push(model.barycentric[i]);
+        local_offsets.push(model.local_offsets[i]);
+        is_rigid.push(model.is_rigid[i]);
+    }
+
+    Ok(GaussianModel {
+        gaussians,
+        sh_coeffs,
+        sh_degree: model.sh_degree,
+        face_indices,
+        barycentric,
+        local_offsets,
+        is_rigid,
+    })
 }
 
 /// Compute cubic sparsity for iterative pruning schedules.
@@ -775,6 +937,66 @@ mod tests {
         assert!(matches!(result, Err(PruningError::InvalidKeepRatio { .. })));
     }
 
+    // ── prune_to_sparsity ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_prune_to_sparsity_prunes_lowest_scoring() {
+        let scores = vec![0.9_f32, 0.1, 0.5, 0.8, 0.2];
+        // target 40% of 5 => ceil(2.0) = 2 lowest-scoring pruned:
+        // index 1 (0.1) and index 4 (0.2).
+        let mask = prune_to_sparsity(&scores, 0.4).expect("prune_to_sparsity");
+        assert_eq!(mask.prune_count(), 2);
+        assert!(!mask.keep[1], "lowest score (index 1) should be pruned");
+        assert!(
+            !mask.keep[4],
+            "second-lowest score (index 4) should be pruned"
+        );
+        assert!(mask.keep[0] && mask.keep[2] && mask.keep[3]);
+    }
+
+    #[test]
+    fn test_prune_to_sparsity_zero_prunes_nothing() {
+        let scores = vec![0.1_f32, 0.2, 0.3];
+        let mask = prune_to_sparsity(&scores, 0.0).expect("prune_to_sparsity");
+        assert_eq!(mask.prune_count(), 0);
+    }
+
+    #[test]
+    fn test_prune_to_sparsity_one_prunes_everything() {
+        let scores = vec![0.1_f32, 0.2, 0.3];
+        let mask = prune_to_sparsity(&scores, 1.0).expect("prune_to_sparsity");
+        assert_eq!(mask.keep_count(), 0);
+    }
+
+    #[test]
+    fn test_prune_to_sparsity_empty_scores_error() {
+        let result = prune_to_sparsity(&[], 0.5);
+        assert!(matches!(result, Err(PruningError::EmptyModel)));
+    }
+
+    #[test]
+    fn test_prune_to_sparsity_invalid_target_error() {
+        let result = prune_to_sparsity(&[0.1, 0.2], 1.5);
+        assert!(matches!(result, Err(PruningError::InvalidThreshold { .. })));
+    }
+
+    // ── GaussianPruner::prune_by_min_scale ──────────────────────────────────
+
+    #[test]
+    fn test_prune_by_min_scale_uses_config_threshold() {
+        let config = PruningConfig {
+            min_scale_log: 0.0, // exp(0.0) = 1.0 linear threshold
+            ..PruningConfig::default()
+        };
+        let pruner = GaussianPruner::new(config);
+        // log-scales: exp(-1.0)=0.37 (below threshold), exp(1.0)=2.72 (above)
+        let scales = vec![-1.0_f32, -1.0, -1.0, 1.0, 1.0, 1.0];
+        let mask = pruner
+            .prune_by_min_scale(&scales)
+            .expect("prune_by_min_scale");
+        assert_eq!(mask.keep, vec![false, true]);
+    }
+
     // ── apply_mask ──────────────────────────────────────────────────────────
 
     type GaussianTuple = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>);
@@ -851,6 +1073,73 @@ mod tests {
         let mask = PruningMask::new(0, true);
         let result = apply_mask(&[], &[], &[], &[], &[], &mask);
         assert!(matches!(result, Err(PruningError::EmptyModel)));
+    }
+
+    // ── apply_mask_to_model ──────────────────────────────────────────────────
+
+    fn make_test_model(n: usize, sh_dim: usize) -> GaussianModel {
+        use oxigaf_render::gaussian::GaussianAttributes;
+        let gaussians: Vec<GaussianAttributes> = (0..n)
+            .map(|i| GaussianAttributes {
+                position: [i as f32, i as f32, i as f32],
+                _pad0: 0.0,
+                rotation: [0.0, 0.0, 0.0, 1.0],
+                scale: [0.0, 0.0, 0.0],
+                opacity: 0.0,
+            })
+            .collect();
+        GaussianModel {
+            gaussians,
+            sh_coeffs: (0..n * sh_dim).map(|i| i as f32 * 0.01).collect(),
+            sh_degree: 0,
+            face_indices: (0..n as u32).collect(),
+            barycentric: vec![[1.0, 0.0, 0.0]; n],
+            local_offsets: vec![[0.0; 3]; n],
+            is_rigid: vec![false; n],
+        }
+    }
+
+    #[test]
+    fn test_apply_mask_to_model_compacts_flame_side_arrays() {
+        let model = make_test_model(3, 0);
+        // keep only Gaussian 1 (middle)
+        let mask = PruningMask {
+            keep: vec![false, true, false],
+        };
+        let pruned = apply_mask_to_model(&model, &mask).expect("apply_mask_to_model");
+        assert_eq!(pruned.gaussians.len(), 1);
+        assert_eq!(pruned.gaussians[0].position, [1.0, 1.0, 1.0]);
+        assert_eq!(pruned.face_indices, vec![1]);
+        assert_eq!(pruned.barycentric.len(), 1);
+        assert_eq!(pruned.local_offsets.len(), 1);
+        assert_eq!(pruned.is_rigid.len(), 1);
+    }
+
+    #[test]
+    fn test_apply_mask_to_model_with_sh_coeffs() {
+        let model = make_test_model(2, 9);
+        let mask = PruningMask {
+            keep: vec![true, false],
+        };
+        let pruned = apply_mask_to_model(&model, &mask).expect("apply_mask_to_model");
+        assert_eq!(pruned.sh_coeffs.len(), 9);
+        assert_eq!(pruned.sh_coeffs, model.sh_coeffs[0..9].to_vec());
+    }
+
+    #[test]
+    fn test_apply_mask_to_model_empty_error() {
+        let model = make_test_model(0, 0);
+        let mask = PruningMask::new(0, true);
+        let result = apply_mask_to_model(&model, &mask);
+        assert!(matches!(result, Err(PruningError::EmptyModel)));
+    }
+
+    #[test]
+    fn test_apply_mask_to_model_size_mismatch_error() {
+        let model = make_test_model(3, 0);
+        let mask = PruningMask::new(2, true); // wrong length vs. model's 3
+        let result = apply_mask_to_model(&model, &mask);
+        assert!(matches!(result, Err(PruningError::SizeMismatch { .. })));
     }
 
     // ── PruningSchedule ─────────────────────────────────────────────────────

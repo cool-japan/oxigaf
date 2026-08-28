@@ -63,6 +63,44 @@ pub enum SamplerError {
 }
 
 // ---------------------------------------------------------------------------
+// Private PRNG (module-local copies, following the score_matching.rs pattern)
+// ---------------------------------------------------------------------------
+
+/// Default seed for a sampler's internal noise source: any fixed non-zero
+/// constant, so stochastic DDIM is reproducible out of the box while
+/// [`MultiStepSampler::set_seed`] varies the trajectory.
+const DEFAULT_SAMPLER_SEED: u64 = 0x2545_F491_4F6C_DD1D;
+
+#[inline]
+fn xorshift64(state: &mut u64) -> u64 {
+    *state ^= *state << 13;
+    *state ^= *state >> 7;
+    *state ^= *state << 17;
+    if *state == 0 {
+        *state = 1;
+    }
+    *state
+}
+
+/// Uniform f32 in [0, 1) using 53 mantissa bits.
+#[inline]
+fn xorshift_f32(state: &mut u64) -> f32 {
+    (xorshift64(state) >> 11) as f32 / (1u64 << 53) as f32
+}
+
+/// Box-Muller transform: one standard normal sample N(0, 1) per call.
+fn bm_normal(state: &mut u64) -> f32 {
+    let u1 = (xorshift_f32(state) + 1e-10_f32).max(1e-10_f32);
+    let u2 = xorshift_f32(state);
+    (-2.0_f32 * u1.ln()).sqrt() * (2.0_f32 * std::f32::consts::PI * u2).cos()
+}
+
+/// Draw `len` independent standard-normal samples.
+fn standard_normal_vec(state: &mut u64, len: usize) -> Vec<f32> {
+    (0..len).map(|_| bm_normal(state)).collect()
+}
+
+// ---------------------------------------------------------------------------
 // SamplingNoiseSchedule
 // ---------------------------------------------------------------------------
 
@@ -136,17 +174,25 @@ impl SamplingNoiseSchedule {
     }
 
     /// Return ᾱ_t.  Clamps `t` to the valid range.
+    ///
+    /// `n_timesteps == 0` (and any other schedule whose vectors are shorter
+    /// than `n_timesteps`, which the public fields make representable) has no
+    /// coefficient to return; the noise-free limit `1.0` is reported instead of
+    /// indexing out of bounds.
     #[inline]
     pub fn alpha_bar_at(&self, t: usize) -> f32 {
         let idx = t.min(self.n_timesteps.saturating_sub(1));
-        self.alpha_bars[idx]
+        self.alpha_bars.get(idx).copied().unwrap_or(1.0)
     }
 
     /// Return σ_t = √(1 − ᾱ_t).  Clamps `t` to the valid range.
+    ///
+    /// Reports the noise-free limit `0.0` for an empty schedule, mirroring
+    /// [`alpha_bar_at`][Self::alpha_bar_at].
     #[inline]
     pub fn sigma_at(&self, t: usize) -> f32 {
         let idx = t.min(self.n_timesteps.saturating_sub(1));
-        self.sigmas[idx]
+        self.sigmas.get(idx).copied().unwrap_or(0.0)
     }
 
     /// Signal-to-noise ratio: SNR_t = ᾱ_t / (1 − ᾱ_t).
@@ -245,391 +291,14 @@ pub fn compute_timestep_schedule(n_total: usize, n_steps: usize) -> Vec<usize> {
 }
 
 // ---------------------------------------------------------------------------
-// Core free functions
+// Step kernels
 // ---------------------------------------------------------------------------
 
-/// Predict the clean image x₀ from a noisy sample xₜ and noise prediction.
-///
-/// Formula:
-/// ```text
-/// x₀_pred = (xₜ − √(1 − ᾱ_t) · ε) / √ᾱ_t
-/// ```
-pub fn predict_x0(
-    sample: &[f32],
-    noise_pred: &[f32],
-    t: usize,
-    schedule: &SamplingNoiseSchedule,
-) -> Result<Vec<f32>, SamplerError> {
-    if sample.len() != noise_pred.len() {
-        return Err(SamplerError::DimensionMismatch {
-            expected: sample.len(),
-            got: noise_pred.len(),
-        });
-    }
-    let alpha_bar = schedule.alpha_bar_at(t);
-    let sqrt_ab = alpha_bar.sqrt();
-    let sqrt_one_minus_ab = (1.0 - alpha_bar).sqrt();
+mod steps;
 
-    let inv_sqrt_ab = if sqrt_ab.abs() < f32::EPSILON {
-        0.0
-    } else {
-        1.0 / sqrt_ab
-    };
-
-    let x0: Vec<f32> = sample
-        .iter()
-        .zip(noise_pred.iter())
-        .map(|(&x, &e)| (x - sqrt_one_minus_ab * e) * inv_sqrt_ab)
-        .collect();
-    Ok(x0)
-}
-
-/// Apply classifier-free guidance (CFG) to combine conditional and unconditional
-/// noise predictions.
-///
-/// Formula:
-/// ```text
-/// output = uncond + scale · (cond − uncond)
-/// ```
-///
-/// This is distinct from `cfg_guidance::apply_cfg`; use `sampler_apply_cfg`
-/// when working within the multi-step sampler module to avoid ambiguity.
-pub fn sampler_apply_cfg(
-    noise_pred_cond: &[f32],
-    noise_pred_uncond: &[f32],
-    guidance_scale: f32,
-) -> Result<Vec<f32>, SamplerError> {
-    if noise_pred_cond.len() != noise_pred_uncond.len() {
-        return Err(SamplerError::DimensionMismatch {
-            expected: noise_pred_cond.len(),
-            got: noise_pred_uncond.len(),
-        });
-    }
-    if guidance_scale < 0.0 {
-        return Err(SamplerError::InvalidParam(format!(
-            "guidance_scale must be ≥ 0, got {guidance_scale}"
-        )));
-    }
-    let out = noise_pred_uncond
-        .iter()
-        .zip(noise_pred_cond.iter())
-        .map(|(&u, &c)| u + guidance_scale * (c - u))
-        .collect();
-    Ok(out)
-}
-
-// ---------------------------------------------------------------------------
-// DDIM step
-// ---------------------------------------------------------------------------
-
-/// One DDIM denoising step.
-///
-/// Computes xₜ₋₁ given the noise prediction εθ(xₜ, t):
-///
-/// ```text
-/// x₀_pred  = (xₜ − √(1−ᾱ_t)·ε) / √ᾱ_t
-/// σ_DDIM   = η · √((1−ᾱ_{t-1})/(1−ᾱ_t)) · √(1 − ᾱ_t/ᾱ_{t-1})
-/// dir_xt   = √(1−ᾱ_{t-1} − σ²) · ε
-/// xₜ₋₁    = √ᾱ_{t-1}·x₀_pred + dir_xt  [+ σ·noise if η>0]
-/// ```
-pub fn ddim_step(
-    sample: &[f32],
-    noise_pred: &[f32],
-    t: usize,
-    t_prev: usize,
-    schedule: &SamplingNoiseSchedule,
-    eta: f32,
-    noise: Option<&[f32]>,
-) -> Result<Vec<f32>, SamplerError> {
-    if sample.len() != noise_pred.len() {
-        return Err(SamplerError::DimensionMismatch {
-            expected: sample.len(),
-            got: noise_pred.len(),
-        });
-    }
-    if let Some(n) = noise {
-        if n.len() != sample.len() {
-            return Err(SamplerError::DimensionMismatch {
-                expected: sample.len(),
-                got: n.len(),
-            });
-        }
-    }
-
-    let alpha_bar_t = schedule.alpha_bar_at(t);
-    // For the very first "previous" step, ᾱ = 1.0 (fully clean)
-    let alpha_bar_t_prev = if t_prev > 0 {
-        schedule.alpha_bar_at(t_prev)
-    } else {
-        1.0_f32
-    };
-
-    let sqrt_ab_t = alpha_bar_t.sqrt();
-    let sqrt_one_minus_ab_t = (1.0 - alpha_bar_t).sqrt();
-
-    // Predict x0
-    let inv_sqrt_ab_t = if sqrt_ab_t.abs() < f32::EPSILON {
-        0.0
-    } else {
-        1.0 / sqrt_ab_t
-    };
-
-    // σ_DDIM: stochastic sigma when η > 0
-    let ratio = if alpha_bar_t_prev > f32::EPSILON {
-        1.0 - alpha_bar_t / alpha_bar_t_prev
-    } else {
-        0.0
-    };
-    let sigma_t = if eta > 0.0 {
-        eta * ((1.0 - alpha_bar_t_prev) / (1.0 - alpha_bar_t).max(f32::EPSILON)).sqrt()
-            * ratio.max(0.0).sqrt()
-    } else {
-        0.0
-    };
-
-    // √(1 - ᾱ_{t-1} - σ²) — coefficient for direction pointing at xₜ
-    let dir_coeff = {
-        let inner = (1.0 - alpha_bar_t_prev - sigma_t * sigma_t).max(0.0);
-        inner.sqrt()
-    };
-    let sqrt_ab_t_prev = alpha_bar_t_prev.sqrt();
-
-    let mut x_prev = Vec::with_capacity(sample.len());
-    for i in 0..sample.len() {
-        let x0_pred = (sample[i] - sqrt_one_minus_ab_t * noise_pred[i]) * inv_sqrt_ab_t;
-        let dir_xt = dir_coeff * noise_pred[i];
-        let val = sqrt_ab_t_prev * x0_pred + dir_xt;
-        x_prev.push(val);
-    }
-
-    // Add stochastic noise if requested
-    if eta > 0.0 && sigma_t > 0.0 {
-        if let Some(n) = noise {
-            for (v, &ni) in x_prev.iter_mut().zip(n.iter()) {
-                *v += sigma_t * ni;
-            }
-        }
-    }
-
-    Ok(x_prev)
-}
-
-// ---------------------------------------------------------------------------
-// PLMS step (Adams-Bashforth multi-step)
-// ---------------------------------------------------------------------------
-
-/// One PLMS denoising step.
-///
-/// Uses the pseudo linear multi-step (Adams-Bashforth) method.
-/// The effective noise estimate is blended from the current and up to 3
-/// previous predictions, yielding up to 4th-order accuracy.
-///
-/// | `history.len()` | Order | Coefficients (current, h[-1], h[-2], h[-3]) |
-/// |-----------------|-------|---------------------------------------------|
-/// | 0               | 1     | 1                                           |
-/// | 1               | 2     | 3/2, −1/2                                   |
-/// | 2               | 3     | 23/12, −16/12, 5/12                         |
-/// | ≥3              | 4     | 55/24, −59/24, 37/24, −9/24                 |
-///
-/// After computing the blended ε, applies a DDIM-style step with η=0.
-pub fn plms_step(
-    sample: &[f32],
-    noise_pred: &[f32],
-    history: &[Vec<f32>],
-    t: usize,
-    t_prev: usize,
-    schedule: &SamplingNoiseSchedule,
-) -> Result<Vec<f32>, SamplerError> {
-    if sample.len() != noise_pred.len() {
-        return Err(SamplerError::DimensionMismatch {
-            expected: sample.len(),
-            got: noise_pred.len(),
-        });
-    }
-    for (k, prev) in history.iter().enumerate() {
-        if prev.len() != sample.len() {
-            return Err(SamplerError::DimensionMismatch {
-                expected: sample.len(),
-                got: prev.len(),
-            });
-        }
-        let _ = k; // suppress unused variable
-    }
-
-    let order = (history.len() + 1).min(4);
-    let len = sample.len();
-
-    // Compute blended ε using Adams-Bashforth coefficients
-    let blended: Vec<f32> = match order {
-        1 => noise_pred.to_vec(),
-        2 => {
-            let h0 = &history[history.len() - 1];
-            (0..len)
-                .map(|i| (3.0 * noise_pred[i] - h0[i]) / 2.0)
-                .collect()
-        }
-        3 => {
-            let h0 = &history[history.len() - 1]; // k-1
-            let h1 = &history[history.len() - 2]; // k-2
-            (0..len)
-                .map(|i| (23.0 * noise_pred[i] - 16.0 * h0[i] + 5.0 * h1[i]) / 12.0)
-                .collect()
-        }
-        _ => {
-            // order == 4
-            let h0 = &history[history.len() - 1];
-            let h1 = &history[history.len() - 2];
-            let h2 = &history[history.len() - 3];
-            (0..len)
-                .map(|i| (55.0 * noise_pred[i] - 59.0 * h0[i] + 37.0 * h1[i] - 9.0 * h2[i]) / 24.0)
-                .collect()
-        }
-    };
-
-    // Apply a deterministic DDIM step (η=0) with the blended ε
-    ddim_step(sample, &blended, t, t_prev, schedule, 0.0, None)
-}
-
-// ---------------------------------------------------------------------------
-// DPM++ 2M step
-// ---------------------------------------------------------------------------
-
-/// One DPM++ 2nd-order multistep denoising step.
-///
-/// Operates in log-SNR space:
-/// `λ_t = log(ᾱ_t / σ_t)`
-///
-/// **First step** (no previous prediction): uses 1st-order exponential
-/// integrator (equivalent to DDIM η=0).
-///
-/// **Subsequent steps**: blends current and previous noise predictions via
-/// the 2M (2nd-order multistep) correction term.
-pub fn dpm_plus_plus_2m_step(
-    sample: &[f32],
-    noise_pred: &[f32],
-    prev_noise_pred: Option<&[f32]>,
-    t: usize,
-    t_prev: usize,
-    schedule: &SamplingNoiseSchedule,
-) -> Result<Vec<f32>, SamplerError> {
-    if sample.len() != noise_pred.len() {
-        return Err(SamplerError::DimensionMismatch {
-            expected: sample.len(),
-            got: noise_pred.len(),
-        });
-    }
-    if let Some(p) = prev_noise_pred {
-        if p.len() != sample.len() {
-            return Err(SamplerError::DimensionMismatch {
-                expected: sample.len(),
-                got: p.len(),
-            });
-        }
-    }
-
-    let alpha_bar_t = schedule.alpha_bar_at(t);
-    let sigma_t = schedule.sigma_at(t);
-
-    let alpha_bar_t_prev = if t_prev > 0 {
-        schedule.alpha_bar_at(t_prev)
-    } else {
-        1.0_f32
-    };
-    let sigma_t_prev = if t_prev > 0 {
-        schedule.sigma_at(t_prev)
-    } else {
-        0.0_f32
-    };
-
-    // λ = log(α / σ) — log-SNR
-    let lambda_t = {
-        let ab = alpha_bar_t;
-        let s = sigma_t.max(f32::EPSILON);
-        (ab / s).ln()
-    };
-    let lambda_t_prev = {
-        let ab = alpha_bar_t_prev;
-        let s = sigma_t_prev.max(f32::EPSILON);
-        // Guard: avoid log(inf) when sigma → 0
-        if sigma_t_prev < f32::EPSILON {
-            lambda_t + 10.0 // artificially large (prev is cleaner)
-        } else {
-            (ab / s).ln()
-        }
-    };
-
-    // h = λ_{t-1} − λ_t  (positive when denoising because λ increases toward clean)
-    let h = lambda_t_prev - lambda_t;
-
-    // Coefficients for the exponential integrator
-    // For 1st-order (Euler in λ-space):
-    //   x_{t-1} = (σ_{t-1}/σ_t)·xₜ − α_{t-1}·(e^{-h} − 1)·(xₜ − σ_t·ε) / σ_t
-    //
-    // In practice we derive x₀ from ε and then apply:
-    //   x_{t-1} = σ_{t-1}/σ_t · xₜ − α_{t-1}·(1 − e^{-h})·x₀_pred
-
-    let alpha_t_prev = alpha_bar_t_prev.sqrt(); // √ᾱ_{t-1}
-    let sigma_ratio = if sigma_t.abs() < f32::EPSILON {
-        0.0
-    } else {
-        sigma_t_prev / sigma_t
-    };
-    let expm1_neg_h = (-h).exp() - 1.0; // e^{-h} - 1  (negative when denoising)
-
-    // Predict x₀ from current noise prediction
-    let x0_pred_t = predict_x0(sample, noise_pred, t, schedule)?;
-
-    match prev_noise_pred {
-        None => {
-            // 1st-order (first step)
-            let x_prev: Vec<f32> = sample
-                .iter()
-                .zip(x0_pred_t.iter())
-                .map(|(&xti, &x0i)| sigma_ratio * xti - alpha_t_prev * expm1_neg_h * x0i)
-                .collect();
-            Ok(x_prev)
-        }
-        Some(prev_eps) => {
-            // Compute x₀ prediction from the previous noise prediction
-            // We re-derive prev x₀ using the previous step's timestep:
-            // For simplicity we use the prev_eps at the same sample (standard DPM++ 2M approach).
-            let x0_pred_prev: Vec<f32> = sample
-                .iter()
-                .zip(prev_eps.iter())
-                .map(|(&xti, &pi)| {
-                    // Use alpha_bar_t for both since we store the pred at step t
-                    // and apply the blended x0 correction
-                    let ab = alpha_bar_t;
-                    let s = sigma_t.max(f32::EPSILON);
-                    let inv_sqrt_ab = if ab.sqrt() < f32::EPSILON {
-                        0.0
-                    } else {
-                        1.0 / ab.sqrt()
-                    };
-                    (xti - s * pi) * inv_sqrt_ab
-                })
-                .collect();
-
-            // D1 correction: (x0_pred_t − x0_pred_prev) / (1/2 correction factor)
-            // r = 1/2 for uniform steps; exact r would need h_prev
-            let r = 0.5_f32;
-            let d1_coeff = 1.0 / (2.0 * r);
-
-            let x_prev: Vec<f32> = sample
-                .iter()
-                .zip(x0_pred_t.iter())
-                .zip(x0_pred_prev.iter())
-                .map(|((&xti, &x0i), &x0_prev_i)| {
-                    let d0 = x0i;
-                    let d1 = (x0i - x0_prev_i) * d1_coeff;
-                    let x0_eff = d0 + d1 * (1.0 + r) * expm1_neg_h / 2.0;
-                    sigma_ratio * xti - alpha_t_prev * expm1_neg_h * x0_eff
-                })
-                .collect();
-            Ok(x_prev)
-        }
-    }
-}
+pub use steps::{
+    ddim_step, dpm_plus_plus_2m_step, dpm_step_size, plms_step, predict_x0, sampler_apply_cfg,
+};
 
 // ---------------------------------------------------------------------------
 // MultiStepSampler
@@ -649,10 +318,19 @@ pub struct MultiStepSampler {
     timesteps: Vec<usize>,
     /// Index into `timesteps`; incremented after each [`step`][Self::step] call.
     current_step: usize,
-    /// Ring buffer of recent noise predictions (for PLMS and DPM++).
+    /// Ring buffer of recent noise predictions: the Adams-Bashforth history
+    /// PLMS integrates over, also kept for DDIM purely as diagnostics.
     history: Vec<Vec<f32>>,
     /// Previous denoised sample (unused internally but available for diagnostics).
     prev_sample: Option<Vec<f32>>,
+    /// Previous step's x₀ prediction — DPM++ 2M second-order state.
+    prev_x0: Option<Vec<f32>>,
+    /// Previous step's log-SNR step size `h` — DPM++ 2M second-order state.
+    prev_h: Option<f32>,
+    /// Seed the internal noise source is (re)initialized from.
+    seed: u64,
+    /// Live state of the internal noise source used by stochastic DDIM (η > 0).
+    rng_state: u64,
 }
 
 impl MultiStepSampler {
@@ -686,13 +364,33 @@ impl MultiStepSampler {
             current_step: 0,
             history: Vec::new(),
             prev_sample: None,
+            prev_x0: None,
+            prev_h: None,
+            seed: DEFAULT_SAMPLER_SEED,
+            rng_state: DEFAULT_SAMPLER_SEED,
         })
+    }
+
+    /// Seed the internal noise source used by stochastic DDIM (η > 0).
+    ///
+    /// Two samplers seeded alike produce identical stochastic trajectories. The
+    /// seed applies immediately and survives
+    /// [`set_timesteps`][Self::set_timesteps]. A zero seed maps to the default,
+    /// because the xorshift state must be non-zero.
+    pub fn set_seed(&mut self, seed: u64) {
+        self.seed = if seed == 0 {
+            DEFAULT_SAMPLER_SEED
+        } else {
+            seed
+        };
+        self.rng_state = self.seed;
     }
 
     /// Compute and store the inference timestep schedule.
     ///
     /// Must be called before the first [`step`][Self::step].
-    /// Resets `current_step` and `history`.
+    /// Resets `current_step`, `history`, the multistep state and the noise
+    /// source, so re-running a sampler reproduces the previous trajectory.
     pub fn set_timesteps(&mut self) -> Result<(), SamplerError> {
         self.timesteps = compute_timestep_schedule(
             self.config.schedule.n_timesteps,
@@ -701,6 +399,9 @@ impl MultiStepSampler {
         self.current_step = 0;
         self.history.clear();
         self.prev_sample = None;
+        self.prev_x0 = None;
+        self.prev_h = None;
+        self.rng_state = self.seed;
         Ok(())
     }
 
@@ -729,7 +430,35 @@ impl MultiStepSampler {
     /// - `sample`: the current noisy latent xₜ.
     ///
     /// Returns xₜ₋₁.
+    ///
+    /// Stochastic DDIM (`SamplerKind::Ddim` with η > 0) draws its own Gaussian
+    /// noise from the sampler's seeded PRNG, so the σ_t·z term the η > 0
+    /// variance schedule budgets for is actually applied. Use
+    /// [`step_with_noise`][Self::step_with_noise] to supply that draw yourself.
     pub fn step(&mut self, noise_pred: &[f32], sample: &[f32]) -> Result<Vec<f32>, SamplerError> {
+        self.step_inner(noise_pred, sample, None)
+    }
+
+    /// Perform one denoising step with caller-supplied stochastic noise.
+    ///
+    /// `noise` must match `sample` in length and is consumed only by
+    /// `SamplerKind::Ddim` with η > 0; the other samplers are deterministic and
+    /// ignore it.
+    pub fn step_with_noise(
+        &mut self,
+        noise_pred: &[f32],
+        sample: &[f32],
+        noise: &[f32],
+    ) -> Result<Vec<f32>, SamplerError> {
+        self.step_inner(noise_pred, sample, Some(noise))
+    }
+
+    fn step_inner(
+        &mut self,
+        noise_pred: &[f32],
+        sample: &[f32],
+        noise: Option<&[f32]>,
+    ) -> Result<Vec<f32>, SamplerError> {
         if self.timesteps.is_empty() {
             return Err(SamplerError::NotInitialized);
         }
@@ -744,16 +473,28 @@ impl MultiStepSampler {
             0
         };
 
-        let x_prev = match &self.config.kind.clone() {
-            SamplerKind::Ddim { eta } => ddim_step(
-                sample,
-                noise_pred,
-                t,
-                t_prev,
-                &self.config.schedule,
-                *eta,
-                None,
-            )?,
+        let x_prev = match self.config.kind.clone() {
+            SamplerKind::Ddim { eta } => {
+                // η > 0 shrinks the deterministic direction term by σ_t², which
+                // only stays variance-preserving if σ_t·z is added back.
+                let generated = if eta > 0.0 && noise.is_none() {
+                    Some(standard_normal_vec(&mut self.rng_state, sample.len()))
+                } else {
+                    None
+                };
+                let draw = if eta > 0.0 {
+                    noise.or(generated.as_deref())
+                } else {
+                    None
+                };
+                // Keep the most recent predictions for diagnostics.
+                self.history.push(noise_pred.to_vec());
+                if self.history.len() > 3 {
+                    self.history.remove(0);
+                }
+                let sched = &self.config.schedule;
+                ddim_step(sample, noise_pred, t, t_prev, sched, eta, draw)?
+            }
             SamplerKind::Plms => {
                 let result = plms_step(
                     sample,
@@ -768,38 +509,28 @@ impl MultiStepSampler {
                 if self.history.len() > 3 {
                     self.history.remove(0);
                 }
-                self.prev_sample = Some(result.clone());
-                self.current_step += 1;
-                return Ok(result);
+                result
             }
             SamplerKind::DpmPlusPlus2M => {
-                let prev = self.history.last().map(|v| v.as_slice());
                 let result = dpm_plus_plus_2m_step(
                     sample,
                     noise_pred,
-                    prev,
+                    self.prev_x0.as_deref(),
+                    self.prev_h,
                     t,
                     t_prev,
                     &self.config.schedule,
                 )?;
-                // Keep only the most recent prediction
-                self.history.push(noise_pred.to_vec());
-                if self.history.len() > 1 {
-                    self.history.remove(0);
-                }
-                self.prev_sample = Some(result.clone());
-                self.current_step += 1;
-                return Ok(result);
+                // Carry this step's x₀ estimate and log-SNR step size forward:
+                // the 2M correction is a finite difference in λ-space, so both
+                // the previous x₀ *and* the previous h are required.
+                let x0_now = predict_x0(sample, noise_pred, t, &self.config.schedule)?;
+                let h_now = dpm_step_size(t, t_prev, &self.config.schedule);
+                self.prev_x0 = Some(x0_now);
+                self.prev_h = h_now;
+                result
             }
         };
-
-        // For DDIM, update history and advance step
-        if matches!(&self.config.kind, SamplerKind::Ddim { .. }) {
-            self.history.push(noise_pred.to_vec());
-            if self.history.len() > 3 {
-                self.history.remove(0);
-            }
-        }
 
         self.prev_sample = Some(x_prev.clone());
         self.current_step += 1;
@@ -1309,7 +1040,7 @@ mod tests {
         let sched = make_cosine_schedule(100);
         let sample = constant(0.5, 4);
         let noise_pred = constant(0.3, 4);
-        let out = dpm_plus_plus_2m_step(&sample, &noise_pred, None, 50, 40, &sched).unwrap();
+        let out = dpm_plus_plus_2m_step(&sample, &noise_pred, None, None, 50, 40, &sched).unwrap();
         assert_eq!(out.len(), 4);
         for v in &out {
             assert!(v.is_finite());
@@ -1321,8 +1052,11 @@ mod tests {
         let sched = make_cosine_schedule(100);
         let sample = constant(0.5, 4);
         let noise_pred = constant(0.3, 4);
-        let prev = constant(0.28, 4);
-        let out = dpm_plus_plus_2m_step(&sample, &noise_pred, Some(&prev), 50, 40, &sched).unwrap();
+        let prev_x0 = constant(0.28, 4);
+        let h_prev = dpm_step_size(60, 50, &sched);
+        let out =
+            dpm_plus_plus_2m_step(&sample, &noise_pred, Some(&prev_x0), h_prev, 50, 40, &sched)
+                .unwrap();
         assert_eq!(out.len(), 4);
         for v in &out {
             assert!(v.is_finite());
@@ -1332,7 +1066,7 @@ mod tests {
     #[test]
     fn dpmpp_dim_mismatch_sample() {
         let sched = make_cosine_schedule(100);
-        let err = dpm_plus_plus_2m_step(&[1.0_f32, 2.0], &[1.0_f32], None, 50, 40, &sched);
+        let err = dpm_plus_plus_2m_step(&[1.0_f32, 2.0], &[1.0_f32], None, None, 50, 40, &sched);
         assert!(matches!(err, Err(SamplerError::DimensionMismatch { .. })));
     }
 
@@ -1343,11 +1077,93 @@ mod tests {
             &[1.0_f32, 2.0],
             &[0.1_f32, 0.2],
             Some(&[0.1_f32]),
+            Some(0.5),
             50,
             40,
             &sched,
         );
         assert!(matches!(err, Err(SamplerError::DimensionMismatch { .. })));
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression: DPM++ 2M first order is algebraically DDIM at η=0.
+    // This pins λ = log(√ᾱ/σ); the earlier λ = log(ᾱ/σ) fails it.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn dpmpp_first_order_matches_ddim_eta0() {
+        let sched = make_cosine_schedule(100);
+        let sample = vec![0.5_f32, -0.3, 1.2, 0.0];
+        let noise_pred = vec![0.3_f32, 0.1, -0.4, 0.7];
+        for (t, t_prev) in [(50_usize, 40_usize), (5, 0)] {
+            let dpm =
+                dpm_plus_plus_2m_step(&sample, &noise_pred, None, None, t, t_prev, &sched).unwrap();
+            let ddim = ddim_step(&sample, &noise_pred, t, t_prev, &sched, 0.0, None).unwrap();
+            for (a, b) in dpm.iter().zip(ddim.iter()) {
+                assert!(
+                    (a - b).abs() < 1e-5,
+                    "t={t}, t_prev={t_prev}: dpm={a}, ddim={b}"
+                );
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression: the 2M correction uses r = h_prev/h and the reference D.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn dpmpp_second_order_matches_reference_formula() {
+        let sched = make_cosine_schedule(100);
+        let sample = vec![0.5_f32, -0.3, 1.2];
+        let noise_pred = vec![0.3_f32, 0.1, -0.4];
+        let prev_x0 = vec![0.2_f32, 0.4, -0.1];
+        let (t, t_prev) = (50_usize, 40_usize);
+        let h = dpm_step_size(t, t_prev, &sched).expect("finite h away from the boundary");
+        let h_prev = dpm_step_size(60, t, &sched).expect("finite h_prev");
+
+        let got = dpm_plus_plus_2m_step(
+            &sample,
+            &noise_pred,
+            Some(&prev_x0),
+            Some(h_prev),
+            t,
+            t_prev,
+            &sched,
+        )
+        .unwrap();
+
+        // Reference: D = (1 + 1/(2r))·x0_t − (1/(2r))·x0_prev,
+        //            x = (σ_prev/σ_t)·x − α_prev·(e^{-h} − 1)·D
+        let r = h_prev / h;
+        let c = 1.0 / (2.0 * r);
+        let x0_t = predict_x0(&sample, &noise_pred, t, &sched).unwrap();
+        let sigma_ratio = sched.sigma_at(t_prev) / sched.sigma_at(t);
+        let alpha_prev = sched.alpha_bar_at(t_prev).sqrt();
+        let expm1_neg_h = (-h).exp() - 1.0;
+        for i in 0..sample.len() {
+            let d = (1.0 + c) * x0_t[i] - c * prev_x0[i];
+            let expected = sigma_ratio * sample[i] - alpha_prev * expm1_neg_h * d;
+            assert!(
+                (got[i] - expected).abs() < 1e-5,
+                "i={i}: got {}, expected {expected}",
+                got[i]
+            );
+        }
+
+        // Without h_prev there is no usable r, so the step stays first order.
+        let first_order = dpm_plus_plus_2m_step(
+            &sample,
+            &noise_pred,
+            Some(&prev_x0),
+            None,
+            t,
+            t_prev,
+            &sched,
+        )
+        .unwrap();
+        let baseline =
+            dpm_plus_plus_2m_step(&sample, &noise_pred, None, None, t, t_prev, &sched).unwrap();
+        assert_eq!(first_order, baseline);
+        assert_ne!(got, baseline, "2M correction must change the result");
     }
 
     // -----------------------------------------------------------------------
@@ -1553,7 +1369,7 @@ mod tests {
     }
 
     #[test]
-    fn dpmpp_history_max_1() {
+    fn dpmpp_carries_prev_x0_and_h() {
         let cfg = MultiStepSamplerConfig {
             kind: SamplerKind::DpmPlusPlus2M,
             n_inference_steps: 10,
@@ -1563,13 +1379,24 @@ mod tests {
         let mut s = MultiStepSampler::new(cfg).unwrap();
         s.set_timesteps().unwrap();
         let n = 4;
+        // Before the first step there is no second-order state.
+        assert!(s.prev_x0.is_none() && s.prev_h.is_none());
         for _ in 0..5 {
             if s.is_done() {
                 break;
             }
             let _ = s.step(&constant(0.1, n), &constant(0.5, n));
         }
-        assert!(s.history.len() <= 1);
+        // The 2M correction needs the previous x₀ *and* the previous step size.
+        assert_eq!(s.prev_x0.as_ref().map(|v| v.len()), Some(n));
+        assert!(
+            s.prev_h.is_some_and(|h| h.is_finite() && h > 0.0),
+            "h_prev must be carried forward, got {:?}",
+            s.prev_h
+        );
+        // set_timesteps must clear it so a re-run reproduces the trajectory.
+        s.set_timesteps().unwrap();
+        assert!(s.prev_x0.is_none() && s.prev_h.is_none());
     }
 
     // -----------------------------------------------------------------------
@@ -1721,5 +1548,66 @@ mod tests {
         assert_eq!(cfg.n_inference_steps, 50);
         assert_eq!(cfg.guidance_scale, 7.5);
         assert!(matches!(cfg.kind, SamplerKind::Ddim { eta } if (eta - 0.0).abs() < 1e-9));
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression: stochastic DDIM must inject the σ_t·z term it budgets for.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn ddim_eta_positive_injects_noise() {
+        let (n, sched) = (8, make_cosine_schedule(100));
+        let sample = constant(0.5, n);
+        let pred = constant(0.1, n);
+
+        let mut s = default_sampler(SamplerKind::Ddim { eta: 1.0 }, 10);
+        let stochastic = s.step(&pred, &sample).unwrap();
+        let (t, t_prev) = (s.timesteps()[0], s.timesteps()[1]);
+
+        // Omitting noise is the variance-deficient trajectory: must differ.
+        let deficient = ddim_step(&sample, &pred, t, t_prev, &sched, 1.0, None).unwrap();
+        assert!(
+            stochastic
+                .iter()
+                .zip(deficient.iter())
+                .any(|(a, b)| (a - b).abs() > 1e-6),
+            "eta > 0 lost its stochastic term"
+        );
+
+        // Caller-supplied noise is honoured verbatim.
+        let z = constant(0.25, n);
+        let mut s2 = default_sampler(SamplerKind::Ddim { eta: 1.0 }, 10);
+        assert_eq!(
+            s2.step_with_noise(&pred, &sample, &z).unwrap(),
+            ddim_step(&sample, &pred, t, t_prev, &sched, 1.0, Some(&z)).unwrap()
+        );
+
+        // Same seed reproduces; a different seed diverges.
+        let mut s3 = default_sampler(SamplerKind::Ddim { eta: 1.0 }, 10);
+        assert_eq!(s3.step(&pred, &sample).unwrap(), stochastic);
+        let mut s4 = default_sampler(SamplerKind::Ddim { eta: 1.0 }, 10);
+        s4.set_seed(0x1234_5678);
+        assert_ne!(s4.step(&pred, &sample).unwrap(), stochastic);
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression: an empty schedule must not index out of bounds.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn empty_schedule_accessors_do_not_panic() {
+        let empty = SamplingNoiseSchedule::cosine(0);
+        assert!(empty.alpha_bars.is_empty());
+        assert_eq!(empty.alpha_bar_at(0), 1.0);
+        assert_eq!(empty.sigma_at(7), 0.0);
+        assert!(empty.snr_at(3).is_finite());
+        assert_eq!(
+            SamplingNoiseSchedule::linear(0, 0.0001, 0.02).sigma_at(0),
+            0.0
+        );
+
+        let (sample, pred) = (vec![0.5_f32, 0.25], vec![0.1_f32, 0.2]);
+        assert!(predict_x0(&sample, &pred, 0, &empty).is_ok());
+        assert!(ddim_step(&sample, &pred, 0, 0, &empty, 0.0, None).is_ok());
+        assert!(dpm_plus_plus_2m_step(&sample, &pred, None, None, 0, 0, &empty).is_ok());
+        assert!(dpm_step_size(0, 0, &empty).is_none());
     }
 }

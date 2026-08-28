@@ -252,25 +252,23 @@ fn main() -> Result<()> {
     }
 }
 
-/// Convert tensor bytes to Vec<f32> based on dtype
+/// Convert tensor bytes to `Vec<f32>` based on dtype.
+///
+/// Delegates to the crate's own [`oxigaf_bridge::precision`] decoders rather
+/// than casting the byte slice in place. `bytemuck::cast_slice` *panics* when
+/// the slice is not aligned for its target type or its length is not a whole
+/// multiple of the element size -- and `safetensors` does not guarantee
+/// dtype-aligned data offsets, so a hand-crafted or third-party
+/// `--checkpoint` (exactly the untrusted input this validator exists to
+/// inspect) could abort the process instead of being reported. The
+/// `precision` decoders read element-by-element from `chunks_exact` and
+/// return an error for a truncated tail, so no alignment or length
+/// precondition can be violated.
 fn tensor_to_f32(data: &[u8], dtype: safetensors::tensor::Dtype) -> Result<Vec<f32>> {
-    use safetensors::tensor::Dtype;
+    use oxigaf_bridge::precision::{bytes_to_f32, float_precision_of};
 
-    match dtype {
-        Dtype::F32 => {
-            let slice: &[f32] = bytemuck::cast_slice(data);
-            Ok(slice.to_vec())
-        }
-        Dtype::F16 => {
-            use half::f16;
-            let slice: &[f16] = bytemuck::cast_slice(data);
-            Ok(slice.iter().map(|x: &f16| x.to_f32()).collect())
-        }
-        Dtype::BF16 => {
-            use half::bf16;
-            let slice: &[bf16] = bytemuck::cast_slice(data);
-            Ok(slice.iter().map(|x: &bf16| x.to_f32()).collect())
-        }
-        _ => anyhow::bail!("Unsupported dtype for validation: {:?}", dtype),
-    }
+    let Some(precision) = float_precision_of(dtype) else {
+        anyhow::bail!("Unsupported dtype for validation: {:?}", dtype);
+    };
+    Ok(bytes_to_f32(data, precision)?)
 }

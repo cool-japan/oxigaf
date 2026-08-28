@@ -3,9 +3,11 @@
 //! This module handles conversion from PyTorch safetensors format to OxiGAF format.
 
 use crate::error::{BridgeError, Result};
-use crate::layer_mapping::LayerMapping;
-use crate::precision::{bytes_to_f32, convert_precision, Precision, PrecisionConfig};
-use safetensors::SafeTensors;
+use crate::layer_mapping::{detect_prefix, LayerMapping, PREFIX_METADATA_KEY};
+use crate::precision::{
+    bytes_to_f32, convert_precision, dtype_of, float_precision_of, PrecisionConfig,
+};
+use safetensors::{Dtype, SafeTensors};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
@@ -19,6 +21,12 @@ use std::path::Path;
 /// * `oxigaf_path` - Path to output OxiGAF safetensors file
 /// * `layer_mapping` - Layer name mapping configuration
 /// * `precision_config` - Precision conversion configuration
+///
+/// # Errors
+///
+/// Returns an error if the input file cannot be read or parsed, if two
+/// distinct PyTorch tensor names map to the same OxiGAF name (a name
+/// collision), or if writing the output file fails.
 pub fn convert(
     pytorch_path: &Path,
     oxigaf_path: &Path,
@@ -34,7 +42,13 @@ pub fn convert(
     let pytorch_tensors = SafeTensors::deserialize(&buffer)?;
 
     // Convert each tensor
-    let mut oxigaf_tensors: HashMap<String, (Vec<u8>, Vec<usize>, Precision)> = HashMap::new();
+    let mut oxigaf_tensors: HashMap<String, (Vec<u8>, Vec<usize>, Dtype)> = HashMap::new();
+    // Records which recognized PyTorch prefix (if any) was stripped from
+    // each tensor, keyed by the resulting OxiGAF name, so
+    // `oxigaf_to_pytorch::convert` can restore it exactly on the way back
+    // instead of assuming one prefix for the whole checkpoint.
+    let mut prefixes: HashMap<String, String> = HashMap::new();
+    let mut total_saturated = 0usize;
 
     for tensor_name in pytorch_tensors.names() {
         let tensor_view = pytorch_tensors
@@ -45,78 +59,118 @@ pub fn convert(
         let oxigaf_name = layer_mapping.pytorch_to_oxigaf(tensor_name)?;
         tracing::debug!("Converting: {} -> {}", tensor_name, oxigaf_name);
 
+        if let Some((prefix, _)) = detect_prefix(tensor_name) {
+            prefixes.insert(oxigaf_name.clone(), prefix.to_string());
+        }
+
         // Get tensor data and shape
         let shape: Vec<usize> = tensor_view.shape().to_vec();
         let data_bytes = tensor_view.data();
 
-        // Determine source precision from dtype
-        let source_precision = match tensor_view.dtype() {
-            safetensors::Dtype::F32 => Precision::FP32,
-            safetensors::Dtype::F16 => Precision::FP16,
-            safetensors::Dtype::BF16 => Precision::BF16,
-            _ => {
-                return Err(BridgeError::UnsupportedDtype(format!(
-                    "{:?}",
-                    tensor_view.dtype()
-                )))
+        let (output_bytes, output_dtype) = match float_precision_of(tensor_view.dtype()) {
+            Some(source_precision) => {
+                // Convert to f32 first
+                let f32_data = bytes_to_f32(data_bytes, source_precision)?;
+
+                // Determine target precision for this layer and convert to it
+                let target_precision = precision_config.get_layer_precision(&oxigaf_name);
+                let (bytes, saturated) = convert_precision(&f32_data, target_precision);
+                if saturated > 0 {
+                    tracing::warn!(
+                        "{} value(s) in '{}' saturated to +/-infinity converting to {}",
+                        saturated,
+                        oxigaf_name,
+                        target_precision.name()
+                    );
+                    total_saturated += saturated;
+                }
+
+                (bytes, dtype_of(target_precision))
+            }
+            None => {
+                // Real checkpoints routinely carry non-float bookkeeping
+                // tensors (e.g. `position_ids`, `num_batches_tracked`) or
+                // boolean masks. These have no meaningful "precision" to
+                // convert, so pass them through unchanged rather than
+                // aborting the whole conversion.
+                let dtype = tensor_view.dtype();
+                tracing::debug!(
+                    "Passing through non-float tensor '{}' unchanged (dtype: {:?})",
+                    tensor_name,
+                    dtype
+                );
+                (data_bytes.to_vec(), dtype)
             }
         };
 
-        // Convert to f32 first
-        let f32_data = bytes_to_f32(data_bytes, source_precision)?;
-
-        // Determine target precision for this layer
-        let target_precision = precision_config.get_layer_precision(&oxigaf_name);
-
-        // Convert to target precision
-        let output_bytes = convert_precision(&f32_data, target_precision);
-
-        oxigaf_tensors.insert(oxigaf_name, (output_bytes, shape, target_precision));
+        if oxigaf_tensors
+            .insert(oxigaf_name.clone(), (output_bytes, shape, output_dtype))
+            .is_some()
+        {
+            return Err(BridgeError::LayerMapping(format!(
+                "Layer name collision: multiple PyTorch tensors map to OxiGAF name '{}'",
+                oxigaf_name
+            )));
+        }
     }
 
-    // Save as OxiGAF safetensors
-    save_safetensors(oxigaf_path, oxigaf_tensors)?;
+    let converted_count = oxigaf_tensors.len();
+    let metadata = prefix_metadata(&prefixes)?;
 
-    tracing::info!(
-        "Successfully converted {} tensors",
-        pytorch_tensors.names().len()
-    );
+    // Save as OxiGAF safetensors
+    save_safetensors(oxigaf_path, oxigaf_tensors, metadata)?;
+
+    if total_saturated > 0 {
+        tracing::warn!(
+            "{} value(s) across all converted tensors saturated to +/-infinity during precision conversion",
+            total_saturated
+        );
+    }
+
+    tracing::info!("Successfully converted {} tensors", converted_count);
 
     Ok(())
+}
+
+/// Builds the `__metadata__` map used to persist stripped-prefix
+/// information, if there is any to persist.
+fn prefix_metadata(prefixes: &HashMap<String, String>) -> Result<Option<HashMap<String, String>>> {
+    if prefixes.is_empty() {
+        return Ok(None);
+    }
+    let encoded = serde_json::to_string(prefixes)?;
+    let mut metadata = HashMap::new();
+    metadata.insert(PREFIX_METADATA_KEY.to_string(), encoded);
+    Ok(Some(metadata))
 }
 
 /// Save tensors in safetensors format
 fn save_safetensors(
     path: &Path,
-    tensors: HashMap<String, (Vec<u8>, Vec<usize>, Precision)>,
+    tensors: HashMap<String, (Vec<u8>, Vec<usize>, Dtype)>,
+    metadata: Option<HashMap<String, String>>,
 ) -> Result<()> {
-    use safetensors::tensor::{Dtype, SafeTensorError, TensorView};
+    use safetensors::tensor::{SafeTensorError, TensorView};
 
     // Prepare tensor data storage
-    let mut tensor_data_storage: Vec<(String, Vec<u8>, Vec<usize>, Precision)> = Vec::new();
+    let mut tensor_data_storage: Vec<(String, Vec<u8>, Vec<usize>, Dtype)> = Vec::new();
 
-    for (name, (data, shape, precision)) in tensors {
-        tensor_data_storage.push((name, data, shape, precision));
+    for (name, (data, shape, dtype)) in tensors {
+        tensor_data_storage.push((name, data, shape, dtype));
     }
 
     // Create views from stored data
     let mut tensor_views: Vec<(&str, TensorView<'_>)> = Vec::new();
 
-    for (name, data, shape, precision) in &tensor_data_storage {
-        let dtype = match precision {
-            Precision::FP32 => Dtype::F32,
-            Precision::FP16 => Dtype::F16,
-            Precision::BF16 => Dtype::BF16,
-        };
-
-        let view = TensorView::new(dtype, shape.clone(), data)
+    for (name, data, shape, dtype) in &tensor_data_storage {
+        let view = TensorView::new(*dtype, shape.clone(), data)
             .map_err(|e: SafeTensorError| BridgeError::SafeTensors(e.to_string()))?;
 
         tensor_views.push((name.as_str(), view));
     }
 
     // Serialize to bytes
-    let serialized = safetensors::tensor::serialize(tensor_views, None)
+    let serialized = safetensors::tensor::serialize(tensor_views, metadata)
         .map_err(|e| BridgeError::SafeTensors(e.to_string()))?;
 
     // Write to file
@@ -130,6 +184,8 @@ fn save_safetensors(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use safetensors::tensor::TensorView;
+    use std::collections::BTreeMap;
     use tempfile::NamedTempFile;
 
     #[test]
@@ -142,9 +198,9 @@ mod tests {
         let bytes: Vec<u8> = data.iter().flat_map(|x| x.to_le_bytes()).collect();
         let shape = vec![2, 2];
 
-        tensors.insert("test_tensor".to_string(), (bytes, shape, Precision::FP32));
+        tensors.insert("test_tensor".to_string(), (bytes, shape, Dtype::F32));
 
-        let result = save_safetensors(path, tensors);
+        let result = save_safetensors(path, tensors, None);
         assert!(result.is_ok(), "Failed to save: {:?}", result.err());
 
         // Verify file was created and has content
@@ -152,14 +208,170 @@ mod tests {
         assert!(metadata.len() > 0);
     }
 
-    #[test]
-    fn test_convert_with_tempfile() {
-        // This is a placeholder test - in practice, you'd create a real PyTorch safetensors file
-        // For now, just test the infrastructure
-        let _mapping = LayerMapping::new();
-        let _config = PrecisionConfig::new();
+    /// Builds a small synthetic PyTorch safetensors file with a float
+    /// tensor under a recognized prefix and a non-float (I64) tensor, then
+    /// writes it to `path`.
+    fn write_synthetic_pytorch_checkpoint(path: &Path) {
+        let float_data = [1.0f32, 2.0, 3.0, 4.0];
+        let float_bytes: Vec<u8> = float_data.iter().flat_map(|x| x.to_le_bytes()).collect();
+        let int_data: [i64; 4] = [10, 20, 30, 40];
+        let int_bytes: Vec<u8> = int_data.iter().flat_map(|x| x.to_le_bytes()).collect();
 
-        // Test would create temp PyTorch file, convert it, and verify output
-        // Skipping actual file I/O test here
+        let mut tensors = BTreeMap::new();
+        tensors.insert(
+            "unet.conv_in.weight".to_string(),
+            TensorView::new(Dtype::F32, vec![2, 2], &float_bytes).expect("test: tensor view"),
+        );
+        tensors.insert(
+            "position_ids".to_string(),
+            TensorView::new(Dtype::I64, vec![4], &int_bytes).expect("test: tensor view"),
+        );
+
+        let serialized =
+            safetensors::serialize(&tensors, None).expect("test: serialize should succeed");
+        std::fs::write(path, &serialized).expect("test: write should succeed");
+    }
+
+    #[test]
+    fn test_convert_with_tempfile() -> Result<()> {
+        let temp_dir = tempfile::tempdir().expect("test: failed to create temp dir");
+        let pytorch_path = temp_dir.path().join("pytorch_checkpoint.safetensors");
+        let oxigaf_path = temp_dir.path().join("oxigaf_checkpoint.safetensors");
+
+        write_synthetic_pytorch_checkpoint(&pytorch_path);
+
+        let mapping = LayerMapping::new();
+        let precision = PrecisionConfig::new();
+        convert(&pytorch_path, &oxigaf_path, &mapping, &precision)?;
+
+        let data = std::fs::read(&oxigaf_path)?;
+        let result =
+            SafeTensors::deserialize(&data).map_err(|e| BridgeError::SafeTensors(e.to_string()))?;
+
+        // "unet." is a recognized prefix and is stripped; the rest of the
+        // dot-separated path is preserved verbatim, which is exactly the
+        // form `candle_nn::VarBuilder::pp` walks.
+        let conv_tensor = result
+            .tensor("conv_in.weight")
+            .map_err(|e| BridgeError::SafeTensors(e.to_string()))?;
+        assert_eq!(conv_tensor.shape(), &[2, 2]);
+        assert_eq!(conv_tensor.dtype(), Dtype::F32);
+        let out_floats: Vec<f32> = conv_tensor
+            .data()
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(out_floats, vec![1.0f32, 2.0, 3.0, 4.0]);
+
+        // Non-float tensors have no recognized prefix and no dots, so the
+        // name is unchanged, and their bytes must pass through untouched
+        // rather than the conversion aborting outright.
+        let int_tensor = result
+            .tensor("position_ids")
+            .map_err(|e| BridgeError::SafeTensors(e.to_string()))?;
+        assert_eq!(int_tensor.dtype(), Dtype::I64);
+        let int_data: [i64; 4] = [10, 20, 30, 40];
+        let expected_bytes: Vec<u8> = int_data.iter().flat_map(|x| x.to_le_bytes()).collect();
+        assert_eq!(int_tensor.data(), expected_bytes.as_slice());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_converted_checkpoint_loads_in_candle_varbuilder() -> Result<()> {
+        // Regression test for the architecture gap this crate carried: a
+        // checkpoint produced by `pytorch_to_oxigaf::convert` used to carry
+        // flat, double-underscore-escaped names
+        // (`down__blocks_0_resnets_0_norm1_weight`) that
+        // `candle_nn::VarBuilder::pp` cannot walk, so it was not loadable by
+        // `oxigaf-diffusion`'s model code (`vs.pp("down_blocks").pp("0")...`,
+        // see `oxigaf-diffusion/src/unet.rs`). It must now load.
+        use candle_core::{DType, Device};
+        use candle_nn as nn;
+
+        let temp_dir = tempfile::tempdir().expect("test: failed to create temp dir");
+        let pytorch_path = temp_dir.path().join("varbuilder_in.safetensors");
+        let oxigaf_path = temp_dir.path().join("varbuilder_out.safetensors");
+
+        let conv: Vec<u8> = [1.0f32, 2.0, 3.0, 4.0]
+            .iter()
+            .flat_map(|x| x.to_le_bytes())
+            .collect();
+        let norm: Vec<u8> = [0.5f32, 0.25]
+            .iter()
+            .flat_map(|x| x.to_le_bytes())
+            .collect();
+
+        let mut tensors = BTreeMap::new();
+        tensors.insert(
+            "unet.conv_in.weight".to_string(),
+            TensorView::new(Dtype::F32, vec![2, 2], &conv).expect("test: tensor view"),
+        );
+        tensors.insert(
+            "unet.down_blocks.0.resnets.0.norm1.weight".to_string(),
+            TensorView::new(Dtype::F32, vec![2], &norm).expect("test: tensor view"),
+        );
+        let serialized =
+            safetensors::serialize(&tensors, None).expect("test: serialize should succeed");
+        std::fs::write(&pytorch_path, &serialized)?;
+
+        convert(
+            &pytorch_path,
+            &oxigaf_path,
+            &LayerMapping::new(),
+            &PrecisionConfig::new(),
+        )?;
+
+        let data = std::fs::read(&oxigaf_path)?;
+        let vb = nn::VarBuilder::from_buffered_safetensors(data, DType::F32, &Device::Cpu)
+            .expect("test: VarBuilder should load the converted checkpoint");
+
+        vb.pp("conv_in")
+            .get((2, 2), "weight")
+            .expect("test: conv_in.weight should be reachable via VarBuilder::pp");
+        vb.pp("down_blocks")
+            .pp("0")
+            .pp("resnets")
+            .pp("0")
+            .pp("norm1")
+            .get((2,), "weight")
+            .expect("test: nested path should be reachable via VarBuilder::pp");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_convert_rejects_colliding_names() -> Result<()> {
+        // Regression test: "unet.conv.weight" and "model.conv.weight" both
+        // strip their recognized prefix and land on the OxiGAF name
+        // "conv_weight". Silently overwriting one tensor with the other
+        // used to go undetected (and the success log even reported the
+        // wrong tensor count); this must now be a hard error.
+        let temp_dir = tempfile::tempdir().expect("test: failed to create temp dir");
+        let pytorch_path = temp_dir.path().join("colliding.safetensors");
+        let oxigaf_path = temp_dir.path().join("colliding_out.safetensors");
+
+        let data = [1.0f32, 2.0, 3.0, 4.0];
+        let bytes: Vec<u8> = data.iter().flat_map(|x| x.to_le_bytes()).collect();
+
+        let mut tensors = BTreeMap::new();
+        tensors.insert(
+            "unet.conv.weight".to_string(),
+            TensorView::new(Dtype::F32, vec![2, 2], &bytes).expect("test: tensor view"),
+        );
+        tensors.insert(
+            "model.conv.weight".to_string(),
+            TensorView::new(Dtype::F32, vec![2, 2], &bytes).expect("test: tensor view"),
+        );
+        let serialized =
+            safetensors::serialize(&tensors, None).expect("test: serialize should succeed");
+        std::fs::write(&pytorch_path, &serialized)?;
+
+        let mapping = LayerMapping::new();
+        let precision = PrecisionConfig::new();
+        let result = convert(&pytorch_path, &oxigaf_path, &mapping, &precision);
+        assert!(result.is_err(), "colliding names must be rejected");
+
+        Ok(())
     }
 }

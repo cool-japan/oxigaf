@@ -124,7 +124,8 @@ impl EasingFunction {
                 if t >= 1.0 {
                     return 1.0;
                 }
-                1.0 - (-10.0 * t).exp() * (2.0 * PI * (10.0 * t - 0.75) / 3.0).cos()
+                // Standard easeOutElastic: 2^(-10t) * sin((10t - 0.75) * (2π/3)) + 1.
+                1.0 + (-10.0 * t).exp2() * ((10.0 * t - 0.75) * (2.0 * PI / 3.0)).sin()
             }
         }
     }
@@ -283,8 +284,13 @@ impl ExpressionTimeline {
     ///
     /// - If `t` is before the first keyframe, returns the first keyframe's weights.
     /// - If `t` is after the last keyframe, returns the last keyframe's weights.
-    /// - Otherwise, Catmull-Rom spline interpolation is performed on the segment
-    ///   that brackets `t`, using the easing function of the left keyframe.
+    /// - Otherwise, the segment that brackets `t` is interpolated using the
+    ///   easing function of its left keyframe: Catmull-Rom spline
+    ///   interpolation for an interior segment (using a uniform
+    ///   parameterisation — very unevenly spaced keyframes can visibly
+    ///   over/undershoot), or plain linear interpolation for a boundary
+    ///   segment (the first or last segment, where one of the two phantom
+    ///   Catmull-Rom control points would be out of range).
     #[must_use]
     pub fn evaluate(&self, t: f32) -> Vec<f32> {
         let n = self.num_dimensions();
@@ -326,25 +332,38 @@ impl ExpressionTimeline {
         // Apply easing.
         let te = kf_left.easing.apply(local_t);
 
-        // Catmull-Rom control points.
-        // p0: the keyframe before i (or p1 if at boundary)
-        // p1: keyframes[i]
-        // p2: keyframes[i+1]
-        // p3: the keyframe after i+1 (or p2 if at boundary)
-        let p0 = if i == 0 {
-            &kf_left.weights
-        } else {
-            &self.keyframes[i - 1].weights
-        };
         let p1 = &kf_left.weights;
         let p2 = &kf_right.weights;
-        let p3 = if i + 2 < self.keyframes.len() {
-            &self.keyframes[i + 2].weights
-        } else {
-            &kf_right.weights
-        };
 
-        // Catmull-Rom per-dimension.
+        // At a boundary segment (i == 0, or i+2 >= keyframes.len()) one of
+        // the two phantom Catmull-Rom control points would be out of
+        // range. Rather than duplicating the nearest endpoint — which
+        // silently distorts the curve away from a straight line (matching
+        // it only at te = 0, 0.5 and 1) — fall back to true linear
+        // interpolation there, per this type's documented contract.
+        if i == 0 || i + 2 >= self.keyframes.len() {
+            let mut result = vec![0.0_f32; n];
+            for (dim, out_val) in result.iter_mut().enumerate().take(n) {
+                let q1 = p1.get(dim).copied().unwrap_or(0.0);
+                let q2 = p2.get(dim).copied().unwrap_or(0.0);
+                *out_val = q1 + (q2 - q1) * te;
+            }
+            return result;
+        }
+
+        // Catmull-Rom control points for an interior segment.
+        // p0: the keyframe before i.
+        // p1, p2: the two keyframes bracketing `t` (kf_left, kf_right).
+        // p3: the keyframe after i+1.
+        let p0 = &self.keyframes[i - 1].weights;
+        let p3 = &self.keyframes[i + 2].weights;
+
+        // Catmull-Rom per-dimension. Note this uses a uniform
+        // parameterisation: with non-uniformly spaced keyframes the
+        // tangents implied here are not scaled by the neighboring
+        // segments' actual durations, which can visibly over/undershoot
+        // for very unevenly spaced keyframes. A centripetal or chordal
+        // parameterisation would address this but is not implemented here.
         let mut result = vec![0.0_f32; n];
         let t2 = te * te;
         let t3 = t2 * te;
@@ -668,6 +687,34 @@ mod tests {
         assert!(v >= 0.0, "elastic mid must be non-negative");
     }
 
+    #[test]
+    fn test_easing_elastic_out_eases_in_from_zero() {
+        // Regression test: the previous (buggy) formula evaluated to
+        // 1 - e^0 * cos(-pi/2) = 1.0 immediately after t=0 (e.g. ~0.979 at
+        // t=0.001), popping instantly to the target instead of easing in.
+        // The correct curve stays close to 0 just after t=0.
+        let e = EasingFunction::ElasticOut;
+        let v = e.apply(0.001);
+        assert!(
+            v < 0.05,
+            "elastic-out must ease in from 0 near t=0, got apply(0.001)={v}"
+        );
+    }
+
+    #[test]
+    fn test_easing_elastic_out_overshoots_past_one() {
+        // A genuine elastic/spring easing must overshoot its target at some
+        // point in (0, 1) before settling back to 1.0.
+        let e = EasingFunction::ElasticOut;
+        let max = (1..1000)
+            .map(|i| e.apply(i as f32 / 1000.0))
+            .fold(f32::MIN, f32::max);
+        assert!(
+            max > 1.05,
+            "elastic-out must overshoot above 1.0 somewhere in (0,1), max={max}"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // ExpressionKeyframe tests
     // -----------------------------------------------------------------------
@@ -734,20 +781,69 @@ mod tests {
 
     #[test]
     fn test_timeline_evaluate_linear_midpoint() {
-        // With Linear easing the Catmull-Rom at boundary degenerates to linear.
-        // Timeline: t=0 → [0.0], t=1 → [2.0]. Evaluate at t=0.5.
+        // With only two keyframes the single segment [0, 1] is a boundary
+        // segment on both sides, which is documented (and, since the fix
+        // for the Catmull-Rom-at-boundaries bug, actually implemented) to
+        // use plain linear interpolation. Timeline: t=0 → [0.0], t=1 →
+        // [2.0]. Evaluate at t=0.5 with Linear easing → local_t=0.5.
         let names = vec!["x".to_string()];
         let mut tl = ExpressionTimeline::new(names);
         tl.add_keyframe(ExpressionKeyframe::new(1.0, vec![2.0]))
             .expect("add 1.0");
 
-        // With only two keyframes p0=p1 and p3=p2, Catmull-Rom becomes linear.
         let mid = tl.evaluate(0.5);
-        // Expected: 0.5 * (2*0 + (-0+2)*0.5 + (0-0+8-2)*0.25 + (0+0-6+2)*0.125)
-        //         = 0.5 * (0 + 1.0 + 1.5 - 0.5) = 0.5 * 2.0 = 1.0
+        // Linear: 0.0 + (2.0 - 0.0) * 0.5 = 1.0.
         assert!(
             (mid[0] - 1.0).abs() < 1e-4,
             "midpoint with linear easing: got {}",
+            mid[0]
+        );
+    }
+
+    #[test]
+    fn test_timeline_evaluate_boundary_segment_is_truly_linear() {
+        // Regression test: unlike `test_timeline_evaluate_linear_midpoint`'s
+        // t=0.5 (where the old endpoint-duplicated-Catmull-Rom formula
+        // happens to coincide with the line, by coincidence of the specific
+        // polynomial), t=0.25 exercises a point where the two formulas
+        // differ, so this would have caught the doc/behavior mismatch.
+        let names = vec!["x".to_string()];
+        let mut tl = ExpressionTimeline::new(names);
+        tl.add_keyframe(ExpressionKeyframe::new(1.0, vec![2.0]))
+            .expect("add 1.0");
+
+        let q = tl.evaluate(0.25);
+        // True linear: 0.0 + (2.0 - 0.0) * 0.25 = 0.5.
+        assert!(
+            (q[0] - 0.5).abs() < 1e-4,
+            "boundary segment at t=0.25 must be linear, got {}",
+            q[0]
+        );
+    }
+
+    #[test]
+    fn test_timeline_evaluate_interior_segment_uses_catmull_rom() {
+        // With >= 4 keyframes, the middle segment (between keyframes 1 and
+        // 2) is an interior segment and should still use full Catmull-Rom
+        // with real p0/p3 control points (not linear).
+        let names = vec!["x".to_string()];
+        let mut tl = ExpressionTimeline::new(names); // kf0: t=0, w=0
+        tl.add_keyframe(ExpressionKeyframe::new(1.0, vec![1.0]))
+            .expect("add kf1");
+        tl.add_keyframe(ExpressionKeyframe::new(2.0, vec![1.0]))
+            .expect("add kf2");
+        tl.add_keyframe(ExpressionKeyframe::new(3.0, vec![0.0]))
+            .expect("add kf3");
+
+        // Segment [kf1, kf2] (both weight 1.0) is interior: i=1, i+2=3 < 4.
+        // p0 = kf0.weights = [0.0], p1 = p2 = [1.0], p3 = kf3.weights = [0.0].
+        // At te=0.5: q = 0.5*(2*1 + (-0+1)*0.5 + (0-5+4-0)*0.25 + (0+3-3+0)*0.125)
+        //          = 0.5*(2 + 0.5 - 0.25 + 0) = 0.5*2.25 = 1.125 (overshoot,
+        // characteristic of Catmull-Rom, unlike linear which would stay at 1.0).
+        let mid = tl.evaluate(1.5);
+        assert!(
+            (mid[0] - 1.125).abs() < 1e-3,
+            "interior segment must use Catmull-Rom (with overshoot), got {}",
             mid[0]
         );
     }

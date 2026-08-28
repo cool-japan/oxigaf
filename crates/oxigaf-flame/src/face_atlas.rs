@@ -45,10 +45,12 @@ pub enum FaceAtlasError {
     },
 
     /// Source texture dimensions do not match the region dimensions.
-    #[error("Texture size mismatch: expected {expected}x{expected}, got {w}x{h}")]
+    #[error("Texture size mismatch: expected {expected_w}x{expected_h}, got {w}x{h}")]
     SizeMismatch {
-        /// Expected square side length.
-        expected: usize,
+        /// Expected width.
+        expected_w: usize,
+        /// Expected height.
+        expected_h: usize,
         /// Actual width.
         w: usize,
         /// Actual height.
@@ -531,10 +533,24 @@ pub fn blit_into_atlas(
 
     if src_w != rect.width || src_h != rect.height {
         return Err(FaceAtlasError::SizeMismatch {
-            expected: rect.width,
+            expected_w: rect.width,
+            expected_h: rect.height,
             w: src_w,
             h: src_h,
         });
+    }
+
+    // Reject regions whose right/bottom edge would run past the atlas
+    // instead of silently wrapping the trailing pixels of each row onto the
+    // start of the next row. `AtlasRegion` and `AtlasRect` are public with
+    // public fields, so a hand-built or mutated region cannot be assumed to
+    // respect the atlas bounds the way regions produced by
+    // `FaceAtlas::add_region` do.
+    if rect.x + src_w > atlas_size || rect.y + src_h > atlas_size {
+        return Err(FaceAtlasError::DimensionError(format!(
+            "region rect ({}, {}, {src_w}x{src_h}) exceeds atlas bounds ({atlas_size}x{atlas_size})",
+            rect.x, rect.y
+        )));
     }
 
     let expected_len = src_w * src_h * 4;
@@ -550,7 +566,12 @@ pub fn blit_into_atlas(
         let src_start = row * src_w * 4;
         let dst_y = rect.y + row;
         if dst_y >= atlas_size {
-            break;
+            // Unreachable given the bounds check above; kept as a hard
+            // error (not a silent `break`) in case that invariant is ever
+            // weakened, so a truncated blit is never mistaken for success.
+            return Err(FaceAtlasError::DimensionError(format!(
+                "blit row {row} (atlas y = {dst_y}) is outside the atlas (size {atlas_size})"
+            )));
         }
         let dst_start = (dst_y * atlas_size + rect.x) * 4;
         let dst_end = dst_start + src_w * 4;
@@ -584,6 +605,17 @@ pub fn extract_from_atlas(
     region: &AtlasRegion,
 ) -> Result<Vec<u8>, FaceAtlasError> {
     let rect = &region.rect;
+
+    // Reject regions whose right/bottom edge runs past the atlas instead of
+    // silently reading trailing pixels from the start of the next row (see
+    // the identical check in `blit_into_atlas`).
+    if rect.x + rect.width > atlas_size || rect.y + rect.height > atlas_size {
+        return Err(FaceAtlasError::DimensionError(format!(
+            "region rect ({}, {}, {}x{}) exceeds atlas bounds ({atlas_size}x{atlas_size})",
+            rect.x, rect.y, rect.width, rect.height
+        )));
+    }
+
     let expected_atlas_len = atlas_size * atlas_size * 4;
     if atlas_pixels.len() < expected_atlas_len {
         return Err(FaceAtlasError::DimensionError(format!(
@@ -1270,6 +1302,45 @@ mod tests {
         assert!(matches!(result, Err(FaceAtlasError::SizeMismatch { .. })));
     }
 
+    #[test]
+    fn test_size_mismatch_display_reports_both_expected_dimensions() {
+        // Regression test: the `Display` impl used to print the width twice
+        // (`expected x expected`) instead of width x height, which produced
+        // a misleading message for a non-square expected size.
+        let err = FaceAtlasError::SizeMismatch {
+            expected_w: 8,
+            expected_h: 16,
+            w: 8,
+            h: 8,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("8x16"),
+            "message should report width x height distinctly, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_blit_into_atlas_rejects_region_wrapping_past_row_end() {
+        // A hand-built region whose right edge exceeds the atlas width.
+        // `FaceAtlas::add_region` can never produce this, but `AtlasRegion`
+        // and `AtlasRect` are public with public fields, so this must be
+        // rejected rather than silently wrapping the trailing pixels of
+        // each row onto the start of the next row.
+        let region = AtlasRegion {
+            id: 0,
+            name: "oob".to_string(),
+            rect: AtlasRect::new(60, 0, 8, 8), // 60 + 8 = 68 > atlas_size (64)
+            padding: 0,
+        };
+        let src = vec![255u8; 8 * 8 * 4];
+        let mut atlas_pixels = vec![0u8; 64 * 64 * 4];
+        let result = blit_into_atlas(&mut atlas_pixels, 64, &region, &src, 8, 8);
+        assert!(matches!(result, Err(FaceAtlasError::DimensionError(_))));
+        // The buffer must be left untouched, not partially/wrongly written.
+        assert!(atlas_pixels.iter().all(|&b| b == 0));
+    }
+
     // -----------------------------------------------------------------------
     // extract_from_atlas
     // -----------------------------------------------------------------------
@@ -1311,6 +1382,23 @@ mod tests {
             extract_from_atlas(&atlas_pixels, 64, &region).expect("extract should succeed");
 
         assert_eq!(extracted, src);
+    }
+
+    #[test]
+    fn test_extract_from_atlas_rejects_region_wrapping_past_row_end() {
+        // Same hand-built out-of-bounds region as the `blit_into_atlas`
+        // regression test: before the fix, `extract_from_atlas` would
+        // silently read trailing pixels from the start of the next row
+        // instead of reporting the region as invalid.
+        let region = AtlasRegion {
+            id: 0,
+            name: "oob".to_string(),
+            rect: AtlasRect::new(60, 0, 8, 8), // 60 + 8 = 68 > atlas_size (64)
+            padding: 0,
+        };
+        let atlas_pixels = vec![128u8; 64 * 64 * 4];
+        let result = extract_from_atlas(&atlas_pixels, 64, &region);
+        assert!(matches!(result, Err(FaceAtlasError::DimensionError(_))));
     }
 
     // -----------------------------------------------------------------------

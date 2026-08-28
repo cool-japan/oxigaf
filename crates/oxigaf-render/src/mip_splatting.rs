@@ -124,18 +124,19 @@ impl MipCamera {
         Self::new(fx, fy, width, height)
     }
 
-    /// Pixel angular size at depth `depth`.
+    /// Angular size of one pixel, in radians (small-angle approximation:
+    /// `atan(1 / focal_length_x)`).
     ///
-    /// The pixel size (radians ≈ world-units per pixel at unit depth) is:
-    /// `max(image_width, image_height) / (focal_length_x * depth)`.
-    ///
-    /// The depth argument is here for API symmetry — the raw ratio
-    /// `1/focal_length_x` is the per-unit-depth pixel size; callers that need
-    /// the actual world footprint should use [`Self::pixel_footprint_radius`].
-    pub fn pixel_size_at_depth(&self, depth: f32) -> f32 {
-        let max_dim = self.image_width.max(self.image_height) as f32;
-        let effective_depth = depth.max(f32::EPSILON);
-        max_dim / (self.focal_length_x * effective_depth)
+    /// For a pinhole camera the angle subtended by a single pixel does not
+    /// depend on depth — unlike the previous formula here, which mixed in
+    /// `max(image_width, image_height)` and divided by `depth`, producing a
+    /// value that *shrank* with distance instead of the constant angular
+    /// size its name and doc promised, and contradicted its own doc's claim
+    /// that "the raw ratio `1/focal_length_x` is the per-unit-depth pixel
+    /// size". For the *world-space* footprint of a pixel at a given depth,
+    /// use [`Self::pixel_footprint_radius`] instead.
+    pub fn pixel_angular_size(&self) -> f32 {
+        (1.0_f32 / self.focal_length_x).atan()
     }
 
     /// World-space footprint radius of one pixel at `depth`.
@@ -783,5 +784,38 @@ mod tests {
         let cam = test_camera();
         let result = compute_mip_level(1.0, 0.0, &cam, 8);
         assert!(matches!(result, Err(MipSplattingError::InvalidScale(v)) if v == 0.0));
+    }
+
+    // 21. pixel_angular_size matches atan(1/focal_length_x)
+    #[test]
+    fn test_pixel_angular_size_matches_atan_of_inverse_focal() {
+        let cam = test_camera(); // focal_length_x = 500.0
+        let expected = (1.0_f32 / 500.0).atan();
+        let got = cam.pixel_angular_size();
+        assert!(
+            (got - expected).abs() < 1e-8,
+            "expected {expected}, got {got}"
+        );
+    }
+
+    // 22. pixel_angular_size is independent of image resolution (unlike the
+    //     old formula, which multiplied by max(width, height))
+    #[test]
+    fn test_pixel_angular_size_independent_of_image_dimensions() {
+        let cam_a = MipCamera::new(500.0, 500.0, 100, 100).expect("valid camera");
+        let cam_b = MipCamera::new(500.0, 500.0, 4000, 3000).expect("valid camera");
+        assert!(
+            (cam_a.pixel_angular_size() - cam_b.pixel_angular_size()).abs() < 1e-6,
+            "angular pixel size must depend only on focal length, not resolution"
+        );
+    }
+
+    // 23. pixel_angular_size decreases as focal length increases (narrower
+    //     per-pixel angle for a more zoomed-in / higher-focal-length camera)
+    #[test]
+    fn test_pixel_angular_size_decreases_with_focal_length() {
+        let narrow_fov = MipCamera::new(2000.0, 2000.0, 512, 512).expect("ok");
+        let wide_fov = MipCamera::new(200.0, 200.0, 512, 512).expect("ok");
+        assert!(narrow_fov.pixel_angular_size() < wide_fov.pixel_angular_size());
     }
 }

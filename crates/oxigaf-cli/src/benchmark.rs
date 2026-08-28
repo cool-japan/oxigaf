@@ -1,24 +1,63 @@
 //! Performance benchmarking utilities.
 //!
-//! Provides comprehensive benchmarking for OxiGAF components:
-//! - FLAME forward pass timing
-//! - Rasterizer forward/backward timing
-//! - Training iteration timing
-//! - Export performance
+//! Every benchmark target drives a **real** OxiGAF component — no simulated or
+//! synthetic stand-in work is ever timed or reported:
+//!
+//! | Target   | What is measured                                                     |
+//! |----------|----------------------------------------------------------------------|
+//! | `flame`  | [`FlameModel::forward`] on a model loaded from `--flame-model`        |
+//! | `raster` | `Rasterizer::forward` and `Rasterizer::backward` on a real wgpu device |
+//! | `train`  | One full `Trainer::train_step` (render → loss → backward → Adam)      |
+//! | `export` | `export::export_ply` writing a real PLY file to a temporary directory |
+//!
+//! ## Prerequisites and skipping
+//!
+//! * `flame` requires `--flame-model <DIR>` (a directory of `.npy` files).
+//! * `raster` and `train` require a working GPU adapter.
+//!
+//! When a prerequisite is missing the target is **skipped** and the reason is
+//! recorded in the report (`skipped` array in JSON, a dedicated section in the
+//! human and Markdown formats). Fabricated numbers are never emitted. If a
+//! single target was requested explicitly (`--target raster`), a missing
+//! prerequisite is a hard error instead of a skip.
+//!
+//! ## Timing resolution
+//!
+//! Per-iteration durations are recorded with [`Instant`] and truncated to whole
+//! microseconds ([`Duration::as_micros`]). Operations faster than 1 µs therefore
+//! report `0.00 us`; increase `--size` if that happens.
+//!
+//! ## Output modes
 //!
 //! Results can be output in human-readable, JSON, CSV, or Markdown format.
+//! `--output` and `--baseline` are honoured in every mode, including the global
+//! `--json` flag: in JSON mode the file receives the bare report (so it can be
+//! fed straight back in through `--baseline`) while stdout carries the usual
+//! `JsonOutput` envelope, and the baseline comparison travels inside the report
+//! as `baseline_comparison` rather than being printed.
 
 use std::io::Write;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
+use nalgebra as na;
 use serde::{Deserialize, Serialize};
+
+use oxigaf::flame::{FlameModel, FlameParams};
+use oxigaf::render::gaussian::{GaussianAttributes, GaussianModel};
+use oxigaf::render::{RasterConfig, Rasterizer, RenderCamera};
+use oxigaf::trainer::{TensorBoardConfig, Trainer, TrainingConfig};
 
 use crate::cli::{BenchTarget, BenchmarkArgs, OutputFormat};
 use crate::output;
 use crate::progress;
 use crate::verbosity::Verbosity;
+
+/// Image width used for the rasterizer and training benchmarks.
+const BENCH_IMAGE_WIDTH: u32 = 512;
+/// Image height used for the rasterizer and training benchmarks.
+const BENCH_IMAGE_HEIGHT: u32 = 512;
 
 // ---------------------------------------------------------------------------
 // Benchmark Results
@@ -45,7 +84,7 @@ pub struct BenchmarkResult {
     pub max_us: u64,
     /// Throughput (operations per second).
     pub ops_per_sec: f64,
-    /// Model size (number of Gaussians).
+    /// Model size — number of Gaussians, or FLAME vertices for the `flame` target.
     pub model_size: usize,
     /// Additional metadata.
     pub metadata: BenchmarkMetadata,
@@ -64,6 +103,31 @@ pub struct BenchmarkMetadata {
     pub gpu_adapter: Option<String>,
 }
 
+/// A benchmark target that could not be executed, and why.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkippedTarget {
+    /// Target identifier (`flame`, `raster`, `train`, `export`).
+    pub target: String,
+    /// Human-readable reason the target was skipped.
+    pub reason: String,
+}
+
+/// One baseline-vs-current comparison entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BaselineComparison {
+    /// Target identifier the comparison applies to.
+    pub target: String,
+    /// Display name of the benchmark.
+    pub name: String,
+    /// Mean iteration time recorded in the baseline (microseconds).
+    pub baseline_mean_us: f64,
+    /// Mean iteration time of the current run (microseconds).
+    pub current_mean_us: f64,
+    /// Relative change in percent, or `None` when the baseline mean is zero
+    /// (the ratio would be infinite).
+    pub diff_pct: Option<f64>,
+}
+
 /// Full benchmark report.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BenchmarkReport {
@@ -73,6 +137,15 @@ pub struct BenchmarkReport {
     pub results: Vec<BenchmarkResult>,
     /// System information.
     pub system: SystemInfo,
+    /// Targets that were requested but could not run.
+    ///
+    /// `#[serde(default)]` keeps older baseline files (written before this
+    /// field existed) loadable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<SkippedTarget>,
+    /// Comparison against `--baseline`, when one was supplied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_comparison: Option<Vec<BaselineComparison>>,
 }
 
 /// System information for benchmark context.
@@ -96,6 +169,8 @@ pub struct SystemInfo {
 
 /// Run the benchmark suite.
 pub fn run_benchmark(args: BenchmarkArgs, verbosity: Verbosity, json_mode: bool) -> Result<()> {
+    validate_args(&args)?;
+
     let start = Instant::now();
 
     if !json_mode {
@@ -105,10 +180,15 @@ pub fn run_benchmark(args: BenchmarkArgs, verbosity: Verbosity, json_mode: bool)
     }
 
     let system_info = collect_system_info();
+    let gpu_adapter = system_info.gpu.clone();
     let mut results = Vec::new();
+    let mut skipped: Vec<SkippedTarget> = Vec::new();
 
     // Progress bar for overall benchmark (hidden in JSON mode)
     let targets = get_benchmark_targets(&args.target);
+    // An explicitly requested single target must fail loudly; the aggregate
+    // `full` run records unavailable targets as skips instead.
+    let single_target = !matches!(args.target, BenchTarget::Full);
     let pb = if !json_mode {
         progress::custom_progress(
             targets.len() as u64,
@@ -122,36 +202,67 @@ pub fn run_benchmark(args: BenchmarkArgs, verbosity: Verbosity, json_mode: bool)
     for target in &targets {
         pb.set_message(target.to_string());
 
-        let result = match target.as_str() {
-            "flame" => benchmark_flame(&args)?,
-            "raster" => benchmark_raster(&args)?,
-            "train" => benchmark_train(&args)?,
-            "export" => benchmark_export(&args)?,
-            _ => continue,
+        let outcome = match target.as_str() {
+            "flame" => benchmark_flame(&args, gpu_adapter.as_deref()),
+            "raster" => benchmark_raster(&args, gpu_adapter.as_deref()),
+            "train" => benchmark_train(&args, gpu_adapter.as_deref()),
+            "export" => benchmark_export(&args, gpu_adapter.as_deref()),
+            other => Err(anyhow!("Unknown benchmark target: {other}")),
         };
 
-        results.push(result);
+        match outcome {
+            Ok(mut target_results) => results.append(&mut target_results),
+            Err(err) => {
+                if single_target {
+                    pb.finish_and_clear();
+                    return Err(err);
+                }
+                let reason = format!("{err:#}");
+                tracing::warn!(
+                    benchmark_target = %target,
+                    reason = %reason,
+                    "Benchmark target skipped — no numbers will be reported for it"
+                );
+                skipped.push(SkippedTarget {
+                    target: target.clone(),
+                    reason,
+                });
+            }
+        }
+
         pb.inc(1);
     }
 
     pb.finish_with_message("done");
+
+    // Compare with baseline if provided — in every output mode, so that CI
+    // jobs running `--json --baseline base.json` get the regression data too.
+    let baseline_comparison = match args.baseline {
+        Some(ref baseline_path) => {
+            let baseline = load_baseline(baseline_path)?;
+            Some(compute_baseline_comparison(&results, &baseline))
+        }
+        None => None,
+    };
 
     // Build report
     let report = BenchmarkReport {
         version: "1.0".to_string(),
         results,
         system: system_info,
+        skipped,
+        baseline_comparison,
     };
-
-    // Compare with baseline if provided (skip in JSON mode)
-    if !json_mode {
-        if let Some(ref baseline_path) = args.baseline {
-            compare_with_baseline(&report, baseline_path)?;
-        }
-    }
 
     // Output results
     if json_mode {
+        // `--output` is honoured in JSON mode as well; the file receives the
+        // bare report so that it can be fed back in via `--baseline`.
+        if let Some(ref path) = args.output {
+            let rendered = format_json(&report)?;
+            write_report_file(&rendered, path)?;
+        }
+
         // Use global JSON output format
         let output = crate::json_output::JsonOutput::success(
             "benchmark",
@@ -159,6 +270,18 @@ pub fn run_benchmark(args: BenchmarkArgs, verbosity: Verbosity, json_mode: bool)
         );
         output.print();
     } else {
+        // The comparison is embedded in the human / Markdown / JSON renderings.
+        // Print it explicitly when it would otherwise be invisible: the report
+        // was saved to a file, or CSV (a flat per-result table) was requested.
+        let comparison_hidden = args.output.is_some() || matches!(args.format, OutputFormat::Csv);
+        let hidden_comparison = report
+            .baseline_comparison
+            .as_deref()
+            .filter(|_| comparison_hidden);
+        if let Some(comparison) = hidden_comparison {
+            print_baseline_comparison(comparison);
+        }
+
         output_report(&report, &args)?;
 
         if verbosity.show_timing() {
@@ -171,6 +294,20 @@ pub fn run_benchmark(args: BenchmarkArgs, verbosity: Verbosity, json_mode: bool)
         }
     }
 
+    Ok(())
+}
+
+/// Validate benchmark arguments before any work is done.
+///
+/// `--warmup 0` is legitimate (no warmup), but `--iterations 0` leaves the
+/// timing vector empty, which would make every statistic undefined.
+fn validate_args(args: &BenchmarkArgs) -> Result<()> {
+    if args.iterations == 0 {
+        return Err(anyhow!(
+            "--iterations must be at least 1 (got 0): benchmark statistics are \
+             undefined without a timed run"
+        ));
+    }
     Ok(())
 }
 
@@ -194,154 +331,394 @@ fn get_benchmark_targets(target: &BenchTarget) -> Vec<String> {
 // Individual Benchmarks
 // ---------------------------------------------------------------------------
 
-/// Benchmark FLAME forward pass.
-fn benchmark_flame(args: &BenchmarkArgs) -> Result<BenchmarkResult> {
-    tracing::info!("Benchmarking FLAME forward pass");
+/// Benchmark the real FLAME forward pass.
+///
+/// Requires `--flame-model <DIR>`; there is no way to synthesize a meaningful
+/// FLAME model, so without one the target cannot be measured.
+fn benchmark_flame(
+    args: &BenchmarkArgs,
+    gpu_adapter: Option<&str>,
+) -> Result<Vec<BenchmarkResult>> {
+    let model_path = args.flame_model.as_ref().ok_or_else(|| {
+        anyhow!(
+            "FLAME benchmark requires a model: pass --flame-model <DIR> \
+             (directory of .npy files produced by scripts/convert_flame.py)"
+        )
+    })?;
 
-    let model_size = args.size.num_gaussians();
+    tracing::info!(
+        path = %model_path.display(),
+        "Benchmarking FLAME forward pass with a real model"
+    );
 
-    // If real FLAME model is provided, use it; otherwise use simulation
-    let use_real_model = args.flame_model.is_some();
-
-    if use_real_model {
-        tracing::info!("Using real FLAME model for benchmarking");
-        // Note: Real FLAME model loading would be integrated here
-        // For now, we still use simulation but with a note
-        tracing::warn!("Real FLAME benchmarking not yet implemented, using simulation");
-    }
-
-    // Warmup and timing
-    let mut times = Vec::with_capacity(args.iterations as usize);
+    let model = FlameModel::load(model_path)
+        .with_context(|| format!("Failed to load FLAME model from {}", model_path.display()))?;
+    let num_vertices = model.num_vertices();
+    let params = FlameParams::neutral();
 
     // Warmup
     for _ in 0..args.warmup {
-        simulate_flame_forward(model_size);
+        std::hint::black_box(model.forward(&params));
     }
 
     // Timed runs
+    let mut times = Vec::with_capacity(args.iterations as usize);
     for _ in 0..args.iterations {
         let start = Instant::now();
-        simulate_flame_forward(model_size);
+        let mesh = model.forward(&params);
         times.push(start.elapsed());
+        std::hint::black_box(mesh);
     }
 
-    Ok(build_result("FLAME Forward", "flame", &times, model_size))
+    Ok(vec![build_result(
+        "FLAME Forward",
+        "flame",
+        &times,
+        num_vertices,
+        gpu_adapter,
+    )])
 }
 
-/// Benchmark rasterizer.
-fn benchmark_raster(args: &BenchmarkArgs) -> Result<BenchmarkResult> {
-    tracing::info!("Benchmarking rasterizer");
+/// Benchmark the real GPU rasterizer (forward and backward passes).
+fn benchmark_raster(
+    args: &BenchmarkArgs,
+    gpu_adapter: Option<&str>,
+) -> Result<Vec<BenchmarkResult>> {
+    let num_gaussians = args.size.num_gaussians();
+    let config = RasterConfig::new().with_resolution(BENCH_IMAGE_WIDTH, BENCH_IMAGE_HEIGHT);
 
-    let model_size = args.size.num_gaussians();
-    let mut times = Vec::with_capacity(args.iterations as usize);
+    tracing::info!(
+        num_gaussians,
+        width = config.image_width,
+        height = config.image_height,
+        "Benchmarking GPU rasterizer"
+    );
 
-    // Warmup
+    let model = synthetic_gaussian_model(num_gaussians, config.sh_degree);
+    let camera = benchmark_camera(config.image_width, config.image_height);
+
+    let mut rasterizer = pollster::block_on(Rasterizer::new(config.clone()))
+        .map_err(|e| anyhow!("GPU rasterizer initialisation failed: {e}"))?;
+    rasterizer.upload_gaussians(&model);
+
+    // Non-zero incoming image gradient so the backward pass has real work.
+    let grad_image = vec![1e-3_f32; (config.image_width * config.image_height * 4) as usize];
+
+    // Warmup (shader compilation, buffer allocation, GPU clock ramp-up)
     for _ in 0..args.warmup {
-        simulate_raster(model_size);
+        let output = rasterizer
+            .forward(&model, &camera)
+            .map_err(|e| anyhow!("Rasterizer forward pass failed: {e}"))?;
+        let gradients = rasterizer
+            .backward(&model, &grad_image)
+            .map_err(|e| anyhow!("Rasterizer backward pass failed: {e}"))?;
+        std::hint::black_box((output, gradients));
     }
 
-    // Timed runs
+    // Timed runs — forward and backward are measured separately.
+    let mut forward_times = Vec::with_capacity(args.iterations as usize);
+    let mut backward_times = Vec::with_capacity(args.iterations as usize);
     for _ in 0..args.iterations {
-        let start = Instant::now();
-        simulate_raster(model_size);
-        times.push(start.elapsed());
+        let t_forward = Instant::now();
+        let output = rasterizer
+            .forward(&model, &camera)
+            .map_err(|e| anyhow!("Rasterizer forward pass failed: {e}"))?;
+        forward_times.push(t_forward.elapsed());
+
+        let t_backward = Instant::now();
+        let gradients = rasterizer
+            .backward(&model, &grad_image)
+            .map_err(|e| anyhow!("Rasterizer backward pass failed: {e}"))?;
+        backward_times.push(t_backward.elapsed());
+
+        std::hint::black_box((output, gradients));
     }
 
-    Ok(build_result("Rasterizer", "raster", &times, model_size))
+    Ok(vec![
+        build_result(
+            "Rasterizer Forward",
+            "raster",
+            &forward_times,
+            num_gaussians,
+            gpu_adapter,
+        ),
+        build_result(
+            "Rasterizer Backward",
+            "raster_backward",
+            &backward_times,
+            num_gaussians,
+            gpu_adapter,
+        ),
+    ])
 }
 
-/// Benchmark training iteration.
-fn benchmark_train(args: &BenchmarkArgs) -> Result<BenchmarkResult> {
-    tracing::info!("Benchmarking training iteration");
+/// Benchmark one real training iteration (`Trainer::train_step`).
+fn benchmark_train(
+    args: &BenchmarkArgs,
+    gpu_adapter: Option<&str>,
+) -> Result<Vec<BenchmarkResult>> {
+    let num_gaussians = args.size.num_gaussians();
+    let raster_config = RasterConfig::new().with_resolution(BENCH_IMAGE_WIDTH, BENCH_IMAGE_HEIGHT);
+    let model = synthetic_gaussian_model(num_gaussians, raster_config.sh_degree);
 
-    let model_size = args.size.num_gaussians();
-    let mut times = Vec::with_capacity(args.iterations as usize);
+    tracing::info!(num_gaussians, "Benchmarking training iteration");
+
+    let (device, queue) = request_benchmark_gpu_device()?;
+
+    // TensorBoard logging is disabled explicitly: a benchmark must not write
+    // event files as a side effect.
+    let training_config = TrainingConfig {
+        tensorboard: TensorBoardConfig {
+            enabled: false,
+            ..TensorBoardConfig::default()
+        },
+        ..TrainingConfig::default()
+    };
+
+    let mut trainer = Trainer::new(training_config, model, raster_config, device, queue, 42)
+        .map_err(|e| anyhow!("Failed to create trainer: {e}"))?;
 
     // Warmup
     for _ in 0..args.warmup {
-        simulate_train_step(model_size);
+        let step = trainer
+            .train_step()
+            .map_err(|e| anyhow!("Training step failed: {e}"))?;
+        std::hint::black_box(step);
     }
 
     // Timed runs
+    let mut times = Vec::with_capacity(args.iterations as usize);
     for _ in 0..args.iterations {
         let start = Instant::now();
-        simulate_train_step(model_size);
+        let step = trainer
+            .train_step()
+            .map_err(|e| anyhow!("Training step failed: {e}"))?;
         times.push(start.elapsed());
+        std::hint::black_box(step);
     }
 
-    Ok(build_result("Training Step", "train", &times, model_size))
+    Ok(vec![build_result(
+        "Training Step",
+        "train",
+        &times,
+        num_gaussians,
+        gpu_adapter,
+    )])
 }
 
-/// Benchmark export.
-fn benchmark_export(args: &BenchmarkArgs) -> Result<BenchmarkResult> {
-    tracing::info!("Benchmarking export");
+/// Benchmark the real PLY export path.
+fn benchmark_export(
+    args: &BenchmarkArgs,
+    gpu_adapter: Option<&str>,
+) -> Result<Vec<BenchmarkResult>> {
+    let num_gaussians = args.size.num_gaussians();
+    let model = synthetic_gaussian_model(num_gaussians, RasterConfig::default().sh_degree);
 
-    let model_size = args.size.num_gaussians();
-    let mut times = Vec::with_capacity(args.iterations as usize);
+    let dir = std::env::temp_dir().join(format!("oxigaf_benchmark_export_{}", unique_suffix()));
+    std::fs::create_dir_all(&dir).with_context(|| {
+        format!(
+            "Failed to create temporary export directory: {}",
+            dir.display()
+        )
+    })?;
+    let path = dir.join("benchmark.ply");
 
+    tracing::info!(
+        num_gaussians,
+        path = %path.display(),
+        "Benchmarking PLY export"
+    );
+
+    let measured = time_ply_export(args, &model, &path, gpu_adapter);
+
+    // Best-effort cleanup; a failure here must not mask the benchmark outcome.
+    if let Err(err) = std::fs::remove_dir_all(&dir) {
+        tracing::debug!(
+            path = %dir.display(),
+            error = %err,
+            "Failed to remove temporary export directory"
+        );
+    }
+
+    measured
+}
+
+/// Timed body of the export benchmark, split out so the caller can always
+/// clean up its temporary directory.
+fn time_ply_export(
+    args: &BenchmarkArgs,
+    model: &GaussianModel,
+    path: &Path,
+    gpu_adapter: Option<&str>,
+) -> Result<Vec<BenchmarkResult>> {
     // Warmup
     for _ in 0..args.warmup {
-        simulate_export(model_size);
+        crate::export::export_ply(model, path)?;
     }
 
     // Timed runs
+    let mut times = Vec::with_capacity(args.iterations as usize);
     for _ in 0..args.iterations {
         let start = Instant::now();
-        simulate_export(model_size);
+        crate::export::export_ply(model, path)?;
         times.push(start.elapsed());
     }
 
-    Ok(build_result("PLY Export", "export", &times, model_size))
+    Ok(vec![build_result(
+        "PLY Export",
+        "export",
+        &times,
+        model.len(),
+        gpu_adapter,
+    )])
 }
 
 // ---------------------------------------------------------------------------
-// Simulation Functions (for benchmarking without real components)
+// Synthetic scene construction (real data structures, deterministic content)
 // ---------------------------------------------------------------------------
 
-/// Simulate FLAME forward pass.
-fn simulate_flame_forward(num_vertices: usize) {
-    // Simulate computation proportional to vertex count
-    let data: Vec<f32> = (0..num_vertices * 3)
-        .map(|i| (i as f32).sin() * 0.01)
-        .collect();
-    std::hint::black_box(data);
+/// Deterministic xorshift64 PRNG returning a value in `[0, 1)`.
+///
+/// Used so that benchmark scenes are reproducible across runs without pulling
+/// in an RNG dependency or depending on wall-clock state.
+#[inline]
+fn xorshift_unit(state: &mut u64) -> f32 {
+    *state ^= *state << 13;
+    *state ^= *state >> 7;
+    *state ^= *state << 17;
+    // Top 24 bits → exactly representable in f32.
+    ((*state >> 40) as f32) / 16_777_216.0
 }
 
-/// Simulate rasterization.
-fn simulate_raster(num_gaussians: usize) {
-    // Simulate sorting and rendering
-    let mut indices: Vec<u32> = (0..num_gaussians as u32).collect();
-    indices.sort_by(|a, b| b.cmp(a));
-    let pixels: Vec<u8> = (0..512 * 512 * 4).map(|i| (i % 256) as u8).collect();
-    std::hint::black_box((indices, pixels));
-}
+/// Build a Gaussian cloud of `n` primitives filling roughly the unit cube.
+///
+/// This is a real [`GaussianModel`] — the same structure produced by training
+/// and consumed by the rasterizer and the exporters. Only its *contents* are
+/// synthetic, so that the benchmark does not require a trained avatar.
+fn synthetic_gaussian_model(n: usize, sh_degree: u32) -> GaussianModel {
+    let sh_per_gaussian = ((sh_degree + 1) * (sh_degree + 1) * 3) as usize;
+    let log_scale = 0.02_f32.ln();
 
-/// Simulate training step.
-fn simulate_train_step(num_gaussians: usize) {
-    // Simulate gradient computation and optimization
-    let gradients: Vec<f32> = (0..num_gaussians * 14) // pos + rot + scale + opacity + sh
-        .map(|i| ((i as f32) * 0.001).cos())
-        .collect();
-    // Simulate Adam update
-    let params: Vec<f32> = gradients
-        .iter()
-        .enumerate()
-        .map(|(i, g)| -g * 0.001 * (1.0 + (i as f32) * 0.0001))
-        .collect();
-    std::hint::black_box(params);
-}
+    let mut state = 0x2545_F491_4F6C_DD1D_u64;
+    let mut gaussians = Vec::with_capacity(n);
+    let mut sh_coeffs = Vec::with_capacity(n * sh_per_gaussian);
 
-/// Simulate export operation.
-fn simulate_export(num_gaussians: usize) {
-    // Simulate PLY generation
-    let header_size = 500;
-    let vertex_line_size = 100; // approximate chars per vertex
-    let total_size = header_size + num_gaussians * vertex_line_size;
-    let mut buffer = Vec::with_capacity(total_size);
-    for i in 0..total_size.min(1_000_000) {
-        buffer.push((i % 128) as u8);
+    for _ in 0..n {
+        let x = xorshift_unit(&mut state) * 2.0 - 1.0;
+        let y = xorshift_unit(&mut state) * 2.0 - 1.0;
+        let z = xorshift_unit(&mut state) * 2.0 - 1.0;
+
+        gaussians.push(GaussianAttributes {
+            position: [x, y, z],
+            _pad0: 0.0,
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            scale: [log_scale; 3],
+            // Logit space: 0.0 → sigmoid(0) = 0.5 opacity.
+            opacity: 0.0,
+        });
+
+        for k in 0..sh_per_gaussian {
+            // DC term carries the colour; higher-order bands start small but
+            // non-zero so the SH evaluation shaders do real work.
+            let value = if k < 3 {
+                xorshift_unit(&mut state)
+            } else {
+                xorshift_unit(&mut state) * 0.01
+            };
+            sh_coeffs.push(value);
+        }
     }
-    std::hint::black_box(buffer);
+
+    GaussianModel {
+        gaussians,
+        sh_coeffs,
+        sh_degree,
+        face_indices: vec![0_u32; n],
+        barycentric: vec![[1.0_f32 / 3.0; 3]; n],
+        local_offsets: vec![[0.0_f32; 3]; n],
+        is_rigid: vec![true; n],
+    }
+}
+
+/// Copy a column-major nalgebra 4×4 matrix into a flat `[f32; 16]`.
+fn mat4_to_array(m: &na::Matrix4<f32>) -> [f32; 16] {
+    let mut out = [0.0_f32; 16];
+    for (dst, src) in out.iter_mut().zip(m.as_slice()) {
+        *dst = *src;
+    }
+    out
+}
+
+/// Build the camera used by the rasterizer benchmark: a right-handed pinhole
+/// camera on the +Z axis looking at the origin.
+fn benchmark_camera(width: u32, height: u32) -> RenderCamera {
+    let eye = na::Point3::new(0.0_f32, 0.0, 4.0);
+    let view = na::Matrix4::look_at_rh(&eye, &na::Point3::origin(), &na::Vector3::y());
+
+    let fov_y = 45.0_f32.to_radians();
+    let aspect = width as f32 / height as f32;
+    let proj = na::Matrix4::new_perspective(aspect, fov_y, 0.01, 100.0);
+
+    // Square pixels: the horizontal focal length equals the vertical one for a
+    // projection built from a vertical FoV plus the width/height aspect ratio.
+    let focal_y = height as f32 / (2.0 * (fov_y / 2.0).tan());
+    let focal_x = focal_y;
+
+    RenderCamera {
+        view_matrix: mat4_to_array(&view),
+        proj_matrix: mat4_to_array(&proj),
+        position: [eye.x, eye.y, eye.z],
+        focal: [focal_x, focal_y],
+    }
+}
+
+/// Request a wgpu device suitable for the training benchmark.
+///
+/// The storage-buffer limit is raised to 16 because the rasterizer backward
+/// pass binds 13+ storage buffers in a single shader stage.
+fn request_benchmark_gpu_device() -> Result<(wgpu::Device, wgpu::Queue)> {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::all(),
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
+    });
+
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        compatible_surface: None,
+        force_fallback_adapter: false,
+        apply_limit_buckets: false,
+    }))
+    .map_err(|e| anyhow!("No suitable GPU adapter found: {e}"))?;
+
+    tracing::info!(
+        adapter = adapter.get_info().name,
+        backend = ?adapter.get_info().backend,
+        "Selected GPU adapter for benchmarking"
+    );
+
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("oxigaf_benchmark"),
+        required_features: wgpu::Features::empty(),
+        required_limits: wgpu::Limits {
+            max_storage_buffers_per_shader_stage: 16,
+            ..wgpu::Limits::default()
+        },
+        memory_hints: wgpu::MemoryHints::Performance,
+        experimental_features: wgpu::ExperimentalFeatures::default(),
+        trace: wgpu::Trace::Off,
+    }))
+    .map_err(|e| anyhow!("GPU device creation failed: {e}"))?;
+
+    Ok((device, queue))
+}
+
+/// A process- and time-unique suffix for temporary paths.
+fn unique_suffix() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{}_{}", std::process::id(), nanos)
 }
 
 // ---------------------------------------------------------------------------
@@ -349,29 +726,43 @@ fn simulate_export(num_gaussians: usize) {
 // ---------------------------------------------------------------------------
 
 /// Build a benchmark result from timing data.
+///
+/// An empty `times` slice yields all-zero statistics rather than `NaN`, so the
+/// report always serializes (serde_json rejects non-finite floats).
 fn build_result(
     name: &str,
     target: &str,
     times: &[Duration],
     model_size: usize,
+    gpu_adapter: Option<&str>,
 ) -> BenchmarkResult {
     let times_us: Vec<u64> = times.iter().map(|d| d.as_micros() as u64).collect();
+    let count = times_us.len();
 
     let total_us: u64 = times_us.iter().sum();
-    let mean_us = total_us as f64 / times_us.len() as f64;
     let min_us = times_us.iter().copied().min().unwrap_or(0);
     let max_us = times_us.iter().copied().max().unwrap_or(0);
 
+    let mean_us = if count == 0 {
+        0.0
+    } else {
+        total_us as f64 / count as f64
+    };
+
     // Standard deviation
-    let variance: f64 = times_us
-        .iter()
-        .map(|&t| {
-            let diff = t as f64 - mean_us;
-            diff * diff
-        })
-        .sum::<f64>()
-        / times_us.len() as f64;
-    let std_us = variance.sqrt();
+    let std_us = if count == 0 {
+        0.0
+    } else {
+        let variance: f64 = times_us
+            .iter()
+            .map(|&t| {
+                let diff = t as f64 - mean_us;
+                diff * diff
+            })
+            .sum::<f64>()
+            / count as f64;
+        variance.sqrt()
+    };
 
     // Throughput
     let ops_per_sec = if mean_us > 0.0 {
@@ -383,7 +774,7 @@ fn build_result(
     BenchmarkResult {
         name: name.to_string(),
         target: target.to_string(),
-        iterations: times_us.len() as u32,
+        iterations: count as u32,
         total_us,
         mean_us,
         std_us,
@@ -395,7 +786,7 @@ fn build_result(
             version: env!("CARGO_PKG_VERSION").to_string(),
             timestamp: chrono_now(),
             platform: std::env::consts::OS.to_string(),
-            gpu_adapter: None,
+            gpu_adapter: gpu_adapter.map(str::to_string),
         },
     }
 }
@@ -530,6 +921,7 @@ fn get_gpu_info() -> Option<String> {
         power_preference: wgpu::PowerPreference::HighPerformance,
         compatible_surface: None,
         force_fallback_adapter: false,
+        apply_limit_buckets: false,
     }))
     .ok()?;
 
@@ -547,20 +939,51 @@ fn get_rust_version() -> String {
 // Baseline Comparison
 // ---------------------------------------------------------------------------
 
-/// Compare results with a baseline file.
-fn compare_with_baseline(report: &BenchmarkReport, baseline_path: &Path) -> Result<()> {
+/// Read and parse a baseline report from disk.
+fn load_baseline(baseline_path: &Path) -> Result<BenchmarkReport> {
     let baseline_data = std::fs::read_to_string(baseline_path)
         .with_context(|| format!("Failed to read baseline: {}", baseline_path.display()))?;
 
-    let baseline: BenchmarkReport =
-        serde_json::from_str(&baseline_data).with_context(|| "Failed to parse baseline JSON")?;
+    serde_json::from_str(&baseline_data)
+        .with_context(|| format!("Failed to parse baseline JSON: {}", baseline_path.display()))
+}
 
-    println!();
-    output::header("Baseline Comparison");
+/// Compare current results against a baseline report.
+///
+/// Results without a matching baseline target are omitted. A baseline mean of
+/// zero (or a non-finite value from a corrupt file) yields `diff_pct: None`
+/// instead of an infinite percentage.
+fn compute_baseline_comparison(
+    results: &[BenchmarkResult],
+    baseline: &BenchmarkReport,
+) -> Vec<BaselineComparison> {
+    let mut comparison = Vec::new();
 
-    for result in &report.results {
+    for result in results {
         if let Some(base) = baseline.results.iter().find(|r| r.target == result.target) {
-            let diff_pct = ((result.mean_us - base.mean_us) / base.mean_us) * 100.0;
+            let diff_pct = if base.mean_us > 0.0 && base.mean_us.is_finite() {
+                Some(((result.mean_us - base.mean_us) / base.mean_us) * 100.0)
+            } else {
+                None
+            };
+
+            comparison.push(BaselineComparison {
+                target: result.target.clone(),
+                name: result.name.clone(),
+                baseline_mean_us: base.mean_us,
+                current_mean_us: result.mean_us,
+                diff_pct,
+            });
+        }
+    }
+
+    comparison
+}
+
+/// Render a single comparison entry as a human-readable line (newline included).
+fn format_comparison_line(entry: &BaselineComparison) -> String {
+    match entry.diff_pct {
+        Some(diff_pct) => {
             let indicator = if diff_pct < -5.0 {
                 "[FASTER]"
             } else if diff_pct > 5.0 {
@@ -568,15 +991,31 @@ fn compare_with_baseline(report: &BenchmarkReport, baseline_path: &Path) -> Resu
             } else {
                 "[~SAME]"
             };
-
-            println!(
-                "  {}: {:.2}us -> {:.2}us ({:+.1}%) {}",
-                result.name, base.mean_us, result.mean_us, diff_pct, indicator
-            );
+            format!(
+                "  {}: {:.2}us -> {:.2}us ({:+.1}%) {}\n",
+                entry.name, entry.baseline_mean_us, entry.current_mean_us, diff_pct, indicator
+            )
         }
+        None => format!(
+            "  {}: {:.2}us -> {:.2}us (baseline mean is zero — no ratio) [N/A]\n",
+            entry.name, entry.baseline_mean_us, entry.current_mean_us
+        ),
+    }
+}
+
+/// Print the baseline comparison to stdout.
+fn print_baseline_comparison(comparison: &[BaselineComparison]) {
+    println!();
+    output::header("Baseline Comparison");
+
+    if comparison.is_empty() {
+        println!("  (no targets in common with the baseline)");
+        return;
     }
 
-    Ok(())
+    for entry in comparison {
+        print!("{}", format_comparison_line(entry));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -594,13 +1033,29 @@ fn output_report(report: &BenchmarkReport, args: &BenchmarkArgs) -> Result<()> {
 
     // Write to file or stdout
     if let Some(ref path) = args.output {
-        let mut file = std::fs::File::create(path)
-            .with_context(|| format!("Failed to create output file: {}", path.display()))?;
-        file.write_all(output.as_bytes())?;
+        write_report_file(&output, path)?;
         output::path_value("Report saved to", path);
     } else {
         println!("{}", output);
     }
+
+    Ok(())
+}
+
+/// Write a rendered report to `path`, creating parent directories as needed.
+///
+/// Prints nothing — callers decide what to report, so that JSON mode keeps a
+/// clean stdout.
+fn write_report_file(rendered: &str, path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create output directory: {}", parent.display()))?;
+    }
+
+    let mut file = std::fs::File::create(path)
+        .with_context(|| format!("Failed to create output file: {}", path.display()))?;
+    file.write_all(rendered.as_bytes())
+        .with_context(|| format!("Failed to write output file: {}", path.display()))?;
 
     Ok(())
 }
@@ -628,6 +1083,10 @@ fn format_human(report: &BenchmarkReport) -> String {
     out.push_str("-".repeat(60).as_str());
     out.push('\n');
 
+    if report.results.is_empty() {
+        out.push_str("\n  (no benchmark target could be measured)\n");
+    }
+
     for result in &report.results {
         out.push_str(&format!("\n  {}:\n", result.name));
         out.push_str(&format!(
@@ -645,9 +1104,29 @@ fn format_human(report: &BenchmarkReport) -> String {
             result.ops_per_sec
         ));
         out.push_str(&format!(
-            "    Model Size: {} Gaussians\n",
-            result.model_size
+            "    Model Size: {} {}\n",
+            result.model_size,
+            model_size_unit(&result.target)
         ));
+    }
+
+    if !report.skipped.is_empty() {
+        out.push('\n');
+        out.push_str("Skipped Targets (not measured — no numbers reported):\n");
+        for skipped in &report.skipped {
+            out.push_str(&format!("  {}: {}\n", skipped.target, skipped.reason));
+        }
+    }
+
+    if let Some(ref comparison) = report.baseline_comparison {
+        out.push('\n');
+        out.push_str("Baseline Comparison:\n");
+        if comparison.is_empty() {
+            out.push_str("  (no targets in common with the baseline)\n");
+        }
+        for entry in comparison {
+            out.push_str(&format_comparison_line(entry));
+        }
     }
 
     out.push('\n');
@@ -657,12 +1136,25 @@ fn format_human(report: &BenchmarkReport) -> String {
     out
 }
 
+/// Unit label for [`BenchmarkResult::model_size`] of a given target.
+fn model_size_unit(target: &str) -> &'static str {
+    if target == "flame" {
+        "FLAME vertices"
+    } else {
+        "Gaussians"
+    }
+}
+
 /// Format report as JSON.
 fn format_json(report: &BenchmarkReport) -> Result<String> {
     serde_json::to_string_pretty(report).context("Failed to serialize to JSON")
 }
 
 /// Format report as CSV.
+///
+/// CSV is a flat per-result table: skipped targets and the baseline comparison
+/// are not representable and are therefore omitted (use JSON, Markdown, or the
+/// human format for those).
 fn format_csv(report: &BenchmarkReport) -> String {
     let mut out = String::new();
     out.push_str("name,target,iterations,mean_us,std_us,min_us,max_us,ops_per_sec,model_size\n");
@@ -703,15 +1195,46 @@ fn format_markdown(report: &BenchmarkReport) -> String {
 
     for result in &report.results {
         out.push_str(&format!(
-            "| {} | {:.2} | {:.2} | {} | {} | {:.2} | {} |\n",
+            "| {} | {:.2} | {:.2} | {} | {} | {:.2} | {} {} |\n",
             result.name,
             result.mean_us,
             result.std_us,
             result.min_us,
             result.max_us,
             result.ops_per_sec,
-            result.model_size
+            result.model_size,
+            model_size_unit(&result.target),
         ));
+    }
+
+    if !report.skipped.is_empty() {
+        out.push_str("\n## Skipped Targets\n\n");
+        out.push_str("These targets were **not measured**; no numbers are reported for them.\n\n");
+        out.push_str("| Target | Reason |\n");
+        out.push_str("|--------|--------|\n");
+        for skipped in &report.skipped {
+            out.push_str(&format!("| {} | {} |\n", skipped.target, skipped.reason));
+        }
+    }
+
+    if let Some(ref comparison) = report.baseline_comparison {
+        out.push_str("\n## Baseline Comparison\n\n");
+        if comparison.is_empty() {
+            out.push_str("_No targets in common with the baseline._\n");
+        } else {
+            out.push_str("| Benchmark | Baseline (us) | Current (us) | Change |\n");
+            out.push_str("|-----------|---------------|--------------|--------|\n");
+            for entry in comparison {
+                let change = match entry.diff_pct {
+                    Some(diff_pct) => format!("{diff_pct:+.1}%"),
+                    None => "n/a".to_string(),
+                };
+                out.push_str(&format!(
+                    "| {} | {:.2} | {:.2} | {} |\n",
+                    entry.name, entry.baseline_mean_us, entry.current_mean_us, change
+                ));
+            }
+        }
     }
 
     out
@@ -720,6 +1243,52 @@ fn format_markdown(report: &BenchmarkReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::BenchSize;
+
+    fn test_args(iterations: u32, warmup: u32) -> BenchmarkArgs {
+        BenchmarkArgs {
+            target: BenchTarget::Export,
+            warmup,
+            iterations,
+            format: OutputFormat::Human,
+            output: None,
+            size: BenchSize::Tiny,
+            flame_model: None,
+            baseline: None,
+        }
+    }
+
+    fn sample_result(target: &str, mean_us: f64) -> BenchmarkResult {
+        BenchmarkResult {
+            name: format!("{target} bench"),
+            target: target.to_string(),
+            iterations: 10,
+            total_us: (mean_us * 10.0) as u64,
+            mean_us,
+            std_us: 1.0,
+            min_us: 1,
+            max_us: 2,
+            ops_per_sec: 0.0,
+            model_size: 100,
+            metadata: BenchmarkMetadata::default(),
+        }
+    }
+
+    fn sample_report(results: Vec<BenchmarkResult>) -> BenchmarkReport {
+        BenchmarkReport {
+            version: "1.0".to_string(),
+            results,
+            system: SystemInfo {
+                os: "test".to_string(),
+                cpu: "test".to_string(),
+                memory_mb: 8192,
+                gpu: None,
+                rust_version: "1.70".to_string(),
+            },
+            skipped: Vec::new(),
+            baseline_comparison: None,
+        }
+    }
 
     #[test]
     fn test_build_result() {
@@ -728,13 +1297,223 @@ mod tests {
             Duration::from_micros(110),
             Duration::from_micros(90),
         ];
-        let result = build_result("Test", "test", &times, 1000);
+        let result = build_result("Test", "test", &times, 1000, None);
 
         assert_eq!(result.name, "Test");
         assert_eq!(result.iterations, 3);
         assert!((result.mean_us - 100.0).abs() < 1.0);
         assert_eq!(result.min_us, 90);
         assert_eq!(result.max_us, 110);
+    }
+
+    /// Regression: `--iterations 0` used to produce `NaN` statistics, which
+    /// serde_json refuses to serialize.
+    #[test]
+    fn test_build_result_empty_times_has_no_nan() {
+        let result = build_result("Empty", "test", &[], 42, None);
+
+        assert_eq!(result.iterations, 0);
+        assert!(result.mean_us.is_finite(), "mean must not be NaN");
+        assert!(result.std_us.is_finite(), "std must not be NaN");
+        assert_eq!(result.mean_us, 0.0);
+        assert_eq!(result.std_us, 0.0);
+        assert_eq!(result.ops_per_sec, 0.0);
+
+        // Must remain serializable (serde_json rejects non-finite floats).
+        let json = serde_json::to_string(&result);
+        assert!(json.is_ok(), "empty result must serialize");
+    }
+
+    #[test]
+    fn test_build_result_records_gpu_adapter() {
+        let times = vec![Duration::from_micros(10)];
+        let result = build_result("Test", "raster", &times, 1, Some("Test Adapter"));
+        assert_eq!(result.metadata.gpu_adapter.as_deref(), Some("Test Adapter"));
+    }
+
+    /// Regression: `--iterations 0` must be rejected up front.
+    #[test]
+    fn test_validate_args_rejects_zero_iterations() {
+        let e = validate_args(&test_args(0, 3)).expect_err("iterations = 0 must be rejected");
+        let message = format!("{e:#}");
+        assert!(
+            message.contains("--iterations"),
+            "error must mention the offending flag, got: {message}"
+        );
+    }
+
+    #[test]
+    fn test_validate_args_accepts_zero_warmup() {
+        assert!(validate_args(&test_args(1, 0)).is_ok());
+    }
+
+    #[test]
+    fn test_compute_baseline_comparison_matches_by_target() {
+        let baseline = sample_report(vec![sample_result("raster", 100.0)]);
+        let current = vec![sample_result("raster", 150.0)];
+
+        let comparison = compute_baseline_comparison(&current, &baseline);
+        assert_eq!(comparison.len(), 1);
+        assert_eq!(comparison[0].target, "raster");
+        let diff = comparison[0].diff_pct.expect("expected a diff percentage");
+        assert!((diff - 50.0).abs() < 1e-6, "unexpected diff: {diff}");
+    }
+
+    /// Regression: a zero baseline mean used to produce an infinite percentage.
+    #[test]
+    fn test_compute_baseline_comparison_zero_mean_guard() {
+        let baseline = sample_report(vec![sample_result("train", 0.0)]);
+        let current = vec![sample_result("train", 25.0)];
+
+        let comparison = compute_baseline_comparison(&current, &baseline);
+        assert_eq!(comparison.len(), 1);
+        assert!(
+            comparison[0].diff_pct.is_none(),
+            "zero baseline mean must not yield a ratio"
+        );
+
+        // The rendered line must not contain `inf`.
+        let line = format_comparison_line(&comparison[0]);
+        assert!(!line.contains("inf"), "unexpected infinity in: {line}");
+    }
+
+    #[test]
+    fn test_compute_baseline_comparison_ignores_unknown_targets() {
+        let baseline = sample_report(vec![sample_result("flame", 10.0)]);
+        let current = vec![sample_result("export", 20.0)];
+        assert!(compute_baseline_comparison(&current, &baseline).is_empty());
+    }
+
+    /// Baseline files written before `skipped` / `baseline_comparison` existed
+    /// must still deserialize.
+    #[test]
+    fn test_legacy_baseline_deserializes() {
+        let legacy = r#"{
+            "version": "1.0",
+            "results": [],
+            "system": {
+                "os": "linux x86_64",
+                "cpu": "test",
+                "memory_mb": 1024,
+                "gpu": null,
+                "rust_version": "1.70"
+            }
+        }"#;
+
+        let parsed: std::result::Result<BenchmarkReport, _> = serde_json::from_str(legacy);
+        let report = parsed.expect("legacy baseline must parse");
+        assert!(report.skipped.is_empty());
+        assert!(report.baseline_comparison.is_none());
+    }
+
+    #[test]
+    fn test_report_round_trip_through_file() {
+        let mut report = sample_report(vec![sample_result("export", 5.0)]);
+        report.skipped.push(SkippedTarget {
+            target: "raster".to_string(),
+            reason: "no GPU".to_string(),
+        });
+
+        let dir = std::env::temp_dir().join(format!("oxigaf_bench_report_{}", unique_suffix()));
+        let path = dir.join("report.json");
+
+        let rendered = format_json(&report).expect("format_json failed");
+        write_report_file(&rendered, &path).expect("write_report_file failed");
+
+        let loaded = load_baseline(&path).expect("load_baseline failed");
+        assert_eq!(loaded.results.len(), 1);
+        assert_eq!(loaded.skipped.len(), 1);
+        assert_eq!(loaded.results[0].target, "export");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_synthetic_gaussian_model_is_well_formed() {
+        let model = synthetic_gaussian_model(8, 3);
+        assert_eq!(model.len(), 8);
+        assert_eq!(model.sh_degree, 3);
+        // (3+1)^2 * 3 = 48 coefficients per Gaussian
+        assert_eq!(model.sh_coeffs.len(), 8 * 48);
+        assert_eq!(model.face_indices.len(), 8);
+        assert_eq!(model.barycentric.len(), 8);
+        assert_eq!(model.local_offsets.len(), 8);
+        assert_eq!(model.is_rigid.len(), 8);
+        assert!(model
+            .gaussians
+            .iter()
+            .all(|g| g.position.iter().all(|v| v.is_finite())));
+    }
+
+    #[test]
+    fn test_synthetic_gaussian_model_is_deterministic() {
+        let a = synthetic_gaussian_model(16, 0);
+        let b = synthetic_gaussian_model(16, 0);
+        assert_eq!(a.sh_coeffs, b.sh_coeffs);
+        for (ga, gb) in a.gaussians.iter().zip(b.gaussians.iter()) {
+            assert_eq!(ga.position, gb.position);
+        }
+    }
+
+    #[test]
+    fn test_benchmark_camera_matrices_are_finite() {
+        let camera = benchmark_camera(512, 512);
+        assert!(camera.view_matrix.iter().all(|v| v.is_finite()));
+        assert!(camera.proj_matrix.iter().all(|v| v.is_finite()));
+        assert!(camera.focal[0] > 0.0 && camera.focal[1] > 0.0);
+        // Right-handed look-at from +Z: the camera position is preserved.
+        assert!((camera.position[2] - 4.0).abs() < 1e-6);
+    }
+
+    /// The export target must exercise the real PLY writer, not a synthetic
+    /// byte buffer: the produced file has to be a parseable PLY header with the
+    /// expected vertex count.
+    #[test]
+    fn test_export_path_writes_real_ply() {
+        let model = synthetic_gaussian_model(4, 0);
+        let dir = std::env::temp_dir().join(format!("oxigaf_bench_ply_{}", unique_suffix()));
+        let path = dir.join("bench.ply");
+
+        crate::export::export_ply(&model, &path).expect("export_ply failed");
+
+        let content = std::fs::read_to_string(&path).expect("failed to read exported PLY");
+        assert!(content.starts_with("ply"), "not a PLY file");
+        assert!(content.contains("element vertex 4"), "wrong vertex count");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// End-to-end check of the export benchmark: it must report exactly the
+    /// requested number of timed iterations and finite statistics.
+    #[test]
+    fn test_benchmark_export_measures_real_work() {
+        let args = test_args(2, 1);
+        let results = benchmark_export(&args, None).expect("benchmark_export failed");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].target, "export");
+        assert_eq!(results[0].iterations, 2);
+        assert!(results[0].mean_us.is_finite());
+    }
+
+    /// A missing `--flame-model` must be an explicit error, never silently
+    /// simulated numbers.
+    #[test]
+    fn test_benchmark_flame_requires_model() {
+        let args = test_args(1, 0);
+        let e = benchmark_flame(&args, None)
+            .expect_err("flame benchmark must not run without --flame-model");
+        let message = format!("{e:#}");
+        assert!(
+            message.contains("--flame-model"),
+            "error must name the missing flag, got: {message}"
+        );
+    }
+
+    #[test]
+    fn test_get_benchmark_targets_full_covers_all() {
+        let targets = get_benchmark_targets(&BenchTarget::Full);
+        assert_eq!(targets, vec!["flame", "raster", "train", "export"]);
     }
 
     #[cfg(target_os = "linux")]
@@ -772,31 +1551,51 @@ mod tests {
 
     #[test]
     fn test_format_csv() {
-        let report = BenchmarkReport {
-            version: "1.0".to_string(),
-            results: vec![BenchmarkResult {
-                name: "Test".to_string(),
-                target: "test".to_string(),
-                iterations: 10,
-                total_us: 1000,
-                mean_us: 100.0,
-                std_us: 10.0,
-                min_us: 90,
-                max_us: 110,
-                ops_per_sec: 10000.0,
-                model_size: 1000,
-                metadata: BenchmarkMetadata::default(),
-            }],
-            system: SystemInfo {
-                os: "test".to_string(),
-                cpu: "test".to_string(),
-                memory_mb: 8192,
-                gpu: None,
-                rust_version: "1.70".to_string(),
-            },
-        };
+        let report = sample_report(vec![BenchmarkResult {
+            name: "Test".to_string(),
+            target: "test".to_string(),
+            iterations: 10,
+            total_us: 1000,
+            mean_us: 100.0,
+            std_us: 10.0,
+            min_us: 90,
+            max_us: 110,
+            ops_per_sec: 10000.0,
+            model_size: 1000,
+            metadata: BenchmarkMetadata::default(),
+        }]);
 
         let csv = format_csv(&report);
         assert!(csv.contains("Test,test,10"));
+    }
+
+    #[test]
+    fn test_format_human_lists_skipped_targets() {
+        let mut report = sample_report(Vec::new());
+        report.skipped.push(SkippedTarget {
+            target: "raster".to_string(),
+            reason: "No suitable GPU adapter found".to_string(),
+        });
+
+        let human = format_human(&report);
+        assert!(human.contains("Skipped Targets"));
+        assert!(human.contains("No suitable GPU adapter found"));
+        assert!(human.contains("no benchmark target could be measured"));
+    }
+
+    #[test]
+    fn test_format_markdown_includes_comparison() {
+        let mut report = sample_report(vec![sample_result("export", 20.0)]);
+        report.baseline_comparison = Some(vec![BaselineComparison {
+            target: "export".to_string(),
+            name: "PLY Export".to_string(),
+            baseline_mean_us: 10.0,
+            current_mean_us: 20.0,
+            diff_pct: Some(100.0),
+        }]);
+
+        let markdown = format_markdown(&report);
+        assert!(markdown.contains("## Baseline Comparison"));
+        assert!(markdown.contains("+100.0%"));
     }
 }

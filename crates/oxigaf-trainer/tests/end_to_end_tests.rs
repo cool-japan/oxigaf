@@ -108,6 +108,7 @@ fn make_test_gaussian_model() -> GaussianModel {
     let init_config = test_init_config();
     let mut rng = rand::rngs::StdRng::seed_from_u64(424242);
     GaussianInitializer::initialize(&mesh, &init_config, &mut rng)
+        .expect("test mesh is well-formed, so initialization must succeed")
 }
 
 /// Setup wgpu device and queue for testing (async).
@@ -125,6 +126,7 @@ async fn setup_gpu_async() -> (wgpu::Device, wgpu::Queue) {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: None,
             force_fallback_adapter: false,
+            apply_limit_buckets: false,
         })
         .await
         .expect("Failed to find GPU adapter");

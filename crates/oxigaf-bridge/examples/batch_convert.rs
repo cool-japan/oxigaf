@@ -180,8 +180,19 @@ fn main() -> Result<()> {
             let output_path = get_output_path(input_path, &args.input_dir, &args.output_dir);
             let converter = WeightConverter::new().with_precision(precision);
 
+            // `get_output_path` deliberately preserves the input's relative
+            // directory structure (e.g. `--pattern "**/*.safetensors"`), so
+            // a nested input needs its matching nested output directory
+            // created before the conversion writes into it.
+            let create_dir_result = match output_path.parent() {
+                Some(parent) => std::fs::create_dir_all(parent),
+                None => Ok(()),
+            };
+
             let file_start = Instant::now();
-            let result = converter.torsh_to_oxigaf(input_path, &output_path);
+            let result = create_dir_result
+                .map_err(oxigaf_bridge::BridgeError::from)
+                .and_then(|()| converter.torsh_to_oxigaf(input_path, &output_path));
             let duration = file_start.elapsed();
 
             let success = result.is_ok();

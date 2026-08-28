@@ -38,7 +38,9 @@ pub const EXIT_TRAINING_ERROR: i32 = 6;
 pub const EXIT_EXPORT_ERROR: i32 = 7;
 
 /// Exit code when process is interrupted (SIGINT / Ctrl+C).
-#[allow(dead_code)]
+///
+/// Matches the shell convention of `128 + SIGINT`; `main.rs`'s signal
+/// handler exits with it after restoring the terminal.
 pub const EXIT_INTERRUPTED: i32 = 130;
 
 // ---------------------------------------------------------------------------
@@ -47,7 +49,6 @@ pub const EXIT_INTERRUPTED: i32 = 130;
 
 /// Comprehensive CLI error type with user-friendly messages.
 #[derive(Debug, Error)]
-#[allow(dead_code)]
 pub enum CliError {
     /// Configuration file not found.
     #[error("Configuration file not found: {path}")]
@@ -113,8 +114,11 @@ pub enum CliError {
     #[error("Insufficient GPU memory: requires {required_mb}MB, available {available_mb}MB")]
     InsufficientVram { required_mb: u64, available_mb: u64 },
 
-    /// Input file (video/image) is invalid.
-    #[error("Invalid input file: {path}")]
+    /// Input path (video/image file, or a frame directory) is invalid.
+    // "input" rather than "input file": the same variant reports directory
+    // problems (e.g. image_io's "not an existing directory"), so the noun
+    // must not contradict the reason.
+    #[error("Invalid input: {path} — {reason}")]
     InputInvalid { path: PathBuf, reason: String },
 
     /// Model file not found or invalid format.
@@ -206,7 +210,7 @@ impl CliError {
                  unclosed brackets, or invalid escape sequences.",
             ),
             Self::ConfigValidationError { .. } => Some(
-                "Review the configuration values. Run `oxigaf config validate` \
+                "Review the configuration values. Run `oxigaf config validate <path>` \
                  for detailed field-by-field validation.",
             ),
             Self::FlameModelInvalid { .. } => Some(
@@ -266,5 +270,98 @@ impl CliError {
 // ---------------------------------------------------------------------------
 
 /// Convenience type alias for CLI operations.
-#[allow(dead_code)]
 pub type CliResult<T> = Result<T, CliError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every suggestion that names a subcommand must name one the parser
+    /// accepts. `cli::tests` asserts the same property from the parser's
+    /// side; this one guards the strings themselves against re-acquiring the
+    /// `config-cmd` spelling that never matched what users could type.
+    #[test]
+    fn suggestions_never_name_the_retired_config_cmd_spelling() {
+        let errors = [
+            CliError::ConfigNotFound {
+                path: PathBuf::from("oxigaf.toml"),
+                source: std::io::Error::new(std::io::ErrorKind::NotFound, "missing"),
+            },
+            CliError::ConfigValidationError {
+                reason: "total_iterations must be > 0".to_string(),
+            },
+        ];
+        for error in errors {
+            let text = error.suggestion().unwrap_or_default();
+            assert!(
+                text.contains("oxigaf config "),
+                "suggestion no longer points at `oxigaf config`: {text}"
+            );
+            assert!(
+                !text.contains("config-cmd"),
+                "suggestion still names the retired `config-cmd`: {text}"
+            );
+        }
+    }
+
+    /// The taxonomy exists so a scripted caller can branch on *why* a run
+    /// failed; collapsing distinct classes onto the catch-all would silently
+    /// undo that.
+    #[test]
+    fn exit_codes_separate_the_failure_classes() {
+        assert_eq!(
+            CliError::ConfigValidationError {
+                reason: String::new()
+            }
+            .exit_code(),
+            EXIT_CONFIG_ERROR
+        );
+        assert_eq!(
+            CliError::GpuNotAvailable {
+                backend: "any".to_string(),
+                fallback: None,
+            }
+            .exit_code(),
+            EXIT_GPU_ERROR
+        );
+        assert_eq!(
+            CliError::MeshExport("no isosurface".to_string()).exit_code(),
+            EXIT_EXPORT_ERROR
+        );
+        assert_eq!(
+            CliError::Other(anyhow::anyhow!("boom")).exit_code(),
+            EXIT_GENERAL_ERROR
+        );
+    }
+
+    /// Regression: `InputInvalid`'s `#[error(...)]` format string used to
+    /// name only `{path}`, so every caller's `reason` — the one field that
+    /// actually explains what is wrong with the input — was built and
+    /// carried around but never reached the user. `commands::quality` and
+    /// `commands::video` used to work around this by attaching the same
+    /// text again as `anyhow` context; now that `Display` renders `reason`
+    /// itself, the message must contain it exactly once.
+    #[test]
+    fn input_invalid_display_renders_the_reason_exactly_once() {
+        let reason = "not an existing file";
+        let err = CliError::InputInvalid {
+            path: PathBuf::from("frames/000.png"),
+            reason: reason.to_string(),
+        };
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("frames/000.png"),
+            "message dropped the path: {rendered}"
+        );
+        assert!(
+            rendered.contains(reason),
+            "message dropped the reason: {rendered}"
+        );
+        assert_eq!(
+            rendered.matches(reason).count(),
+            1,
+            "reason must appear exactly once, not duplicated by a leftover \
+             context layer: {rendered}"
+        );
+    }
+}

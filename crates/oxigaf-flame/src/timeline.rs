@@ -70,7 +70,10 @@ pub enum BlendMode {
     Override,
     /// This layer's output is added to lower layers (scaled by weight).
     Additive,
-    /// Weighted blend — identical to Additive in the implemented algorithm.
+    /// True weighted average across all active `Weighted` layers: each
+    /// layer's contribution is normalized by the sum of weights across
+    /// every non-muted, active `Weighted` layer, so e.g. `N` such layers
+    /// each at weight `1/N` average rather than sum.
     Weighted,
 }
 
@@ -220,6 +223,25 @@ impl AnimationTimeline {
         self.layers.iter_mut().find(|l| l.name == name)
     }
 
+    /// Return a reference to the layer whose clip has the given name.
+    ///
+    /// Layer lookups elsewhere in this API (e.g. [`layer_mut`](Self::layer_mut))
+    /// key on the *layer's* name; this keys on the *clip's* name instead,
+    /// useful when a layer-naming convention differs from clip names.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TimelineError::ClipNotFound`] if no layer's clip has that name.
+    pub fn find_layer_by_clip_name(
+        &self,
+        clip_name: &str,
+    ) -> Result<&TimelineLayer, TimelineError> {
+        self.layers
+            .iter()
+            .find(|l| l.clip.name == clip_name)
+            .ok_or_else(|| TimelineError::ClipNotFound(clip_name.to_string()))
+    }
+
     /// Set the blend weight of a layer.
     ///
     /// The weight is clamped to `[0, 1]` before being applied.
@@ -283,6 +305,26 @@ impl AnimationTimeline {
         self.global_time = t;
     }
 
+    /// Set the global playhead to an absolute time, rejecting non-finite
+    /// values.
+    ///
+    /// Unlike [`set_time`](Self::set_time), which accepts any `f32`
+    /// (including negative values -- treated as "before the layer
+    /// starts"), this rejects NaN and infinite times, which would
+    /// otherwise silently propagate into every layer's evaluated weights
+    /// via [`evaluate`](Self::evaluate).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TimelineError::InvalidTime`] if `t` is NaN or infinite.
+    pub fn try_set_time(&mut self, t: f32) -> Result<(), TimelineError> {
+        if !t.is_finite() {
+            return Err(TimelineError::InvalidTime(t));
+        }
+        self.global_time = t;
+        Ok(())
+    }
+
     /// Return the current global playhead position in seconds.
     #[must_use]
     pub fn global_time(&self) -> f32 {
@@ -305,14 +347,43 @@ impl AnimationTimeline {
     ///    - Apply blend mode:
     ///      - `Override`:  `result = lerp(result, layer_weights, weight)`
     ///      - `Additive`:  `result = result + layer_weights * weight`
-    ///      - `Weighted`:  same as Additive
+    ///      - `Weighted`:  `result += layer_weights * (weight / sum_of_active_weighted_weights)`
+    ///        (a true weighted average across all active `Weighted` layers)
     /// 3. Clamp final result element-wise to `[-3, 3]`.
     ///
     /// # Errors
     ///
     /// Returns [`TimelineError::DimMismatch`] if a layer produces a weight
-    /// vector of unexpected length.
+    /// vector of unexpected length, or [`TimelineError::BlendWeightOutOfRange`]
+    /// if a non-muted layer's `weight` is outside `[0, 1]` (the documented
+    /// contract on [`TimelineLayer::weight`], which the builder methods do
+    /// not themselves enforce).
     pub fn evaluate(&self) -> Result<Vec<f32>, TimelineError> {
+        for layer in &self.layers {
+            if !layer.muted && !(0.0..=1.0).contains(&layer.weight) {
+                return Err(TimelineError::BlendWeightOutOfRange(layer.weight));
+            }
+        }
+
+        // `Weighted` blending needs the total weight across all layers
+        // that will actually contribute this evaluation (same muted/
+        // not-yet-started skip conditions as the main pass below) so each
+        // contribution can be normalized into a true weighted average,
+        // unlike `Additive`/`Override` which apply as a single streaming
+        // pass with no such lookahead.
+        let weighted_total: f32 = self
+            .layers
+            .iter()
+            .filter(|l| {
+                if l.muted || l.blend_mode != BlendMode::Weighted {
+                    return false;
+                }
+                let local_time = self.global_time - l.start_offset;
+                !(local_time < 0.0 && l.clip.loop_mode == LoopMode::Once)
+            })
+            .map(|l| l.weight)
+            .sum();
+
         let mut result = vec![0.0_f32; self.expr_dims];
 
         for layer in &self.layers {
@@ -347,9 +418,17 @@ impl AnimationTimeline {
                         *r = *r + (lw - *r) * w;
                     }
                 }
-                BlendMode::Additive | BlendMode::Weighted => {
+                BlendMode::Additive => {
                     for (r, &lw) in result.iter_mut().zip(layer_weights.iter()) {
                         *r += lw * w;
+                    }
+                }
+                BlendMode::Weighted => {
+                    if weighted_total > 1e-12 {
+                        let norm_w = w / weighted_total;
+                        for (r, &lw) in result.iter_mut().zip(layer_weights.iter()) {
+                            *r += lw * norm_w;
+                        }
                     }
                 }
             }
@@ -658,6 +737,44 @@ mod tests {
         assert!((tl.global_time() - 0.0).abs() < 1e-6);
     }
 
+    // Gives `TimelineError::InvalidTime` a real construction site.
+    #[test]
+    fn test_try_set_time_rejects_non_finite() {
+        let mut tl = AnimationTimeline::new(2);
+        assert!(matches!(
+            tl.try_set_time(f32::NAN),
+            Err(TimelineError::InvalidTime(_))
+        ));
+        assert!(matches!(
+            tl.try_set_time(f32::INFINITY),
+            Err(TimelineError::InvalidTime(_))
+        ));
+        // Global time must be left unchanged by a rejected call.
+        assert!((tl.global_time() - 0.0).abs() < 1e-6);
+
+        assert!(tl.try_set_time(3.5).is_ok());
+        assert!((tl.global_time() - 3.5).abs() < 1e-4);
+    }
+
+    // Gives `TimelineError::ClipNotFound` a real construction site.
+    #[test]
+    fn test_find_layer_by_clip_name() {
+        let mut tl = AnimationTimeline::new(2);
+        let clip = make_neutral_clip(2);
+        let clip_name = clip.name.clone();
+        tl.add_layer(TimelineLayer::new("my_layer", clip)).unwrap();
+
+        let found = tl
+            .find_layer_by_clip_name(&clip_name)
+            .expect("clip should be found");
+        assert_eq!(found.name, "my_layer");
+
+        assert!(matches!(
+            tl.find_layer_by_clip_name("no_such_clip"),
+            Err(TimelineError::ClipNotFound(_))
+        ));
+    }
+
     // -----------------------------------------------------------------------
     // Test 13: evaluate with empty timeline returns zero vector
     // -----------------------------------------------------------------------
@@ -714,6 +831,45 @@ mod tests {
                 "muted layer should yield 0, got {v}"
             );
         }
+    }
+
+    // Gives `TimelineError::BlendWeightOutOfRange` a real construction
+    // site: `evaluate` validates each non-muted layer's weight, since
+    // `TimelineLayer::weight`'s documented `[0, 1]` contract is otherwise
+    // unenforced (`with_weight` stores the raw value unchecked, unlike
+    // `AnimationTimeline::set_layer_weight`, which clamps).
+    #[test]
+    fn test_evaluate_rejects_out_of_range_layer_weight() {
+        let mut tl = AnimationTimeline::new(2);
+        let clip = make_neutral_clip(2);
+        tl.add_layer(
+            TimelineLayer::new("l", clip)
+                .with_blend_mode(BlendMode::Override)
+                .with_weight(1.5), // out of [0, 1], unchecked by with_weight
+        )
+        .unwrap();
+
+        assert!(matches!(
+            tl.evaluate(),
+            Err(TimelineError::BlendWeightOutOfRange(w)) if (w - 1.5).abs() < 1e-6
+        ));
+    }
+
+    // A muted layer's out-of-range weight must NOT be validated -- it
+    // never contributes to the blend regardless of its weight value.
+    #[test]
+    fn test_evaluate_ignores_muted_layer_out_of_range_weight() {
+        let mut tl = AnimationTimeline::new(2);
+        let clip = make_neutral_clip(2);
+        tl.add_layer(
+            TimelineLayer::new("l", clip)
+                .with_blend_mode(BlendMode::Override)
+                .with_weight(5.0)
+                .muted(true),
+        )
+        .unwrap();
+
+        assert!(tl.evaluate().is_ok());
     }
 
     // -----------------------------------------------------------------------
@@ -791,7 +947,12 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_evaluate_weighted_blend() {
+    fn test_evaluate_weighted_blend_single_layer_normalizes_to_full_value() {
+        // A single `Weighted` layer's nominal weight cancels in the
+        // normalization -- the average of one value, at any positive
+        // weight, is that value itself. (Previously `Weighted` was a
+        // no-op alias for `Additive`, which would have scaled by the raw
+        // weight, 0.3, instead of normalizing to 1.0.)
         let mut tl = AnimationTimeline::new(2);
 
         let base = make_neutral_clip(2);
@@ -812,9 +973,53 @@ mod tests {
 
         tl.set_time(1.0);
         let result = tl.evaluate().unwrap();
-        // base=0, weighted adds 1.0 * 0.3 = 0.3
         for &v in &result {
-            assert!((v - 0.3).abs() < 1e-4, "weighted should add 0.3, got {v}");
+            assert!(
+                (v - 1.0).abs() < 1e-4,
+                "single weighted layer should normalize to its full value, got {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_evaluate_weighted_blend_two_layers_average() {
+        // Two `Weighted` layers at equal weight must AVERAGE (1.5), not
+        // sum (3.0) -- this is the behaviour `Weighted` was presumably
+        // introduced for, and was previously indistinguishable from
+        // `Additive`.
+        let mut tl = AnimationTimeline::new(2);
+
+        let base = make_neutral_clip(2);
+        tl.add_layer(
+            TimelineLayer::new("base", base)
+                .with_blend_mode(BlendMode::Override)
+                .with_weight(1.0),
+        )
+        .unwrap();
+
+        let w1 = make_once_clip(2, 1.0);
+        tl.add_layer(
+            TimelineLayer::new("w1", w1)
+                .with_blend_mode(BlendMode::Weighted)
+                .with_weight(1.0),
+        )
+        .unwrap();
+
+        let w2 = make_once_clip(2, 2.0);
+        tl.add_layer(
+            TimelineLayer::new("w2", w2)
+                .with_blend_mode(BlendMode::Weighted)
+                .with_weight(1.0),
+        )
+        .unwrap();
+
+        tl.set_time(1.0);
+        let result = tl.evaluate().unwrap();
+        for &v in &result {
+            assert!(
+                (v - 1.5).abs() < 1e-4,
+                "two equal-weight Weighted layers should average to 1.5, got {v}"
+            );
         }
     }
 

@@ -19,28 +19,18 @@
 //! println!("total loss: {loss}");
 //! ```
 
+use std::collections::VecDeque;
+
 use thiserror::Error;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// PRNG (no rand crate)
-// ─────────────────────────────────────────────────────────────────────────────
-
-#[inline]
-fn xorshift64(state: &mut u64) -> u64 {
-    *state ^= *state << 13;
-    *state ^= *state >> 7;
-    *state ^= *state << 17;
-    if *state == 0 {
-        *state = 1;
-    }
-    *state
-}
-
-#[allow(dead_code)]
-#[inline]
-fn xorshift_f32(state: &mut u64) -> f32 {
-    xorshift64(state) as f32 / u64::MAX as f32
-}
+// NOTE: this module used to carry a private `xorshift64`/`xorshift_f32` pair
+// under a "PRNG (no rand crate)" banner, kept alive only by `#[allow(dead_code)]`
+// and by two tests that exercised the generator itself. Every loss in this
+// module — soft-label KL, feature matching, attention transfer, relational KD —
+// is a deterministic function of its inputs, so nothing ever drew a number from
+// it. The scaffolding was removed rather than re-suppressed; a stochastic
+// distillation variant that needs randomness should take an explicit seed or
+// sampler parameter instead of reviving a module-private generator.
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Error type
@@ -320,9 +310,16 @@ pub fn kd_pairwise_distances(
 // Loss functions
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Soft-label KL divergence: `KL(student_soft ‖ teacher_soft)` with temperature `T`.
+/// Soft-label KL divergence: `KL(teacher_soft ‖ student_soft)` with temperature `T`.
 ///
-/// Applies softmax with temperature to both, then computes KL divergence.
+/// Applies softmax with temperature to both, then computes the FORWARD KL
+/// divergence with the teacher distribution as the target `p` and the
+/// student distribution as `q` — this is the standard Hinton et al. 2015
+/// knowledge-distillation direction, matching
+/// `F.kl_div(log_softmax(student), softmax(teacher))` in PyTorch. The
+/// reverse direction `KL(student ‖ teacher)` is mode-seeking and drives the
+/// student to collapse onto a single teacher mode instead of covering the
+/// whole teacher distribution, which is not what distillation wants.
 /// Returns a scalar loss.
 pub fn kd_soft_loss(
     student_logits: &[f32],
@@ -343,7 +340,7 @@ pub fn kd_soft_loss(
     }
     let student_soft = kd_softmax_with_temperature(student_logits, temperature)?;
     let teacher_soft = kd_softmax_with_temperature(teacher_logits, temperature)?;
-    kd_kl_divergence(&student_soft, &teacher_soft)
+    kd_kl_divergence(&teacher_soft, &student_soft)
 }
 
 /// Hard MSE loss between student output and ground-truth target.
@@ -463,9 +460,23 @@ pub fn kd_attention_transfer_loss(
 
 /// Relational knowledge distillation (Park et al. 2019).
 ///
-/// Computes pairwise distance matrix for a batch of embeddings, then penalises
-/// discrepancy between teacher and student distances using pseudo-Huber distance:
-/// `sqrt((d_teacher - d_student)² + beta²) - beta`
+/// Computes the pairwise distance matrix for a batch of embeddings on each
+/// side, normalises each side's distances by ITS OWN mean pairwise distance
+/// (the RKD-D distance-wise potential `psi(t_i, t_j) = ||t_i - t_j|| / mu`,
+/// with `mu` computed separately for teacher and student) — this
+/// normalisation is what makes the loss invariant to the differing
+/// embedding-space scales of teacher and student, which is the entire
+/// point of the method. It then penalises the discrepancy between the
+/// normalised teacher and student distances using the pseudo-Huber loss:
+/// `sqrt((psi_teacher - psi_student)² + beta²) - beta`
+///
+/// Note: with exactly 2 samples there is only one pairwise distance per
+/// side, so `psi = d / mean([d]) = 1.0` identically regardless of `d` —
+/// the loss is always exactly `0.0` for `batch == 2`, since normalisation
+/// erases all scale information when there is nothing to compare a
+/// distance to. A caller seeing `0.0` for a 2-sample batch should not read
+/// that as "student matches teacher"; use `batch >= 3` for a meaningful
+/// signal.
 ///
 /// `embeddings`: flat `[batch_size * embed_dim]`.
 pub fn kd_relational_loss(
@@ -503,11 +514,23 @@ pub fn kd_relational_loss(
     let dists_s = kd_pairwise_distances(student_embeddings, embed_dim)?;
     let dists_t = kd_pairwise_distances(teacher_embeddings, embed_dim)?;
     let n_pairs = dists_s.len();
+
+    // RKD-D normalises each side's pairwise distances by its OWN mean
+    // distance before comparing (see doc above). Guard the near-degenerate
+    // case (all embeddings on one side coincide, mean ≈ 0) to avoid
+    // dividing by ~0.
+    let mu_s = dists_s.iter().sum::<f32>() / n_pairs as f32;
+    let mu_t = dists_t.iter().sum::<f32>() / n_pairs as f32;
+    let mu_s = if mu_s > 1e-12 { mu_s } else { 1.0 };
+    let mu_t = if mu_t > 1e-12 { mu_t } else { 1.0 };
+
     let loss: f32 = dists_s
         .iter()
         .zip(dists_t.iter())
         .map(|(&ds, &dt)| {
-            let diff = dt - ds;
+            let psi_s = ds / mu_s;
+            let psi_t = dt / mu_t;
+            let diff = psi_t - psi_s;
             (diff * diff + beta * beta).sqrt() - beta
         })
         .sum::<f32>()
@@ -517,14 +540,27 @@ pub fn kd_relational_loss(
 
 /// Total distillation loss combining all terms.
 ///
-/// Attention and relational terms are set to 0.0 (caller must compute them
-/// separately if needed via `kd_attention_transfer_loss` / `kd_relational_loss`).
+/// `total = alpha*hard + (1-alpha)*T²*soft + feature_weight*feature
+///  + attention_weight*attention + relational_weight*relational`
+/// (matching [`DistillationConfig`]'s documented formula).
+///
+/// * `attention_maps` — when `Some((student_map, teacher_map, height,
+///   width, channels))`, feeds [`kd_attention_transfer_loss`] to compute
+///   the attention term; when `None`, the attention term is `0.0` (as if
+///   `config.attention_weight` were 0).
+/// * `relational_embeddings` — when `Some((student_embeddings,
+///   teacher_embeddings, embed_dim))`, feeds [`kd_relational_loss`] (using
+///   `config.beta`) to compute the relational term; when `None`, the
+///   relational term is `0.0`.
+#[allow(clippy::too_many_arguments)]
 pub fn kd_total_loss(
     student_logits: &[f32],
     teacher_logits: &[f32],
     target: &[f32],
     student_features: &[Vec<f32>],
     teacher_features: &[Vec<f32>],
+    attention_maps: Option<(&[f32], &[f32], usize, usize, usize)>,
+    relational_embeddings: Option<(&[f32], &[f32], usize)>,
     config: &DistillationConfig,
 ) -> Result<DistillationLoss, DistillationError> {
     config.validate()?;
@@ -536,15 +572,28 @@ pub fn kd_total_loss(
     } else {
         0.0
     };
-    let total =
-        config.alpha * hard + (1.0 - config.alpha) * t2 * soft + config.feature_weight * feature;
+    let attention = if let Some((s_map, t_map, height, width, channels)) = attention_maps {
+        kd_attention_transfer_loss(s_map, t_map, height, width, channels)?
+    } else {
+        0.0
+    };
+    let relational = if let Some((s_emb, t_emb, embed_dim)) = relational_embeddings {
+        kd_relational_loss(s_emb, t_emb, embed_dim, config.beta)?
+    } else {
+        0.0
+    };
+    let total = config.alpha * hard
+        + (1.0 - config.alpha) * t2 * soft
+        + config.feature_weight * feature
+        + config.attention_weight * attention
+        + config.relational_weight * relational;
     Ok(DistillationLoss {
         total,
         hard,
         soft,
         feature,
-        attention: 0.0,
-        relational: 0.0,
+        attention,
+        relational,
     })
 }
 
@@ -610,8 +659,10 @@ impl Default for DistillationStats {
 pub struct DistillationHistory {
     config: DistillationConfig,
     stats: DistillationStats,
-    /// Capped at [`HISTORY_CAP`] entries.
-    loss_history: Vec<f32>,
+    /// Capped at [`HISTORY_CAP`] entries. Backed by a `VecDeque` so eviction
+    /// at capacity is O(1) via `pop_front()` instead of the O(n) memmove
+    /// that `Vec::remove(0)` would incur on every recorded step.
+    loss_history: VecDeque<f32>,
     /// Running sums for incremental mean computation.
     sum_total: f32,
     sum_hard: f32,
@@ -625,7 +676,7 @@ impl DistillationHistory {
         Self {
             config,
             stats: DistillationStats::default(),
-            loss_history: Vec::new(),
+            loss_history: VecDeque::new(),
             sum_total: 0.0,
             sum_hard: 0.0,
             sum_soft: 0.0,
@@ -652,9 +703,9 @@ impl DistillationHistory {
                 EMA_DECAY * self.stats.ema_total_loss + (1.0 - EMA_DECAY) * loss.total;
         }
         if self.loss_history.len() >= HISTORY_CAP {
-            self.loss_history.remove(0);
+            self.loss_history.pop_front();
         }
-        self.loss_history.push(loss.total);
+        self.loss_history.push_back(loss.total);
     }
 
     /// Immutable access to current statistics.
@@ -663,7 +714,7 @@ impl DistillationHistory {
     }
 
     /// Immutable access to loss history (capped at 2000 entries).
-    pub fn loss_history(&self) -> &[f32] {
+    pub fn loss_history(&self) -> &VecDeque<f32> {
         &self.loss_history
     }
 
@@ -676,10 +727,12 @@ impl DistillationHistory {
         if window < 2 || self.loss_history.len() < window {
             return false;
         }
-        let slice = &self.loss_history[self.loss_history.len() - window..];
+        let start = self.loss_history.len() - window;
         let half = window / 2;
-        let first_mean: f32 = slice[..half].iter().sum::<f32>() / half as f32;
-        let second_mean: f32 = slice[half..].iter().sum::<f32>() / (window - half) as f32;
+        let first_mean: f32 =
+            self.loss_history.range(start..start + half).sum::<f32>() / half as f32;
+        let second_mean: f32 =
+            self.loss_history.range(start + half..).sum::<f32>() / (window - half) as f32;
         second_mean <= first_mean
     }
 
@@ -1264,7 +1317,10 @@ mod tests {
         let s_feats = vec![vec![1.0_f32, 2.0]];
         let t_feats = vec![vec![1.1_f32, 1.9]];
         let cfg = DistillationConfig::default();
-        let loss = kd_total_loss(&s_logits, &t_logits, &target, &s_feats, &t_feats, &cfg).unwrap();
+        let loss = kd_total_loss(
+            &s_logits, &t_logits, &target, &s_feats, &t_feats, None, None, &cfg,
+        )
+        .unwrap();
         assert!(loss.total >= 0.0);
         assert!(loss.hard >= 0.0);
         assert!(loss.soft >= 0.0);
@@ -1282,6 +1338,8 @@ mod tests {
             &target,
             &[],
             &[],
+            None,
+            None,
             &DistillationConfig::default(),
         )
         .unwrap();
@@ -1301,11 +1359,82 @@ mod tests {
             relational_weight: 0.0001,
             beta: 1.0,
         };
-        let loss = kd_total_loss(&s, &t, &target, &[], &[], &cfg).unwrap();
+        let loss = kd_total_loss(&s, &t, &target, &[], &[], None, None, &cfg).unwrap();
         let hard_ref = kd_hard_loss(&s, &target).unwrap();
         let soft_ref = kd_soft_loss(&s, &t, cfg.temperature).unwrap();
         let expected = 0.5 * hard_ref + 0.5 * 4.0 * soft_ref; // T²=4
         assert!(approx(loss.total, expected, 1e-5));
+    }
+
+    #[test]
+    fn test_total_loss_includes_attention_and_relational_when_provided() {
+        // Regression test: kd_total_loss must actually wire in
+        // attention_weight/relational_weight instead of hardcoding both
+        // terms to 0.0.
+        let s_logits = vec![1.0_f32, 0.5, 0.2];
+        let t_logits = vec![0.9_f32, 0.6, 0.3];
+        let target = vec![0.0_f32, 1.0, 0.0];
+
+        // 2x2 spatial, 2 channels; student/teacher differ.
+        let s_map: Vec<f32> = (0..8).map(|i| i as f32).collect();
+        let t_map: Vec<f32> = (0..8).map(|i| (7 - i) as f32).collect();
+
+        // batch=3, embed_dim=2 — large enough that RKD-D normalisation is
+        // non-degenerate (see kd_relational_loss's doc on the batch=2 case).
+        let s_emb = vec![1.0_f32, 0.0, 0.0, 1.0, 1.0, 1.0];
+        let t_emb = vec![2.0_f32, 0.0, 0.0, 2.0, 3.0, 3.0];
+
+        let cfg = DistillationConfig::default();
+        let loss = kd_total_loss(
+            &s_logits,
+            &t_logits,
+            &target,
+            &[],
+            &[],
+            Some((&s_map, &t_map, 2, 2, 2)),
+            Some((&s_emb, &t_emb, 2)),
+            &cfg,
+        )
+        .unwrap();
+
+        let expected_attention = kd_attention_transfer_loss(&s_map, &t_map, 2, 2, 2).unwrap();
+        let expected_relational = kd_relational_loss(&s_emb, &t_emb, 2, cfg.beta).unwrap();
+        assert!(
+            expected_attention > 0.0,
+            "test data should produce a nonzero attention term"
+        );
+        assert!(
+            expected_relational > 0.0,
+            "test data should produce a nonzero relational term"
+        );
+
+        assert!(approx(loss.attention, expected_attention, 1e-5));
+        assert!(approx(loss.relational, expected_relational, 1e-5));
+
+        let hard = kd_hard_loss(&s_logits, &target).unwrap();
+        let soft = kd_soft_loss(&s_logits, &t_logits, cfg.temperature).unwrap();
+        let t2 = cfg.temperature * cfg.temperature;
+        let expected_total = cfg.alpha * hard
+            + (1.0 - cfg.alpha) * t2 * soft
+            + cfg.attention_weight * expected_attention
+            + cfg.relational_weight * expected_relational;
+        assert!(
+            approx(loss.total, expected_total, 1e-4),
+            "expected total={expected_total}, got {}",
+            loss.total
+        );
+    }
+
+    #[test]
+    fn test_total_loss_omits_attention_and_relational_when_none() {
+        let s_logits = vec![1.0_f32, 0.5, 0.2];
+        let t_logits = vec![0.9_f32, 0.6, 0.3];
+        let target = vec![0.0_f32, 1.0, 0.0];
+        let cfg = DistillationConfig::default();
+        let loss =
+            kd_total_loss(&s_logits, &t_logits, &target, &[], &[], None, None, &cfg).unwrap();
+        assert_eq!(loss.attention, 0.0);
+        assert_eq!(loss.relational, 0.0);
     }
 
     // ── DistillationHistory ───────────────────────────────────────────────────
@@ -1409,6 +1538,31 @@ mod tests {
         assert_eq!(h.loss_history().len(), 2000);
     }
 
+    // Regression test: eviction at capacity must use O(1) `pop_front` (via
+    // `VecDeque`) rather than `Vec::remove(0)`, while preserving FIFO order
+    // — the oldest entries are dropped first and the remaining entries stay
+    // in chronological order.
+    #[test]
+    fn test_history_loss_history_evicts_oldest_first() {
+        let mut h = DistillationHistory::new(DistillationConfig::default());
+        for i in 0..2001 {
+            h.record(&DistillationLoss {
+                total: i as f32,
+                hard: 0.0,
+                soft: 0.0,
+                feature: 0.0,
+                attention: 0.0,
+                relational: 0.0,
+            });
+        }
+        let history = h.loss_history();
+        assert_eq!(history.len(), 2000);
+        // total=0.0 (the very first recorded step) must have been evicted;
+        // the oldest surviving entry is total=1.0.
+        assert_eq!(history.front().copied(), Some(1.0));
+        assert_eq!(history.back().copied(), Some(2000.0));
+    }
+
     #[test]
     fn test_history_is_converging_constant_loss() {
         let mut h = DistillationHistory::new(DistillationConfig::default());
@@ -1506,23 +1660,30 @@ mod tests {
         assert!(s.contains("steps"));
     }
 
-    // ── xorshift64 ────────────────────────────────────────────────────────────
+    // ── determinism ───────────────────────────────────────────────────────────
+    //
+    // Replaces the two tests that only exercised the removed module-private
+    // xorshift PRNG. What actually matters for this module is the property
+    // that made that PRNG dead in the first place: every loss here is a pure
+    // function of its inputs, so repeated evaluation must be bit-identical.
 
     #[test]
-    fn test_xorshift_sequence_non_zero() {
-        let mut state: u64 = 42;
-        for _ in 0..1000 {
-            let v = xorshift64(&mut state);
-            assert!(v != 0, "xorshift64 produced zero");
-        }
-    }
+    fn test_combined_loss_is_deterministic() {
+        let config = DistillationConfig::default();
+        let student = vec![1.8_f32, 1.1, 0.6, -0.4];
+        let teacher = vec![2.0_f32, 1.0, 0.5, -0.5];
+        let target = vec![0.0_f32, 1.0, 0.0, 0.0];
 
-    #[test]
-    fn test_xorshift_f32_in_unit_interval() {
-        let mut state: u64 = 12345;
-        for _ in 0..1000 {
-            let v = xorshift_f32(&mut state);
-            assert!((0.0..=1.0).contains(&v), "v={v}");
+        let first = kd_combined_loss(&student, &teacher, &target, &config)
+            .expect("test: combined loss should succeed");
+        for _ in 0..8 {
+            let again = kd_combined_loss(&student, &teacher, &target, &config)
+                .expect("test: combined loss should succeed");
+            assert_eq!(
+                first.to_bits(),
+                again.to_bits(),
+                "kd_combined_loss must be a pure function of its inputs"
+            );
         }
     }
 }

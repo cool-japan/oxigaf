@@ -223,39 +223,69 @@ fn softmax(values: &[f32], temperature: f32) -> Vec<f32> {
 
 /// Compute the overall expression intensity as the normalised RMS of the leading coefficients.
 ///
-/// Uses the first `min(20, params.len())` coefficients. Result is clamped to [0, 1] by
-/// dividing by 3.0 (typical maximum absolute value for FLAME PCA coefficients).
+/// Uses the first `min(config.n_params, params.len())` coefficients. Result is
+/// clamped to [0, 1] by dividing by 3.0 (typical maximum absolute value for
+/// FLAME PCA coefficients).
+///
+/// # Not monotonic in `n_params`
+///
+/// Because this is a root-mean-*square*, widening the window can *lower* the
+/// result: the extra coefficients enlarge the divisor `n` whether or not they
+/// contribute to the numerator. With `params = [3, 0, 0, …]`, `n_params = 1`
+/// reports `1.0` while `n_params = 8` reports `sqrt(9/8)/3 ≈ 0.354`. That is
+/// the intended reading of an RMS — "how strong is the average leading
+/// coefficient", not "how much total energy is there" — so do not assume
+/// `intensity(n) <= intensity(n + k)`. Use a fixed `n_params` when comparing
+/// intensities across frames or subjects.
 ///
 /// # Errors
 ///
 /// Returns [`EmotionError::EmptyParams`] when `params` is empty.
-pub fn compute_expression_intensity(params: &[f32]) -> Result<f32, EmotionError> {
+pub fn compute_expression_intensity(
+    params: &[f32],
+    config: &EmotionConfig,
+) -> Result<f32, EmotionError> {
     if params.is_empty() {
         return Err(EmotionError::EmptyParams);
     }
-    let n = params.len().min(20);
+    let n = params.len().min(config.n_params);
+    if n == 0 {
+        // config.n_params == 0: no coefficients to consider.
+        return Ok(0.0);
+    }
     let rms = (params[..n].iter().map(|v| v * v).sum::<f32>() / n as f32).sqrt();
     // Normalise: typical max |coeff| for FLAME PCA is ~3.0
     let normalised = (rms / 3.0).clamp(0.0, 1.0);
     Ok(normalised)
 }
 
-/// Safely index a slice, returning 0.0 when out of bounds.
+/// Safely index a slice, returning 0.0 when `i` is out of bounds for
+/// `params` OR `i >= limit`.
 #[inline]
-fn param_at(params: &[f32], i: usize) -> f32 {
+fn param_at(params: &[f32], i: usize, limit: usize) -> f32 {
+    if i >= limit {
+        return 0.0;
+    }
     params.get(i).copied().unwrap_or(0.0)
 }
 
 /// Project expression PCA coefficients onto the arousal-valence circumplex axes.
 ///
-/// Uses a simple linear combination of the first 10 expression parameters with
-/// hand-tuned weights. Real systems would fit these from labelled data.
+/// Uses a simple linear combination of 6 expression parameters (indices 0
+/// and 2 and 4 for arousal; 1, 3 and 5 for valence) with hand-tuned weights
+/// of 0.5/0.3/0.2 each. Real systems would fit these from labelled data.
+/// Any of these 6 indices at or beyond `config.n_params` is treated as
+/// absent (contributes 0), so setting `config.n_params < 6` progressively
+/// drops the higher-indexed terms.
 ///
 /// # Errors
 ///
 /// Returns [`EmotionError::EmptyParams`] when `params` is empty, or
 /// [`EmotionError::ParamsTooShort`] when fewer than 2 parameters are provided.
-pub fn compute_arousal_valence(params: &[f32]) -> Result<ArousalValence, EmotionError> {
+pub fn compute_arousal_valence(
+    params: &[f32],
+    config: &EmotionConfig,
+) -> Result<ArousalValence, EmotionError> {
     if params.is_empty() {
         return Err(EmotionError::EmptyParams);
     }
@@ -266,8 +296,13 @@ pub fn compute_arousal_valence(params: &[f32]) -> Result<ArousalValence, Emotion
         });
     }
 
-    let arousal = param_at(params, 0) * 0.5 + param_at(params, 2) * 0.3 + param_at(params, 4) * 0.2;
-    let valence = param_at(params, 1) * 0.5 + param_at(params, 3) * 0.3 + param_at(params, 5) * 0.2;
+    let limit = config.n_params;
+    let arousal = param_at(params, 0, limit) * 0.5
+        + param_at(params, 2, limit) * 0.3
+        + param_at(params, 4, limit) * 0.2;
+    let valence = param_at(params, 1, limit) * 0.5
+        + param_at(params, 3, limit) * 0.3
+        + param_at(params, 5, limit) * 0.2;
 
     Ok(ArousalValence {
         arousal: arousal.clamp(-1.0, 1.0),
@@ -291,7 +326,7 @@ pub fn compute_emotion_scores(
     params: &[f32],
     config: &EmotionConfig,
 ) -> Result<Vec<EmotionScore>, EmotionError> {
-    let av = compute_arousal_valence(params)?;
+    let av = compute_arousal_valence(params, config)?;
 
     let emotions = BasicEmotion::all();
     let similarities: Vec<f32> = emotions
@@ -343,8 +378,8 @@ pub fn recognize_emotion(
         });
     }
 
-    let intensity = compute_expression_intensity(params)?;
-    let arousal_valence = compute_arousal_valence(params)?;
+    let intensity = compute_expression_intensity(params, config)?;
+    let arousal_valence = compute_arousal_valence(params, config)?;
     let scores = compute_emotion_scores(params, config)?;
 
     // scores is sorted descending; first entry is dominant
@@ -434,14 +469,19 @@ pub fn emotion_trajectory(
 /// - Dominant emotions are majority-voted over a sliding window of up to 5 frames.
 /// - Confidences are smoothed with exponential moving average (EMA, decay = 0.7).
 ///
-/// The returned trajectory has the same length as the input.
+/// The returned `emotions`/`confidences` share a length equal to
+/// `min(trajectory.emotions.len(), trajectory.confidences.len())`.
+/// `EmotionTrajectory`'s fields are all public and independently writable,
+/// so the two are not guaranteed to already have matching lengths; only
+/// their common prefix can be smoothed safely. `av_history` is always
+/// copied through unchanged.
 #[must_use]
 pub fn smooth_emotion_trajectory(trajectory: &EmotionTrajectory) -> EmotionTrajectory {
     const WINDOW: usize = 5;
     const HALF: usize = WINDOW / 2;
     const EMA_DECAY: f32 = 0.7;
 
-    let n = trajectory.emotions.len();
+    let n = trajectory.emotions.len().min(trajectory.confidences.len());
     if n == 0 {
         return EmotionTrajectory {
             emotions: Vec::new(),
@@ -479,7 +519,7 @@ pub fn smooth_emotion_trajectory(trajectory: &EmotionTrajectory) -> EmotionTraje
     let mut smoothed_confidences = Vec::with_capacity(n);
     let mut ema = trajectory.confidences[0];
     smoothed_confidences.push(ema);
-    for &c in &trajectory.confidences[1..] {
+    for &c in &trajectory.confidences[1..n] {
         ema = EMA_DECAY * ema + (1.0 - EMA_DECAY) * c;
         smoothed_confidences.push(ema);
     }
@@ -662,27 +702,27 @@ mod tests {
     #[test]
     fn intensity_zero_for_zero_params() {
         let params = vec![0.0_f32; 30];
-        let intensity = compute_expression_intensity(&params).unwrap();
+        let intensity = compute_expression_intensity(&params, &EmotionConfig::default()).unwrap();
         assert_abs_diff_eq!(intensity, 0.0, epsilon = 1e-6);
     }
 
     #[test]
     fn intensity_large_values_clamped_to_one() {
         let params = vec![100.0_f32; 20];
-        let intensity = compute_expression_intensity(&params).unwrap();
+        let intensity = compute_expression_intensity(&params, &EmotionConfig::default()).unwrap();
         assert_abs_diff_eq!(intensity, 1.0, epsilon = 1e-6);
     }
 
     #[test]
     fn intensity_empty_params_errors() {
-        let result = compute_expression_intensity(&[]);
+        let result = compute_expression_intensity(&[], &EmotionConfig::default());
         assert!(matches!(result, Err(EmotionError::EmptyParams)));
     }
 
     #[test]
     fn intensity_single_param_succeeds() {
         let params = vec![1.5_f32];
-        let intensity = compute_expression_intensity(&params).unwrap();
+        let intensity = compute_expression_intensity(&params, &EmotionConfig::default()).unwrap();
         // RMS = 1.5, normalised = 1.5/3.0 = 0.5
         assert_relative_eq!(intensity, 0.5, epsilon = 1e-5);
     }
@@ -691,7 +731,8 @@ mod tests {
     fn intensity_in_unit_interval() {
         for mag in [0.0, 0.5, 1.0, 2.0, 3.0, 5.0] {
             let params = vec![mag; 20];
-            let intensity = compute_expression_intensity(&params).unwrap();
+            let intensity =
+                compute_expression_intensity(&params, &EmotionConfig::default()).unwrap();
             assert!(
                 (0.0..=1.0).contains(&intensity),
                 "intensity {intensity} out of [0,1] for mag={mag}"
@@ -699,34 +740,148 @@ mod tests {
         }
     }
 
+    #[test]
+    fn intensity_respects_config_n_params() {
+        // Regression test: `EmotionConfig::n_params` previously had zero
+        // effect on `compute_expression_intensity`.
+        let mut params = vec![0.0_f32; 20];
+        params[0] = 3.0; // at the clamp boundary: |3.0|/3.0 = 1.0
+        for v in params.iter_mut().skip(10) {
+            *v = 3.0; // large values, but past a restrictive n_params
+        }
+
+        let restrictive = EmotionConfig {
+            n_params: 1,
+            ..EmotionConfig::default()
+        };
+        let intensity = compute_expression_intensity(&params, &restrictive).unwrap();
+        // Only params[0] = 3.0 is considered: RMS = 3.0, normalised = 1.0.
+        assert_abs_diff_eq!(intensity, 1.0, epsilon = 1e-6);
+
+        let permissive = EmotionConfig {
+            n_params: 20,
+            ..EmotionConfig::default()
+        };
+        let intensity_full = compute_expression_intensity(&params, &permissive).unwrap();
+        // Widening the window changes the answer, which is the whole point of
+        // the regression: `n_params` is genuinely consulted. The exact value
+        // is the closed form of the documented metric — 11 entries of 3.0
+        // (index 0 plus indices 10..20) averaged over the full 20-wide
+        // window: sqrt(11 * 9 / 20) / 3 = sqrt(0.55).
+        let expected_full = 0.55_f32.sqrt();
+        assert_abs_diff_eq!(intensity_full, expected_full, epsilon = 1e-6);
+        assert!(
+            (intensity_full - intensity).abs() > 1e-3,
+            "n_params must change the result: {intensity_full} vs {intensity}"
+        );
+    }
+
+    #[test]
+    fn intensity_is_not_monotonic_in_n_params() {
+        // `compute_expression_intensity` is a *root-mean-square* over the
+        // first `n` coefficients, so it is deliberately NOT monotonic in
+        // `n_params`: extending the window over near-zero coefficients
+        // divides by a larger `n` without adding to the numerator, which
+        // *lowers* the reported intensity.
+        //
+        // This is the documented behaviour of an RMS ("how strong is the
+        // average leading coefficient"), not a bug — but it is unintuitive
+        // enough that an earlier version of `intensity_respects_config_n_params`
+        // asserted the opposite (`intensity_full >= intensity`) and failed.
+        // Pin the real property down so that mistake cannot recur.
+        let mut params = vec![0.0_f32; 8];
+        params[0] = 3.0; // one strong coefficient, the rest silent
+
+        let narrow = compute_expression_intensity(
+            &params,
+            &EmotionConfig {
+                n_params: 1,
+                ..EmotionConfig::default()
+            },
+        )
+        .unwrap();
+        let wide = compute_expression_intensity(
+            &params,
+            &EmotionConfig {
+                n_params: 8,
+                ..EmotionConfig::default()
+            },
+        )
+        .unwrap();
+
+        assert_abs_diff_eq!(narrow, 1.0, epsilon = 1e-6);
+        // sqrt(9 / 8) / 3 = sqrt(1/8)
+        assert_abs_diff_eq!(wide, 0.125_f32.sqrt(), epsilon = 1e-6);
+        assert!(
+            wide < narrow,
+            "padding the window with zeros must dilute the RMS: {wide} vs {narrow}"
+        );
+    }
+
+    #[test]
+    fn intensity_zero_n_params_is_zero_not_nan() {
+        let params = vec![5.0_f32; 10];
+        let config = EmotionConfig {
+            n_params: 0,
+            ..EmotionConfig::default()
+        };
+        let intensity = compute_expression_intensity(&params, &config).unwrap();
+        assert_abs_diff_eq!(intensity, 0.0, epsilon = 1e-6);
+    }
+
     // ── compute_arousal_valence ──────────────────────────────────
 
     #[test]
     fn arousal_valence_zeros_gives_origin() {
         let params = vec![0.0_f32; 10];
-        let av = compute_arousal_valence(&params).unwrap();
+        let av = compute_arousal_valence(&params, &EmotionConfig::default()).unwrap();
         assert_abs_diff_eq!(av.arousal, 0.0, epsilon = 1e-6);
         assert_abs_diff_eq!(av.valence, 0.0, epsilon = 1e-6);
     }
 
     #[test]
     fn arousal_valence_empty_errors() {
-        let result = compute_arousal_valence(&[]);
+        let result = compute_arousal_valence(&[], &EmotionConfig::default());
         assert!(matches!(result, Err(EmotionError::EmptyParams)));
     }
 
     #[test]
     fn arousal_valence_single_param_errors() {
-        let result = compute_arousal_valence(&[1.0]);
+        let result = compute_arousal_valence(&[1.0], &EmotionConfig::default());
         assert!(matches!(result, Err(EmotionError::ParamsTooShort { .. })));
     }
 
     #[test]
     fn arousal_valence_clamped_to_minus_one_one() {
         let params = vec![10.0_f32; 10];
-        let av = compute_arousal_valence(&params).unwrap();
+        let av = compute_arousal_valence(&params, &EmotionConfig::default()).unwrap();
         assert!(av.arousal >= -1.0 && av.arousal <= 1.0);
         assert!(av.valence >= -1.0 && av.valence <= 1.0);
+    }
+
+    #[test]
+    fn arousal_valence_respects_config_n_params() {
+        // Regression test: `EmotionConfig::n_params` previously had zero
+        // effect on `compute_arousal_valence`. With n_params=1, only index 0
+        // (arousal weight 0.5) may contribute; index 2 and 4 must be dropped.
+        let mut params = vec![0.0_f32; 10];
+        params[0] = 1.0;
+        params[2] = 1.0;
+        params[4] = 1.0;
+        let restrictive = EmotionConfig {
+            n_params: 1,
+            ..EmotionConfig::default()
+        };
+        let av = compute_arousal_valence(&params, &restrictive).unwrap();
+        assert_abs_diff_eq!(av.arousal, 0.5, epsilon = 1e-6);
+
+        let permissive = EmotionConfig {
+            n_params: 10,
+            ..EmotionConfig::default()
+        };
+        let av_full = compute_arousal_valence(&params, &permissive).unwrap();
+        // All three terms (0.5 + 0.3 + 0.2) contribute now.
+        assert_abs_diff_eq!(av_full.arousal, 1.0, epsilon = 1e-6);
     }
 
     #[test]
@@ -734,7 +889,7 @@ mod tests {
         // params[0] = 2.0, all others 0 → arousal = 2.0*0.5 = 1.0 (clamped), valence = 0
         let mut params = vec![0.0_f32; 10];
         params[0] = 2.0;
-        let av = compute_arousal_valence(&params).unwrap();
+        let av = compute_arousal_valence(&params, &EmotionConfig::default()).unwrap();
         assert!(
             av.arousal > 0.0,
             "Expected positive arousal from params[0]=2.0"
@@ -976,6 +1131,48 @@ mod tests {
     }
 
     #[test]
+    fn smooth_empty_confidences_does_not_panic() {
+        // Regression test: `EmotionTrajectory`'s fields are all public and
+        // independently writable, so `emotions` non-empty with
+        // `confidences` empty is a shape the type permits even though
+        // `emotion_trajectory` itself never produces it. This must not
+        // index `confidences[0]` unconditionally.
+        let traj = EmotionTrajectory {
+            emotions: vec![BasicEmotion::Happy],
+            confidences: Vec::new(),
+            av_history: Vec::new(),
+        };
+        let smoothed = smooth_emotion_trajectory(&traj);
+        assert!(smoothed.emotions.is_empty());
+        assert!(smoothed.confidences.is_empty());
+    }
+
+    #[test]
+    fn smooth_mismatched_lengths_uses_common_prefix() {
+        // `confidences` longer than `emotions`: the result must not exceed
+        // the shorter (common) length, so `emotions`/`confidences` stay the
+        // same length as each other in the output.
+        let traj = EmotionTrajectory {
+            emotions: vec![BasicEmotion::Happy, BasicEmotion::Sad],
+            confidences: vec![0.9, 0.8, 0.7, 0.6],
+            av_history: Vec::new(),
+        };
+        let smoothed = smooth_emotion_trajectory(&traj);
+        assert_eq!(smoothed.emotions.len(), 2);
+        assert_eq!(smoothed.confidences.len(), 2);
+
+        // `emotions` longer than `confidences`.
+        let traj2 = EmotionTrajectory {
+            emotions: vec![BasicEmotion::Happy, BasicEmotion::Sad, BasicEmotion::Angry],
+            confidences: vec![0.9],
+            av_history: Vec::new(),
+        };
+        let smoothed2 = smooth_emotion_trajectory(&traj2);
+        assert_eq!(smoothed2.emotions.len(), 1);
+        assert_eq!(smoothed2.confidences.len(), 1);
+    }
+
+    #[test]
     fn smooth_constant_emotion_unchanged() {
         // All frames same params → same dominant emotion → majority vote unchanged
         let frames: Vec<Vec<f32>> = (0..10).map(|_| vec![0.5_f32; 10]).collect();
@@ -1168,12 +1365,12 @@ mod tests {
     #[test]
     fn arousal_valence_within_bounds_for_extreme_params() {
         let params_pos = vec![100.0_f32; 10];
-        let av = compute_arousal_valence(&params_pos).unwrap();
+        let av = compute_arousal_valence(&params_pos, &EmotionConfig::default()).unwrap();
         assert!(av.arousal >= -1.0 && av.arousal <= 1.0);
         assert!(av.valence >= -1.0 && av.valence <= 1.0);
 
         let params_neg = vec![-100.0_f32; 10];
-        let av2 = compute_arousal_valence(&params_neg).unwrap();
+        let av2 = compute_arousal_valence(&params_neg, &EmotionConfig::default()).unwrap();
         assert!(av2.arousal >= -1.0 && av2.arousal <= 1.0);
         assert!(av2.valence >= -1.0 && av2.valence <= 1.0);
     }

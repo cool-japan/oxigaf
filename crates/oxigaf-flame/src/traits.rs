@@ -3,8 +3,12 @@
 //! These traits provide abstraction boundaries that allow testing and
 //! interchangeability of normal map generation and surface sampling.
 
+use crate::model::FlameModel;
+use crate::normal_map::{Camera, NormalMapRenderer};
 use crate::{FlameError, FlameParams, Mesh};
+use nalgebra as na;
 use rand::SeedableRng;
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // NormalMapProvider
@@ -33,13 +37,20 @@ pub trait NormalMapProvider: Send + Sync {
     /// Generate multiple normal maps from the same parameters but different camera poses.
     ///
     /// `camera_poses` are 4×4 view matrices (one per view) in row-major order.
-    /// The default implementation calls [`generate_normal_map`] once per pose,
-    /// ignoring the pose matrix. Implementors that support camera transformations
-    /// should override this method.
+    ///
+    /// The default implementation cannot honour distinct camera poses (it has
+    /// no camera model to apply them with), so it only handles the
+    /// unambiguous cases: zero poses yields zero images, and exactly one pose
+    /// delegates to [`generate_normal_map`] once (there is nothing for a
+    /// single view to disagree with). For two or more poses it returns
+    /// [`FlameError::InvalidParams`] rather than silently returning N
+    /// identical images — implementors that support camera transformations
+    /// (e.g. [`FlameNormalMapProvider`]) must override this method.
     ///
     /// # Errors
     ///
-    /// Returns the first error encountered during generation.
+    /// Returns [`FlameError::InvalidParams`] if `camera_poses.len() > 1`.
+    /// Otherwise returns the first error encountered during generation.
     ///
     /// [`generate_normal_map`]: NormalMapProvider::generate_normal_map
     fn generate_normal_maps_multi_view(
@@ -49,10 +60,15 @@ pub trait NormalMapProvider: Send + Sync {
         width: u32,
         height: u32,
     ) -> Result<Vec<Vec<u8>>, FlameError> {
-        camera_poses
-            .iter()
-            .map(|_pose| self.generate_normal_map(params, width, height))
-            .collect()
+        match camera_poses.len() {
+            0 => Ok(Vec::new()),
+            1 => Ok(vec![self.generate_normal_map(params, width, height)?]),
+            n => Err(FlameError::InvalidParams(format!(
+                "generate_normal_maps_multi_view: the default implementation ignores \
+                 camera poses and cannot honour {n} distinct views; the provider must \
+                 override this method to support multi-view generation"
+            ))),
+        }
     }
 
     /// Image dimensions this provider outputs by default.
@@ -86,7 +102,11 @@ pub struct SurfaceSample {
 
 /// Trait for sampling surface points from a FLAME mesh.
 ///
-/// Used by Gaussian initialization in the trainer crate.
+/// This is the pluggable seam for Gaussian initialization: the trainer's
+/// `GaussianInitializer::initialize_with_sampler` accepts any
+/// `&dyn MeshSurfaceSampler`, so an alternative sampling strategy can be
+/// substituted without touching the initializer. [`DefaultSampler`] is the
+/// area-weighted implementation used by default.
 pub trait MeshSurfaceSampler: Send + Sync {
     /// Sample `n` surface points from the mesh.
     ///
@@ -106,7 +126,9 @@ pub trait MeshSurfaceSampler: Send + Sync {
 
 /// Default implementation of [`MeshSurfaceSampler`] using area-weighted sampling.
 ///
-/// Delegates to [`crate::sampler::sample_mesh_surface`].
+/// Delegates to [`crate::sampler::sample_mesh_surface`], propagating its
+/// malformed-mesh errors (mismatched `normals` length, out-of-range face
+/// indices) instead of reporting them as an empty sample set.
 pub struct DefaultSampler;
 
 impl MeshSurfaceSampler for DefaultSampler {
@@ -116,23 +138,22 @@ impl MeshSurfaceSampler for DefaultSampler {
         n: usize,
         seed: u64,
     ) -> Result<SurfaceSample, FlameError> {
-        if n == 0 {
-            return Ok(SurfaceSample {
-                positions: Vec::new(),
-                normals: Vec::new(),
-                face_indices: Vec::new(),
-                barycentric: Vec::new(),
-            });
-        }
-
+        // Validate before honouring `n == 0`: a caller probing a mesh with a
+        // zero-sample request must still learn that the mesh is unusable,
+        // and this keeps the trait's contract identical to
+        // `sample_mesh_surface`'s regardless of `n`. (An `n == 0` fast path
+        // here would silently accept a malformed mesh that every non-zero
+        // `n` rejects.)
         if mesh.faces.is_empty() {
             return Err(FlameError::InvalidParams(
                 "cannot sample from a mesh with no faces".to_string(),
             ));
         }
 
+        // `sample_mesh_surface` performs the remaining topology validation
+        // and itself returns no points when `n == 0`.
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-        let points = crate::sampler::sample_mesh_surface(mesh, n, &mut rng);
+        let points = crate::sampler::sample_mesh_surface(mesh, n, &mut rng)?;
 
         let num = points.len();
         let mut positions = Vec::with_capacity(num);
@@ -153,6 +174,94 @@ impl MeshSurfaceSampler for DefaultSampler {
             face_indices,
             barycentric,
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FlameNormalMapProvider
+// ---------------------------------------------------------------------------
+
+/// Production [`NormalMapProvider`] backed by a loaded [`FlameModel`] and the
+/// CPU [`NormalMapRenderer`] rasterizer.
+///
+/// [`Self::generate_normal_map`] runs the FLAME forward pass on `params` and
+/// rasterizes the resulting mesh from a default front-facing camera.
+/// [`Self::generate_normal_maps_multi_view`] evaluates the mesh once and
+/// re-renders it from each supplied camera pose, so — unlike the trait's
+/// default implementation — the output genuinely varies per view.
+#[derive(Clone)]
+pub struct FlameNormalMapProvider {
+    model: Arc<FlameModel>,
+}
+
+impl FlameNormalMapProvider {
+    /// Wrap a loaded FLAME model for normal-map generation.
+    #[must_use]
+    pub fn new(model: Arc<FlameModel>) -> Self {
+        Self { model }
+    }
+
+    /// Build a [`Camera`] for `width`×`height` from a row-major 4×4
+    /// world-to-camera view matrix: the upper-left 3×3 block is the
+    /// rotation and column 3 (rows 0..3) is the translation, matching the
+    /// convention documented on
+    /// [`NormalMapProvider::generate_normal_maps_multi_view`]. Intrinsics
+    /// (focal length, principal point, near/far planes) come from
+    /// [`Camera::default_front`].
+    fn camera_from_pose(pose: &[[f32; 4]; 4], width: u32, height: u32) -> Camera {
+        let rotation = na::Matrix3::new(
+            pose[0][0], pose[0][1], pose[0][2], pose[1][0], pose[1][1], pose[1][2], pose[2][0],
+            pose[2][1], pose[2][2],
+        );
+        let translation = na::Vector3::new(pose[0][3], pose[1][3], pose[2][3]);
+        let mut camera = Camera::default_front(width, height);
+        camera.rotation = rotation;
+        camera.translation = translation;
+        camera
+    }
+}
+
+impl NormalMapProvider for FlameNormalMapProvider {
+    fn generate_normal_map(
+        &self,
+        params: &FlameParams,
+        width: u32,
+        height: u32,
+    ) -> Result<Vec<u8>, FlameError> {
+        if width == 0 || height == 0 {
+            return Err(FlameError::InvalidParams(format!(
+                "generate_normal_map: width and height must be > 0; got {width}x{height}"
+            )));
+        }
+        let mesh = self.model.forward(params);
+        let camera = Camera::default_front(width, height);
+        Ok(NormalMapRenderer::render(&mesh, &camera).into_raw())
+    }
+
+    fn generate_normal_maps_multi_view(
+        &self,
+        params: &FlameParams,
+        camera_poses: &[[[f32; 4]; 4]],
+        width: u32,
+        height: u32,
+    ) -> Result<Vec<Vec<u8>>, FlameError> {
+        if width == 0 || height == 0 {
+            return Err(FlameError::InvalidParams(format!(
+                "generate_normal_maps_multi_view: width and height must be > 0; got \
+                 {width}x{height}"
+            )));
+        }
+        // Evaluate the FLAME forward pass once and re-render it from every
+        // requested pose, so the output genuinely differs per view (unlike
+        // the trait's pose-ignoring default).
+        let mesh = self.model.forward(params);
+        Ok(camera_poses
+            .iter()
+            .map(|pose| {
+                let camera = Self::camera_from_pose(pose, width, height);
+                NormalMapRenderer::render(&mesh, &camera).into_raw()
+            })
+            .collect())
     }
 }
 
@@ -344,6 +453,37 @@ mod tests {
     }
 
     #[test]
+    fn default_sampler_validates_even_when_zero_samples_requested() {
+        // Regression: an `n == 0` fast path used to return `Ok(empty)` before
+        // any validation, so a mesh that every non-zero `n` rejects was
+        // silently accepted at `n == 0`. Validation must not depend on `n`.
+        let sampler = DefaultSampler;
+
+        let no_faces = Mesh::new(vec![], vec![]);
+        assert!(
+            sampler.sample_surface(&no_faces, 0, 0).is_err(),
+            "a face-less mesh must be rejected regardless of the sample count"
+        );
+
+        let malformed = Mesh {
+            vertices: vec![na::Point3::new(0.0f32, 0.0, 0.0)],
+            normals: Vec::new(),
+            faces: vec![[0, 0, 0]],
+            uv_coords: Vec::new(),
+        };
+        assert!(
+            sampler.sample_surface(&malformed, 0, 0).is_err(),
+            "a malformed mesh must be rejected regardless of the sample count"
+        );
+
+        // A well-formed mesh with n == 0 is still an ordinary empty success.
+        let ok = sampler
+            .sample_surface(&quad_mesh(), 0, 0)
+            .expect("n == 0 on a well-formed mesh is not an error");
+        assert!(ok.positions.is_empty());
+    }
+
+    #[test]
     fn default_sampler_empty_mesh_returns_error() {
         let mesh = Mesh::new(vec![], vec![]);
         let sampler = DefaultSampler;
@@ -352,6 +492,60 @@ mod tests {
             result.is_err(),
             "sampling from empty mesh should return error"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression: `sample_mesh_surface` reports a malformed mesh as an error
+    // rather than an empty `Vec`. `DefaultSampler` must propagate that error
+    // instead of handing back a zero-length `SurfaceSample` that the caller
+    // cannot tell apart from a legitimately empty result.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn default_sampler_propagates_malformed_mesh_error() {
+        // `Mesh`'s fields are public, so this bypasses `Mesh::new`'s
+        // invariants: three vertices but no normals, and a face pointing at a
+        // vertex index that does not exist.
+        let mismatched_normals = Mesh {
+            vertices: vec![
+                na::Point3::new(0.0f32, 0.0, 0.0),
+                na::Point3::new(1.0f32, 0.0, 0.0),
+                na::Point3::new(0.0f32, 1.0, 0.0),
+            ],
+            normals: Vec::new(),
+            faces: vec![[0, 1, 2]],
+            uv_coords: Vec::new(),
+        };
+        let out_of_range_face = Mesh {
+            vertices: vec![
+                na::Point3::new(0.0f32, 0.0, 0.0),
+                na::Point3::new(1.0f32, 0.0, 0.0),
+            ],
+            normals: vec![na::Vector3::new(0.0f32, 0.0, 1.0); 2],
+            faces: vec![[0, 1, 9]],
+            uv_coords: Vec::new(),
+        };
+
+        let sampler = DefaultSampler;
+        for (label, mesh) in [
+            ("mismatched normals length", mismatched_normals),
+            ("out-of-range face index", out_of_range_face),
+        ] {
+            match sampler.sample_surface(&mesh, 16, 11) {
+                Err(FlameError::InvalidParams(msg)) => {
+                    assert!(
+                        msg.contains("sample_mesh_surface"),
+                        "{label}: error should come from the sampler, got: {msg}"
+                    );
+                }
+                Err(other) => panic!("{label}: expected InvalidParams, got {other:?}"),
+                Ok(sample) => panic!(
+                    "{label}: a malformed mesh must be an error, but sampling \
+                     succeeded with {} points",
+                    sample.positions.len()
+                ),
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -380,14 +574,19 @@ mod tests {
     }
 
     #[test]
-    fn generate_normal_maps_multi_view_default_impl_works() {
+    fn generate_normal_maps_multi_view_default_impl_rejects_multiple_poses() {
+        // The default implementation has no camera model, so it cannot
+        // honour distinct poses. Even when the caller happens to pass
+        // identical matrices (as here), it must fail loudly rather than
+        // silently return N duplicate images — a real (differing) pose set
+        // would be silently wrong under the old "just ignore the pose"
+        // default.
         let provider = MockNormalMapProvider {
             width: 64,
             height: 64,
         };
         let params = FlameParams::neutral();
 
-        // Create 3 dummy camera pose matrices (identity)
         let identity: [[f32; 4]; 4] = [
             [1.0, 0.0, 0.0, 0.0],
             [0.0, 1.0, 0.0, 0.0],
@@ -396,20 +595,37 @@ mod tests {
         ];
         let poses = vec![identity; 3];
 
-        let results = provider
-            .generate_normal_maps_multi_view(&params, &poses, 64, 64)
-            .expect("multi-view generation failed");
+        let result = provider.generate_normal_maps_multi_view(&params, &poses, 64, 64);
+        assert!(
+            result.is_err(),
+            "default multi-view impl must reject more than one pose, not silently \
+             duplicate images"
+        );
+    }
 
-        assert_eq!(results.len(), 3, "should produce one image per pose");
-        for (i, img) in results.iter().enumerate() {
-            let expected = 64 * 64 * 3;
-            assert_eq!(
-                img.len(),
-                expected,
-                "view {i}: expected {expected} bytes, got {}",
-                img.len()
-            );
-        }
+    #[test]
+    fn generate_normal_maps_multi_view_default_impl_single_pose_delegates() {
+        // Exactly one pose has no ambiguity to silently get wrong, so the
+        // default implementation may (and does) delegate to
+        // `generate_normal_map` directly.
+        let provider = MockNormalMapProvider {
+            width: 64,
+            height: 64,
+        };
+        let params = FlameParams::neutral();
+        let identity: [[f32; 4]; 4] = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+
+        let results = provider
+            .generate_normal_maps_multi_view(&params, &[identity], 64, 64)
+            .expect("single pose has no ambiguity, default impl should succeed");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].len(), 64 * 64 * 3);
     }
 
     #[test]
@@ -441,5 +657,119 @@ mod tests {
             .generate_normal_maps_multi_view(&params, &[], 64, 64)
             .expect("empty pose list should succeed");
         assert!(results.is_empty(), "zero poses should yield zero images");
+    }
+
+    // -----------------------------------------------------------------------
+    // FlameNormalMapProvider (production impl) tests
+    // -----------------------------------------------------------------------
+
+    /// A minimal 3-vertex, 2-joint synthetic FLAME model with a single,
+    /// non-degenerate, visible-from-`Camera::default_front` triangle. Shape,
+    /// expression, and pose-corrective blend shapes are all zero, so
+    /// `model.forward(&FlameParams::neutral())` reproduces `v_template`
+    /// unchanged — only camera pose affects the render.
+    fn build_visible_triangle_model() -> FlameModel {
+        use ndarray::{Array2, Array3};
+
+        let n_verts = 3;
+        let n_joints = 2;
+        let n_shape = 1;
+        let n_expr = 1;
+        let n_pose_dirs = (n_joints - 1) * 9;
+
+        let v_template = Array2::from_shape_vec(
+            (n_verts, 3),
+            vec![0.0, 0.05, 0.0, -0.05, -0.05, 0.0, 0.05, -0.05, 0.0],
+        )
+        .expect("test: fixed shape matches data length");
+
+        let faces = vec![[0u32, 1, 2]];
+        let shapedirs = Array3::zeros((n_verts, 3, n_shape));
+        let expressiondirs = Array3::zeros((n_verts, 3, n_expr));
+        let posedirs = Array3::zeros((n_verts, 3, n_pose_dirs));
+        let j_regressor =
+            Array2::from_shape_vec((n_joints, n_verts), vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0])
+                .expect("test: fixed shape matches data length");
+        let parents = vec![-1i32, 0];
+        let lbs_weights =
+            Array2::from_shape_vec((n_verts, n_joints), vec![1.0, 0.0, 1.0, 0.0, 1.0, 0.0])
+                .expect("test: fixed shape matches data length");
+
+        FlameModel::from_arrays(
+            v_template,
+            faces,
+            shapedirs,
+            expressiondirs,
+            posedirs,
+            j_regressor,
+            parents,
+            lbs_weights,
+            n_joints,
+        )
+    }
+
+    #[test]
+    fn flame_normal_map_provider_single_view_matches_dimensions() {
+        let model = Arc::new(build_visible_triangle_model());
+        let provider = FlameNormalMapProvider::new(model);
+        let params = FlameParams::neutral();
+        let img = provider
+            .generate_normal_map(&params, 32, 48)
+            .expect("generation should succeed");
+        assert_eq!(img.len(), 32 * 48 * 3);
+    }
+
+    #[test]
+    fn flame_normal_map_provider_multi_view_varies_by_pose() {
+        // Two poses that differ only by a small camera-space X translation:
+        // the rendered triangle must shift accordingly, proving (unlike the
+        // trait's pose-ignoring default) that the pose is actually honoured.
+        let model = Arc::new(build_visible_triangle_model());
+        let provider = FlameNormalMapProvider::new(model);
+        let params = FlameParams::neutral();
+
+        let pose_a: [[f32; 4]; 4] = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.6],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let pose_b: [[f32; 4]; 4] = [
+            [1.0, 0.0, 0.0, 0.05],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.6],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+
+        let images = provider
+            .generate_normal_maps_multi_view(&params, &[pose_a, pose_b], 64, 64)
+            .expect("multi-view generation should succeed");
+
+        assert_eq!(images.len(), 2);
+        assert_eq!(images[0].len(), 64 * 64 * 3);
+        assert_eq!(images[1].len(), 64 * 64 * 3);
+        assert_ne!(
+            images[0], images[1],
+            "different camera poses must produce different renders, unlike the \
+             trait's pose-ignoring default implementation"
+        );
+    }
+
+    #[test]
+    fn flame_normal_map_provider_rejects_zero_dimensions() {
+        let model = Arc::new(build_visible_triangle_model());
+        let provider = FlameNormalMapProvider::new(model);
+        let params = FlameParams::neutral();
+
+        assert!(
+            provider.generate_normal_map(&params, 0, 64).is_err(),
+            "zero width must be rejected, not panic inside the rasterizer"
+        );
+        assert!(
+            provider
+                .generate_normal_maps_multi_view(&params, &[[[0.0; 4]; 4]], 64, 0)
+                .is_err(),
+            "zero height must be rejected, not panic inside the rasterizer"
+        );
     }
 }

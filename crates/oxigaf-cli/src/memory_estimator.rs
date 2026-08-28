@@ -58,7 +58,7 @@ pub struct GaussianLayout {
     pub scales_bytes: usize,
     /// Opacities array: n × 1 × 4 bytes (pre-sigmoid f32).
     pub opacities_bytes: usize,
-    /// Spherical harmonics array: n × sh_coefficients × 4 bytes (f32).
+    /// Spherical harmonics array: n × sh_coefficients × 3 color channels × 4 bytes (f32).
     pub sh_bytes: usize,
     /// Sum of all parameter arrays.
     pub total_bytes: usize,
@@ -119,9 +119,12 @@ pub struct MemoryEstimate {
     pub total_gpu_bytes: usize,
     /// Total estimated CPU/system memory consumption in bytes.
     pub total_cpu_bytes: usize,
-    /// Suggested minimum VRAM in gigabytes (includes 20% overhead buffer).
+    /// Suggested minimum VRAM in GiB (2^30 bytes; includes 20% overhead
+    /// buffer). Uses the same binary-GiB convention as [`mem_format_bytes`],
+    /// so it is directly comparable to `total_gpu_bytes` once formatted.
     pub recommended_vram_gb: f32,
-    /// Suggested minimum system RAM in gigabytes.
+    /// Suggested minimum system RAM in GiB (2^30 bytes), same convention as
+    /// `recommended_vram_gb`.
     pub recommended_ram_gb: f32,
     /// Whether the total GPU footprint fits within the configured VRAM target.
     pub fits_in_vram: bool,
@@ -205,6 +208,24 @@ const MAX_RENDER_DIM: usize = 16_384;
 /// Maximum tile buffer size: 256 MB.
 const MAX_TILE_BUFFER_BYTES: usize = 256 * 1024 * 1024;
 
+/// Tile size (in pixels, per axis) used by the tile-based rasterizer.
+///
+/// Must match `oxigaf_render::config::RasterConfig`'s default `tile_size`
+/// of 16 (see `crates/oxigaf-render/src/config.rs`, used by `tiles_x`/
+/// `tiles_y`). oxigaf-cli does not depend on oxigaf-render, so the value
+/// cannot be imported directly; a previous 64px assumption here understated
+/// `tile_buffer_bytes` by up to 16x. Kept as a single named constant so a
+/// future correction only needs to happen in one place.
+const RASTER_TILE_SIZE_PX: usize = 16;
+
+/// Bytes per gibibyte (2^30), used for VRAM/RAM recommendations so they use
+/// the same binary-unit convention as [`mem_format_bytes`] (whose "GB"
+/// label is actually GiB-scaled). Kept distinct from a decimal-SI
+/// `1_000_000_000.0` divisor, which previously put `recommended_vram_gb`/
+/// `recommended_ram_gb` on a different scale than every other size printed
+/// by [`format_memory_estimate`].
+const BYTES_PER_GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+
 // ---------------------------------------------------------------------------
 // estimate_gaussian_layout
 // ---------------------------------------------------------------------------
@@ -247,8 +268,17 @@ pub fn estimate_gaussian_layout(
         .checked_mul(4)
         .ok_or(MemEstimateError::GaussianCountOverflow(n_gaussians))?;
 
+    // A 3DGS Gaussian stores `sh_coeffs` coefficients *per color channel*
+    // (RGB), not `sh_coeffs` total -- see oxigaf-render's `gaussian.rs`
+    // (`sh_coeffs` layout documented as [N, C] with C = (degree+1)^2 * 3)
+    // and `export.rs` (`(sh_degree+1).pow(2) * 3`). Omitting the `* 3` here
+    // previously under-counted SH storage by 3x (e.g. 64 B/Gaussian instead
+    // of 192 B at the standard degree 3), which cascaded into every
+    // estimate derived from `total_bytes` below (training memory,
+    // `fits_in_vram`, `recommended_vram_gb`, `max_gaussians_for_vram`).
     let sh_bytes = n_gaussians
         .checked_mul(sh_coeffs)
+        .and_then(|x| x.checked_mul(3))
         .and_then(|x| x.checked_mul(4))
         .ok_or(MemEstimateError::GaussianCountOverflow(n_gaussians))?;
 
@@ -310,9 +340,10 @@ pub fn estimate_render_buffers(
         .ok_or(MemEstimateError::ResolutionTooLarge { width, height })?;
 
     // Tile-based sort buffer estimate
-    // 64×64 pixel tiles; up to min(n_gaussians, 1024) entries per tile × 8 bytes
-    let tile_w = width.div_ceil(64);
-    let tile_h = height.div_ceil(64);
+    // 16×16 pixel tiles (matches oxigaf-render's default `RasterConfig`);
+    // up to min(n_gaussians, 1024) entries per tile × 8 bytes
+    let tile_w = width.div_ceil(RASTER_TILE_SIZE_PX);
+    let tile_h = height.div_ceil(RASTER_TILE_SIZE_PX);
     let n_tiles = tile_w.saturating_mul(tile_h);
     let per_tile_entries = n_gaussians.min(1024);
     let tile_buffer_bytes = n_tiles
@@ -451,13 +482,18 @@ pub fn estimate_memory(config: &MemEstimateConfig) -> Result<MemoryEstimate, Mem
     // CPU: keep a host copy of Gaussian parameters for density control
     let total_cpu_bytes = gaussians.total_bytes;
 
-    // 20% headroom buffer for VRAM recommendation
+    // 20% headroom buffer for VRAM recommendation. Divides by `BYTES_PER_GIB`
+    // (2^30), not decimal 1e9, so this is on the same scale as
+    // `mem_format_bytes`'s "GB" label used for `total_gpu_bytes` elsewhere
+    // in the same report -- these two used to disagree by a factor of
+    // ~1.074 (e.g. "Total GPU: 7.45 GB" next to "Recommended VRAM: 9.60 GB"
+    // was not actually a clean 1.2x headroom).
     #[allow(clippy::cast_precision_loss)]
-    let recommended_vram_gb = (total_gpu_bytes as f64 / 1e9 * 1.2) as f32;
+    let recommended_vram_gb = (total_gpu_bytes as f64 / BYTES_PER_GIB * 1.2) as f32;
 
-    // 2× the CPU footprint for RAM recommendation
+    // 2× the CPU footprint for RAM recommendation (same GiB convention).
     #[allow(clippy::cast_precision_loss)]
-    let recommended_ram_gb = (total_cpu_bytes as f64 / 1e9 * 2.0) as f32;
+    let recommended_ram_gb = (total_cpu_bytes as f64 / BYTES_PER_GIB * 2.0) as f32;
 
     let fits_in_vram = total_gpu_bytes <= config.target_vram_bytes;
 
@@ -834,8 +870,8 @@ mod tests {
         assert_eq!(layout.scales_bytes, n * 3 * 4);
         // opacities: n × 4
         assert_eq!(layout.opacities_bytes, n * 4);
-        // sh: n × 16 × 4
-        assert_eq!(layout.sh_bytes, n * 16 * 4);
+        // sh: n × 16 coeffs × 3 color channels × 4 bytes
+        assert_eq!(layout.sh_bytes, n * 16 * 3 * 4);
 
         let expected_total = layout.positions_bytes
             + layout.rotations_bytes
@@ -861,32 +897,42 @@ mod tests {
     fn test_layout_sh_degree_0() {
         let layout = estimate_gaussian_layout(1000, 0).expect("sh0 layout failed");
         assert_eq!(layout.sh_coefficients, 1);
-        assert_eq!(layout.sh_bytes, 1000 * 4);
+        assert_eq!(layout.sh_bytes, 1000 * 3 * 4); // 1000 gaussians × 1 coeff × 3 channels × 4 bytes
     }
 
     #[test]
     fn test_layout_sh_degree_1() {
         let layout = estimate_gaussian_layout(1000, 1).expect("sh1 layout failed");
         assert_eq!(layout.sh_coefficients, 4);
-        assert_eq!(layout.sh_bytes, 1000 * 4 * 4);
+        assert_eq!(layout.sh_bytes, 1000 * 4 * 3 * 4);
     }
 
     #[test]
     fn test_layout_sh_degree_2() {
         let layout = estimate_gaussian_layout(1000, 2).expect("sh2 layout failed");
         assert_eq!(layout.sh_coefficients, 9);
-        assert_eq!(layout.sh_bytes, 1000 * 9 * 4);
+        assert_eq!(layout.sh_bytes, 1000 * 9 * 3 * 4);
     }
 
     #[test]
     fn test_layout_single_gaussian() {
+        // Regression: pins the documented 236 B/Gaussian at the standard
+        // degree 3 (12 + 16 + 12 + 4 + 192 = 236). `sh_bytes` used to omit
+        // the "× 3 color channels" factor (16 coeffs × 4 bytes = 64 instead
+        // of 16 × 3 × 4 = 192), under-reporting total_bytes as 108 instead
+        // of 236 -- a ~2.2x error that propagated into every derived
+        // training/VRAM estimate.
         let layout = estimate_gaussian_layout(1, 3).expect("single gaussian failed");
         assert_eq!(layout.positions_bytes, 12);
         assert_eq!(layout.rotations_bytes, 16);
         assert_eq!(layout.scales_bytes, 12);
         assert_eq!(layout.opacities_bytes, 4);
-        assert_eq!(layout.sh_bytes, 16 * 4); // 16 coeffs × 4 bytes
-        assert_eq!(layout.total_bytes, 12 + 16 + 12 + 4 + 64);
+        assert_eq!(layout.sh_bytes, 16 * 3 * 4); // 16 coeffs × 3 channels × 4 bytes
+        assert_eq!(layout.total_bytes, 12 + 16 + 12 + 4 + 192);
+        assert_eq!(
+            layout.total_bytes, 236,
+            "must match the documented 236 B/Gaussian at degree 3"
+        );
     }
 
     #[test]
@@ -946,6 +992,21 @@ mod tests {
         // Large n_gaussians should cap tile_buffer at 256 MB
         let rb = estimate_render_buffers(512, 512, 100_000_000).expect("large gaussian count");
         assert!(rb.tile_buffer_bytes <= MAX_TILE_BUFFER_BYTES);
+    }
+
+    #[test]
+    fn test_render_buffers_tile_size_matches_16px_raster_default() {
+        // Regression: this used to assume 64×64 pixel tiles, 16x fewer
+        // than oxigaf-render's actual default `RasterConfig::tile_size` of
+        // 16px, understating `tile_buffer_bytes` by up to 16x. At 512×512
+        // with 16px tiles: 32×32 = 1024 tiles.
+        let n_gaussians = 2000usize;
+        let rb = estimate_render_buffers(512, 512, n_gaussians).expect("512x512 buffers failed");
+        let expected_tiles = 32 * 32;
+        let expected_per_tile_entries = n_gaussians.min(1024);
+        let expected_tile_bytes =
+            (expected_tiles * expected_per_tile_entries * 8).min(MAX_TILE_BUFFER_BYTES);
+        assert_eq!(rb.tile_buffer_bytes, expected_tile_bytes);
     }
 
     #[test]
@@ -1162,9 +1223,20 @@ mod tests {
     fn test_estimate_memory_recommended_vram() {
         let config = MemEstimateConfig::default();
         let est = estimate_memory(&config).expect("estimation failed");
-        // recommended_vram_gb = total_gpu / 1e9 * 1.2
-        let expected = est.total_gpu_bytes as f64 / 1e9 * 1.2;
-        assert!((est.recommended_vram_gb as f64 - expected).abs() < 0.01);
+        // recommended_vram_gb = total_gpu / GiB (2^30) * 1.2 -- GiB, not the
+        // decimal-SI 1e9 this used to divide by, so it is on the same scale
+        // as `mem_format_bytes`'s "GB" label used elsewhere in the same
+        // report.
+        let expected_gib = est.total_gpu_bytes as f64 / BYTES_PER_GIB * 1.2;
+        assert!((est.recommended_vram_gb as f64 - expected_gib).abs() < 0.01);
+
+        // Regression guard: must actually differ from the old decimal-GB
+        // formula (for any nonzero byte count, 1 GiB > 1 GB so the GiB
+        // count is strictly smaller), so a future accidental revert to
+        // `/ 1e9` is caught here rather than only in the value above.
+        let expected_decimal_gb = est.total_gpu_bytes as f64 / 1e9 * 1.2;
+        assert!(est.total_gpu_bytes > 0);
+        assert!((est.recommended_vram_gb as f64 - expected_decimal_gb).abs() > 0.01);
     }
 
     // ------------------------------------------------------------------

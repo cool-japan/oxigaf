@@ -17,16 +17,31 @@
 //! | Inner lip     | 60–67   | 8     |
 
 use crate::{error::FlameError, mesh::Mesh};
+use std::sync::Once;
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
-/// FLAME vertex indices for the 68 iBUG landmarks.
+/// **Unverified, approximate** FLAME vertex indices for the 68 iBUG
+/// landmarks.
 ///
-/// Based on FLAME 2020 canonical mesh topology (5023 vertices).
-/// These map the 68 standard iBUG facial landmark positions to their
-/// corresponding vertex indices in the FLAME mesh.
+/// These values are placeholders and have *not* been validated against the
+/// official FLAME `landmark_embedding.npy` asset (which this crate does not
+/// bundle and cannot fetch at build/run time). Several groups follow
+/// arithmetic or consecutive-integer patterns (e.g. left eyebrow is an exact
+/// step-2 sequence, outer lip is 12 consecutive integers) that no real
+/// landmark embedding exhibits -- the true positions are not close to a
+/// regular pattern on the mesh surface. Left/right symmetry is not
+/// guaranteed either.
+///
+/// Do not rely on this table for anatomically accurate landmark positions.
+/// [`LandmarkExtractor::new`] emits a one-time `tracing::warn!` the first
+/// time it is used, for exactly this reason. If you have genuine embedding
+/// data (converted from the official `landmark_embedding.npy`, distributed
+/// as face indices + barycentric weights rather than single vertex ids),
+/// use [`LandmarkExtractor::with_barycentric_embedding`] instead, or supply
+/// verified vertex indices via [`LandmarkExtractor::with_indices`].
 const FLAME_68_VERTEX_INDICES: [u32; 68] = [
     // Jaw line (0–16)
     2306, 2304, 2303, 2302, 2301, 2300, 1910, 1908, 1907, 1906, 1905, 2448, 2449, 2450, 2444, 2443,
@@ -146,28 +161,76 @@ pub struct Landmark {
     pub group: LandmarkGroup,
 }
 
+/// A landmark located by barycentric coordinates within a mesh face,
+/// matching the format the official FLAME `landmark_embedding.npy` uses
+/// (face index + barycentric weights) rather than a single nearest-vertex
+/// id.
+///
+/// Construct a [`LandmarkExtractor`] from a list of these via
+/// [`LandmarkExtractor::with_barycentric_embedding`] when real embedding
+/// data (converted from `landmark_embedding.npy`) is available -- this is
+/// the accurate alternative to [`LandmarkExtractor::new`]'s built-in,
+/// unverified vertex-index table.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BarycentricLandmark {
+    /// Index into the mesh's face list.
+    pub face_index: u32,
+    /// Barycentric weights `[b0, b1, b2]` for the face's three vertices, in
+    /// face-winding order. Nominally sums to `1.0`.
+    pub weights: [f32; 3],
+}
+
+/// Emits a one-time [`tracing::warn!`] the first time an extractor backed by
+/// the unverified `FLAME_68_VERTEX_INDICES` table is constructed. Gated by
+/// [`Once`] rather than firing unconditionally, since
+/// `LandmarkExtractor::new()` is reachable from per-frame paths (e.g.
+/// `Mesh::extract_landmarks`) and an unconditional warning would spam logs.
+static UNVERIFIED_TABLE_WARNING: Once = Once::new();
+
 // ---------------------------------------------------------------------------
 // LandmarkExtractor
 // ---------------------------------------------------------------------------
 
 /// Extracts static facial landmarks from a FLAME mesh using precomputed
-/// vertex indices.
+/// vertex indices, or from a real barycentric embedding.
 ///
-/// By default the extractor uses the canonical 68-point iBUG indices for the
-/// FLAME 2020 mesh topology.  Custom indices can be supplied via
-/// [`LandmarkExtractor::with_indices`] for fine-tuning or alternative mesh
-/// versions.
+/// By default ([`LandmarkExtractor::new`]) the extractor uses the built-in
+/// 68-point vertex-index table, which is an **unverified approximation**
+/// (see `FLAME_68_VERTEX_INDICES`) -- not ground truth from the official
+/// FLAME landmark embedding. Verified vertex indices can be supplied via
+/// [`LandmarkExtractor::with_indices`], and a genuine barycentric embedding
+/// (the format the official asset actually uses) via
+/// [`LandmarkExtractor::with_barycentric_embedding`].
 pub struct LandmarkExtractor {
-    /// Vertex indices corresponding to each landmark point.
+    /// Vertex indices corresponding to each landmark point. Used when
+    /// `barycentric` is `None`.
     vertex_indices: Vec<u32>,
+    /// Real `(face_index, barycentric weights)` embedding, used instead of
+    /// `vertex_indices` when present. See
+    /// [`LandmarkExtractor::with_barycentric_embedding`].
+    barycentric: Option<Vec<BarycentricLandmark>>,
 }
 
 impl LandmarkExtractor {
     /// Create an extractor using the canonical FLAME 68-point landmark indices.
+    ///
+    /// The built-in table is an **unverified approximation** (see
+    /// `FLAME_68_VERTEX_INDICES`); this logs a one-time warning the first
+    /// time any extractor is constructed this way.
     #[must_use]
     pub fn new() -> Self {
+        UNVERIFIED_TABLE_WARNING.call_once(|| {
+            tracing::warn!(
+                "LandmarkExtractor::new() uses FLAME_68_VERTEX_INDICES, an unverified, \
+                 approximate 68-point vertex table that has not been validated against the \
+                 official FLAME landmark_embedding.npy. For production-accurate landmarks, \
+                 supply verified indices via LandmarkExtractor::with_indices or real \
+                 embedding data via LandmarkExtractor::with_barycentric_embedding."
+            );
+        });
         Self {
             vertex_indices: FLAME_68_VERTEX_INDICES.to_vec(),
+            barycentric: None,
         }
     }
 
@@ -184,6 +247,35 @@ impl LandmarkExtractor {
         }
         Ok(Self {
             vertex_indices: indices,
+            barycentric: None,
+        })
+    }
+
+    /// Create an extractor from a real barycentric landmark embedding
+    /// (face index + barycentric weights per landmark), matching the format
+    /// distributed as `landmark_embedding.npy` for the official FLAME
+    /// model.
+    ///
+    /// This crate does not bundle a `landmark_embedding.npy` parser or the
+    /// asset itself; callers must supply the `(face_index, weights)` pairs
+    /// (e.g. loaded from a converted `.npy`/`.json` sidecar). This is the
+    /// accurate alternative to the unverified table used by
+    /// [`LandmarkExtractor::new`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FlameError::InvalidParams`] if `embedding` is empty.
+    pub fn with_barycentric_embedding(
+        embedding: Vec<BarycentricLandmark>,
+    ) -> Result<Self, FlameError> {
+        if embedding.is_empty() {
+            return Err(FlameError::InvalidParams(
+                "barycentric landmark embedding must not be empty".to_string(),
+            ));
+        }
+        Ok(Self {
+            vertex_indices: Vec::new(),
+            barycentric: Some(embedding),
         })
     }
 
@@ -191,7 +283,10 @@ impl LandmarkExtractor {
     #[inline]
     #[must_use]
     pub fn num_landmarks(&self) -> usize {
-        self.vertex_indices.len()
+        match &self.barycentric {
+            Some(embedding) => embedding.len(),
+            None => self.vertex_indices.len(),
+        }
     }
 
     /// Extract all landmarks from `mesh`.
@@ -199,8 +294,13 @@ impl LandmarkExtractor {
     /// # Errors
     ///
     /// Returns [`FlameError::IndexOutOfBounds`] if any stored vertex index
-    /// is greater than or equal to the number of vertices in `mesh`.
+    /// (or, for a barycentric extractor, any face index or the face's own
+    /// vertex indices) is out of bounds for `mesh`.
     pub fn extract(&self, mesh: &Mesh) -> Result<Vec<Landmark>, FlameError> {
+        if let Some(embedding) = &self.barycentric {
+            return Self::extract_barycentric(mesh, embedding);
+        }
+
         let num_verts = mesh.vertices.len();
         let mut landmarks = Vec::with_capacity(self.vertex_indices.len());
 
@@ -224,17 +324,79 @@ impl LandmarkExtractor {
         Ok(landmarks)
     }
 
+    /// Extract landmarks from a real barycentric embedding: `position =
+    /// b0*v[f0] + b1*v[f1] + b2*v[f2]` for each `(face_index, weights)`
+    /// entry.
+    fn extract_barycentric(
+        mesh: &Mesh,
+        embedding: &[BarycentricLandmark],
+    ) -> Result<Vec<Landmark>, FlameError> {
+        let num_faces = mesh.faces.len();
+        let num_verts = mesh.vertices.len();
+        let mut landmarks = Vec::with_capacity(embedding.len());
+
+        for (landmark_idx, bl) in embedding.iter().enumerate() {
+            let fi = bl.face_index as usize;
+            if fi >= num_faces {
+                return Err(FlameError::index_out_of_bounds(
+                    format!("landmark {landmark_idx} face index"),
+                    fi,
+                    num_faces,
+                ));
+            }
+            let face = mesh.faces[fi];
+            for (c, &vi) in face.iter().enumerate() {
+                if vi as usize >= num_verts {
+                    return Err(FlameError::index_out_of_bounds(
+                        format!("landmark {landmark_idx} face {fi} vertex[{c}]"),
+                        vi as usize,
+                        num_verts,
+                    ));
+                }
+            }
+            let [b0, b1, b2] = bl.weights;
+            let v0 = &mesh.vertices[face[0] as usize];
+            let v1 = &mesh.vertices[face[1] as usize];
+            let v2 = &mesh.vertices[face[2] as usize];
+            let position = [
+                b0 * v0.x + b1 * v1.x + b2 * v2.x,
+                b0 * v0.y + b1 * v1.y + b2 * v2.y,
+                b0 * v0.z + b1 * v1.z + b2 * v2.z,
+            ];
+            landmarks.push(Landmark {
+                position,
+                index: landmark_idx,
+                group: LandmarkGroup::from_index(landmark_idx),
+            });
+        }
+
+        Ok(landmarks)
+    }
+
     /// Extract only landmarks belonging to `group`.
     ///
     /// # Errors
     ///
     /// Returns [`FlameError::IndexOutOfBounds`] if any vertex index in the
-    /// requested group is out of bounds for `mesh`.
+    /// requested group is out of bounds for `mesh`. Returns
+    /// [`FlameError::InvalidParams`] if this extractor was built from a
+    /// barycentric embedding ([`LandmarkExtractor::with_barycentric_embedding`]),
+    /// which has no iBUG index-range grouping; call
+    /// [`LandmarkExtractor::extract`] and filter by [`Landmark::group`]
+    /// instead.
     pub fn extract_group(
         &self,
         mesh: &Mesh,
         group: LandmarkGroup,
     ) -> Result<Vec<Landmark>, FlameError> {
+        if self.barycentric.is_some() {
+            return Err(FlameError::InvalidParams(
+                "extract_group is not supported for a barycentric-embedding extractor; \
+                 call extract() and filter by Landmark::group instead"
+                    .to_string(),
+            ));
+        }
+
         let range = group.index_range();
         let num_verts = mesh.vertices.len();
         let mut landmarks = Vec::with_capacity(group.count());
@@ -270,9 +432,13 @@ impl LandmarkExtractor {
     ///
     /// The returned slice covers only the portion of `self.vertex_indices`
     /// that falls within the group's index range and within the extractor's
-    /// stored indices.
+    /// stored indices. Returns an empty slice for a barycentric-embedding
+    /// extractor, which has no vertex-index representation.
     #[must_use]
     pub fn group_indices(&self, group: LandmarkGroup) -> &[u32] {
+        if self.barycentric.is_some() {
+            return &[];
+        }
         let range = group.index_range();
         let start = *range.start();
         let end = (*range.end() + 1).min(self.vertex_indices.len());
@@ -743,5 +909,135 @@ mod tests {
                 lm.index
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // LandmarkExtractor::with_barycentric_embedding
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_with_barycentric_embedding_rejects_empty() {
+        let result = LandmarkExtractor::with_barycentric_embedding(vec![]);
+        assert!(result.is_err(), "empty embedding should produce an error");
+    }
+
+    #[test]
+    fn test_with_barycentric_embedding_accepts_custom() {
+        let embedding = vec![
+            BarycentricLandmark {
+                face_index: 0,
+                weights: [1.0, 0.0, 0.0],
+            },
+            BarycentricLandmark {
+                face_index: 1,
+                weights: [0.3, 0.3, 0.4],
+            },
+        ];
+        let extractor = LandmarkExtractor::with_barycentric_embedding(embedding)
+            .expect("non-empty embedding should succeed");
+        assert_eq!(extractor.num_landmarks(), 2);
+    }
+
+    #[test]
+    fn test_extract_barycentric_vertex_weight_reproduces_vertex_position() {
+        // A weight of [1,0,0] on a face must reproduce that face's first
+        // vertex position exactly.
+        let mesh = synthetic_mesh(MIN_VERTS);
+        let embedding = vec![BarycentricLandmark {
+            face_index: 0,
+            weights: [1.0, 0.0, 0.0],
+        }];
+        let extractor = LandmarkExtractor::with_barycentric_embedding(embedding).expect("ok");
+        let landmarks = extractor.extract(&mesh).expect("should succeed");
+        assert_eq!(landmarks.len(), 1);
+        let expected_vertex = mesh.faces[0][0] as usize;
+        let expected = &mesh.vertices[expected_vertex];
+        assert!((landmarks[0].position[0] - expected.x).abs() < 1e-5);
+        assert!((landmarks[0].position[1] - expected.y).abs() < 1e-5);
+        assert!((landmarks[0].position[2] - expected.z).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_extract_barycentric_centroid_weight_averages_vertices() {
+        // Equal weights [1/3, 1/3, 1/3] must reproduce the face centroid.
+        let mesh = synthetic_mesh(MIN_VERTS);
+        let embedding = vec![BarycentricLandmark {
+            face_index: 2,
+            weights: [1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0],
+        }];
+        let extractor = LandmarkExtractor::with_barycentric_embedding(embedding).expect("ok");
+        let landmarks = extractor.extract(&mesh).expect("should succeed");
+        let face = mesh.faces[2];
+        let expected = [
+            (mesh.vertices[face[0] as usize].x
+                + mesh.vertices[face[1] as usize].x
+                + mesh.vertices[face[2] as usize].x)
+                / 3.0,
+            (mesh.vertices[face[0] as usize].y
+                + mesh.vertices[face[1] as usize].y
+                + mesh.vertices[face[2] as usize].y)
+                / 3.0,
+            (mesh.vertices[face[0] as usize].z
+                + mesh.vertices[face[1] as usize].z
+                + mesh.vertices[face[2] as usize].z)
+                / 3.0,
+        ];
+        for (k, (&exp, &got)) in expected
+            .iter()
+            .zip(landmarks[0].position.iter())
+            .enumerate()
+        {
+            assert!(
+                (got - exp).abs() < 1e-5,
+                "component {k}: expected {exp}, got {got}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_extract_barycentric_rejects_out_of_range_face_index() {
+        let mesh = synthetic_mesh(MIN_VERTS);
+        let embedding = vec![BarycentricLandmark {
+            face_index: u32::try_from(mesh.faces.len()).expect("fits in u32") + 1000,
+            weights: [0.5, 0.5, 0.0],
+        }];
+        let extractor = LandmarkExtractor::with_barycentric_embedding(embedding).expect("ok");
+        let result = extractor.extract(&mesh);
+        assert!(result.is_err(), "out-of-range face index should error");
+    }
+
+    #[test]
+    fn test_extract_group_errors_for_barycentric_extractor() {
+        let mesh = synthetic_mesh(MIN_VERTS);
+        let embedding = vec![BarycentricLandmark {
+            face_index: 0,
+            weights: [1.0, 0.0, 0.0],
+        }];
+        let extractor = LandmarkExtractor::with_barycentric_embedding(embedding).expect("ok");
+        let result = extractor.extract_group(&mesh, LandmarkGroup::Nose);
+        assert!(
+            matches!(result, Err(FlameError::InvalidParams(_))),
+            "extract_group should be rejected for a barycentric extractor"
+        );
+    }
+
+    #[test]
+    fn test_group_indices_empty_for_barycentric_extractor() {
+        let embedding = vec![BarycentricLandmark {
+            face_index: 0,
+            weights: [1.0, 0.0, 0.0],
+        }];
+        let extractor = LandmarkExtractor::with_barycentric_embedding(embedding).expect("ok");
+        assert!(extractor.group_indices(LandmarkGroup::Nose).is_empty());
+    }
+
+    #[test]
+    fn test_new_is_reusable_after_warning_fires() {
+        // The one-time warning (`UNVERIFIED_TABLE_WARNING`) must not prevent
+        // repeated construction or otherwise change behavior.
+        let a = LandmarkExtractor::new();
+        let b = LandmarkExtractor::new();
+        assert_eq!(a.num_landmarks(), b.num_landmarks());
+        assert_eq!(a.num_landmarks(), 68);
     }
 }

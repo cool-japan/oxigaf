@@ -1,9 +1,17 @@
 //! GPU→CPU intermediate buffer readback debug utilities.
 //!
 //! This module provides CPU-side snapshots of GPU pipeline intermediate state
-//! for debugging 3D Gaussian Splatting rasterization. Since GPU hardware may
-//! not be available in tests, all core logic runs on the CPU path; GPU-side
-//! readback would feed the same data structures.
+//! for debugging 3D Gaussian Splatting rasterization. Two entry points build the
+//! same [`RasterizationSnapshot`]:
+//!
+//! * [`DebugReadbackBuilder::read_from_gpu`] copies the rasterizer's own
+//!   `tile_ranges`, `depths` and `radii` buffers back to the CPU, so the
+//!   snapshot reflects what the GPU actually produced (including GPU-side
+//!   tiling bugs). [`DebugReadbackBuilder::snapshot_from_gpu_data`] does the
+//!   same from already-downloaded buffer contents.
+//! * [`DebugReadbackBuilder::compute_snapshot`] re-derives tile occupancy on the
+//!   CPU from caller-supplied Gaussian data. It is the reference model — useful
+//!   to diff against the GPU snapshot and available when no adapter exists.
 //!
 //! ## Usage
 //!
@@ -131,14 +139,23 @@ pub struct RasterizationSnapshot {
     /// Image height in pixels.
     pub height: u32,
 
-    /// Minimum depth value across all Gaussians.
-    /// `f32::INFINITY` when no Gaussians are present.
+    /// Minimum depth value across the Gaussians the snapshot considered.
+    /// `f32::INFINITY` when there are none.
+    ///
+    /// The two builders differ here, because only the GPU path knows what was
+    /// culled: [`DebugReadbackBuilder::compute_snapshot`] includes every
+    /// Gaussian it is given, while [`DebugReadbackBuilder::snapshot_from_gpu_data`]
+    /// skips Gaussians with a negative radius (their depth slot is never
+    /// written by preprocess). Expect the range to differ between a CPU and a
+    /// GPU snapshot of the same scene whenever anything was culled.
     pub min_depth: f32,
-    /// Maximum depth value across all Gaussians.
-    /// `f32::NEG_INFINITY` when no Gaussians are present.
+    /// Maximum depth value across the Gaussians the snapshot considered.
+    /// `f32::NEG_INFINITY` when there are none. Same culling caveat as
+    /// [`min_depth`](Self::min_depth).
     pub max_depth: f32,
 
     /// Screen-space radius (pixels) per Gaussian.  Length: `num_gaussians`.
+    /// Culled Gaussians report `0.0` in a GPU snapshot.
     pub gaussian_screen_sizes: Vec<f32>,
 
     /// Summary statistics derived from the tile counts and Gaussian data.
@@ -285,10 +302,9 @@ pub fn validate_buffer_count(
 /// Near-plane threshold for classifying a Gaussian as "visible".
 const NEAR_PLANE_THRESHOLD: f32 = 0.001;
 
-/// Builder for computing a [`RasterizationSnapshot`] from CPU-side data.
-///
-/// GPU-side readback would call the same logic after copying GPU buffers back to
-/// CPU memory.
+/// Builder for a [`RasterizationSnapshot`], either read back from the GPU
+/// ([`read_from_gpu`](Self::read_from_gpu)) or re-derived on the CPU
+/// ([`compute_snapshot`](Self::compute_snapshot)).
 ///
 /// # Example
 ///
@@ -384,16 +400,7 @@ impl DebugReadbackBuilder {
         gaussian_radii: &[f32],
     ) -> Result<RasterizationSnapshot, RenderError> {
         // ── Validate config ───────────────────────────────────────────────
-        if self.width == 0 || self.height == 0 {
-            return Err(RenderError::Rasterize(
-                "Image dimensions must be non-zero".to_string(),
-            ));
-        }
-        if self.tile_size == 0 {
-            return Err(RenderError::Rasterize(
-                "Tile size must be non-zero".to_string(),
-            ));
-        }
+        self.validate_config()?;
 
         // ── Validate input lengths ────────────────────────────────────────
         let n = gaussian_positions_2d.len();
@@ -500,6 +507,281 @@ impl DebugReadbackBuilder {
             stats,
         })
     }
+
+    /// Validate the tile configuration shared by both snapshot paths.
+    fn validate_config(&self) -> Result<(), RenderError> {
+        if self.width == 0 || self.height == 0 {
+            return Err(RenderError::Rasterize(
+                "Image dimensions must be non-zero".to_string(),
+            ));
+        }
+        if self.tile_size == 0 {
+            return Err(RenderError::Rasterize(
+                "Tile size must be non-zero".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Build a snapshot from raw rasterizer buffer contents.
+    ///
+    /// This is the pure half of [`read_from_gpu`](Self::read_from_gpu): it does
+    /// no GPU work, so it can be exercised without an adapter.
+    ///
+    /// # Parameters
+    ///
+    /// - `tile_ranges`: the rasterizer's `tile_ranges` buffer, `(start, end)`
+    ///   per tile in row-major tile order — exactly `2 × num_tiles` values.
+    ///   Occupancy is `end - start`, i.e. the number of Gaussian-tile pairs the
+    ///   GPU actually sorted into that tile.
+    /// - `gaussian_depths`: the `depths` buffer, one `f32` per Gaussian.
+    /// - `gaussian_radii`: the `radii` buffer, one `i32` per Gaussian; negative
+    ///   means the Gaussian was culled in preprocess.
+    ///
+    /// Culled Gaussians report a screen size of `0.0` and are excluded from the
+    /// depth range and the visible count (their depth slot is never written).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RenderError::Rasterize`] if `width`, `height` or `tile_size` is
+    /// zero, and [`RenderError::MismatchedBufferSizes`] if `tile_ranges` does not
+    /// hold `2 × num_tiles` values or the two per-Gaussian slices differ in length.
+    pub fn snapshot_from_gpu_data(
+        &self,
+        tile_ranges: &[u32],
+        gaussian_depths: &[f32],
+        gaussian_radii: &[i32],
+    ) -> Result<RasterizationSnapshot, RenderError> {
+        self.validate_config()?;
+
+        let num_tiles_x = self.num_tiles_x();
+        let num_tiles_y = self.num_tiles_y();
+        let total_tiles = (num_tiles_x as usize) * (num_tiles_y as usize);
+
+        if tile_ranges.len() != total_tiles * 2 {
+            return Err(RenderError::MismatchedBufferSizes {
+                expected: total_tiles * 2,
+                actual: tile_ranges.len(),
+            });
+        }
+        if gaussian_radii.len() != gaussian_depths.len() {
+            return Err(RenderError::MismatchedBufferSizes {
+                expected: gaussian_depths.len(),
+                actual: gaussian_radii.len(),
+            });
+        }
+
+        // tile_ranges is [start, end) per tile; an empty tile is (0, 0).
+        let tile_gaussian_counts: Vec<u32> = tile_ranges
+            .chunks_exact(2)
+            .map(|range| range[1].saturating_sub(range[0]))
+            .collect();
+
+        let mut min_depth = f32::INFINITY;
+        let mut max_depth = f32::NEG_INFINITY;
+        let mut visible_gaussians: u32 = 0;
+        let mut gaussian_screen_sizes = Vec::with_capacity(gaussian_depths.len());
+
+        for (&depth, &radius) in gaussian_depths.iter().zip(gaussian_radii.iter()) {
+            if radius < 0 {
+                // Culled in preprocess: its depth slot carries no meaning.
+                gaussian_screen_sizes.push(0.0);
+                continue;
+            }
+            gaussian_screen_sizes.push(radius as f32);
+
+            if depth < min_depth {
+                min_depth = depth;
+            }
+            if depth > max_depth {
+                max_depth = depth;
+            }
+            if depth > NEAR_PLANE_THRESHOLD {
+                visible_gaussians += 1;
+            }
+        }
+
+        let total_gaussians = u32::try_from(gaussian_depths.len()).unwrap_or(u32::MAX);
+        let stats = RasterizationStats::compute(
+            &tile_gaussian_counts,
+            self.capacity_per_tile,
+            total_gaussians,
+            visible_gaussians,
+        );
+
+        Ok(RasterizationSnapshot {
+            tile_gaussian_counts,
+            num_tiles_x,
+            num_tiles_y,
+            tile_size: self.tile_size,
+            width: self.width,
+            height: self.height,
+            min_depth,
+            max_depth,
+            gaussian_screen_sizes,
+            stats,
+        })
+    }
+
+    /// Copy the rasterizer's intermediate buffers back to the CPU and build a
+    /// snapshot of what the GPU actually produced.
+    ///
+    /// `tile_ranges`, `depths` and `radii` are `IntermediateBuffers` fields of
+    /// the same names; all three carry `COPY_SRC`. Each buffer is copied into a
+    /// `MAP_READ` staging buffer, so this blocks on the device and is meant for
+    /// debug/validation paths (e.g. behind the `gpu_debug` feature), not the
+    /// steady-state render loop.
+    ///
+    /// Call this **after a completed forward pass**: `tile_ranges` is
+    /// zero-cleared at the start of every frame and only filled by the
+    /// `tile_ranges` kernel, so reading it earlier (or after a pass that failed)
+    /// yields all-zero counts that look exactly like an empty scene.
+    ///
+    /// # Errors
+    ///
+    /// * [`RenderError::Rasterize`] when the tile configuration is degenerate.
+    /// * [`RenderError::BufferOverflow`] when a buffer is smaller than the
+    ///   configuration implies.
+    /// * [`RenderError::BufferMapFailed`] when a staging buffer cannot be mapped.
+    /// * [`RenderError::MismatchedBufferSizes`] when the downloaded data does not
+    ///   match the tile grid.
+    pub fn read_from_gpu(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        tile_ranges: &wgpu::Buffer,
+        depths: &wgpu::Buffer,
+        radii: &wgpu::Buffer,
+        num_gaussians: u32,
+    ) -> Result<RasterizationSnapshot, RenderError> {
+        self.validate_config()?;
+
+        let total_tiles = u64::from(self.num_tiles_x()) * u64::from(self.num_tiles_y());
+        let tile_bytes = total_tiles * 2 * 4;
+        let gaussian_bytes = u64::from(num_gaussians) * 4;
+
+        let tile_bytes_read =
+            read_buffer_bytes(device, queue, tile_ranges, tile_bytes, "tile_ranges")?;
+        let tile_range_values = u32_from_le_bytes(&tile_bytes_read);
+
+        let (depth_values, radius_values) = if gaussian_bytes == 0 {
+            (Vec::new(), Vec::new())
+        } else {
+            let depth_bytes = read_buffer_bytes(device, queue, depths, gaussian_bytes, "depths")?;
+            let radius_bytes = read_buffer_bytes(device, queue, radii, gaussian_bytes, "radii")?;
+            (
+                f32_from_le_bytes(&depth_bytes),
+                i32_from_le_bytes(&radius_bytes),
+            )
+        };
+
+        self.snapshot_from_gpu_data(&tile_range_values, &depth_values, &radius_values)
+    }
+}
+
+// ── GPU readback plumbing ─────────────────────────────────────────────────────
+
+/// Copy `byte_len` bytes out of `buffer` into host memory.
+fn read_buffer_bytes(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    buffer: &wgpu::Buffer,
+    byte_len: u64,
+    label: &str,
+) -> Result<Vec<u8>, RenderError> {
+    if byte_len == 0 {
+        return Ok(Vec::new());
+    }
+    if buffer.size() < byte_len {
+        return Err(RenderError::BufferOverflow {
+            buffer_name: label.to_string(),
+            max_size: buffer.size(),
+            requested: byte_len,
+        });
+    }
+
+    // Staging size must satisfy COPY_BUFFER_ALIGNMENT for both the copy and the
+    // subsequent map; every caller here reads whole 4-byte elements.
+    let staging_size = byte_len.next_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT);
+    let staging = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("debug_readback_staging"),
+        size: staging_size,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("debug_readback"),
+    });
+    encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, byte_len);
+    queue.submit(std::iter::once(encoder.finish()));
+
+    let slice = staging.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        tx.send(result).ok();
+    });
+    let _ = device.poll(wgpu::PollType::Wait {
+        submission_index: None,
+        timeout: None,
+    });
+    rx.recv()
+        .map_err(|e| RenderError::BufferMapFailed {
+            buffer_name: label.to_string(),
+            error: format!("Channel recv failed: {e}"),
+        })?
+        .map_err(|e| RenderError::BufferMapFailed {
+            buffer_name: label.to_string(),
+            error: e.to_string(),
+        })?;
+
+    let data = slice
+        .get_mapped_range()
+        .map_err(|e| RenderError::BufferMapFailed {
+            buffer_name: label.to_string(),
+            error: format!("Mapped range failed: {e}"),
+        })?;
+    let len = byte_len.min(data.len() as u64) as usize;
+    let bytes = data.get(..len).unwrap_or_default().to_vec();
+    drop(data);
+    staging.unmap();
+
+    Ok(bytes)
+}
+
+/// Read a little-endian 4-byte word without alignment assumptions.
+#[inline]
+fn le_word(chunk: &[u8]) -> [u8; 4] {
+    let mut raw = [0u8; 4];
+    // Callers pass `chunks_exact(4)` items, so `n` is always 4; the clamp keeps
+    // the helper total rather than panicking on a short slice.
+    let n = chunk.len().min(4);
+    raw[..n].copy_from_slice(&chunk[..n]);
+    raw
+}
+
+/// Decode a little-endian `u32` array.
+fn u32_from_le_bytes(bytes: &[u8]) -> Vec<u32> {
+    bytes
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes(le_word(c)))
+        .collect()
+}
+
+/// Decode a little-endian `f32` array.
+fn f32_from_le_bytes(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(le_word(c)))
+        .collect()
+}
+
+/// Decode a little-endian `i32` array.
+fn i32_from_le_bytes(bytes: &[u8]) -> Vec<i32> {
+    bytes
+        .chunks_exact(4)
+        .map(|c| i32::from_le_bytes(le_word(c)))
+        .collect()
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -868,6 +1150,102 @@ mod tests {
     }
 
     // ── gaussian_screen_sizes ─────────────────────────────────────────────
+
+    // ── GPU snapshot assembly ─────────────────────────────────────────────
+
+    #[test]
+    fn test_snapshot_from_gpu_data_uses_real_tile_ranges() {
+        // 32×32 image, tile_size=16 → 2×2 tiles.
+        // Ranges: tile0 = [0,3), tile1 = empty, tile2 = [3,7), tile3 = empty.
+        let tile_ranges = vec![0, 3, 0, 0, 3, 7, 0, 0];
+        let depths = vec![1.0f32, 2.0, 3.0];
+        let radii = vec![4i32, 8, 12];
+
+        let snap = DebugReadbackBuilder::new(32, 32)
+            .with_tile_size(16)
+            .snapshot_from_gpu_data(&tile_ranges, &depths, &radii)
+            .expect("gpu snapshot");
+
+        assert_eq!(snap.tile_gaussian_counts, vec![3, 0, 4, 0]);
+        assert_eq!(snap.stats.max_tile_occupancy, 4);
+        assert_eq!(snap.stats.empty_tiles, 2);
+        assert_eq!(snap.stats.total_gaussians, 3);
+        assert_eq!(snap.gaussian_screen_sizes, vec![4.0, 8.0, 12.0]);
+    }
+
+    #[test]
+    fn test_snapshot_from_gpu_data_excludes_culled_gaussians() {
+        // 16×16 image → 1 tile. Gaussian 0 was culled (negative radius).
+        let tile_ranges = vec![0, 1];
+        let depths = vec![f32::NAN, 2.0f32];
+        let radii = vec![-1i32, 8];
+
+        let snap = DebugReadbackBuilder::new(16, 16)
+            .with_tile_size(16)
+            .snapshot_from_gpu_data(&tile_ranges, &depths, &radii)
+            .expect("gpu snapshot");
+
+        assert_eq!(snap.gaussian_screen_sizes, vec![0.0, 8.0]);
+        assert_eq!(snap.stats.total_gaussians, 2);
+        assert_eq!(snap.stats.visible_gaussians, 1);
+        assert!((snap.min_depth - 2.0).abs() < 1e-6);
+        assert!((snap.max_depth - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_snapshot_from_gpu_data_rejects_wrong_tile_range_length() {
+        // 2×2 tiles need 8 values, not 4.
+        let err = DebugReadbackBuilder::new(32, 32)
+            .with_tile_size(16)
+            .snapshot_from_gpu_data(&[0, 1, 0, 0], &[], &[])
+            .expect_err("short tile_ranges must be rejected");
+        assert!(matches!(
+            err,
+            RenderError::MismatchedBufferSizes {
+                expected: 8,
+                actual: 4
+            }
+        ));
+    }
+
+    #[test]
+    fn test_snapshot_from_gpu_data_rejects_mismatched_gaussian_slices() {
+        let err = DebugReadbackBuilder::new(16, 16)
+            .with_tile_size(16)
+            .snapshot_from_gpu_data(&[0, 0], &[1.0, 2.0], &[4])
+            .expect_err("depths/radii mismatch must be rejected");
+        assert!(matches!(err, RenderError::MismatchedBufferSizes { .. }));
+    }
+
+    #[test]
+    fn test_snapshot_from_gpu_data_empty_scene() {
+        let snap = DebugReadbackBuilder::new(16, 16)
+            .with_tile_size(16)
+            .snapshot_from_gpu_data(&[0, 0], &[], &[])
+            .expect("empty gpu snapshot");
+        assert_eq!(snap.tile_gaussian_counts, vec![0]);
+        assert_eq!(snap.min_depth, f32::INFINITY);
+        assert_eq!(snap.max_depth, f32::NEG_INFINITY);
+    }
+
+    #[test]
+    fn test_le_decoders_round_trip() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&7u32.to_le_bytes());
+        bytes.extend_from_slice(&(-3i32).to_le_bytes());
+        assert_eq!(u32_from_le_bytes(&bytes)[0], 7);
+        assert_eq!(i32_from_le_bytes(&bytes)[1], -3);
+
+        let float_bytes = 1.5f32.to_le_bytes();
+        assert!((f32_from_le_bytes(&float_bytes)[0] - 1.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_le_decoders_ignore_trailing_partial_word() {
+        // 6 bytes → one complete word, the trailing 2 are dropped.
+        let bytes = [1u8, 0, 0, 0, 9, 9];
+        assert_eq!(u32_from_le_bytes(&bytes), vec![1]);
+    }
 
     #[test]
     fn test_gaussian_screen_sizes_stored_correctly() {

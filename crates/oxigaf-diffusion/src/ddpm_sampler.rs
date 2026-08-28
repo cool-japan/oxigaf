@@ -39,10 +39,73 @@ pub enum BetaSchedule {
     Linear { start: f32, end: f32 },
     /// Cosine schedule (Nichol & Dhariwal 2021).
     Cosine { offset: f32 },
-    /// Sigmoid-based schedule.
-    Sigmoid { start: f32, end: f32, tau: f32 },
+    /// Sigmoid-based schedule. `start`/`end` are the sigmoid *domain*
+    /// bounds (e.g. -3.0..3.0), not beta values; `beta_start`/`beta_end`
+    /// are the actual output beta range (e.g. 0.0001..0.02).
+    Sigmoid {
+        start: f32,
+        end: f32,
+        tau: f32,
+        beta_start: f32,
+        beta_end: f32,
+    },
     /// Scaled linear (for resolution adaptation).
     Scaled { scale: f32 },
+}
+
+impl BetaSchedule {
+    /// Validate the parameters of this variant, rejecting combinations
+    /// that would otherwise produce NaN/Inf betas (and, downstream, NaN/Inf
+    /// in every schedule coefficient derived from them).
+    pub fn validate(&self) -> Result<(), DdpmError> {
+        match self {
+            BetaSchedule::Linear { start, end } => {
+                if !start.is_finite() || !end.is_finite() {
+                    return Err(DdpmError::InvalidConfig(
+                        "Linear beta schedule: start/end must be finite".into(),
+                    ));
+                }
+            }
+            BetaSchedule::Cosine { offset } => {
+                if !offset.is_finite() || *offset <= -1.0 {
+                    return Err(DdpmError::InvalidConfig(format!(
+                        "Cosine beta schedule: offset must be finite and > -1.0, got {offset}"
+                    )));
+                }
+            }
+            BetaSchedule::Sigmoid {
+                start,
+                end,
+                tau,
+                beta_start,
+                beta_end,
+            } => {
+                if !tau.is_finite() || *tau == 0.0 {
+                    return Err(DdpmError::InvalidConfig(format!(
+                        "Sigmoid beta schedule: tau must be finite and non-zero, got {tau}"
+                    )));
+                }
+                if !start.is_finite() || !end.is_finite() || (start - end).abs() < f32::EPSILON {
+                    return Err(DdpmError::InvalidConfig(
+                        "Sigmoid beta schedule: start must differ from end".into(),
+                    ));
+                }
+                if !beta_start.is_finite() || !beta_end.is_finite() {
+                    return Err(DdpmError::InvalidConfig(
+                        "Sigmoid beta schedule: beta_start/beta_end must be finite".into(),
+                    ));
+                }
+            }
+            BetaSchedule::Scaled { scale } => {
+                if !scale.is_finite() || *scale <= 0.0 {
+                    return Err(DdpmError::InvalidConfig(format!(
+                        "Scaled beta schedule: scale must be finite and > 0.0, got {scale}"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -89,17 +152,53 @@ pub fn cosine_beta_schedule(num_timesteps: usize, offset: f32) -> Vec<f32> {
 }
 
 /// Sigmoid-based beta schedule.
-pub fn sigmoid_beta_schedule(num_timesteps: usize, start: f32, end: f32, tau: f32) -> Vec<f32> {
+///
+/// `beta_t = beta_start + (sigmoid(t/tau) - sigmoid(start/tau)) /
+/// (sigmoid(end/tau) - sigmoid(start/tau)) * (beta_end - beta_start)`,
+/// where `t` ranges linearly over `[start, end]` across the
+/// `num_timesteps` entries.
+///
+/// `start`/`end` are the sigmoid *domain* bounds (e.g. -3.0..3.0), not beta
+/// values — `beta_start`/`beta_end` are the actual output beta range (e.g.
+/// 0.0001..0.02) the result is rescaled into. Without this rescale the
+/// output spans the sigmoid's full `[0, 1]` range regardless of
+/// `beta_start`/`beta_end`, which is far outside a valid beta range and
+/// produces NaN/Inf in every schedule coefficient derived from it.
+///
+/// Guards against `tau == 0` (falls back to `tau = 1`) and a degenerate,
+/// zero-width sigmoid domain (`sigmoid(end/tau) == sigmoid(start/tau)`,
+/// which would otherwise divide by ~0) by falling back to linear
+/// interpolation over the step index in that case. The result is always
+/// clamped to `[1e-6, 0.999]`, a safe beta range.
+pub fn sigmoid_beta_schedule(
+    num_timesteps: usize,
+    start: f32,
+    end: f32,
+    tau: f32,
+    beta_start: f32,
+    beta_end: f32,
+) -> Vec<f32> {
     if num_timesteps == 0 {
         return Vec::new();
     }
+    if num_timesteps == 1 {
+        return vec![beta_start.clamp(1e-6, 0.999)];
+    }
     let sig = |x: f32| 1.0_f32 / (1.0 + (-x).exp());
-    let v_start = sig(start / tau);
-    let v_end = sig(end / tau);
+    let safe_tau = if tau == 0.0 { 1.0 } else { tau };
+    let v_start = sig(start / safe_tau);
+    let v_end = sig(end / safe_tau);
+    let span = v_end - v_start;
+
     (0..num_timesteps)
         .map(|i| {
-            let t = start + (end - start) * (i as f32) / ((num_timesteps.max(2) - 1) as f32);
-            (sig(t / tau) - v_start) / (v_end - v_start)
+            let t = start + (end - start) * (i as f32) / ((num_timesteps - 1) as f32);
+            let frac = if span.abs() < 1e-12 {
+                i as f32 / (num_timesteps - 1) as f32
+            } else {
+                (sig(t / safe_tau) - v_start) / span
+            };
+            (beta_start + frac * (beta_end - beta_start)).clamp(1e-6, 0.999)
         })
         .collect()
 }
@@ -140,24 +239,34 @@ impl DdpmSchedule {
         if num_timesteps == 0 {
             return Err(DdpmError::EmptySchedule);
         }
+        beta_schedule.validate()?;
 
         let betas = match beta_schedule {
             BetaSchedule::Linear { start, end } => linear_beta_schedule(num_timesteps, start, end),
             BetaSchedule::Cosine { offset } => cosine_beta_schedule(num_timesteps, offset),
-            BetaSchedule::Sigmoid { start, end, tau } => {
-                sigmoid_beta_schedule(num_timesteps, start, end, tau)
-            }
+            BetaSchedule::Sigmoid {
+                start,
+                end,
+                tau,
+                beta_start,
+                beta_end,
+            } => sigmoid_beta_schedule(num_timesteps, start, end, tau, beta_start, beta_end),
             BetaSchedule::Scaled { scale } => {
                 // Scaled linear: betas linearly spaced in sqrt-space then squared.
                 let beta_start = (0.0001_f32 * scale).sqrt();
                 let beta_end = (0.02_f32 * scale).sqrt();
-                (0..num_timesteps)
-                    .map(|i| {
-                        let v = beta_start
-                            + (beta_end - beta_start) * (i as f32) / ((num_timesteps - 1) as f32);
-                        v * v
-                    })
-                    .collect()
+                if num_timesteps == 1 {
+                    vec![beta_start * beta_start]
+                } else {
+                    (0..num_timesteps)
+                        .map(|i| {
+                            let v = beta_start
+                                + (beta_end - beta_start) * (i as f32)
+                                    / ((num_timesteps - 1) as f32);
+                            v * v
+                        })
+                        .collect()
+                }
             }
         };
 
@@ -167,6 +276,17 @@ impl DdpmSchedule {
                 betas.len(),
                 num_timesteps
             )));
+        }
+
+        // Defense in depth: every beta must be finite and in the open (0, 1)
+        // interval, or every downstream coefficient (alphas_cumprod,
+        // posterior_variance, sqrt_recip_alphas_cumprod, ...) risks NaN/Inf.
+        for (i, &b) in betas.iter().enumerate() {
+            if !b.is_finite() || b <= 0.0 || b >= 1.0 {
+                return Err(DdpmError::NumericalError(format!(
+                    "beta[{i}] = {b} is out of the valid (0, 1) range"
+                )));
+            }
         }
 
         let alphas: Vec<f32> = betas.iter().map(|&b| 1.0 - b).collect();
@@ -278,7 +398,18 @@ impl DdpmSchedule {
 pub struct DdpmSamplerConfig {
     /// Number of inference steps (may be < num_timesteps for strided sampling).
     pub num_inference_steps: usize,
-    /// DDIM interpolation factor: 0.0 = deterministic (DDIM), 1.0 = stochastic (DDPM).
+    /// Posterior noise scale factor. The Gaussian noise sampled at each
+    /// reverse step (`t > 0`) is multiplied by `eta` before being passed to
+    /// [`p_sample`], which always uses the DDPM posterior mean
+    /// `c1·x̂₀ + c2·x_t`. `eta = 0.0` therefore yields the DDPM posterior
+    /// mean with *no* injected noise (a deterministic trajectory through
+    /// posterior means); `eta = 1.0` yields the standard stochastic DDPM
+    /// posterior.
+    ///
+    /// This is **not** the DDIM update (`√ᾱ_{t-1}·x̂₀ + √(1−ᾱ_{t-1})·ε`,
+    /// with its own `σ_t` formula) — this sampler implements only DDPM's
+    /// stochastic reverse process, with `eta` as a noise-amplitude dial
+    /// rather than a DDPM/DDIM interpolation factor.
     pub eta: f32,
     /// Clip x_0 prediction to [−1, 1] after recovery.
     pub clip_sample: bool,
@@ -341,20 +472,26 @@ fn xorshift64(state: u64) -> u64 {
     x
 }
 
-/// Generate `n` standard-normal samples using xorshift64 + Box-Muller.
+/// Fill `out` with standard-normal samples using xorshift64 + Box-Muller,
+/// advancing `state` in place.
 ///
-/// The seed guard `state = state.max(1)` is applied before first use.
-pub fn generate_noise(n: usize, seed: u64) -> Vec<f32> {
-    let mut state = seed.max(1);
-    let mut out = Vec::with_capacity(n);
-
+/// Unlike [`generate_noise`] (which always restarts from a fresh seed),
+/// repeated calls sharing the same `state` draw from disjoint windows of
+/// one continuous PRNG stream, so consecutive draws do not overlap. This is
+/// what [`sample`] uses internally so every reverse step gets independent
+/// noise instead of a near-copy of the previous step's draw.
+fn fill_noise(out: &mut [f32], state: &mut u64) {
+    if *state == 0 {
+        *state = 1;
+    }
+    let n = out.len();
     let mut i = 0usize;
     while i < n {
         // Uniform u1 in (0, 1)
-        state = xorshift64(state);
-        let u1 = state as f64 / u64::MAX as f64;
-        state = xorshift64(state);
-        let u2 = state as f64 / u64::MAX as f64;
+        *state = xorshift64(*state);
+        let u1 = *state as f64 / u64::MAX as f64;
+        *state = xorshift64(*state);
+        let u2 = *state as f64 / u64::MAX as f64;
 
         // Guard against ln(0)
         let u1 = u1.max(f64::EPSILON);
@@ -363,17 +500,23 @@ pub fn generate_noise(n: usize, seed: u64) -> Vec<f32> {
         let mag = (-2.0 * u1.ln()).sqrt();
         let theta = 2.0 * std::f64::consts::PI * u2;
 
-        let z0 = (mag * theta.cos()) as f32;
-        out.push(z0);
+        out[i] = (mag * theta.cos()) as f32;
         i += 1;
 
         if i < n {
-            let z1 = (mag * theta.sin()) as f32;
-            out.push(z1);
+            out[i] = (mag * theta.sin()) as f32;
             i += 1;
         }
     }
+}
 
+/// Generate `n` standard-normal samples using xorshift64 + Box-Muller.
+///
+/// The seed guard `state = state.max(1)` is applied before first use.
+pub fn generate_noise(n: usize, seed: u64) -> Vec<f32> {
+    let mut state = seed.max(1);
+    let mut out = vec![0.0_f32; n];
+    fill_noise(&mut out, &mut state);
     out
 }
 
@@ -569,7 +712,12 @@ pub fn dynamic_threshold(x: &[f32], ratio: f32) -> Vec<f32> {
         return Vec::new();
     }
     let mut abs_vals: Vec<f32> = x.iter().map(|&v| v.abs()).collect();
-    abs_vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    // `f32::total_cmp` is a genuine total order (unlike `partial_cmp` with an
+    // `Equal` fallback for incomparable values, which is not transitive and
+    // panics on current Rust's total-order-checking sort implementation as
+    // soon as a NaN appears — exactly the untrusted-input case dynamic
+    // thresholding is meant to survive).
+    abs_vals.sort_by(f32::total_cmp);
 
     let idx = ((x.len() as f32) * ratio) as usize;
     let idx = idx.min(x.len() - 1);
@@ -628,14 +776,18 @@ where
         ));
     }
 
-    // Initialise x_T ~ N(0, I)
-    let mut seed = config.seed.max(1);
-    let mut x_t = generate_noise(shape, seed);
+    // Initialise x_T ~ N(0, I). A single PRNG state is threaded through the
+    // whole routine (see `fill_noise`): every draw below advances it in
+    // place, so the initial noise and every reverse step's noise come from
+    // disjoint windows of one continuous stream instead of each step
+    // re-seeding from a value only one xorshift64 application away from
+    // the previous step's seed (which used to make consecutive steps'
+    // "noise" nearly identical).
+    let mut state = config.seed.max(1);
+    let mut x_t = vec![0.0_f32; shape];
+    fill_noise(&mut x_t, &mut state);
 
     for &t in &timesteps {
-        // Advance seed for step noise (distinct from initial x_T seed)
-        seed = xorshift64(seed);
-
         // Get model noise prediction
         let noise_pred = noise_model(&x_t, t);
 
@@ -669,10 +821,16 @@ where
             noise_pred
         };
 
-        // Step noise for t > 0
+        // Step noise for t > 0, drawn from the shared PRNG stream so it
+        // never overlaps the initial x_T draw or any previous step's draw.
         let step_noise = if t > 0 && config.eta > 0.0 {
-            let raw = generate_noise(shape, seed);
-            Some(raw.iter().map(|&v| v * config.eta).collect::<Vec<f32>>())
+            let mut raw = vec![0.0_f32; shape];
+            fill_noise(&mut raw, &mut state);
+            Some(
+                raw.into_iter()
+                    .map(|v| v * config.eta)
+                    .collect::<Vec<f32>>(),
+            )
         } else {
             None
         };
@@ -855,17 +1013,53 @@ mod tests {
 
     #[test]
     fn test_sigmoid_beta_length() {
-        let betas = sigmoid_beta_schedule(100, -3.0, 3.0, 1.0);
+        let betas = sigmoid_beta_schedule(100, -3.0, 3.0, 1.0, 0.0001, 0.02);
         assert_eq!(betas.len(), 100);
     }
 
     #[test]
     fn test_sigmoid_beta_valid_range() {
-        let betas = sigmoid_beta_schedule(100, -3.0, 3.0, 1.0);
+        let betas = sigmoid_beta_schedule(100, -3.0, 3.0, 1.0, 0.0001, 0.02);
         for &b in &betas {
-            // Sigmoid values are in (0, 1) — not necessarily strictly positive
-            assert!(b.is_finite(), "beta must be finite, got {}", b);
+            assert!(
+                (0.0001 - 1e-6..=0.02 + 1e-6).contains(&b),
+                "beta={b} out of expected [beta_start, beta_end] range"
+            );
         }
+    }
+
+    #[test]
+    fn test_sigmoid_beta_schedule_respects_beta_range() {
+        // Regression test: the schedule must be rescaled into
+        // [beta_start, beta_end], not span the full sigmoid [0, 1] range
+        // (which made betas[0] == 0.0 and betas[last] == 1.0, producing
+        // NaN/Inf schedule coefficients downstream).
+        let betas = sigmoid_beta_schedule(1000, -6.0, 6.0, 1.0, 0.0001, 0.02);
+        assert!(
+            (betas[0] - 0.0001).abs() < 1e-3,
+            "betas[0] should be near beta_start=0.0001, got {}",
+            betas[0]
+        );
+        assert!(
+            (betas[betas.len() - 1] - 0.02).abs() < 1e-3,
+            "betas[last] should be near beta_end=0.02, got {}",
+            betas[betas.len() - 1]
+        );
+        for &b in &betas {
+            assert!(
+                b.is_finite() && b > 0.0,
+                "beta must be finite and positive, got {b}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_sigmoid_beta_schedule_zero_tau_no_nan() {
+        // tau == 0 must not produce NaN/Inf (guarded internally, even
+        // though DdpmSchedule::new additionally rejects it via validate()).
+        let betas = sigmoid_beta_schedule(50, -3.0, 3.0, 0.0, 0.0001, 0.02);
+        assert_eq!(betas.len(), 50);
+        assert!(betas.iter().all(|b| b.is_finite()));
     }
 
     // --- DdpmSchedule::new ---
@@ -941,6 +1135,96 @@ mod tests {
         .expect("should succeed");
         // At t=0, alphas_cumprod_prev = 1.0, so (1 - 1.0) = 0, posterior_variance = 0.
         assert!(sched.posterior_variance[0].abs() < EPSILON);
+    }
+
+    // --- BetaSchedule::validate / DdpmSchedule::new parameter guards ---
+
+    #[test]
+    fn test_schedule_cosine_offset_minus_one_rejected() {
+        let result = DdpmSchedule::new(10, BetaSchedule::Cosine { offset: -1.0 });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_schedule_sigmoid_tau_zero_rejected() {
+        let result = DdpmSchedule::new(
+            10,
+            BetaSchedule::Sigmoid {
+                start: -3.0,
+                end: 3.0,
+                tau: 0.0,
+                beta_start: 0.0001,
+                beta_end: 0.02,
+            },
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_schedule_sigmoid_start_equals_end_rejected() {
+        let result = DdpmSchedule::new(
+            10,
+            BetaSchedule::Sigmoid {
+                start: 1.0,
+                end: 1.0,
+                tau: 1.0,
+                beta_start: 0.0001,
+                beta_end: 0.02,
+            },
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_schedule_scaled_negative_scale_rejected() {
+        let result = DdpmSchedule::new(10, BetaSchedule::Scaled { scale: -1.0 });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_schedule_scaled_zero_scale_rejected() {
+        let result = DdpmSchedule::new(10, BetaSchedule::Scaled { scale: 0.0 });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_schedule_scaled_num_timesteps_one_no_nan() {
+        let sched =
+            DdpmSchedule::new(1, BetaSchedule::Scaled { scale: 1.0 }).expect("should succeed");
+        assert_eq!(sched.betas.len(), 1);
+        assert!(sched.betas[0].is_finite());
+    }
+
+    #[test]
+    fn test_schedule_sigmoid_new_no_nan_or_inf() {
+        // End-to-end regression test for the sigmoid rescale fix: the full
+        // derived schedule must be free of NaN/Inf.
+        let sched = DdpmSchedule::new(
+            200,
+            BetaSchedule::Sigmoid {
+                start: -3.0,
+                end: 3.0,
+                tau: 1.0,
+                beta_start: 0.0001,
+                beta_end: 0.02,
+            },
+        )
+        .expect("should succeed");
+        for &v in &sched.alphas_cumprod {
+            assert!(
+                v.is_finite() && v > 0.0,
+                "alphas_cumprod must be finite and positive, got {v}"
+            );
+        }
+        for &v in &sched.posterior_variance {
+            assert!(v.is_finite(), "posterior_variance must be finite, got {v}");
+        }
+        for &v in &sched.sqrt_recip_alphas_cumprod {
+            assert!(
+                v.is_finite(),
+                "sqrt_recip_alphas_cumprod must be finite, got {v}"
+            );
+        }
     }
 
     // --- get_beta / get_alpha_cumprod ---
@@ -1246,6 +1530,45 @@ mod tests {
         assert_eq!(n.len(), 16);
     }
 
+    // --- fill_noise (shared-state threading used by `sample`) ---
+
+    #[test]
+    fn test_fill_noise_advances_shared_state() {
+        let mut state = 42_u64;
+        let mut out = vec![0.0_f32; 8];
+        fill_noise(&mut out, &mut state);
+        assert_ne!(state, 42_u64, "fill_noise must advance the threaded state");
+        assert!(out.iter().any(|&v| v != 0.0));
+    }
+
+    #[test]
+    fn test_fill_noise_consecutive_draws_not_a_shifted_copy() {
+        // Regression test for the DDPM `sample()` bug: re-seeding
+        // `generate_noise` from a seed only one or two xorshift64
+        // applications away from the previous seed made each reverse
+        // step's "noise" vector nearly identical to the previous one,
+        // shifted by ~2 elements. Two `fill_noise` calls sharing one
+        // threaded `state` must NOT exhibit that pattern: the second draw
+        // should not line up with the first one shifted left by 2.
+        let mut state = 42_u64;
+        let mut first = vec![0.0_f32; 64];
+        fill_noise(&mut first, &mut state);
+        let mut second = vec![0.0_f32; 64];
+        fill_noise(&mut second, &mut state);
+
+        let shifted_matches = first[2..]
+            .iter()
+            .zip(second.iter())
+            .filter(|(&a, &b)| (a - b).abs() < 1e-4)
+            .count();
+        assert!(
+            shifted_matches < first.len() / 4,
+            "second draw should not be a left-shift-by-2 copy of the first \
+             (this was the DDPM sample() re-seeding bug's signature): \
+             {shifted_matches} matching elements"
+        );
+    }
+
     // --- dynamic_threshold ---
 
     #[test]
@@ -1261,6 +1584,19 @@ mod tests {
     fn test_dynamic_threshold_empty() {
         let result = dynamic_threshold(&[], 0.995);
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_dynamic_threshold_nan_input_does_not_panic() {
+        // dynamic_threshold is called on the model's x_0 prediction, which
+        // may contain NaN after a diverging step. `partial_cmp` with an
+        // `Equal` fallback for NaN is not a total order and panics on
+        // current Rust's sort; `total_cmp` must not.
+        let mut x: Vec<f32> = (0..20).map(|i| i as f32 - 10.0).collect();
+        x[5] = f32::NAN;
+        x[15] = f32::NAN;
+        let result = dynamic_threshold(&x, 0.995);
+        assert_eq!(result.len(), x.len());
     }
 
     // --- clip_sample ---

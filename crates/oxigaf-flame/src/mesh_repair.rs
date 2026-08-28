@@ -188,9 +188,23 @@ impl MeshRepairExt for crate::mesh::Mesh {
 ///
 /// Returns the grid cell index as an `i64` so that floats on opposite sides of
 /// zero map to different cells.
+///
+/// `repair_mesh` rejects a non-finite or non-positive `merge_threshold`
+/// before this is ever called (see its `merge_threshold` validation), so
+/// `val / threshold` should always be finite here. As defense in depth this
+/// still guards against a non-finite result -- e.g. a `threshold` of `0.0`
+/// would otherwise make every coordinate map to `+-inf`/`NaN`, which
+/// `as i64` silently saturates to the same extreme cell index for every
+/// vertex, collapsing the entire mesh into one vertex -- returning `0`
+/// instead of propagating that saturation.
 #[inline]
 fn quantize(val: f32, threshold: f32) -> i64 {
-    (val / threshold).floor() as i64
+    let q = val / threshold;
+    if q.is_finite() {
+        q.floor() as i64
+    } else {
+        0
+    }
 }
 
 /// Directed-edge key: `(from_vertex, to_vertex)`.
@@ -273,9 +287,10 @@ fn fix_winding_order(vertices_count: usize, faces: &[[u32; 3]]) -> (Vec<[u32; 3]
     let mut out_faces: Vec<[u32; 3]> = faces.to_vec();
     let face_count = out_faces.len();
 
-    // Build directed-edge → face-indices map from current face list.
-    // We rebuild this lazily per BFS iteration after potential flips.
-    // For efficiency, build once and update on flip.
+    // Build directed-edge → face-indices map from current face list. Used
+    // once here for the initial map; every subsequent flip below patches
+    // it incrementally in place (only the flipped face's 3 edges change)
+    // rather than calling this again.
     let build_edge_map = |fcs: &[[u32; 3]]| -> HashMap<DirectedEdge, Vec<usize>> {
         let mut map: HashMap<DirectedEdge, Vec<usize>> = HashMap::new();
         for (fi, face) in fcs.iter().enumerate() {
@@ -301,6 +316,12 @@ fn fix_winding_order(vertices_count: usize, faces: &[[u32; 3]]) -> (Vec<[u32; 3]
         visited[start] = true;
 
         while let Some(fi) = queue.pop_front() {
+            // Snapshot `fi`'s own edges by value ([u32; 3] is Copy) before
+            // any mutation below. `fi` itself is never flipped while it is
+            // being processed here (only its neighbors `nfi` are), so this
+            // snapshot stays valid for the rest of this iteration even as
+            // `out_faces`/`edge_map` are patched underneath it -- do not
+            // "optimize" this back to a live index into `out_faces`.
             let face = out_faces[fi];
             let directed_edges = [(face[0], face[1]), (face[1], face[2]), (face[2], face[0])];
 
@@ -325,13 +346,44 @@ fn fix_winding_order(vertices_count: usize, faces: &[[u32; 3]]) -> (Vec<[u32; 3]
                     edge_map.get(&same_edge).cloned().unwrap_or_default();
                 for nfi in same_neighbors {
                     if nfi != fi && !visited[nfi] {
-                        // Flip this face by swapping indices 1 and 2.
-                        let f = &mut out_faces[nfi];
-                        f.swap(1, 2);
+                        // Flip this face by swapping indices 1 and 2, then
+                        // patch `edge_map` incrementally instead of
+                        // rebuilding it from all F faces: reversing a
+                        // triangle's winding replaces each of its 3
+                        // directed edges with its exact reverse (swapping
+                        // the cyclic order of [f0,f1,f2] maps (f0,f1) →
+                        // (f0,f2), (f1,f2) → (f2,f1), (f2,f0) → (f1,f0)),
+                        // so only those 6 map entries ever change. The old
+                        // full rebuild made repairing a mesh with O(F)
+                        // inconsistent faces cost O(F^2) hash operations.
+                        let old_face = out_faces[nfi];
+                        let old_edges = [
+                            (old_face[0], old_face[1]),
+                            (old_face[1], old_face[2]),
+                            (old_face[2], old_face[0]),
+                        ];
+                        for edge in old_edges {
+                            if let Some(bucket) = edge_map.get_mut(&edge) {
+                                bucket.retain(|&x| x != nfi);
+                                if bucket.is_empty() {
+                                    edge_map.remove(&edge);
+                                }
+                            }
+                        }
+
+                        out_faces[nfi].swap(1, 2);
+                        let new_face = out_faces[nfi];
+                        let new_edges = [
+                            (new_face[0], new_face[1]),
+                            (new_face[1], new_face[2]),
+                            (new_face[2], new_face[0]),
+                        ];
+                        for edge in new_edges {
+                            edge_map.entry(edge).or_default().push(nfi);
+                        }
+
                         faces_flipped += 1;
                         visited[nfi] = true;
-                        // Rebuild edge map to reflect the flip.
-                        edge_map = build_edge_map(&out_faces);
                         queue.push_back(nfi);
                     }
                 }
@@ -346,61 +398,157 @@ fn fix_winding_order(vertices_count: usize, faces: &[[u32; 3]]) -> (Vec<[u32; 3]
 // Hole filling
 // ---------------------------------------------------------------------------
 
-/// Find boundary directed edges: edges that appear only once (no reverse edge).
-fn find_boundary_directed_edges(faces: &[[u32; 3]]) -> HashMap<u32, u32> {
-    // Count how many times each directed edge appears.
-    let mut directed: HashMap<DirectedEdge, u32> = HashMap::new();
-    for face in faces {
-        for (a, b) in [(face[0], face[1]), (face[1], face[2]), (face[2], face[0])] {
-            *directed.entry((a, b)).or_insert(0) += 1;
-        }
-    }
-
-    // A boundary directed edge (a→b) exists when (a,b) is present but (b,a) is not.
-    let mut boundary_next: HashMap<u32, u32> = HashMap::new();
-    for &(a, b) in directed.keys() {
-        if !directed.contains_key(&(b, a)) {
-            boundary_next.insert(a, b);
-        }
-    }
-    boundary_next
+/// The boundary of a face set, together with enough face topology to walk
+/// along it unambiguously.
+///
+/// # Why vertex adjacency is not enough
+///
+/// The obvious representation -- "for each vertex, the list of vertices it
+/// reaches via a boundary edge" -- loses information exactly where it matters.
+/// At a *pinch vertex*, where two otherwise separate holes touch at a single
+/// vertex `u`, `u` has two incoming and two outgoing boundary edges, and the
+/// adjacency list cannot say which outgoing edge continues which incoming one.
+/// A tracer walking that map has to guess, and pairing them the wrong way
+/// splices two distinct triangular holes into one bogus six-vertex loop.
+///
+/// Worse, the guess used to be made by popping from a `HashMap`-ordered
+/// `Vec`, so which pairing came out depended on hash iteration order: the
+/// same mesh traced correctly or incorrectly from run to run.
+///
+/// The pairing is not actually ambiguous -- the *faces* determine it. This
+/// struct therefore keeps the per-face edge cycle and resolves the successor
+/// by rotating around the shared vertex (see
+/// [`BoundaryGraph::boundary_successor`]), which is both deterministic and
+/// topologically correct.
+struct BoundaryGraph {
+    /// Every boundary directed edge `(a, b)`: present in some face, with no
+    /// reverse `(b, a)` anywhere in the mesh. A `BTreeSet` so that tracing
+    /// visits loops in a stable, mesh-order-independent sequence.
+    edges: std::collections::BTreeSet<DirectedEdge>,
+    /// For every directed edge present in the mesh, the next edge around its
+    /// own face: for face `(a, b, c)`, `(a,b) → (b,c) → (c,a) → (a,b)`.
+    ///
+    /// Its key set is exactly the set of directed edges the mesh contains,
+    /// so `face_next.contains_key(&(b, a))` is the "does the reverse exist"
+    /// test that distinguishes interior edges from boundary edges.
+    ///
+    /// If a directed edge occurs in more than one face -- only possible on a
+    /// non-manifold or inconsistently wound mesh -- the first face in `faces`
+    /// order wins. That keeps the map single-valued and deterministic;
+    /// [`BoundaryGraph::boundary_successor`] bounds its rotation so a
+    /// mis-paired fan cannot spin forever.
+    face_next: std::collections::BTreeMap<DirectedEdge, DirectedEdge>,
 }
 
-/// Trace closed boundary loops from the adjacency map `start → next`.
-///
-/// Returns a list of loops, each expressed as an ordered list of vertex indices.
-fn trace_boundary_loops(boundary_next: &HashMap<u32, u32>) -> Vec<Vec<u32>> {
-    let mut visited: HashMap<u32, bool> = HashMap::new();
-    let mut loops: Vec<Vec<u32>> = Vec::new();
-
-    for &start in boundary_next.keys() {
-        if visited.get(&start).copied().unwrap_or(false) {
-            continue;
+impl BoundaryGraph {
+    /// Build the boundary graph for `faces`.
+    fn new(faces: &[[u32; 3]]) -> Self {
+        let mut face_next: std::collections::BTreeMap<DirectedEdge, DirectedEdge> =
+            std::collections::BTreeMap::new();
+        for face in faces {
+            let cycle = [
+                ((face[0], face[1]), (face[1], face[2])),
+                ((face[1], face[2]), (face[2], face[0])),
+                ((face[2], face[0]), (face[0], face[1])),
+            ];
+            for (edge, next) in cycle {
+                // First face wins; see the field docs.
+                face_next.entry(edge).or_insert(next);
+            }
         }
 
+        let edges = face_next
+            .keys()
+            .copied()
+            .filter(|&(a, b)| !face_next.contains_key(&(b, a)))
+            .collect();
+
+        Self { edges, face_next }
+    }
+
+    /// The boundary edge that follows `edge` around the same boundary loop.
+    ///
+    /// `edge` is a boundary edge `(z, u)` arriving at `u`. The loop continues
+    /// along whichever boundary edge leaves `u` on the *same side* of the
+    /// surface, which is found by rotating through `u`'s face fan:
+    ///
+    /// 1. Take the next edge in `edge`'s own face, `(u, y)`.
+    /// 2. If `(y, u)` also exists then `{u, y}` is an interior edge -- there
+    ///    is another face on the far side. Step across it by taking the next
+    ///    edge in *that* face, which is again an edge leaving `u`, and repeat.
+    /// 3. Stop at the first candidate whose reverse is absent. That edge is
+    ///    on the boundary and is in the same fan, hence the same loop.
+    ///
+    /// On a pinch vertex the two fans meeting at `u` are traversed
+    /// independently, so each incoming boundary edge finds the outgoing edge
+    /// belonging to its own hole and the two loops stay separate.
+    ///
+    /// Returns `None` when the fan cannot be resolved -- a dangling edge, or a
+    /// non-manifold umbrella that never closes. The rotation is bounded by
+    /// the total directed-edge count, so this always terminates.
+    fn boundary_successor(&self, edge: DirectedEdge) -> Option<DirectedEdge> {
+        let mut candidate = *self.face_next.get(&edge)?;
+        // Each step consumes a distinct face of `u`'s fan; the mesh has fewer
+        // faces than directed edges, so this bound can never cut a legitimate
+        // rotation short.
+        for _ in 0..self.face_next.len() {
+            let reverse = (candidate.1, candidate.0);
+            match self.face_next.get(&reverse) {
+                // Interior edge: cross into the adjacent face and keep turning.
+                Some(&across) => candidate = across,
+                // No face on the far side: this is the boundary edge we want.
+                None => return Some(candidate),
+            }
+        }
+        None
+    }
+}
+
+/// Trace closed boundary loops, consuming each boundary edge exactly once.
+///
+/// Successors come from [`BoundaryGraph::boundary_successor`], so a vertex
+/// shared by several holes routes each incoming edge to the outgoing edge in
+/// its own fan and every hole is recovered separately. Loops are seeded from
+/// the `BTreeSet` of boundary edges in ascending order, making both the set of
+/// loops and the rotation of each loop's vertex list a pure function of the
+/// face list -- no hash iteration order is involved anywhere.
+///
+/// A trace is abandoned (and its consumed edges not retried) when the fan
+/// cannot be resolved, or when it revisits an already-consumed edge without
+/// returning to its start. Both mean the boundary is not a disjoint union of
+/// simple loops -- possible when `fix_winding_order` is disabled independently
+/// of `fill_holes` -- and match the previous leave-it-unfilled behavior.
+/// Because every iteration either consumes an edge from the finite `unused`
+/// pool or stops, this always terminates.
+///
+/// Returns a list of loops, each an ordered list of vertex indices following
+/// the mesh's own boundary directed-edge direction.
+fn trace_boundary_loops(graph: &BoundaryGraph) -> Vec<Vec<u32>> {
+    let mut unused = graph.edges.clone();
+    let mut loops: Vec<Vec<u32>> = Vec::new();
+
+    while let Some(&start) = unused.iter().next() {
         let mut loop_verts: Vec<u32> = Vec::new();
-        let mut current = start;
+        let mut edge = start;
         let mut ok = true;
 
         loop {
-            if visited.get(&current).copied().unwrap_or(false) {
-                // If we've come back to the start, the loop is complete.
-                if current == start {
-                    break;
-                }
-                // Otherwise this boundary is non-simple; skip it.
+            if !unused.remove(&edge) {
+                // Walked back onto a consumed edge without closing: the
+                // boundary is not a simple loop here.
                 ok = false;
                 break;
             }
-            visited.insert(current, true);
-            loop_verts.push(current);
+            loop_verts.push(edge.0);
 
-            if let Some(&next) = boundary_next.get(&current) {
-                current = next;
-            } else {
+            let Some(next) = graph.boundary_successor(edge) else {
                 ok = false;
                 break;
+            };
+            if next == start {
+                break;
             }
+            edge = next;
         }
 
         if ok && loop_verts.len() >= 3 {
@@ -417,12 +565,12 @@ fn trace_boundary_loops(boundary_next: &HashMap<u32, u32>) -> Vec<Vec<u32>> {
 ///
 /// `(new_faces_to_add, holes_filled)`.
 fn fill_holes(faces: &[[u32; 3]], max_hole_size: usize) -> (Vec<[u32; 3]>, usize) {
-    let boundary_next = find_boundary_directed_edges(faces);
-    if boundary_next.is_empty() {
+    let graph = BoundaryGraph::new(faces);
+    if graph.edges.is_empty() {
         return (Vec::new(), 0);
     }
 
-    let loops = trace_boundary_loops(&boundary_next);
+    let loops = trace_boundary_loops(&graph);
     let mut new_faces: Vec<[u32; 3]> = Vec::new();
     let mut holes_filled = 0usize;
 
@@ -432,10 +580,20 @@ fn fill_holes(faces: &[[u32; 3]], max_hole_size: usize) -> (Vec<[u32; 3]>, usize
         if n > max_hole_size {
             continue;
         }
-        // Fan-triangulate from loop_verts[0].
+        // Fan-triangulate from loop_verts[0]. `loop_verts` is ordered along
+        // the *existing* mesh's boundary directed-edge direction (see
+        // `BoundaryGraph` / `trace_boundary_loops`), so a
+        // fill triangle spanning consecutive loop vertices (v_i, v_i+1)
+        // must traverse that segment in REVERSE -- [pivot, v_i+1, v_i] --
+        // to contribute the opposite directed edge from the one the
+        // surrounding mesh already has. Emitting [pivot, v_i, v_i+1]
+        // instead (the original, buggy order) duplicates the existing
+        // directed edges rather than canceling them, leaving every filled
+        // triangle's normal pointing opposite to the surrounding surface
+        // and the "repaired" mesh still non-manifold.
         let pivot = loop_verts[0];
         for i in 1..(n - 1) {
-            new_faces.push([pivot, loop_verts[i], loop_verts[i + 1]]);
+            new_faces.push([pivot, loop_verts[i + 1], loop_verts[i]]);
         }
         holes_filled += 1;
     }
@@ -474,7 +632,9 @@ fn validate_faces(vertices: &[[f32; 3]], faces: &[[u32; 3]]) -> Result<(), MeshR
 ///
 /// - [`MeshRepairError::EmptyMesh`] if the vertex array is empty.
 /// - [`MeshRepairError::InvalidFaceIndex`] if a face references a nonexistent vertex.
-/// - [`MeshRepairError::RepairFailed`] if an internal step fails unexpectedly.
+/// - [`MeshRepairError::RepairFailed`] if `config.merge_threshold` is
+///   non-finite or `<= 0.0` while `config.remove_duplicate_vertices` is
+///   `true`, or if an internal step fails unexpectedly.
 pub fn repair_mesh(
     vertices: &[[f32; 3]],
     faces: &[[u32; 3]],
@@ -486,6 +646,22 @@ pub fn repair_mesh(
 
     // Validate all face indices before any operation.
     validate_faces(vertices, faces)?;
+
+    // A zero, negative, or non-finite merge_threshold makes `quantize` map
+    // every vertex to the same (or a nonsensical) grid cell: `val / 0.0` is
+    // `+-inf`/`NaN`, which `as i64` saturates to the same extreme value
+    // regardless of `val`, silently collapsing the whole mesh into one
+    // vertex while `duplicates_removed` still reports a "successful"
+    // repair. Only checked when the dedup step actually runs, since an
+    // unused threshold is otherwise harmless.
+    if config.remove_duplicate_vertices
+        && (!config.merge_threshold.is_finite() || config.merge_threshold <= 0.0)
+    {
+        return Err(MeshRepairError::RepairFailed(format!(
+            "merge_threshold must be finite and > 0.0, got {}",
+            config.merge_threshold
+        )));
+    }
 
     let original_vertex_count = vertices.len();
     let original_face_count = faces.len();
@@ -996,5 +1172,328 @@ mod tests {
         let err = MeshRepairError::RepairFailed("test failure".to_string());
         let msg = err.to_string();
         assert!(msg.contains("test failure"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Hole-fill winding: filled triangles must not duplicate existing
+    // directed edges (regression for the inverted-normal bug).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_fill_holes_produces_consistent_winding_not_duplicate_directed_edges() {
+        // A single triangle has one triangular hole on its "back" side.
+        // Filling it must add a triangle whose winding is the *reverse* of
+        // the original, so every directed edge in the closed result
+        // appears at most once (each undirected edge shared by exactly 2
+        // faces, traversed in opposite directions) -- not twice in the
+        // same direction, which would mean inverted normals / a
+        // non-manifold seam.
+        let (_, faces) = single_triangle();
+        let (new_faces, filled) = fill_holes(&faces, 10);
+        assert_eq!(filled, 1);
+
+        let all_faces: Vec<[u32; 3]> = faces.iter().chain(new_faces.iter()).copied().collect();
+        let mut directed_edge_counts: HashMap<(u32, u32), u32> = HashMap::new();
+        for face in &all_faces {
+            for edge in [(face[0], face[1]), (face[1], face[2]), (face[2], face[0])] {
+                *directed_edge_counts.entry(edge).or_insert(0) += 1;
+            }
+        }
+        for (&(a, b), &count) in &directed_edge_counts {
+            assert_eq!(
+                count, 1,
+                "directed edge ({a},{b}) appears {count} times; hole fill must not \
+                 duplicate an existing directed edge (that indicates inverted winding)"
+            );
+            assert_eq!(
+                directed_edge_counts.get(&(b, a)).copied().unwrap_or(0),
+                1,
+                "reverse edge ({b},{a}) must exist exactly once for a closed 2-triangle mesh"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // fix_winding_order: incremental edge-map patch produces the same fully
+    // consistent result as the old full-rebuild approach, even with many
+    // flips (regression for the O(F^2) rebuild performance bug).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_fix_winding_order_incremental_patch_produces_fully_consistent_mesh() {
+        // A strip where every other triangle starts with inconsistent
+        // (flipped) winding, exercising the multi-flip incremental
+        // edge-map patch (not just the single-flip case the smaller tests
+        // above cover). After the fix, every undirected edge shared by two
+        // faces must have its two directed contributions pointing in
+        // opposite directions (consistent orientation) -- not both the
+        // same way.
+        let n_cols = 20usize; // 20 columns -> 19*2 = 38 triangles
+        let mut verts: Vec<[f32; 3]> = Vec::new();
+        for i in 0..n_cols {
+            verts.push([i as f32, 0.0, 0.0]);
+            verts.push([i as f32, 1.0, 0.0]);
+        }
+        let mut faces: Vec<[u32; 3]> = Vec::new();
+        for i in 0..(n_cols - 1) {
+            let idx_a = (2 * i) as u32;
+            let idx_b = (2 * i + 1) as u32;
+            let idx_c = (2 * i + 2) as u32;
+            let idx_d = (2 * i + 3) as u32;
+            let mut f0 = [idx_a, idx_c, idx_b];
+            let mut f1 = [idx_b, idx_c, idx_d];
+            // Deliberately flip a subset to introduce inconsistency.
+            if i % 2 == 1 {
+                f0.swap(1, 2);
+            }
+            if i % 3 == 0 {
+                f1.swap(1, 2);
+            }
+            faces.push(f0);
+            faces.push(f1);
+        }
+
+        let (fixed_faces, flipped) = fix_winding_order(verts.len(), &faces);
+        assert!(flipped > 0, "some faces should have needed flipping");
+
+        let mut directed_counts: HashMap<(u32, u32), u32> = HashMap::new();
+        for face in &fixed_faces {
+            for edge in [(face[0], face[1]), (face[1], face[2]), (face[2], face[0])] {
+                *directed_counts.entry(edge).or_insert(0) += 1;
+            }
+        }
+        for (&(a, b), &count) in &directed_counts {
+            assert_eq!(
+                count, 1,
+                "directed edge ({a},{b}) appears {count} times after fix_winding_order; \
+                 the mesh is not consistently wound"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // merge_threshold validation (regression for silent whole-mesh collapse).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_repair_rejects_zero_merge_threshold() {
+        let (verts, faces) = two_tri_strip();
+        let cfg = MeshRepairConfig {
+            merge_threshold: 0.0,
+            ..MeshRepairConfig::default()
+        };
+        let result = repair_mesh(&verts, &faces, &cfg);
+        assert!(
+            matches!(result, Err(MeshRepairError::RepairFailed(_))),
+            "zero merge_threshold must be rejected, not silently collapse the mesh"
+        );
+    }
+
+    #[test]
+    fn test_repair_rejects_negative_merge_threshold() {
+        let (verts, faces) = two_tri_strip();
+        let cfg = MeshRepairConfig {
+            merge_threshold: -1.0,
+            ..MeshRepairConfig::default()
+        };
+        let result = repair_mesh(&verts, &faces, &cfg);
+        assert!(matches!(result, Err(MeshRepairError::RepairFailed(_))));
+    }
+
+    #[test]
+    fn test_repair_rejects_nan_merge_threshold() {
+        let (verts, faces) = two_tri_strip();
+        let cfg = MeshRepairConfig {
+            merge_threshold: f32::NAN,
+            ..MeshRepairConfig::default()
+        };
+        let result = repair_mesh(&verts, &faces, &cfg);
+        assert!(matches!(result, Err(MeshRepairError::RepairFailed(_))));
+    }
+
+    #[test]
+    fn test_repair_allows_invalid_merge_threshold_when_dedup_disabled() {
+        let (verts, faces) = two_tri_strip();
+        let cfg = MeshRepairConfig {
+            remove_duplicate_vertices: false,
+            merge_threshold: 0.0, // unused, must not be rejected
+            ..MeshRepairConfig::default()
+        };
+        let result = repair_mesh(&verts, &faces, &cfg);
+        assert!(
+            result.is_ok(),
+            "unused merge_threshold should not block repair"
+        );
+    }
+
+    #[test]
+    fn test_quantize_handles_zero_threshold_without_panicking() {
+        // Defense in depth: even if called directly with a degenerate
+        // threshold, `quantize` must not panic and must not saturate to an
+        // extreme value that silently merges unrelated vertices.
+        assert_eq!(quantize(1.0, 0.0), 0);
+        assert_eq!(quantize(-1.0, 0.0), 0);
+        assert_eq!(quantize(0.0, 0.0), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Boundary tracing: a pinch vertex shared by two separate holes must
+    // not lose one of them (regression for the HashMap<u32,u32> overwrite).
+    // -----------------------------------------------------------------------
+
+    /// Normalize a loop to its lexicographically smallest rotation so two
+    /// traces of the same cycle compare equal regardless of where they were
+    /// seeded. Used to state loop-identity assertions without over-specifying
+    /// the tracer's starting edge.
+    fn canonical_loop(l: &[u32]) -> Vec<u32> {
+        (0..l.len())
+            .map(|i| {
+                let mut r = l[i..].to_vec();
+                r.extend_from_slice(&l[..i]);
+                r
+            })
+            .min()
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn test_trace_boundary_loops_finds_both_loops_sharing_a_pinch_vertex() {
+        // Two separate triangular holes that share exactly one vertex (0).
+        // Vertex 0 has two outgoing boundary edges, one per loop, and two
+        // incoming ones. Pairing them by vertex adjacency alone is ambiguous:
+        // the wrong pairing splices both triangles into a single bogus
+        // six-vertex loop. `BoundaryGraph` resolves the pairing from the face
+        // fans instead, so each hole is recovered separately.
+        let faces: Vec<[u32; 3]> = vec![[0, 1, 2], [0, 3, 4]];
+        let graph = BoundaryGraph::new(&faces);
+
+        let outgoing_at_pinch = graph.edges.iter().filter(|&&(a, _)| a == 0).count();
+        assert_eq!(
+            outgoing_at_pinch, 2,
+            "pinch vertex 0 must retain both of its outgoing boundary edges"
+        );
+
+        let loops = trace_boundary_loops(&graph);
+        assert_eq!(
+            loops.len(),
+            2,
+            "both triangular holes must be traced, got {loops:?}"
+        );
+        for l in &loops {
+            assert_eq!(l.len(), 3, "each hole boundary has 3 vertices, got {l:?}");
+        }
+
+        let mut canonical: Vec<Vec<u32>> = loops.iter().map(|l| canonical_loop(l)).collect();
+        canonical.sort();
+        assert_eq!(
+            canonical,
+            vec![vec![0, 1, 2], vec![0, 3, 4]],
+            "each traced loop must be one of the two original triangles"
+        );
+
+        // fill_holes should then add one triangle per hole.
+        let (new_faces, filled) = fill_holes(&faces, 10);
+        assert_eq!(filled, 2, "both holes should be filled");
+        assert_eq!(new_faces.len(), 2);
+    }
+
+    #[test]
+    fn test_trace_boundary_loops_is_deterministic_across_vertex_relabelling() {
+        // The old tracer seeded loops from `HashMap` iteration order, so the
+        // result depended on where the walk happened to start. Starting at a
+        // non-pinch vertex made it splice the two holes together, which is why
+        // the pinch test flapped between passing and failing on identical
+        // builds. Relabelling the pinch vertex moves it all over the hash
+        // order while leaving the topology (two triangles sharing one vertex)
+        // untouched, so every labelling must give the same answer.
+        for pinch in [0u32, 5, 9, 42, 1000] {
+            let faces: Vec<[u32; 3]> = vec![[pinch, 1, 2], [pinch, 3, 4]];
+            let graph = BoundaryGraph::new(&faces);
+            let loops = trace_boundary_loops(&graph);
+            assert_eq!(
+                loops.len(),
+                2,
+                "pinch vertex {pinch}: expected 2 loops, got {loops:?}"
+            );
+
+            let mut canonical: Vec<Vec<u32>> = loops.iter().map(|l| canonical_loop(l)).collect();
+            canonical.sort();
+            let mut want = vec![
+                canonical_loop(&[pinch, 1, 2]),
+                canonical_loop(&[pinch, 3, 4]),
+            ];
+            want.sort();
+            assert_eq!(canonical, want, "pinch vertex {pinch}");
+
+            let (_, filled) = fill_holes(&faces, 10);
+            assert_eq!(filled, 2, "pinch vertex {pinch}: both holes must fill");
+        }
+    }
+
+    #[test]
+    fn test_trace_boundary_loops_is_stable_across_repeated_runs() {
+        // Direct guard against the observed flapping: identical input must
+        // produce byte-identical output every time. With hash iteration order
+        // in the traversal this failed intermittently.
+        let faces: Vec<[u32; 3]> = vec![[7, 1, 2], [7, 3, 4], [10, 11, 12]];
+        let first = trace_boundary_loops(&BoundaryGraph::new(&faces));
+        assert_eq!(first.len(), 3);
+        for _ in 0..64 {
+            assert_eq!(
+                trace_boundary_loops(&BoundaryGraph::new(&faces)),
+                first,
+                "boundary tracing must be a pure function of the face list"
+            );
+        }
+    }
+
+    #[test]
+    fn test_boundary_successor_rotates_past_interior_edges() {
+        // A two-triangle fan around vertex 0: faces (1,0,2) and (2,0,3) share
+        // the interior edge {0,2}. Arriving at 0 along the boundary edge
+        // (1,0), the successor must skip the interior edge (0,2) and continue
+        // with the boundary edge (0,3) on the far side of the fan. A tracer
+        // that just took the first outgoing edge would emit (0,2) and cut the
+        // fan in half.
+        let faces: Vec<[u32; 3]> = vec![[1, 0, 2], [2, 0, 3]];
+        let graph = BoundaryGraph::new(&faces);
+
+        assert!(
+            !graph.edges.contains(&(0, 2)),
+            "the shared edge {{0,2}} is interior, not boundary"
+        );
+        assert_eq!(
+            graph.boundary_successor((1, 0)),
+            Some((0, 3)),
+            "successor must rotate through the fan past the interior edge"
+        );
+
+        let loops = trace_boundary_loops(&graph);
+        assert_eq!(loops.len(), 1, "the fan has a single boundary loop");
+        assert_eq!(
+            canonical_loop(&loops[0]),
+            canonical_loop(&[1, 0, 3, 2]),
+            "got {:?}",
+            loops[0]
+        );
+    }
+
+    #[test]
+    fn test_boundary_successor_terminates_on_a_closed_mesh() {
+        // A closed tetrahedron has no boundary at all: every directed edge has
+        // a reverse, so the rotation in `boundary_successor` would spin
+        // forever without its bound. There is nothing to seed a trace from, so
+        // it must simply return no loops (and `fill_holes` must add nothing).
+        let faces: Vec<[u32; 3]> = vec![[0, 1, 2], [0, 2, 3], [0, 3, 1], [1, 3, 2]];
+        let graph = BoundaryGraph::new(&faces);
+        assert!(
+            graph.edges.is_empty(),
+            "a tetrahedron has no boundary edges"
+        );
+        assert!(trace_boundary_loops(&graph).is_empty());
+
+        let (new_faces, filled) = fill_holes(&faces, 10);
+        assert_eq!(filled, 0);
+        assert!(new_faces.is_empty());
     }
 }

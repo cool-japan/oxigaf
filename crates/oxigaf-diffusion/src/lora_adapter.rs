@@ -131,9 +131,25 @@ fn transpose(data: &[f32], rows: usize, cols: usize) -> Vec<f32> {
 // ---------------------------------------------------------------------------
 
 /// Gaussian-initialize a LoRA A matrix [rank × in_dim] with xorshift64 + Box-Muller.
-/// Standard deviation = 1/sqrt(rank) (Kaiming-style approximation).
+///
+/// Standard deviation = `1/sqrt(in_dim)` — Kaiming fan-in initialisation,
+/// matching the reference LoRA implementation's `kaiming_uniform_(lora_A,
+/// a=sqrt(5))` over `fan_in = in_features`. A now for a `[rank × in_dim]`
+/// matrix mapping `in_dim -> rank` has fan-in `in_dim`, not `rank`; scaling
+/// by `1/sqrt(rank)` instead (as this function used to) makes the initial
+/// A-matrix roughly `sqrt(in_dim/rank)` times too large — e.g. ~16x for a
+/// typical `rank=4, in_dim=1024` attention layer — which, although B starts
+/// at zero (so the *output* is unaffected at step 0), still makes the
+/// gradient flowing through B that much too large from the very first
+/// update.
+///
+/// `in_dim == 0` is guarded against explicitly (`in_dim.max(1)`): the old
+/// `1/sqrt(rank)` formula could itself divide by zero when `rank == 0`
+/// (`(0.0f32).sqrt() == 0.0` → `1.0 / 0.0 == inf` → an all-NaN A matrix);
+/// guarding the new denominator the same way keeps that same degenerate
+/// case (now keyed on `in_dim` instead) equally safe.
 pub fn init_lora_a(rank: usize, in_dim: usize, seed: u64) -> Vec<f32> {
-    let stddev = 1.0 / (rank as f32).sqrt();
+    let stddev = 1.0 / (in_dim.max(1) as f32).sqrt();
     let mut state = seed.max(1);
     let mut out = Vec::with_capacity(rank * in_dim);
     for _ in 0..(rank * in_dim) {
@@ -235,7 +251,19 @@ impl LoraLayer {
     /// Compute the full weight delta ΔW = scaling * B @ A.
     ///
     /// Returns an [out_dim × in_dim] matrix (row-major).
-    pub fn weight_delta(&self) -> Vec<f32> {
+    ///
+    /// # Errors
+    ///
+    /// [`LoraError::DimensionMismatch`] if `a_matrix`/`b_matrix`'s actual
+    /// lengths disagree with `rank`/`in_dim`/`out_dim` (all `pub` fields, so
+    /// nothing outside `LoraLayer::new` enforces they stay in sync — e.g. a
+    /// layer produced by [`deserialize_adapter`] from corrupt data). This
+    /// used to be silently swallowed into an all-zero delta
+    /// (`matmul(...).unwrap_or_else(|_| vec![0.0; ...])`), which made
+    /// [`LoraLayer::merge_into_weight`] a silent no-op instead of reporting
+    /// the problem — reporting `Ok(())`/"merged N layers" while leaving the
+    /// model weights untouched.
+    pub fn weight_delta(&self) -> Result<Vec<f32>, LoraError> {
         // B @ A: B is [out_dim × rank], A is [rank × in_dim] → [out_dim × in_dim]
         let raw = matmul(
             &self.b_matrix,
@@ -243,15 +271,20 @@ impl LoraLayer {
             self.out_dim,
             self.rank,
             self.in_dim,
-        )
-        .unwrap_or_else(|_| vec![0.0f32; self.out_dim * self.in_dim]);
+        )?;
         let scale = self.scaling();
-        raw.into_iter().map(|v| v * scale).collect()
+        Ok(raw.into_iter().map(|v| v * scale).collect())
     }
 
     /// Merge the LoRA delta into a base weight matrix in-place.
     ///
     /// `base_weight` must be [out_dim × in_dim] row-major.
+    ///
+    /// # Errors
+    ///
+    /// [`LoraError::DimensionMismatch`] if `base_weight`'s length doesn't
+    /// match `out_dim * in_dim`, or propagated from [`LoraLayer::weight_delta`]
+    /// if this layer's own matrices are inconsistent with its declared shape.
     pub fn merge_into_weight(&self, base_weight: &mut [f32]) -> Result<(), LoraError> {
         let expected = self.out_dim * self.in_dim;
         if base_weight.len() != expected {
@@ -260,7 +293,7 @@ impl LoraLayer {
                 actual: base_weight.len(),
             });
         }
-        let delta = self.weight_delta();
+        let delta = self.weight_delta()?;
         for (w, d) in base_weight.iter_mut().zip(delta.iter()) {
             *w += d;
         }
@@ -475,11 +508,79 @@ pub fn apply_lora_dropout(
 // Norm helper
 // ---------------------------------------------------------------------------
 
-/// Compute the L2 norm of the LoRA weight delta ΔW.
-pub fn lora_weight_norm(layer: &LoraLayer) -> f32 {
-    let delta = layer.weight_delta();
-    let sum_sq: f32 = delta.iter().map(|&v| v * v).sum();
-    sum_sq.sqrt()
+/// Compute the L2 (Frobenius) norm of the LoRA weight delta ΔW = `scaling *
+/// B @ A`, **without** ever materialising the full `[out_dim × in_dim]`
+/// product.
+///
+/// Uses the identity `‖s·B·A‖_F² = s²·tr(Aᵀ·(BᵀB)·A) = s²·Σᵢⱼ G[i][j]·(Aᵢ·Aⱼ)`,
+/// where `G = BᵀB` is the small `[rank × rank]` Gram matrix of B's columns
+/// and `Aᵢ` is row `i` of A. Computing `G` costs `O(out_dim · rank²)`, and
+/// the double sum over `G` costs `O(rank² · in_dim)` — for a typical
+/// SD-scale layer (`out_dim = in_dim = 1280`, `rank = 4`) that's roughly a
+/// 300x reduction in floating-point work, and it never allocates the
+/// `out_dim * in_dim` transient vector that `weight_delta` (used by the
+/// merge path, where the full matrix actually is needed) must.
+///
+/// # Errors
+///
+/// [`LoraError::DimensionMismatch`] if `a_matrix`/`b_matrix`'s actual
+/// lengths disagree with `rank`/`in_dim`/`out_dim` — see
+/// [`LoraLayer::weight_delta`].
+pub fn lora_weight_norm(layer: &LoraLayer) -> Result<f32, LoraError> {
+    let rank = layer.rank;
+    let in_dim = layer.in_dim;
+    let out_dim = layer.out_dim;
+    if layer.a_matrix.len() != rank * in_dim {
+        return Err(LoraError::DimensionMismatch {
+            expected: rank * in_dim,
+            actual: layer.a_matrix.len(),
+        });
+    }
+    if layer.b_matrix.len() != out_dim * rank {
+        return Err(LoraError::DimensionMismatch {
+            expected: out_dim * rank,
+            actual: layer.b_matrix.len(),
+        });
+    }
+    if rank == 0 {
+        return Ok(0.0);
+    }
+
+    // G = B^T B: a small [rank x rank] Gram matrix, G[i][j] = column i of B
+    // dotted with column j of B (summed over the out_dim rows of B).
+    let mut gram = vec![0.0f32; rank * rank];
+    for k in 0..out_dim {
+        let row = &layer.b_matrix[k * rank..(k + 1) * rank];
+        for i in 0..rank {
+            let bi = row[i];
+            if bi == 0.0 {
+                continue;
+            }
+            for (j, &bj) in row.iter().enumerate() {
+                gram[i * rank + j] += bi * bj;
+            }
+        }
+    }
+
+    // ||B @ A||_F^2 = tr(A^T G A) = sum_{i,j} G[i][j] * (A_i . A_j).
+    let mut sum_sq = 0.0f32;
+    for i in 0..rank {
+        let a_i = &layer.a_matrix[i * in_dim..(i + 1) * in_dim];
+        for j in 0..rank {
+            let g_ij = gram[i * rank + j];
+            if g_ij == 0.0 {
+                continue;
+            }
+            let a_j = &layer.a_matrix[j * in_dim..(j + 1) * in_dim];
+            let dot: f32 = a_i.iter().zip(a_j.iter()).map(|(&x, &y)| x * y).sum();
+            sum_sq += g_ij * dot;
+        }
+    }
+
+    let scale = layer.scaling();
+    // `sum_sq` is mathematically >= 0 (G is PSD), but clamp before `sqrt` to
+    // absorb any floating-point cancellation noise near zero.
+    Ok((sum_sq * scale * scale).max(0.0).sqrt())
 }
 
 // ---------------------------------------------------------------------------
@@ -533,7 +634,11 @@ pub fn compute_lora_stats(adapter: &LoraAdapter) -> Result<LoraStats, LoraError>
     let n_layers = adapter.layers.len();
     let total_params = adapter.total_params();
 
-    let norms: Vec<f32> = adapter.layers.iter().map(lora_weight_norm).collect();
+    let norms: Vec<f32> = adapter
+        .layers
+        .iter()
+        .map(lora_weight_norm)
+        .collect::<Result<Vec<_>, _>>()?;
     let sum: f32 = norms.iter().sum();
     let mean_weight_norm = sum / n_layers as f32;
     let max_weight_norm = norms.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
@@ -560,23 +665,64 @@ pub fn compute_lora_stats(adapter: &LoraAdapter) -> Result<LoraStats, LoraError>
 // Serialization
 // ---------------------------------------------------------------------------
 
+/// Maximum value accepted for any dimension field (`n_layers`, `in_dim`,
+/// `out_dim`, `rank`, a layer name's byte length) read back from a
+/// serialized `&[f32]` stream. Generous for any realistic model (SD-scale
+/// layers run up to a few thousand) while still rejecting a corrupt or
+/// hostile encoding — e.g. `f32::to_bits`-garbage or a huge sentinel like
+/// `1e30` — long before it could drive a `checked_mul`/allocation attempt
+/// anywhere near this magnitude.
+const MAX_LORA_DIM: usize = 1 << 24;
+
+/// Validate and convert one header field from its raw `f32` encoding to a
+/// bounded `usize`.
+///
+/// Rust's `as` cast from `f32` to `usize` *saturates* rather than
+/// overflowing (`NaN -> 0`, `1e30 -> usize::MAX`), so casting an
+/// arbitrary, caller-supplied `f32` unchecked can silently turn a corrupt
+/// header into an enormous `usize` — which then makes downstream
+/// `rank * in_dim`-style arithmetic wrap (in release builds) to a small
+/// value that passes a naive bounds check, ultimately causing a slice-index
+/// panic instead of a reported error.
+fn read_dim_field(raw: f32, field: &str) -> Result<usize, LoraError> {
+    if !raw.is_finite() || raw < 0.0 {
+        return Err(LoraError::SerializationError(format!(
+            "{field} must be a non-negative finite number, got {raw}"
+        )));
+    }
+    let value = raw as usize;
+    if value > MAX_LORA_DIM {
+        return Err(LoraError::SerializationError(format!(
+            "{field} = {value} exceeds the maximum accepted dimension {MAX_LORA_DIM}"
+        )));
+    }
+    Ok(value)
+}
+
 /// Serialize an adapter to a flat `Vec<f32>` for checkpointing.
 ///
 /// Format:
 /// ```text
 /// [n_layers as f32,
-///  [in_dim, out_dim, rank, alpha, a_data..., b_data...] per layer...]
+///  [name_len as f32, name_bytes... (each as f32),
+///   in_dim, out_dim, rank, alpha, a_data..., b_data...] per layer...]
 /// ```
+///
+/// Layer names are carried as a length-prefixed run of byte values (each
+/// widened to `f32`) so that [`deserialize_adapter`] can recover them
+/// exactly — see [`deserialize_adapter`]'s docs for why this matters.
 pub fn serialize_adapter(adapter: &LoraAdapter) -> Vec<f32> {
     let n = adapter.layers.len();
     // Estimate capacity
-    let cap = 1 + adapter
-        .layers
-        .iter()
-        .fold(0, |acc, l| acc + 4 + l.a_matrix.len() + l.b_matrix.len());
+    let cap = 1 + adapter.layers.iter().fold(0, |acc, l| {
+        acc + 1 + l.name.len() + 4 + l.a_matrix.len() + l.b_matrix.len()
+    });
     let mut out = Vec::with_capacity(cap);
     out.push(n as f32);
     for layer in &adapter.layers {
+        let name_bytes = layer.name.as_bytes();
+        out.push(name_bytes.len() as f32);
+        out.extend(name_bytes.iter().map(|&b| b as f32));
         out.push(layer.in_dim as f32);
         out.push(layer.out_dim as f32);
         out.push(layer.rank as f32);
@@ -587,30 +733,68 @@ pub fn serialize_adapter(adapter: &LoraAdapter) -> Vec<f32> {
     out
 }
 
-/// Deserialize an adapter from a flat `Vec<f32>`.
+/// Deserialize an adapter from a flat `Vec<f32>` (as produced by
+/// [`serialize_adapter`]).
+///
+/// Recovers each layer's name from the length-prefixed byte run written by
+/// [`serialize_adapter`] — [`merge_lora_weights`] matches layers to model
+/// weights *by name*, so a round trip that dropped names (as this function
+/// used to, synthesizing `"layer_{idx}"` placeholders instead) could never
+/// match anything, making `merge_lora_weights` silently merge zero layers
+/// for any deserialized adapter.
+///
+/// # Errors
+///
+/// - [`LoraError::SerializationError`] if the stream is empty, truncated, or
+///   any dimension field (`n_layers`, a name's byte length, `in_dim`,
+///   `out_dim`, `rank`) is negative, non-finite, implausibly large, encodes
+///   invalid UTF-8, or would overflow while computing buffer offsets.
+/// - [`LoraError::InvalidRank`] if a layer's `rank` is `0`.
 pub fn deserialize_adapter(data: &[f32], config: LoraConfig) -> Result<LoraAdapter, LoraError> {
     if data.is_empty() {
         return Err(LoraError::SerializationError("data is empty".to_string()));
     }
-    let n_layers = *data
-        .first()
-        .ok_or_else(|| LoraError::SerializationError("missing n_layers".to_string()))?
-        as usize;
+    let n_layers = read_dim_field(data[0], "n_layers")?;
 
     let mut adapter = LoraAdapter::new(config)?;
     let mut cursor = 1usize;
 
     for layer_idx in 0..n_layers {
+        if cursor >= data.len() {
+            return Err(LoraError::SerializationError(format!(
+                "truncated name length at layer {layer_idx}"
+            )));
+        }
+        let name_len = read_dim_field(data[cursor], "name_len")?;
+        cursor += 1;
+        if cursor + name_len > data.len() {
+            return Err(LoraError::SerializationError(format!(
+                "truncated name at layer {layer_idx}"
+            )));
+        }
+        let mut name_bytes = Vec::with_capacity(name_len);
+        for &v in &data[cursor..cursor + name_len] {
+            if !v.is_finite() || !(0.0..=255.0).contains(&v) {
+                return Err(LoraError::SerializationError(format!(
+                    "invalid name byte at layer {layer_idx}: {v}"
+                )));
+            }
+            name_bytes.push(v as u8);
+        }
+        cursor += name_len;
+        let name = String::from_utf8(name_bytes).map_err(|e| {
+            LoraError::SerializationError(format!("invalid UTF-8 name at layer {layer_idx}: {e}"))
+        })?;
+
         // Read header: [in_dim, out_dim, rank, alpha]
         if cursor + 4 > data.len() {
             return Err(LoraError::SerializationError(format!(
-                "truncated header at layer {}",
-                layer_idx
+                "truncated header at layer {layer_idx}"
             )));
         }
-        let in_dim = data[cursor] as usize;
-        let out_dim = data[cursor + 1] as usize;
-        let rank = data[cursor + 2] as usize;
+        let in_dim = read_dim_field(data[cursor], "in_dim")?;
+        let out_dim = read_dim_field(data[cursor + 1], "out_dim")?;
+        let rank = read_dim_field(data[cursor + 2], "rank")?;
         let alpha = data[cursor + 3];
         cursor += 4;
 
@@ -618,13 +802,21 @@ pub fn deserialize_adapter(data: &[f32], config: LoraConfig) -> Result<LoraAdapt
             return Err(LoraError::InvalidRank { rank });
         }
 
-        let a_len = rank * in_dim;
-        let b_len = out_dim * rank;
-
-        if cursor + a_len + b_len > data.len() {
+        let a_len = rank.checked_mul(in_dim).ok_or_else(|| {
+            LoraError::SerializationError(format!("a_matrix size overflow at layer {layer_idx}"))
+        })?;
+        let b_len = out_dim.checked_mul(rank).ok_or_else(|| {
+            LoraError::SerializationError(format!("b_matrix size overflow at layer {layer_idx}"))
+        })?;
+        let end = cursor
+            .checked_add(a_len)
+            .and_then(|v| v.checked_add(b_len))
+            .ok_or_else(|| {
+                LoraError::SerializationError(format!("cursor overflow at layer {layer_idx}"))
+            })?;
+        if end > data.len() {
             return Err(LoraError::SerializationError(format!(
-                "truncated matrix data at layer {}",
-                layer_idx
+                "truncated matrix data at layer {layer_idx}"
             )));
         }
 
@@ -634,7 +826,7 @@ pub fn deserialize_adapter(data: &[f32], config: LoraConfig) -> Result<LoraAdapt
         cursor += b_len;
 
         let layer = LoraLayer {
-            name: format!("layer_{}", layer_idx),
+            name,
             in_dim,
             out_dim,
             rank,
@@ -898,7 +1090,7 @@ mod tests {
     #[test]
     fn test_weight_delta_shape() {
         let layer = LoraLayer::new("test", 8, 16, 4, 4.0, SEED).unwrap();
-        let delta = layer.weight_delta();
+        let delta = layer.weight_delta().unwrap();
         assert_eq!(
             delta.len(),
             16 * 8,
@@ -909,10 +1101,18 @@ mod tests {
     #[test]
     fn test_weight_delta_zero_b_is_zero() {
         let layer = LoraLayer::new("test", 8, 16, 4, 4.0, SEED).unwrap();
-        let delta = layer.weight_delta();
+        let delta = layer.weight_delta().unwrap();
         for &v in &delta {
             assert_eq!(v, 0.0);
         }
+    }
+
+    #[test]
+    fn test_weight_delta_rejects_inconsistent_a_matrix() {
+        let mut layer = LoraLayer::new("test", 8, 16, 4, 4.0, SEED).unwrap();
+        layer.a_matrix.pop(); // now shorter than rank * in_dim
+        let result = layer.weight_delta();
+        assert!(matches!(result, Err(LoraError::DimensionMismatch { .. })));
     }
 
     // --- LoraLayer::merge_into_weight ---
@@ -1095,6 +1295,46 @@ mod tests {
     }
 
     #[test]
+    fn test_init_lora_a_stddev_scales_with_in_dim_not_rank() {
+        // Regression: stddev must be ~1/sqrt(in_dim) (Kaiming fan-in), not
+        // ~1/sqrt(rank). Use a large sample (many rows sharing the same
+        // in_dim) so the empirical stddev is a reliable estimate.
+        let rank = 4;
+        let in_dim = 1024;
+        let a = init_lora_a(rank, in_dim, SEED);
+        let n = a.len() as f32;
+        let mean = a.iter().sum::<f32>() / n;
+        let variance = a.iter().map(|&x| (x - mean) * (x - mean)).sum::<f32>() / n;
+        let empirical_stddev = variance.sqrt();
+        let expected_stddev = 1.0 / (in_dim as f32).sqrt(); // ~0.03125
+        let wrong_stddev = 1.0 / (rank as f32).sqrt(); // ~0.5 (the old, buggy formula)
+        assert!(
+            (empirical_stddev - expected_stddev).abs() < expected_stddev * 0.5,
+            "empirical stddev {empirical_stddev} should be close to 1/sqrt(in_dim) = {expected_stddev}"
+        );
+        assert!(
+            (empirical_stddev - wrong_stddev).abs() > expected_stddev * 3.0,
+            "empirical stddev {empirical_stddev} should NOT match the old 1/sqrt(rank) = {wrong_stddev} formula"
+        );
+    }
+
+    #[test]
+    fn test_init_lora_a_zero_in_dim_does_not_produce_nan() {
+        // in_dim == 0 used to divide by `(0.0f32).sqrt() == 0.0` under the
+        // old `1/sqrt(rank)`-keyed guard once rank was also 0; with the
+        // fixed formula keyed on `in_dim`, `in_dim.max(1)` must still avoid
+        // dividing by zero.
+        let a = init_lora_a(4, 0, SEED);
+        assert!(
+            a.is_empty(),
+            "rank * in_dim == 0 should yield an empty matrix"
+        );
+        let a_zero_rank = init_lora_a(0, 64, SEED);
+        assert!(a_zero_rank.is_empty());
+        assert!(a_zero_rank.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
     fn test_init_lora_b_all_zeros() {
         let b = init_lora_b(64, 4);
         assert_eq!(b.len(), 64 * 4);
@@ -1140,8 +1380,36 @@ mod tests {
     fn test_lora_weight_norm_zero_b() {
         let layer = LoraLayer::new("test", 8, 16, 4, 4.0, SEED).unwrap();
         // B is initialised to zero so norm should be 0.
-        let norm = lora_weight_norm(&layer);
+        let norm = lora_weight_norm(&layer).unwrap();
         assert!(norm.abs() < 1e-8);
+    }
+
+    #[test]
+    fn test_lora_weight_norm_matches_naive_delta_norm() {
+        // The fast Gram-matrix formula must agree with a direct Frobenius
+        // norm of the full `weight_delta()` matrix.
+        let mut layer = LoraLayer::new("test", 6, 5, 3, 2.0, SEED).unwrap();
+        for (i, v) in layer.b_matrix.iter_mut().enumerate() {
+            *v = (i as f32 * 0.37).sin();
+        }
+        for (i, v) in layer.a_matrix.iter_mut().enumerate() {
+            *v = (i as f32 * 0.61).cos();
+        }
+        let fast = lora_weight_norm(&layer).unwrap();
+        let delta = layer.weight_delta().unwrap();
+        let naive: f32 = delta.iter().map(|&v| v * v).sum::<f32>().sqrt();
+        assert!(
+            (fast - naive).abs() < naive.max(1.0) * 1e-3,
+            "fast={fast} naive={naive}"
+        );
+    }
+
+    #[test]
+    fn test_lora_weight_norm_rejects_inconsistent_b_matrix() {
+        let mut layer = LoraLayer::new("test", 8, 16, 4, 4.0, SEED).unwrap();
+        layer.b_matrix.push(0.0); // now longer than out_dim * rank
+        let result = lora_weight_norm(&layer);
+        assert!(matches!(result, Err(LoraError::DimensionMismatch { .. })));
     }
 
     // --- merge_lora_weights ---
@@ -1201,8 +1469,8 @@ mod tests {
     #[test]
     fn test_serialize_deserialize_round_trip() {
         let mut adapter = LoraAdapter::new(LoraConfig::default()).unwrap();
-        let layer_a = LoraLayer::new("a", 8, 16, 2, 2.0, SEED).unwrap();
-        let layer_b = LoraLayer::new("b", 4, 8, 1, 1.0, SEED + 1).unwrap();
+        let layer_a = LoraLayer::new("unet.attn1.to_q", 8, 16, 2, 2.0, SEED).unwrap();
+        let layer_b = LoraLayer::new("unet.attn1.to_k", 4, 8, 1, 1.0, SEED + 1).unwrap();
         adapter.add_layer(layer_a.clone());
         adapter.add_layer(layer_b.clone());
 
@@ -1211,6 +1479,7 @@ mod tests {
 
         assert_eq!(restored.num_layers(), 2);
         let ra = restored.layers.first().unwrap();
+        assert_eq!(ra.name, layer_a.name, "layer name must round-trip");
         assert_eq!(ra.in_dim, layer_a.in_dim);
         assert_eq!(ra.out_dim, layer_a.out_dim);
         assert_eq!(ra.rank, layer_a.rank);
@@ -1219,9 +1488,56 @@ mod tests {
     }
 
     #[test]
+    fn test_deserialize_adapter_preserves_names_for_merge() {
+        // Regression: a deserialized adapter's layer names used to be
+        // synthesized as "layer_{idx}", so `merge_lora_weights` (which
+        // matches by name) could never find a match. Round-tripping through
+        // (de)serialize must preserve the real name so merging still works.
+        let mut adapter = LoraAdapter::new(LoraConfig::default()).unwrap();
+        let mut layer = LoraLayer::new("unet.attn1.to_q", 2, 2, 1, 1.0, SEED).unwrap();
+        layer.a_matrix = vec![1.0, 0.0];
+        layer.b_matrix = vec![1.0, 0.0];
+        adapter.add_layer(layer);
+
+        let serialized = serialize_adapter(&adapter);
+        let restored = deserialize_adapter(&serialized, LoraConfig::default()).unwrap();
+
+        let mut weights = vec![("unet.attn1.to_q".to_string(), vec![0.0f32; 4])];
+        let merged = merge_lora_weights(&mut weights, &restored).unwrap();
+        assert_eq!(
+            merged, 1,
+            "deserialized adapter must still match weights by name"
+        );
+    }
+
+    #[test]
     fn test_deserialize_empty_error() {
         let result = deserialize_adapter(&[], LoraConfig::default());
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_deserialize_adapter_rejects_huge_dimension() {
+        // n_layers=1, name_len=0, in_dim=1e30 (saturates to a huge usize on
+        // an unchecked cast) — must be rejected outright, not silently
+        // accepted and then panic deep in slice arithmetic.
+        let data = vec![1.0, 0.0, 1e30, 4.0, 4.0, 1.0];
+        let result = deserialize_adapter(&data, LoraConfig::default());
+        assert!(matches!(result, Err(LoraError::SerializationError(_))));
+    }
+
+    #[test]
+    fn test_deserialize_adapter_rejects_nan_dimension() {
+        let data = vec![1.0, 0.0, f32::NAN, 4.0, 4.0, 1.0];
+        let result = deserialize_adapter(&data, LoraConfig::default());
+        assert!(matches!(result, Err(LoraError::SerializationError(_))));
+    }
+
+    #[test]
+    fn test_deserialize_adapter_rejects_negative_dimension() {
+        let data = vec![1.0, 0.0, -5.0, 4.0, 4.0, 1.0];
+        let result = deserialize_adapter(&data, LoraConfig::default());
+        assert!(matches!(result, Err(LoraError::SerializationError(_))));
     }
 
     // --- interpolate_adapters ---

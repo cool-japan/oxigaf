@@ -99,9 +99,30 @@ impl JointLimits {
 
     /// Return the L2 norm of the per-component bound violations.
     ///
-    /// Returns `0.0` when the vector is within limits.
+    /// Returns `0.0` when the vector is within limits. Used for
+    /// human-readable diagnostics (see [`PoseScorer::validate`]), where a
+    /// value directly in radians is what a caller wants to read. For the
+    /// differentiable score used in optimisation, see
+    /// [`violation_sq_norm`](Self::violation_sq_norm) instead — squaring
+    /// avoids the non-differentiable kink this L2 norm has at zero
+    /// violation.
     #[must_use]
     pub fn violation_norm(&self, aa: [f32; 3]) -> f32 {
+        self.violation_sq_norm(aa).sqrt()
+    }
+
+    /// Return the summed squared per-component bound violations (no square root).
+    ///
+    /// Returns `0.0` when the vector is within limits. This is the
+    /// quantity [`PoseScorer::score`] sums over joints and
+    /// [`PoseScorer::score_gradient`] differentiates exactly: unlike
+    /// [`violation_norm`](Self::violation_norm)'s square root, the squared
+    /// form is smooth (continuously differentiable) everywhere, including
+    /// at the boundary where a component's violation crosses zero, and its
+    /// gradient w.r.t. a pose component is simply `2 * violation` (no
+    /// division by the norm, so no near-zero blow-up either).
+    #[must_use]
+    pub fn violation_sq_norm(&self, aa: [f32; 3]) -> f32 {
         let mut sq_sum = 0.0_f32;
         for (component, &limit_pair) in aa.iter().zip(self.component_limits.iter()) {
             let [lo, hi] = limit_pair;
@@ -114,7 +135,7 @@ impl JointLimits {
             };
             sq_sum += violation * violation;
         }
-        sq_sum.sqrt()
+        sq_sum
     }
 }
 
@@ -133,23 +154,27 @@ impl JointLimits {
 #[must_use]
 pub fn default_joint_limits() -> [JointLimits; 5] {
     [
-        // Joint 0: global rotation — head turns freely
+        // Joint 0: global rotation — head turns freely.
+        // Axis-angle component order is [x, y, z]: rotation about x is
+        // pitch (nodding), about y is yaw (turning), about z is roll
+        // (tilting). The wider range belongs to yaw (y), matching how a
+        // human head turns roughly ±90° side to side but nods only ~±30°.
         JointLimits::new([
-            [-1.57, 1.57], // yaw (y-axis): ±90°
-            [-0.52, 0.52], // pitch (x-axis): ±30°
-            [-0.52, 0.52], // roll (z-axis): ±30°
+            [-0.52, 0.52], // x-axis (pitch): ±30°
+            [-1.57, 1.57], // y-axis (yaw): ±90°
+            [-0.52, 0.52], // z-axis (roll): ±30°
         ]),
-        // Joint 1: neck — more restricted than global
+        // Joint 1: neck — more restricted than global.
         JointLimits::new([
-            [-0.79, 0.79], // yaw: ±45°
-            [-0.52, 0.52], // pitch: ±30°
-            [-0.26, 0.26], // roll: ±15°
+            [-0.52, 0.52], // x-axis (pitch): ±30°
+            [-0.79, 0.79], // y-axis (yaw): ±45°
+            [-0.26, 0.26], // z-axis (roll): ±15°
         ]),
         // Joint 2: jaw — opens only (positive x), minimal yaw/roll
         JointLimits::new([
-            [0.0, 0.52],   // opening: 0–30°
-            [-0.05, 0.05], // minimal yaw
-            [-0.05, 0.05], // minimal roll
+            [0.0, 0.52],   // x-axis (opening): 0–30°
+            [-0.05, 0.05], // y-axis (minimal yaw)
+            [-0.05, 0.05], // z-axis (minimal roll)
         ]),
         // Joint 3: left eye — ±25° all axes
         JointLimits::new([[-0.44, 0.44], [-0.44, 0.44], [-0.44, 0.44]]),
@@ -291,8 +316,15 @@ pub struct PoseValidityReport {
 ///
 /// The total score is:
 /// ```text
-/// score = limit_weight × total_violation + prior_weight × neg_log_likelihood
+/// score = limit_weight × Σⱼ violation_sq_normⱼ + prior_weight × neg_log_likelihood
 /// ```
+///
+/// The limit term sums each joint's *squared* violation (see
+/// [`JointLimits::violation_sq_norm`]), NOT the L2 norm — so despite the
+/// similar name, this is a different quantity from
+/// [`PoseValidityReport::total_violation`], which sums the (non-squared)
+/// L2 norm for human-readable diagnostics. See [`PoseScorer::score`] for
+/// why the two deliberately differ.
 pub struct PoseScorer {
     /// Anatomical limits for each of the five FLAME joints.
     pub joint_limits: [JointLimits; 5],
@@ -335,8 +367,15 @@ impl PoseScorer {
     /// Compute the total score for a pose.
     ///
     /// ```text
-    /// score = limit_weight × total_violation + prior_weight × neg_log_likelihood
+    /// score = limit_weight × Σⱼ violation_sq_normⱼ + prior_weight × neg_log_likelihood
     /// ```
+    ///
+    /// The limit term sums each joint's *squared* violation
+    /// ([`JointLimits::violation_sq_norm`]), not its L2 norm: this keeps
+    /// `score` differentiable everywhere (including exactly at a joint's
+    /// limit boundary) so that [`score_gradient`](Self::score_gradient) is
+    /// its exact analytic gradient rather than an approximation that only
+    /// agrees away from the kink an L2-norm penalty would otherwise have.
     ///
     /// Returns [`PosePriorError::InvalidPoseLength`] when `pose.len() != 15`.
     ///
@@ -424,6 +463,13 @@ impl PoseScorer {
     /// - **Prior gradient**: `prior_weight × ∂NLL/∂pose_i`
     /// - **Violation gradient**: `limit_weight × 2 × (pose_i − clamp(pose_i, lo_i, hi_i))`
     ///
+    /// This is the *exact* analytic gradient of [`score`](Self::score):
+    /// since `score`'s limit term sums each component's squared violation
+    /// `(pose_i − clamp(pose_i))²` independently (component-wise clamping
+    /// means one pose component's violation never depends on another's),
+    /// `∂/∂pose_i (pose_i − clamp(pose_i))² = 2 × (pose_i − clamp(pose_i))`
+    /// exactly, with no cross terms and no division by a joint-level norm.
+    ///
     /// Returns [`PosePriorError::InvalidPoseLength`] when `pose.len() != 15`.
     ///
     /// # Errors
@@ -451,7 +497,12 @@ impl PoseScorer {
     // Internal helpers
     // ------------------------------------------------------------------
 
-    /// Compute the sum of per-joint violation norms.
+    /// Compute the sum of per-joint SQUARED violation norms (see
+    /// [`JointLimits::violation_sq_norm`]) — this is the quantity `score`
+    /// actually optimises, and whose gradient `score_gradient` computes
+    /// exactly. It intentionally does NOT match [`PoseValidityReport`]'s
+    /// `total_violation` field, which uses the (non-squared) L2 norm for
+    /// human-readable diagnostics instead.
     ///
     /// Caller must ensure `pose.len() == 15`.
     fn compute_total_violation(&self, pose: &[f32]) -> f32 {
@@ -459,7 +510,7 @@ impl PoseScorer {
             .map(|j| {
                 let start = j * 3;
                 let aa = [pose[start], pose[start + 1], pose[start + 2]];
-                self.joint_limits[j].violation_norm(aa)
+                self.joint_limits[j].violation_sq_norm(aa)
             })
             .sum()
     }
@@ -595,6 +646,25 @@ mod tests {
         assert!(v > 0.0, "expected positive violation, got {v}");
     }
 
+    #[test]
+    fn joint_limits_violation_sq_norm_is_square_of_violation_norm() {
+        let lim = JointLimits::new([[-1.0, 1.0], [-1.0, 1.0], [-1.0, 1.0]]);
+        let aa = [2.0, -3.0, 0.0];
+        let norm = lim.violation_norm(aa);
+        let sq_norm = lim.violation_sq_norm(aa);
+        assert!(
+            (sq_norm - norm * norm).abs() < 1e-5,
+            "violation_sq_norm ({sq_norm}) must equal violation_norm^2 ({})",
+            norm * norm
+        );
+    }
+
+    #[test]
+    fn joint_limits_violation_sq_norm_valid_is_zero() {
+        let lim = JointLimits::new([[-1.0, 1.0], [-1.0, 1.0], [-1.0, 1.0]]);
+        assert!(lim.violation_sq_norm([0.0, 0.5, -0.5]).abs() < 1e-6);
+    }
+
     // -----------------------------------------------------------------------
     // default_joint_limits
     // -----------------------------------------------------------------------
@@ -603,6 +673,36 @@ mod tests {
     fn default_joint_limits_returns_five_entries() {
         let limits = default_joint_limits();
         assert_eq!(limits.len(), 5);
+    }
+
+    #[test]
+    fn default_joint_limits_yaw_wider_than_pitch_for_global_rotation() {
+        // Regression: axis-angle component 0 is the x-axis (pitch/nodding)
+        // and component 1 is the y-axis (yaw/turning). A human head turns
+        // roughly ±90° side to side but nods only ~±30°, so the WIDE range
+        // must land on component 1 (y), not component 0 (x).
+        let limits = default_joint_limits();
+        assert!(
+            limits[0].is_valid([0.0, 1.4, 0.0]),
+            "an 80-degree head turn (yaw, y-axis) should be within joint 0's limits"
+        );
+        assert!(
+            !limits[0].is_valid([1.4, 0.0, 0.0]),
+            "an 80-degree nod (pitch, x-axis) should exceed joint 0's ±30° limit"
+        );
+    }
+
+    #[test]
+    fn default_joint_limits_yaw_wider_than_pitch_for_neck() {
+        let limits = default_joint_limits();
+        assert!(
+            limits[1].is_valid([0.0, 0.7, 0.0]),
+            "a 40-degree neck turn (yaw, y-axis) should be within joint 1's ±45° limit"
+        );
+        assert!(
+            !limits[1].is_valid([0.7, 0.0, 0.0]),
+            "a 40-degree neck nod (pitch, x-axis) should exceed joint 1's ±30° limit"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -782,6 +882,53 @@ mod tests {
         let pose = vec![0.1_f32; 15];
         let grad = scorer.score_gradient(&pose).expect("valid");
         assert_eq!(grad.len(), 15);
+    }
+
+    #[test]
+    fn pose_scorer_score_gradient_matches_finite_difference() {
+        // Regression: `score_gradient` must be the actual gradient of
+        // `score`. Before the fix, `score` summed the L2 NORM of each
+        // joint's violation while `score_gradient` returned the gradient
+        // of the SQUARED violation (`2 * violation`), so the two disagreed
+        // by a factor of `violation_norm` almost everywhere.
+        //
+        // Mix of components that violate their limits (by a safe margin,
+        // so the central-difference step below can't cross a boundary
+        // kink) and components that stay within range, spread across
+        // multiple joints so both the prior and limit terms are exercised.
+        let scorer = PoseScorer::default_flame();
+        let mut pose = vec![0.0_f32; 15];
+        pose[0] = 0.9; // joint 0 x (pitch, limit ±0.52): violates
+        pose[1] = -2.0; // joint 0 y (yaw, limit ±1.57): violates
+        pose[3] = 0.2; // joint 1 x (pitch, limit ±0.52): within range
+        pose[6] = 1.2; // joint 2 x (jaw opening, limit [0, 0.52]): violates
+        pose[9] = 0.1; // joint 3 x (left eye, limit ±0.44): within range
+
+        let analytic = scorer.score_gradient(&pose).expect("valid");
+
+        // 1e-2 rather than 1e-3: the score is piecewise-quadratic (smooth
+        // to first order, so central-difference truncation error is
+        // negligible either way) and none of the perturbed components sit
+        // within 0.3 of a limit boundary, so a larger step buys a cleaner
+        // f32 subtraction — score's magnitude here (~tens) means a 1e-3
+        // step leaves the central difference dominated by cancellation
+        // noise rather than the quantity being measured.
+        let eps = 1e-2_f32;
+        for i in 0..15 {
+            let mut p_plus = pose.clone();
+            p_plus[i] += eps;
+            let mut p_minus = pose.clone();
+            p_minus[i] -= eps;
+            let s_plus = scorer.score(&p_plus).expect("valid");
+            let s_minus = scorer.score(&p_minus).expect("valid");
+            let numeric = (s_plus - s_minus) / (2.0 * eps);
+            assert!(
+                (analytic[i] - numeric).abs() < 5e-2,
+                "component {i}: analytic gradient {} does not match \
+                 finite-difference estimate {numeric}",
+                analytic[i]
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

@@ -39,6 +39,10 @@ pub enum BlendSolverError {
     /// No basis vectors were provided.
     #[error("No basis vectors provided")]
     EmptyBasis,
+
+    /// Solver configuration is invalid (e.g. `max_iter == 0`).
+    #[error("Invalid solver config: {0}")]
+    InvalidConfig(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -55,13 +59,32 @@ pub struct BlendSolverConfig {
     /// Gradient descent step size (default: 0.01).
     pub step_size: f32,
     /// Minimum blend weight (default: -3.0).
+    ///
+    /// Note: [`solve_blend_shapes`] takes its bounds from the `constraints`
+    /// argument, not from this field — pass it through
+    /// [`WeightConstraints::uniform`] yourself if you want it enforced.
+    /// Unlike `weight_max`, this field has no built-in consumer in this
+    /// module (`nonneg_solve_blend_shapes` always uses `0.0` as the lower
+    /// bound, by definition of "non-negative").
     pub weight_min: f32,
     /// Maximum blend weight (default: 3.0).
+    ///
+    /// Used by [`nonneg_solve_blend_shapes`] as the upper bound of its
+    /// generated constraints. Like `weight_min`, [`solve_blend_shapes`]
+    /// itself takes its bounds from the `constraints` argument, not from
+    /// this field.
     pub weight_max: f32,
     /// L2 regularization on weights (default: 1e-3).
     pub regularization: f32,
     /// Project weights to >= 0 after each step (default: false).
     pub enforce_nonneg: bool,
+    /// RMSE threshold above which a non-converged solve is reported as
+    /// [`BlendSolverError::SolverDiverged`] (default: 1.0).
+    ///
+    /// This is in the same units as `template_verts`/`target_verts`, so it
+    /// should be scaled to the mesh's units (e.g. a mesh authored in
+    /// millimetres needs a much larger threshold than one in metres).
+    pub divergence_threshold: f32,
 }
 
 impl Default for BlendSolverConfig {
@@ -74,6 +97,7 @@ impl Default for BlendSolverConfig {
             weight_max: 3.0,
             regularization: 1e-3,
             enforce_nonneg: false,
+            divergence_threshold: 1.0,
         }
     }
 }
@@ -282,10 +306,13 @@ pub fn apply_blend_displacements(
 
 /// Compute per-vertex Euclidean distances between two flat N×3 vertex arrays.
 ///
-/// Both slices must have the same length (a multiple of 3).
+/// Both slices are expected to have the same length (a multiple of 3). If
+/// they do not, only the vertices common to both are compared —
+/// `min(pred_verts.len(), target_verts.len()) / 3` vertices — rather than
+/// indexing past the end of the shorter slice.
 #[must_use]
 pub fn compute_vertex_errors(pred_verts: &[f32], target_verts: &[f32]) -> Vec<f32> {
-    let n_verts = pred_verts.len() / 3;
+    let n_verts = pred_verts.len().min(target_verts.len()) / 3;
     let mut errors = Vec::with_capacity(n_verts);
     for v in 0..n_verts {
         let dx = pred_verts[v * 3] - target_verts[v * 3];
@@ -297,9 +324,12 @@ pub fn compute_vertex_errors(pred_verts: &[f32], target_verts: &[f32]) -> Vec<f3
 }
 
 /// Root-mean-squared vertex error (RMSE).
+///
+/// See [`compute_vertex_errors`] for how a slice length mismatch is handled;
+/// the mean here is likewise taken over the common vertex count.
 #[must_use]
 pub fn compute_residual(pred_verts: &[f32], target_verts: &[f32]) -> f32 {
-    let n_verts = pred_verts.len() / 3;
+    let n_verts = pred_verts.len().min(target_verts.len()) / 3;
     if n_verts == 0 {
         return 0.0;
     }
@@ -318,17 +348,29 @@ pub fn compute_residual(pred_verts: &[f32], target_verts: &[f32]) -> f32 {
 /// `dL/dw_b = (2/N) * sum_v( dot(pred_v - target_v, displacements[b][v]) )`
 ///
 /// Returns a `Vec<f32>` of length `basis.n_basis`.
+///
+/// `basis.n_vertices` is expected to match `pred_verts`/`target_verts` (and
+/// every basis displacement vector, per [`BlendBasis::validate`]); if it does
+/// not — e.g. a hand-built `BlendBasis` whose `n_vertices` disagrees with an
+/// actual displacement length — the vertex count used is clamped to the
+/// smallest of `basis.n_vertices`, `pred_verts.len() / 3`,
+/// `target_verts.len() / 3`, and (per basis vector) `disp.len() / 3`, rather
+/// than indexing out of bounds.
 #[must_use]
 pub fn gradient_wrt_weights(
     basis: &BlendBasis,
     pred_verts: &[f32],
     target_verts: &[f32],
 ) -> Vec<f32> {
-    let n_verts = basis.n_vertices;
-    let scale = 2.0 / n_verts.max(1) as f32;
+    let common_n_verts = basis
+        .n_vertices
+        .min(pred_verts.len() / 3)
+        .min(target_verts.len() / 3);
+    let scale = 2.0 / common_n_verts.max(1) as f32;
     let mut grad = vec![0.0f32; basis.n_basis];
 
     for (b, disp) in basis.displacements.iter().enumerate() {
+        let n_verts = common_n_verts.min(disp.len() / 3);
         let mut acc = 0.0f32;
         for v in 0..n_verts {
             let base = v * 3;
@@ -342,15 +384,17 @@ pub fn gradient_wrt_weights(
     grad
 }
 
-/// Project weights into the feasible region defined by `constraints`.
+/// Project weights into the feasible region defined by `constraints`, in place.
 ///
 /// 1. Clamp each weight to `[min_weights[i], max_weights[i]]`.
 /// 2. For symmetry pairs `(i, j)`, set both to their mean.
-#[must_use]
-pub fn project_weights(weights: &[f32], constraints: &WeightConstraints) -> Vec<f32> {
-    let mut w = weights.to_vec();
+///
+/// This is the in-place counterpart of [`project_weights`]; prefer it in hot
+/// loops (such as [`solve_blend_shapes`]'s gradient descent iterations) to
+/// avoid allocating a fresh `Vec` on every call.
+pub fn project_weights_in_place(weights: &mut [f32], constraints: &WeightConstraints) {
     // Clamp
-    for (i, wi) in w.iter_mut().enumerate() {
+    for (i, wi) in weights.iter_mut().enumerate() {
         if i < constraints.min_weights.len() {
             *wi = wi.max(constraints.min_weights[i]);
         }
@@ -360,12 +404,22 @@ pub fn project_weights(weights: &[f32], constraints: &WeightConstraints) -> Vec<
     }
     // Symmetry averaging
     for &(a, b) in &constraints.symmetry_pairs {
-        if a < w.len() && b < w.len() {
-            let mean = (w[a] + w[b]) * 0.5;
-            w[a] = mean;
-            w[b] = mean;
+        if a < weights.len() && b < weights.len() {
+            let mean = (weights[a] + weights[b]) * 0.5;
+            weights[a] = mean;
+            weights[b] = mean;
         }
     }
+}
+
+/// Project weights into the feasible region defined by `constraints`.
+///
+/// 1. Clamp each weight to `[min_weights[i], max_weights[i]]`.
+/// 2. For symmetry pairs `(i, j)`, set both to their mean.
+#[must_use]
+pub fn project_weights(weights: &[f32], constraints: &WeightConstraints) -> Vec<f32> {
+    let mut w = weights.to_vec();
+    project_weights_in_place(&mut w, constraints);
     w
 }
 
@@ -401,6 +455,18 @@ pub fn solve_blend_shapes(
         });
     }
     basis.validate()?;
+    if basis.n_vertices != n_template {
+        return Err(BlendSolverError::BasisDimensionMismatch {
+            n_basis: basis.n_basis,
+            n_verts: basis.n_vertices,
+            expected: n_template,
+        });
+    }
+    if config.max_iter == 0 {
+        return Err(BlendSolverError::InvalidConfig(
+            "max_iter must be > 0".to_owned(),
+        ));
+    }
 
     // --- Initialise -----------------------------------------------------------
     let mut weights = vec![0.0f32; basis.n_basis];
@@ -425,13 +491,16 @@ pub fn solve_blend_shapes(
     };
 
     // --- Gradient descent loop ------------------------------------------------
+    // `pred` always holds the forward pass for the *current* `weights`; it is
+    // computed once before the loop and then carried forward, updated
+    // exactly once per iteration (after the weight update), so the O(n_basis
+    // * n_vertices) forward pass runs once per iteration instead of twice.
+    let mut pred = apply_blend_displacements(template_verts, &basis.displacements, &weights);
     for iter in 0..config.max_iter {
         n_iter = iter + 1;
 
-        // Forward: apply displacements
-        let pred = apply_blend_displacements(template_verts, &basis.displacements, &weights);
-
-        // Gradient of MSE loss w.r.t. weights
+        // Gradient of MSE loss w.r.t. weights, using this iteration's
+        // starting prediction.
         let mut grad = gradient_wrt_weights(basis, &pred, target_verts);
 
         // L2 regularisation
@@ -444,12 +513,14 @@ pub fn solve_blend_shapes(
             *w -= config.step_size * grad[b];
         }
 
-        // Projection
-        weights = project_weights(&weights, &effective_constraints);
+        // Projection (in place, avoiding a fresh allocation every iteration)
+        project_weights_in_place(&mut weights, &effective_constraints);
 
-        // Compute new residual
-        let pred_new = apply_blend_displacements(template_verts, &basis.displacements, &weights);
-        let new_residual = compute_residual(&pred_new, target_verts);
+        // Forward pass for the updated weights: this is both this
+        // iteration's residual/convergence check *and* next iteration's
+        // gradient input.
+        pred = apply_blend_displacements(template_verts, &basis.displacements, &weights);
+        let new_residual = compute_residual(&pred, target_verts);
 
         // Check convergence
         if (residual - new_residual).abs() < config.tolerance {
@@ -461,16 +532,17 @@ pub fn solve_blend_shapes(
     }
 
     // --- Divergence check -----------------------------------------------------
-    if !converged && residual > 1.0 {
+    if !converged && residual > config.divergence_threshold {
         return Err(BlendSolverError::SolverDiverged {
             iters: n_iter,
             residual,
         });
     }
 
-    // Compute final per-vertex errors
-    let pred_final = apply_blend_displacements(template_verts, &basis.displacements, &weights);
-    let vertex_errors = compute_vertex_errors(&pred_final, target_verts);
+    // Compute final per-vertex errors from the last forward pass computed in
+    // the loop above (it already reflects the final `weights`, so this does
+    // not need to re-run `apply_blend_displacements` a third time).
+    let vertex_errors = compute_vertex_errors(&pred, target_verts);
 
     Ok(BlendSolverResult {
         weights,
@@ -674,6 +746,13 @@ mod tests {
         assert!(!format!("{e}").is_empty());
     }
 
+    #[test]
+    fn test_error_invalid_config_display() {
+        let e = BlendSolverError::InvalidConfig("max_iter must be > 0".to_owned());
+        let s = format!("{e}");
+        assert!(s.contains("max_iter"));
+    }
+
     // -----------------------------------------------------------------------
     // BlendBasis::new
     // -----------------------------------------------------------------------
@@ -855,6 +934,18 @@ mod tests {
         assert!(errors[1].abs() < 1e-6);
     }
 
+    #[test]
+    fn test_compute_vertex_errors_mismatched_lengths_no_panic() {
+        // `pred` has 3 vertices, `target` only 2: only the common (shorter)
+        // prefix must be compared instead of indexing out of bounds.
+        let pred = vec![1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 5.0, 5.0, 5.0];
+        let target = vec![0.0f32, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let errors = compute_vertex_errors(&pred, &target);
+        assert_eq!(errors.len(), 2);
+        assert!((errors[0] - 1.0).abs() < 1e-6);
+        assert!(errors[1].abs() < 1e-6);
+    }
+
     // -----------------------------------------------------------------------
     // compute_residual
     // -----------------------------------------------------------------------
@@ -879,6 +970,16 @@ mod tests {
     fn test_compute_residual_empty() {
         let r = compute_residual(&[], &[]);
         assert!(r.abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_compute_residual_mismatched_lengths_no_panic() {
+        // Only the 2 common vertices are compared: squared errors 1 and 0 →
+        // RMSE = sqrt(1/2).
+        let pred = vec![1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 5.0, 5.0, 5.0];
+        let target = vec![0.0f32, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let r = compute_residual(&pred, &target);
+        assert!((r - 0.5f32.sqrt()).abs() < 1e-5, "r={r}");
     }
 
     // -----------------------------------------------------------------------
@@ -914,8 +1015,21 @@ mod tests {
         assert!(grad.iter().all(|&g| g.abs() < 1e-6));
     }
 
+    #[test]
+    fn test_gradient_wrt_weights_mismatched_lengths_no_panic() {
+        // `basis` expects 5 vertices, but `pred`/`target` only supply 2:
+        // must clamp to the common vertex count instead of indexing out of
+        // bounds.
+        let basis = BlendBasis::new(uniform_basis(5, 1.0, 0.0, 0.0)).unwrap();
+        let pred = flat_verts(2, 1.0, 0.0, 0.0);
+        let target = flat_verts(2, 0.0, 0.0, 0.0);
+        let grad = gradient_wrt_weights(&basis, &pred, &target);
+        assert_eq!(grad.len(), 1);
+        assert!(grad[0].is_finite());
+    }
+
     // -----------------------------------------------------------------------
-    // project_weights
+    // project_weights / project_weights_in_place
     // -----------------------------------------------------------------------
 
     #[test]
@@ -940,6 +1054,18 @@ mod tests {
         // indices 1 and 3 unchanged
         assert!((projected[1] - 0.5).abs() < 1e-6);
         assert!((projected[3] - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_project_weights_in_place_matches_project_weights() {
+        // `project_weights` now delegates to `project_weights_in_place`;
+        // this pins the two down as equivalent.
+        let constraints = WeightConstraints::uniform(3, -1.0, 1.0).unwrap();
+        let weights = vec![-5.0f32, 0.5, 3.0];
+        let via_alloc = project_weights(&weights, &constraints);
+        let mut via_in_place = weights.clone();
+        project_weights_in_place(&mut via_in_place, &constraints);
+        assert_eq!(via_alloc, via_in_place);
     }
 
     // -----------------------------------------------------------------------
@@ -1005,6 +1131,117 @@ mod tests {
             result,
             Err(BlendSolverError::VertexCountMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn test_solve_blend_shapes_basis_vertex_count_exceeds_template_error() {
+        // Regression test: template and target agree with each other (5
+        // vertices) but the basis was built for 8 vertices. This used to
+        // panic with an index-out-of-bounds deep inside the gradient
+        // computation instead of returning a `Result` error.
+        let template = flat_verts(5, 0.0, 0.0, 0.0);
+        let target = flat_verts(5, 1.0, 0.0, 0.0);
+        let basis = BlendBasis::new(uniform_basis(8, 1.0, 0.0, 0.0)).unwrap();
+        let constraints = WeightConstraints::unconstrained(1);
+        let config = BlendSolverConfig::default();
+        let result = solve_blend_shapes(&template, &target, &basis, &constraints, &config);
+        assert!(matches!(
+            result,
+            Err(BlendSolverError::BasisDimensionMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn test_solve_blend_shapes_max_iter_zero_error() {
+        let template = flat_verts(3, 0.0, 0.0, 0.0);
+        let target = flat_verts(3, 1.0, 0.0, 0.0);
+        let basis = BlendBasis::new(uniform_basis(3, 1.0, 0.0, 0.0)).unwrap();
+        let constraints = WeightConstraints::unconstrained(1);
+        let config = BlendSolverConfig {
+            max_iter: 0,
+            ..Default::default()
+        };
+        let result = solve_blend_shapes(&template, &target, &basis, &constraints, &config);
+        assert!(matches!(result, Err(BlendSolverError::InvalidConfig(_))));
+    }
+
+    #[test]
+    fn test_solve_blend_shapes_default_divergence_threshold_errors() {
+        // A single tiny step towards a far-away target cannot converge, and
+        // the residual stays far above the default `divergence_threshold`
+        // of 1.0.
+        let n = 4usize;
+        let template = flat_verts(n, 0.0, 0.0, 0.0);
+        let target = flat_verts(n, 100.0, 100.0, 100.0);
+        let basis = BlendBasis::new(uniform_basis(n, 1.0, 0.0, 0.0)).unwrap();
+        let constraints = WeightConstraints::unconstrained(1);
+        let config = BlendSolverConfig {
+            max_iter: 1,
+            step_size: 0.001,
+            ..Default::default()
+        };
+        let result = solve_blend_shapes(&template, &target, &basis, &constraints, &config);
+        assert!(matches!(
+            result,
+            Err(BlendSolverError::SolverDiverged { .. })
+        ));
+    }
+
+    #[test]
+    fn test_solve_blend_shapes_custom_divergence_threshold_allows_large_residual() {
+        // Same setup as `test_solve_blend_shapes_default_divergence_threshold_errors`,
+        // but with `divergence_threshold` raised so the (still non-converged)
+        // result is accepted instead of reported as diverged. This is only
+        // possible now that the threshold is configurable rather than a
+        // hardcoded `1.0`.
+        let n = 4usize;
+        let template = flat_verts(n, 0.0, 0.0, 0.0);
+        let target = flat_verts(n, 100.0, 100.0, 100.0);
+        let basis = BlendBasis::new(uniform_basis(n, 1.0, 0.0, 0.0)).unwrap();
+        let constraints = WeightConstraints::unconstrained(1);
+        let config = BlendSolverConfig {
+            max_iter: 1,
+            step_size: 0.001,
+            divergence_threshold: 1.0e6,
+            ..Default::default()
+        };
+        let result = solve_blend_shapes(&template, &target, &basis, &constraints, &config)
+            .expect("a large divergence_threshold should accept a large residual");
+        assert!(!result.converged);
+        assert_eq!(result.n_iterations, 1);
+    }
+
+    #[test]
+    fn test_solve_blend_shapes_vertex_errors_match_final_weights() {
+        // Regression test for hoisting the forward pass out of the loop:
+        // `result.vertex_errors` must match what an independent forward pass
+        // from `result.weights` produces, even though the loop no longer
+        // recomputes a third forward pass after the last iteration.
+        let n = 6usize;
+        let template = flat_verts(n, 0.2, -0.1, 0.4);
+        let disp = vec![0.3f32; n * 3];
+        let target: Vec<f32> = template
+            .iter()
+            .zip(disp.iter())
+            .map(|(t, d)| t + 0.7 * d)
+            .collect();
+        let basis = BlendBasis::new(vec![disp]).unwrap();
+        let constraints = WeightConstraints::unconstrained(1);
+        let config = BlendSolverConfig {
+            max_iter: 50,
+            step_size: 0.05,
+            ..Default::default()
+        };
+        let result = solve_blend_shapes(&template, &target, &basis, &constraints, &config).unwrap();
+
+        let recomputed_pred =
+            apply_blend_displacements(&template, &basis.displacements, &result.weights);
+        let recomputed_errors = compute_vertex_errors(&recomputed_pred, &target);
+
+        assert_eq!(result.vertex_errors.len(), recomputed_errors.len());
+        for (a, b) in result.vertex_errors.iter().zip(recomputed_errors.iter()) {
+            assert!((a - b).abs() < 1e-6, "a={a} b={b}");
+        }
     }
 
     #[test]

@@ -43,14 +43,33 @@ pub enum AugmentationError {
 // ---- PRNG helpers (xorshift64, no rand crate) ---------------------------------
 
 /// xorshift64 PRNG step — modifies state in place, returns next pseudo-random u64.
+///
+/// Zero is a fixed point of xorshift64 (it would stay zero forever), so a
+/// zero state is remapped to `1` before stepping. This mirrors the guard
+/// used by the other inline xorshift64 copies in this crate
+/// (`curriculum_learning`, `continual_learning`, `contrastive_learning`).
 #[inline]
 fn xorshift64(state: &mut u64) -> u64 {
+    if *state == 0 {
+        *state = 1;
+    }
     let mut x = *state;
     x ^= x << 13;
     x ^= x >> 7;
     x ^= x << 17;
     *state = x;
     x
+}
+
+/// SplitMix64 finalizer — a strong bit mixer used to decorrelate the small,
+/// near-adjacent seeds [`AugmentationPipeline::apply`] derives per step
+/// (xorshift64 has poor avalanche when seeded from adjacent small integers).
+#[inline]
+fn mix_seed(seed: u64) -> u64 {
+    let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
 }
 
 /// Uniform float in [0, 1) with 53 bits of precision.
@@ -63,6 +82,19 @@ fn xorshift_f32(state: &mut u64) -> f32 {
 #[inline]
 fn xorshift_range(state: &mut u64, lo: f32, hi: f32) -> f32 {
     lo + xorshift_f32(state) * (hi - lo)
+}
+
+/// Map a destination pixel index back to a source-space coordinate using the
+/// `align_corners=false` convention: destination pixel *centres* map to
+/// source-space centres, i.e. `origin + (dst + 0.5) * scale - 0.5`.
+///
+/// Mapping corner-to-corner instead (`origin + dst * scale`) would sample
+/// only a sub-range of `[origin, origin + len*scale)` and offset every
+/// output by half a source pixel. Matches the convention already used by
+/// `ActivationMap::resize` in `activation_maps.rs`.
+#[inline]
+fn align_centers_src_coord(dst_idx: usize, origin: f32, scale: f32) -> f32 {
+    origin + (dst_idx as f32 + 0.5) * scale - 0.5
 }
 
 // ---- AugImage ----------------------------------------------------------------
@@ -105,19 +137,88 @@ impl AugImage {
     }
 
     /// Get the RGB triple at column `x`, row `y`.
+    ///
+    /// # Panics
+    ///
+    /// Panics (via slice indexing) if `x >= self.width` or `y >= self.height`,
+    /// or if `data`/`width`/`height` were mutated externally (all three
+    /// fields are public) such that `data.len() != width * height * 3` no
+    /// longer holds. Callers that cannot guarantee bounds should use
+    /// [`AugImage::try_pixel`] instead.
     #[inline]
     pub fn pixel(&self, x: usize, y: usize) -> [f32; 3] {
+        debug_assert!(
+            x < self.width && y < self.height,
+            "pixel({x}, {y}) out of bounds for {}x{} image",
+            self.width,
+            self.height
+        );
         let base = (y * self.width + x) * 3;
         [self.data[base], self.data[base + 1], self.data[base + 2]]
     }
 
     /// Set the RGB triple at column `x`, row `y`.
+    ///
+    /// # Panics
+    ///
+    /// Panics (via slice indexing) if `x >= self.width` or `y >= self.height`,
+    /// or if the `width`×`height`×3 == `data.len()` invariant was broken by
+    /// external mutation of the public fields. Callers that cannot guarantee
+    /// bounds should use [`AugImage::try_set_pixel`] instead.
     #[inline]
     pub fn set_pixel(&mut self, x: usize, y: usize, rgb: [f32; 3]) {
+        debug_assert!(
+            x < self.width && y < self.height,
+            "set_pixel({x}, {y}) out of bounds for {}x{} image",
+            self.width,
+            self.height
+        );
         let base = (y * self.width + x) * 3;
         self.data[base] = rgb[0];
         self.data[base + 1] = rgb[1];
         self.data[base + 2] = rgb[2];
+    }
+
+    /// Checked variant of [`AugImage::pixel`]: returns `None` instead of
+    /// panicking when `(x, y)` is out of bounds or the image invariant is
+    /// broken.
+    #[inline]
+    pub fn try_pixel(&self, x: usize, y: usize) -> Option<[f32; 3]> {
+        if x >= self.width || y >= self.height {
+            return None;
+        }
+        let base = (y * self.width + x) * 3;
+        let g = self.data.get(base..base + 3)?;
+        Some([g[0], g[1], g[2]])
+    }
+
+    /// Checked variant of [`AugImage::set_pixel`]: returns
+    /// [`AugmentationError::DimensionMismatch`] instead of panicking when
+    /// `(x, y)` is out of bounds.
+    pub fn try_set_pixel(
+        &mut self,
+        x: usize,
+        y: usize,
+        rgb: [f32; 3],
+    ) -> Result<(), AugmentationError> {
+        if x >= self.width || y >= self.height {
+            return Err(AugmentationError::DimensionMismatch {
+                width: self.width,
+                height: self.height,
+                channels: 3,
+            });
+        }
+        let base = (y * self.width + x) * 3;
+        let Some(slot) = self.data.get_mut(base..base + 3) else {
+            return Err(AugmentationError::DataLengthMismatch {
+                len: self.data.len(),
+                width: self.width,
+                height: self.height,
+                channels: 3,
+            });
+        };
+        slot.copy_from_slice(&rgb);
+        Ok(())
     }
 
     /// Total number of pixels.
@@ -129,8 +230,14 @@ impl AugImage {
     /// Sample with bilinear interpolation.
     ///
     /// Coordinates are clamped to `[0, W-1]` and `[0, H-1]`, so this never
-    /// returns out-of-bounds black (clamp-to-edge semantics).
+    /// returns out-of-bounds black (clamp-to-edge semantics). Returns
+    /// `[0.0; 3]` for a zero-width or zero-height image, since there are no
+    /// pixels to sample.
     pub fn sample_bilinear(&self, fx: f32, fy: f32) -> [f32; 3] {
+        if self.width == 0 || self.height == 0 {
+            return [0.0; 3];
+        }
+
         let w = self.width as f32;
         let h = self.height as f32;
 
@@ -140,8 +247,8 @@ impl AugImage {
 
         let x0 = cx.floor() as usize;
         let y0 = cy.floor() as usize;
-        let x1 = (x0 + 1).min(self.width - 1);
-        let y1 = (y0 + 1).min(self.height - 1);
+        let x1 = (x0 + 1).min(self.width.saturating_sub(1));
+        let y1 = (y0 + 1).min(self.height.saturating_sub(1));
 
         let tx = cx - x0 as f32;
         let ty = cy - y0 as f32;
@@ -451,6 +558,14 @@ impl RandomCropResize {
     /// 4. Clamp to image bounds, then sample a random top-left.
     /// 5. Bilinear-resize the crop back to the original dimensions.
     pub fn apply(&self, img: &AugImage, rng: &mut u64) -> Result<AugImage, AugmentationError> {
+        if img.width == 0 || img.height == 0 {
+            return Err(AugmentationError::DimensionMismatch {
+                width: img.width,
+                height: img.height,
+                channels: 3,
+            });
+        }
+
         let w = img.width as f32;
         let h = img.height as f32;
 
@@ -484,15 +599,16 @@ impl RandomCropResize {
             (xorshift_f32(rng) * max_y as f32) as usize % (max_y + 1)
         };
 
-        // Bilinear resize crop → original dimensions
+        // Bilinear resize crop → original dimensions (see
+        // `align_centers_src_coord` for the align_corners=false mapping).
         let mut out = AugImage::zeros(img.width, img.height);
         let scale_x = crop_w as f32 / img.width as f32;
         let scale_y = crop_h as f32 / img.height as f32;
 
         for oy in 0..img.height {
             for ox in 0..img.width {
-                let src_x = x0 as f32 + ox as f32 * scale_x;
-                let src_y = y0 as f32 + oy as f32 * scale_y;
+                let src_x = align_centers_src_coord(ox, x0 as f32, scale_x);
+                let src_y = align_centers_src_coord(oy, y0 as f32, scale_y);
                 let rgb = img.sample_bilinear(src_x, src_y);
                 out.set_pixel(ox, oy, rgb);
             }
@@ -690,25 +806,34 @@ impl AugmentationPipeline {
     /// Apply the pipeline to `img`, advancing the internal call counter.
     ///
     /// Each step is applied only when its probability check passes.
-    /// The RNG seed for step `i` is derived deterministically as:
-    /// `base_seed.wrapping_add(call_count * 997 + step_idx * 31)`
+    /// The raw seed for step `i` is derived deterministically as
+    /// `base_seed.wrapping_add(call_count * 997 + step_idx * 31)` (and that
+    /// value plus 1 for the independent parameter draw), then passed through
+    /// a SplitMix64 finalizer (`mix_seed`) before use. The finalizer is
+    /// required because xorshift64 has poor avalanche when seeded from
+    /// small, near-adjacent integers — without it, the probability gate and
+    /// the sampled parameters would be correlated both with each other and
+    /// across consecutive calls, and a `base_seed` of 0 would make the very
+    /// first gate seed exactly 0.
     pub fn apply(&mut self, img: &AugImage) -> Result<AugImage, AugmentationError> {
         let mut current = img.clone();
         let count = self.call_count;
 
         for (step_idx, (step, &prob)) in self.steps.iter().zip(self.step_probs.iter()).enumerate() {
-            let mut rng = self
+            let raw_seed = self
                 .base_seed
                 .wrapping_add(count.wrapping_mul(997).wrapping_add(step_idx as u64 * 31));
+            let mut rng = mix_seed(raw_seed);
 
             // Probability gate
             if xorshift_f32(&mut rng) < prob {
                 // Re-derive rng after the gate check so factor sampling is independent
-                let mut rng2 = self.base_seed.wrapping_add(
+                let raw_seed2 = self.base_seed.wrapping_add(
                     count
                         .wrapping_mul(997)
                         .wrapping_add(step_idx as u64 * 31 + 1),
                 );
+                let mut rng2 = mix_seed(raw_seed2);
                 current = step.apply(&current, &mut rng2)?;
             }
         }
@@ -1049,5 +1174,155 @@ mod tests {
         assert_eq!(pipeline.call_count(), 2);
         pipeline.apply(&img).unwrap();
         assert_eq!(pipeline.call_count(), 3);
+    }
+
+    // ---- Regression tests -----------------------------------------------
+
+    // 23. xorshift64 never gets stuck at the zero fixed point.
+    #[test]
+    fn test_xorshift64_zero_seed_is_not_a_fixed_point() {
+        let mut state = 0u64;
+        let first = xorshift64(&mut state);
+        assert_ne!(first, 0, "xorshift64(0) must not stay at the fixed point");
+        assert_ne!(state, 0);
+        // A few more steps should also never collapse back to zero.
+        for _ in 0..8 {
+            assert_ne!(xorshift64(&mut state), 0);
+        }
+    }
+
+    // 24. A pipeline seeded with 0 must not degenerate into a fixed
+    // deterministic no-jitter transform (regression for the missing
+    // zero-state guard: previously the very first gate seed
+    // `base_seed=0, call=0, step=0` was exactly 0, and the unguarded
+    // `xorshift_f32` returned 0.0 forever, pinning ColorJitter's sampled
+    // factors to the low end of their ranges every single call).
+    // Use prob=1.0 so the step is guaranteed to execute regardless of the
+    // gate draw, isolating the assertion to "did sampling actually vary".
+    #[test]
+    fn test_pipeline_zero_seed_still_varies_output() {
+        let img = test_image(16, 16);
+        let mut pipeline = AugmentationPipeline::new(0);
+        pipeline
+            .add_step(AugStep::ColorJitter(ColorJitter::default()), 1.0)
+            .unwrap();
+        let out = pipeline.apply(&img).unwrap();
+        // ColorJitter::default() samples brightness/contrast/saturation from
+        // [0.9, 1.1] and hue from [-0.05, 0.05]; landing exactly on the
+        // identity point (1.0, 1.0, 1.0, 0.0) from a continuous PRNG draw is
+        // effectively impossible, so any non-degenerate RNG must change the
+        // image.
+        assert_ne!(out.data, img.data);
+    }
+
+    // 24b. mix_seed must decorrelate the small, adjacent raw seeds that
+    // AugmentationPipeline derives for the gate draw vs. the independent
+    // parameter draw within one step (raw seeds differing by exactly 1).
+    // Raw xorshift64 has poor avalanche for such inputs; the SplitMix64
+    // finalizer should scramble them into unrelated 64-bit outputs.
+    #[test]
+    fn test_mix_seed_decorrelates_adjacent_seeds() {
+        for base in [0u64, 997, 1994, u64::MAX - 1] {
+            let a = mix_seed(base);
+            let b = mix_seed(base.wrapping_add(1));
+            // The regression this guards against is raw xorshift64's poor
+            // avalanche on adjacent small seeds (correlated first outputs);
+            // requiring the mixed outputs to merely differ is sufficient to
+            // catch "mixer accidentally disabled / no-op", without asserting
+            // an exact avalanche threshold that isn't provable by inspection.
+            assert_ne!(a, b, "mix_seed({base}) == mix_seed({base}+1)");
+        }
+    }
+
+    // 25. RandomCropResize::apply must not panic on a zero-dimension image;
+    // it should return a DimensionMismatch error instead.
+    #[test]
+    fn test_crop_resize_zero_dimension_returns_error() {
+        let img = AugImage::zeros(0, 0);
+        let crop = RandomCropResize::default();
+        let mut rng = 1u64;
+        let result = crop.apply(&img, &mut rng);
+        assert!(matches!(
+            result,
+            Err(AugmentationError::DimensionMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn test_crop_resize_zero_width_returns_error() {
+        let img = AugImage::zeros(0, 4);
+        let crop = RandomCropResize::default();
+        let mut rng = 1u64;
+        let result = crop.apply(&img, &mut rng);
+        assert!(matches!(
+            result,
+            Err(AugmentationError::DimensionMismatch { .. })
+        ));
+    }
+
+    // 26. sample_bilinear must not panic on a zero-dimension image; it
+    // should return black instead.
+    #[test]
+    fn test_sample_bilinear_zero_dimension_returns_black() {
+        let img = AugImage::zeros(0, 0);
+        assert_eq!(img.sample_bilinear(0.0, 0.0), [0.0; 3]);
+        assert_eq!(img.sample_bilinear(5.0, -3.0), [0.0; 3]);
+
+        let img_w0 = AugImage::zeros(0, 4);
+        assert_eq!(img_w0.sample_bilinear(0.0, 0.0), [0.0; 3]);
+    }
+
+    // 27. pixel()/set_pixel() out-of-bounds access panics in debug builds
+    // (documented precondition); try_pixel()/try_set_pixel() must not panic
+    // and should report the failure instead.
+    #[test]
+    fn test_try_pixel_out_of_bounds_returns_none() {
+        let img = AugImage::zeros(4, 4);
+        assert!(img.try_pixel(3, 3).is_some());
+        assert!(img.try_pixel(4, 0).is_none());
+        assert!(img.try_pixel(0, 4).is_none());
+    }
+
+    #[test]
+    fn test_try_set_pixel_out_of_bounds_returns_error() {
+        let mut img = AugImage::zeros(4, 4);
+        assert!(img.try_set_pixel(3, 3, [1.0, 1.0, 1.0]).is_ok());
+        assert!(matches!(
+            img.try_set_pixel(4, 0, [1.0, 1.0, 1.0]),
+            Err(AugmentationError::DimensionMismatch { .. })
+        ));
+        assert_eq!(img.try_pixel(3, 3), Some([1.0, 1.0, 1.0]));
+    }
+
+    // 28. align_centers_src_coord implements align_corners=false mapping:
+    // destination pixel centres map to source-space centres.
+    #[test]
+    fn test_align_centers_src_coord_half_pixel_convention() {
+        // scale=1.0 (no resize): dst index k maps exactly to origin + k.
+        for k in 0..5usize {
+            let got = align_centers_src_coord(k, 3.0, 1.0);
+            assert!((got - (3.0 + k as f32)).abs() < 1e-6, "k={k} got={got}");
+        }
+        // scale=0.5 (2x downsample from origin 0): dst=0 -> -0.25, dst=1 -> 0.25.
+        assert!((align_centers_src_coord(0, 0.0, 0.5) - (-0.25)).abs() < 1e-6);
+        assert!((align_centers_src_coord(1, 0.0, 0.5) - 0.25).abs() < 1e-6);
+    }
+
+    // 29. RandomCropResize with a forced full-frame crop (min_crop=1.0,
+    // aspect locked to 1.0, square image so area^0.5 == width == height)
+    // must reproduce the input image exactly: the crop covers the whole
+    // frame, so align-centers resampling degenerates to sampling each
+    // source pixel exactly.
+    #[test]
+    fn test_crop_resize_full_frame_is_identity() {
+        let img = test_image(8, 8);
+        let crop = RandomCropResize::new(1.0, [1.0, 1.0]).unwrap();
+        for seed in [1u64, 42, 9999] {
+            let mut rng = seed;
+            let out = crop.apply(&img, &mut rng).unwrap();
+            for (a, b) in img.data.iter().zip(out.data.iter()) {
+                assert!((a - b).abs() < 1e-4, "seed={seed}: expected identity crop");
+            }
+        }
     }
 }

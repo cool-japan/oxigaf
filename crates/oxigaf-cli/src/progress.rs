@@ -107,6 +107,14 @@ pub fn download_progress(total_bytes: u64, verbosity: Verbosity) -> ProgressBar 
 ///
 /// Shows frame count and rendering progress with ETA.
 ///
+/// `oxigaf render` schedules its frames through
+/// [`crate::parallel_render::ParallelRenderer`], whose `execute` takes a
+/// [`crate::progress_types::BatchProgress`] rather than a bare
+/// [`ProgressBar`], so it drives that type instead. This helper stays the
+/// styling for any caller that renders frames in its own loop; it used to
+/// carry an `#[allow(dead_code)]` for that reason, which was never needed —
+/// it is public API of the library crate, not a private binary item.
+///
 /// # Arguments
 ///
 /// * `num_frames` - Total number of frames to render
@@ -130,7 +138,6 @@ pub fn download_progress(total_bytes: u64, verbosity: Verbosity) -> ProgressBar 
 /// pb.finish_with_message("Rendering complete");
 /// ```
 #[must_use]
-#[allow(dead_code)]
 pub fn render_progress(num_frames: u64, verbosity: Verbosity) -> ProgressBar {
     if !verbosity.show_progress() {
         return ProgressBar::hidden();

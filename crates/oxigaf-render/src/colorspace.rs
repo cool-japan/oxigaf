@@ -448,7 +448,12 @@ impl ToneMapping {
             Self::Reinhard => x / (1.0 + x),
             Self::ReinhardExtended { white } => {
                 let w = *white;
-                (x * (1.0 + x / (w * w))) / (1.0 + x)
+                // Guard the divisor: `white` is a public, freely-settable
+                // field with no validation, and `white == 0.0` (with
+                // `x == 0.0`, i.e. a black pixel) would otherwise compute
+                // `0.0 / 0.0 = NaN` here.
+                let w2 = (w * w).max(1e-6);
+                (x * (1.0 + x / w2)) / (1.0 + x)
             }
             Self::Aces => {
                 // Narkowicz 2015 approximation
@@ -464,7 +469,14 @@ impl ToneMapping {
                 hable_partial(x * 2.0) / white_scale
             }
         };
-        result.clamp(0.0, 1.0)
+        // `f32::clamp` returns `self` unchanged when `self` is NaN (neither
+        // comparison holds), so a NaN `result` would otherwise propagate
+        // into the output image uncaught; fail safe to 0.0 instead.
+        if result.is_finite() {
+            result.clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
     }
 
     /// Apply tone mapping to all three components of a Color (per-channel).
@@ -609,10 +621,33 @@ pub fn apply_tone_mapping_image(
     tone_mapping: ToneMapping,
     output_gamma: bool,
 ) -> Result<Vec<f32>, ColorError> {
+    apply_tone_mapping_image_channels(pixels, height, width, 3, tone_mapping, output_gamma)
+}
+
+/// Apply tone mapping to a flat f32 image with an explicit channel stride.
+///
+/// Supports `channels == 3` (RGB) or `channels == 4` (RGBA; the alpha
+/// channel is passed through unchanged, untouched by tone mapping or gamma
+/// encoding). Any other channel count returns
+/// [`ColorError::UnsupportedChannelCount`].
+///
+/// If `output_gamma` is `true`, the RGB result is gamma-encoded to sRGB
+/// after tone mapping. Returns a new `Vec<f32>` with the same dimensions.
+pub fn apply_tone_mapping_image_channels(
+    pixels: &[f32],
+    height: usize,
+    width: usize,
+    channels: usize,
+    tone_mapping: ToneMapping,
+    output_gamma: bool,
+) -> Result<Vec<f32>, ColorError> {
     if pixels.is_empty() {
         return Err(ColorError::EmptyImage);
     }
-    let expected = height * width * 3;
+    if channels != 3 && channels != 4 {
+        return Err(ColorError::UnsupportedChannelCount { channels });
+    }
+    let expected = height * width * channels;
     if pixels.len() != expected {
         return Err(ColorError::InvalidPixelCount {
             expected,
@@ -621,7 +656,7 @@ pub fn apply_tone_mapping_image(
     }
 
     let mut out = Vec::with_capacity(pixels.len());
-    for chunk in pixels.chunks(3) {
+    for chunk in pixels.chunks(channels) {
         let c = Color::new(chunk[0], chunk[1], chunk[2]);
         let mapped = tone_mapping.apply(c);
         if output_gamma {
@@ -629,6 +664,9 @@ pub fn apply_tone_mapping_image(
             out.extend_from_slice(&encoded.c);
         } else {
             out.extend_from_slice(&mapped.c);
+        }
+        if channels == 4 {
+            out.push(chunk[3]);
         }
     }
     Ok(out)
@@ -644,10 +682,32 @@ pub fn convert_image_colorspace(
     from: ColorSpace,
     to: ColorSpace,
 ) -> Result<Vec<f32>, ColorError> {
+    convert_image_colorspace_channels(pixels, height, width, 3, from, to)
+}
+
+/// Convert a flat f32 image from one color space to another with an
+/// explicit channel stride.
+///
+/// Supports `channels == 3` (RGB) or `channels == 4` (RGBA; the alpha
+/// channel is passed through unchanged). Any other channel count returns
+/// [`ColorError::UnsupportedChannelCount`].
+///
+/// Returns a new `Vec<f32>` with the same dimensions.
+pub fn convert_image_colorspace_channels(
+    pixels: &[f32],
+    height: usize,
+    width: usize,
+    channels: usize,
+    from: ColorSpace,
+    to: ColorSpace,
+) -> Result<Vec<f32>, ColorError> {
     if pixels.is_empty() {
         return Err(ColorError::EmptyImage);
     }
-    let expected = height * width * 3;
+    if channels != 3 && channels != 4 {
+        return Err(ColorError::UnsupportedChannelCount { channels });
+    }
+    let expected = height * width * channels;
     if pixels.len() != expected {
         return Err(ColorError::InvalidPixelCount {
             expected,
@@ -656,10 +716,13 @@ pub fn convert_image_colorspace(
     }
 
     let mut out = Vec::with_capacity(pixels.len());
-    for chunk in pixels.chunks(3) {
+    for chunk in pixels.chunks(channels) {
         let c = Color::new(chunk[0], chunk[1], chunk[2]);
         let converted = convert_color(c, from, to);
         out.extend_from_slice(&converted.c);
+        if channels == 4 {
+            out.push(chunk[3]);
+        }
     }
     Ok(out)
 }
@@ -905,6 +968,35 @@ mod tests {
     }
 
     #[test]
+    fn test_tone_mapping_reinhard_extended_white_zero_no_nan() {
+        // `white` is a public, unvalidated field; `white == 0.0` with
+        // `x == 0.0` (a black pixel) previously computed 0.0/0.0 = NaN,
+        // which `f32::clamp` then let straight through to the output.
+        let tm = ToneMapping::ReinhardExtended { white: 0.0 };
+        let got = tm.apply_channel(0.0);
+        assert!(got.is_finite(), "expected finite output, got {got}");
+        assert!((0.0..=1.0).contains(&got), "expected in [0,1], got {got}");
+
+        // Also check a non-zero x with white == 0.0 stays finite.
+        let got2 = tm.apply_channel(0.5);
+        assert!(got2.is_finite(), "expected finite output, got {got2}");
+    }
+
+    #[test]
+    fn test_tone_mapping_reinhard_extended_normal_case() {
+        // Sanity check that the divisor guard doesn't perturb a normal,
+        // well-formed `white`.
+        let tm = ToneMapping::ReinhardExtended { white: 4.0 };
+        let x = 1.0_f32;
+        let expected = (x * (1.0 + x / 16.0)) / (1.0 + x);
+        let got = tm.apply_channel(x);
+        assert!(
+            approx_eq(got, expected, EPS),
+            "got {got}, expected {expected}"
+        );
+    }
+
+    #[test]
     fn test_tone_mapping_clamp() {
         let tm = ToneMapping::Clamp;
         assert!(approx_eq(tm.apply_channel(2.0), 1.0, EPS));
@@ -1033,5 +1125,84 @@ mod tests {
                 "roundtrip failed: original={orig}, recovered={rec}"
             );
         }
+    }
+
+    #[test]
+    fn test_apply_tone_mapping_image_channels_unsupported_count() {
+        // `ColorError::UnsupportedChannelCount` was previously declared but
+        // constructed by no code path in the crate.
+        let pixels = vec![0.5_f32; 8]; // 2×2×2, an unsupported channel count
+        let result = apply_tone_mapping_image_channels(&pixels, 2, 2, 2, ToneMapping::Clamp, false);
+        assert!(matches!(
+            result,
+            Err(ColorError::UnsupportedChannelCount { channels: 2 })
+        ));
+    }
+
+    #[test]
+    fn test_apply_tone_mapping_image_channels_rgba_passes_alpha_through() {
+        // 1 pixel, RGBA: alpha must survive tone mapping untouched.
+        let pixels = vec![1.0_f32, 1.0, 1.0, 0.25];
+        let result =
+            apply_tone_mapping_image_channels(&pixels, 1, 1, 4, ToneMapping::Reinhard, false)
+                .expect("tone mapping failed");
+        assert_eq!(result.len(), 4);
+        // Reinhard(1.0) = 0.5 for each RGB channel.
+        assert!(approx_eq(result[0], 0.5, EPS));
+        assert!(approx_eq(result[1], 0.5, EPS));
+        assert!(approx_eq(result[2], 0.5, EPS));
+        // Alpha is untouched.
+        assert!(
+            approx_eq(result[3], 0.25, EPS),
+            "alpha should pass through unchanged"
+        );
+    }
+
+    #[test]
+    fn test_apply_tone_mapping_image_still_matches_channels_wrapper() {
+        // The 3-channel convenience wrapper must behave identically to the
+        // channels-generic function called with channels=3.
+        let pixels = vec![0.2_f32, 0.4, 0.6, 0.8, 0.1, 0.9];
+        let a = apply_tone_mapping_image(&pixels, 1, 2, ToneMapping::Aces, true)
+            .expect("wrapper failed");
+        let b = apply_tone_mapping_image_channels(&pixels, 1, 2, 3, ToneMapping::Aces, true)
+            .expect("channels fn failed");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_convert_image_colorspace_channels_unsupported_count() {
+        let pixels = vec![0.5_f32; 5]; // 5 channels: unsupported
+        let result = convert_image_colorspace_channels(
+            &pixels,
+            1,
+            1,
+            5,
+            ColorSpace::LinearRgb,
+            ColorSpace::SRgb,
+        );
+        assert!(matches!(
+            result,
+            Err(ColorError::UnsupportedChannelCount { channels: 5 })
+        ));
+    }
+
+    #[test]
+    fn test_convert_image_colorspace_channels_rgba_passes_alpha_through() {
+        let pixels = vec![1.0_f32, 1.0, 1.0, 0.75];
+        let result = convert_image_colorspace_channels(
+            &pixels,
+            1,
+            1,
+            4,
+            ColorSpace::LinearRgb,
+            ColorSpace::SRgb,
+        )
+        .expect("conversion failed");
+        assert_eq!(result.len(), 4);
+        assert!(
+            approx_eq(result[3], 0.75, EPS),
+            "alpha should pass through unchanged"
+        );
     }
 }

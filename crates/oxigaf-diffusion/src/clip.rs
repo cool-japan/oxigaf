@@ -110,7 +110,11 @@ impl Module for ClipEncoderLayer {
 
         let residual = &xs;
         let h = self.layer_norm2.forward(&xs)?;
-        let h = self.fc1.forward(&h)?.gelu()?;
+        // HuggingFace `laion/CLIP-ViT-H-14` sets `hidden_act = "gelu"`, which is
+        // the exact erf-based GELU. candle's `.gelu()` is the tanh approximation;
+        // `.gelu_erf()` matches the reference implementation (the ~1e-3 relative
+        // per-activation gap compounds across 32 encoder layers otherwise).
+        let h = self.fc1.forward(&h)?.gelu_erf()?;
         let h = self.fc2.forward(&h)?;
         h + residual
     }
@@ -121,15 +125,30 @@ impl Module for ClipEncoderLayer {
 // ---------------------------------------------------------------------------
 
 /// CLIP vision model configuration (ViT-H/14 defaults).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClipVisionConfig {
+    /// Hidden width of every encoder layer (ViT-H/14 = 1280).
     pub embed_dim: usize,
+    /// Self-attention head count; [`Self::embed_dim`] must divide by it.
     pub num_heads: usize,
+    /// Number of stacked encoder layers (ViT-H/14 = 32).
     pub num_layers: usize,
+    /// Feed-forward hidden width (ViT-H/14 = 4 × `embed_dim` = 5120).
     pub intermediate_size: usize,
+    /// Square input resolution the position embedding is sized for.
     pub image_size: usize,
+    /// Square patch edge; [`Self::image_size`] must divide by it.
     pub patch_size: usize,
 }
+
+/// Head width of every ViT-H/14 attention head: `1280 / 16`.
+///
+/// [`ClipVisionConfig::vit_h14_with_embed_dim`] holds this constant while
+/// scaling the tower's width, so `embed_dim` has to be a multiple of it.
+pub const VIT_H14_HEAD_DIM: usize = 80;
+
+/// Feed-forward expansion factor of a ViT-H/14 encoder layer: `5120 / 1280`.
+pub const VIT_H14_MLP_RATIO: usize = 4;
 
 impl Default for ClipVisionConfig {
     fn default() -> Self {
@@ -145,8 +164,54 @@ impl Default for ClipVisionConfig {
 }
 
 impl ClipVisionConfig {
+    /// Number of image patches the tower tokenises its input into.
     pub fn num_patches(&self) -> usize {
         (self.image_size / self.patch_size).pow(2)
+    }
+
+    /// ViT-H/14's geometry re-scaled to an arbitrary hidden width.
+    ///
+    /// Depth (32 layers), input resolution (224²) and patch size (14) are
+    /// ViT-H/14's; the two width-derived quantities are held to ViT-H/14's own
+    /// ratios rather than to its absolute numbers:
+    ///
+    /// - `num_heads = embed_dim / 80` — ViT-H/14's heads are 80 wide
+    ///   (`1280 / 16`), and the encoder's attention partitions `embed_dim` by
+    ///   the head *count*, so scaling the count is what keeps each head 80 wide.
+    /// - `intermediate_size = 4 * embed_dim` — ViT-H/14's MLP ratio
+    ///   (`5120 / 1280`).
+    ///
+    /// `vit_h14_with_embed_dim(1280)` therefore reproduces [`Self::default`]
+    /// exactly; the tests below pin that.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::DiffusionError::InvalidConfig`] unless `embed_dim` is a
+    /// **positive** multiple of [`VIT_H14_HEAD_DIM`]. Zero is rejected
+    /// separately from the divisibility rule (`0` *is* a multiple of 80, but a
+    /// zero-width tower has no weights `nn::linear` can build), and a width
+    /// that is not a multiple of 80 would silently change the head geometry the
+    /// checkpoint was trained with.
+    pub fn vit_h14_with_embed_dim(embed_dim: usize) -> crate::DiffusionResult<Self> {
+        if embed_dim == 0 {
+            return Err(crate::DiffusionError::InvalidConfig(
+                "CLIP vision embed_dim must be > 0".to_string(),
+            ));
+        }
+        if !embed_dim.is_multiple_of(VIT_H14_HEAD_DIM) {
+            return Err(crate::DiffusionError::InvalidConfig(format!(
+                "CLIP vision embed_dim must be a multiple of {VIT_H14_HEAD_DIM} \
+                 (ViT-H/14's head width), got {embed_dim}"
+            )));
+        }
+        Ok(Self {
+            embed_dim,
+            num_heads: embed_dim / VIT_H14_HEAD_DIM,
+            num_layers: 32,
+            intermediate_size: VIT_H14_MLP_RATIO * embed_dim,
+            image_size: 224,
+            patch_size: 14,
+        })
     }
 }
 
@@ -163,6 +228,9 @@ pub struct ClipImageEncoder {
     post_layernorm: nn::LayerNorm,
     /// Optional projection to map to cross-attention dimension.
     ip_projection: Option<nn::Linear>,
+    /// Width of the tokens `forward` returns: the projection target when
+    /// `ip_projection` is present, the tower's own `embed_dim` otherwise.
+    output_dim: usize,
     config: ClipVisionConfig,
 }
 
@@ -193,7 +261,14 @@ impl ClipImageEncoder {
             vs.pp("embeddings.position_embedding"),
         )?;
 
-        let class_embedding = vs.get((1, 1, embed_dim), "embeddings.class_embedding")?;
+        // HuggingFace `CLIPVisionModel` stores `embeddings.class_embedding` as a
+        // rank-1 parameter of shape `(embed_dim,)`. `VarBuilder::get` requires an
+        // exact shape match (it does not reshape), so requesting `(1, 1, embed_dim)`
+        // directly would fail to load a real checkpoint. Fetch the rank-1 tensor and
+        // reshape it here instead, so `forward`'s `broadcast_as` call is unaffected.
+        let class_embedding = vs
+            .get((embed_dim,), "embeddings.class_embedding")?
+            .reshape((1, 1, embed_dim))?;
 
         let pre_layernorm = nn::layer_norm(embed_dim, 1e-5, vs.pp("pre_layrnorm"))?;
 
@@ -224,15 +299,36 @@ impl ClipImageEncoder {
             encoder_layers,
             post_layernorm,
             ip_projection,
+            output_dim: project_to.unwrap_or(embed_dim),
             config: clip_config.clone(),
         })
+    }
+
+    /// Width of the tokens [`Self::forward`] returns.
+    ///
+    /// This is the IP-Adapter projection's output width when one was requested
+    /// at construction (`project_to`), and the vision tower's own
+    /// [`ClipVisionConfig::embed_dim`] otherwise. It is the width the U-Net's
+    /// `attn_ip` cross-attention has to be built for — see
+    /// [`DiffusionConfig::ip_adapter_context_dim`], which is where
+    /// [`build_clip_encoder`] and [`crate::unet::MultiViewUNet::new`] both read
+    /// it from so the two cannot disagree.
+    pub fn output_dim(&self) -> usize {
+        self.output_dim
+    }
+
+    /// The vision tower geometry this encoder was built with.
+    pub fn vision_config(&self) -> &ClipVisionConfig {
+        &self.config
     }
 
     /// Encode an image batch into patch-level embeddings.
     ///
     /// - `pixel_values`: `(B, 3, H, W)` normalised image tensor.
     ///
-    /// Returns `(B, num_patches + 1, embed_dim)` or projected dimension.
+    /// Returns `(B, num_patches + 1, D)`, where `D` is [`Self::output_dim`] —
+    /// the IP projection's target width when one was requested, the vision
+    /// tower's own `embed_dim` otherwise.
     pub fn forward(&self, pixel_values: &Tensor) -> Result<Tensor> {
         let batch_size = pixel_values.dim(0)?;
         let device = pixel_values.device();
@@ -277,13 +373,38 @@ impl ClipImageEncoder {
     }
 }
 
-/// Build a CLIP encoder from a DiffusionConfig with default ViT-H/14 settings.
+/// Build a CLIP encoder from a `DiffusionConfig`, on ViT-H/14's geometry.
+///
+/// The tower is [`ClipVisionConfig::vit_h14_with_embed_dim`] at
+/// [`DiffusionConfig::clip_embed_dim`], so that field actually selects the
+/// vision tower's width. It used to hardcode [`ClipVisionConfig::default`],
+/// which pinned the tower at 1280 no matter what the configuration said —
+/// [`crate::model_variants`] presets and any hand-built config could set
+/// `clip_embed_dim` and see no effect at all, and a checkpoint whose vision
+/// tower was not 1280 wide could not be loaded.
+///
+/// The IP projection targets [`DiffusionConfig::ip_adapter_context_dim`], which
+/// is the same width [`crate::unet::MultiViewUNet::new`] builds its `attn_ip`
+/// cross-attention for. Reading both from one accessor is what keeps the
+/// encoder's output and the U-Net's IP context from diverging: they used to be
+/// two independent fields (`cross_attention_dim` here, `clip_embed_dim` there),
+/// so a run on [`DiffusionConfig::default`] fed 1024-wide tokens into a
+/// 1280-wide projection and shape-errored on the first denoising step.
+///
+/// # Errors
+///
+/// Reports a `clip_embed_dim` that is not a positive multiple of
+/// [`VIT_H14_HEAD_DIM`] as [`candle_core::Error::Msg`] — the same condition
+/// [`DiffusionConfig::validate`] rejects up front, restated here because this
+/// function is reachable without a prior `validate` call. Weight-loading
+/// failures propagate unchanged.
 pub fn build_clip_encoder(
     vs: nn::VarBuilder,
     config: &DiffusionConfig,
 ) -> Result<ClipImageEncoder> {
-    let clip_config = ClipVisionConfig::default();
-    ClipImageEncoder::new(vs, &clip_config, Some(config.cross_attention_dim))
+    let clip_config = ClipVisionConfig::vit_h14_with_embed_dim(config.clip_embed_dim)
+        .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+    ClipImageEncoder::new(vs, &clip_config, Some(config.ip_adapter_context_dim()))
 }
 
 #[cfg(test)]
@@ -399,5 +520,191 @@ mod tests {
     fn default_num_patches_is_256() {
         let cfg = ClipVisionConfig::default();
         assert_eq!(cfg.num_patches(), 256);
+    }
+
+    // ------------------------------------------------------------------
+    // IP-Adapter width contract
+    //
+    // Regression: `build_clip_encoder` projected to `cross_attention_dim`
+    // (1024) while `unet::stage_transformer_spec` built `attn_ip` for
+    // `clip_embed_dim` (1280), so a run on the DEFAULT config fed 1024-wide
+    // tokens into a 1280-wide projection and shape-errored on the first
+    // denoising step. Both sides now read
+    // `DiffusionConfig::ip_adapter_context_dim`.
+    // ------------------------------------------------------------------
+
+    /// A CLIP tower small enough to build in a unit test.
+    ///
+    /// ViT-H/14 — what [`build_clip_encoder`] builds — is 32 layers of 1280
+    /// hidden units (~630 M parameters), which `nn::VarMap` cannot initialise
+    /// in test time. The width contract does not depend on depth, so it is
+    /// pinned on a 1-layer tower plus a weight-free assertion on
+    /// [`DiffusionConfig::default`] below.
+    fn tiny_vision_config(embed_dim: usize) -> ClipVisionConfig {
+        ClipVisionConfig {
+            embed_dim,
+            num_heads: 2,
+            num_layers: 1,
+            intermediate_size: embed_dim * 2,
+            image_size: 8,
+            patch_size: 4,
+        }
+    }
+
+    #[test]
+    fn ip_projection_output_dim_is_the_ip_adapter_context_dim() -> Result<()> {
+        let device = candle_core::Device::Cpu;
+        let varmap = nn::VarMap::new();
+        let vs = nn::VarBuilder::from_varmap(&varmap, candle_core::DType::F32, &device);
+
+        // Deliberately divergent widths: the tower is 80 wide, the U-Net's
+        // IP context 24. The projection is what bridges them. (80 is the
+        // narrowest tower `DiffusionConfig::validate` accepts.)
+        let config = DiffusionConfig {
+            cross_attention_dim: 24,
+            clip_embed_dim: 80,
+            ..DiffusionConfig::default()
+        };
+        let vision = tiny_vision_config(config.clip_embed_dim);
+        let encoder = ClipImageEncoder::new(vs, &vision, Some(config.ip_adapter_context_dim()))?;
+
+        assert_eq!(encoder.output_dim(), config.ip_adapter_context_dim());
+        assert_eq!(encoder.vision_config().embed_dim, config.clip_embed_dim);
+
+        let pixels = Tensor::randn(
+            0f32,
+            1f32,
+            (1usize, 3usize, vision.image_size, vision.image_size),
+            &device,
+        )?;
+        let tokens = encoder.forward(&pixels)?;
+        assert_eq!(
+            tokens.dims(),
+            &[1, vision.num_patches() + 1, config.ip_adapter_context_dim()],
+            "encoded tokens must be as wide as the U-Net's attn_ip context"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unprojected_encoder_reports_the_tower_width() -> Result<()> {
+        let device = candle_core::Device::Cpu;
+        let varmap = nn::VarMap::new();
+        let vs = nn::VarBuilder::from_varmap(&varmap, candle_core::DType::F32, &device);
+        let vision = tiny_vision_config(16);
+        let encoder = ClipImageEncoder::new(vs, &vision, None)?;
+        assert_eq!(encoder.output_dim(), vision.embed_dim);
+
+        let pixels = Tensor::randn(
+            0f32,
+            1f32,
+            (1usize, 3usize, vision.image_size, vision.image_size),
+            &device,
+        )?;
+        let tokens = encoder.forward(&pixels)?;
+        assert_eq!(tokens.dims(), &[1, vision.num_patches() + 1, 16]);
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // `clip_embed_dim` actually sizes the tower
+    //
+    // Regression: `build_clip_encoder` hardcoded `ClipVisionConfig::default()`,
+    // so `DiffusionConfig::clip_embed_dim` was inert — every configuration got
+    // a 1280-wide ViT-H/14 tower regardless of what it asked for.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn vit_h14_with_1280_reproduces_default_exactly() {
+        let scaled =
+            ClipVisionConfig::vit_h14_with_embed_dim(1280).expect("1280 is ViT-H/14's own width");
+        assert_eq!(
+            scaled,
+            ClipVisionConfig::default(),
+            "the width-parameterised constructor must be a superset of Default"
+        );
+    }
+
+    #[test]
+    fn vit_h14_scaling_holds_the_head_width_and_mlp_ratio() {
+        for embed_dim in [80usize, 160, 640, 1280, 2560] {
+            let cfg = ClipVisionConfig::vit_h14_with_embed_dim(embed_dim)
+                .expect("multiple of 80 must be accepted");
+            assert_eq!(cfg.embed_dim, embed_dim);
+            assert_eq!(
+                cfg.embed_dim / cfg.num_heads,
+                VIT_H14_HEAD_DIM,
+                "every head must stay {VIT_H14_HEAD_DIM} wide at embed_dim={embed_dim}"
+            );
+            assert_eq!(cfg.intermediate_size, VIT_H14_MLP_RATIO * embed_dim);
+            // Depth and patchification are ViT-H/14's, not scaled.
+            assert_eq!(cfg.num_layers, 32);
+            assert_eq!(cfg.image_size, 224);
+            assert_eq!(cfg.patch_size, 14);
+        }
+    }
+
+    #[test]
+    fn vit_h14_rejects_zero_and_non_multiples_of_the_head_width() {
+        // Zero is a multiple of 80, so it needs its own guard.
+        assert!(ClipVisionConfig::vit_h14_with_embed_dim(0).is_err());
+        for embed_dim in [1usize, 79, 81, 768, 1024] {
+            assert!(
+                ClipVisionConfig::vit_h14_with_embed_dim(embed_dim).is_err(),
+                "embed_dim={embed_dim} is not a multiple of {VIT_H14_HEAD_DIM}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_clip_encoder_sizes_the_tower_from_clip_embed_dim() -> Result<()> {
+        // A 1-layer check is impossible here (ViT-H/14 depth is fixed at 32),
+        // so assert on the *geometry* `build_clip_encoder` derives rather than
+        // on an instantiated tower.
+        let config = DiffusionConfig {
+            clip_embed_dim: 640,
+            ..DiffusionConfig::default()
+        };
+        let vision = ClipVisionConfig::vit_h14_with_embed_dim(config.clip_embed_dim)
+            .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+        assert_eq!(vision.embed_dim, 640);
+        assert_ne!(
+            vision,
+            ClipVisionConfig::default(),
+            "a non-default clip_embed_dim must not fall back to ViT-H/14's 1280"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn build_clip_encoder_reports_an_unbuildable_clip_embed_dim() {
+        let device = candle_core::Device::Cpu;
+        let varmap = nn::VarMap::new();
+        let vs = nn::VarBuilder::from_varmap(&varmap, candle_core::DType::F32, &device);
+        // 1024 is ViT-L/14's width, not a multiple of ViT-H/14's 80-wide head.
+        let config = DiffusionConfig {
+            clip_embed_dim: 1024,
+            ..DiffusionConfig::default()
+        };
+        let err = build_clip_encoder(vs, &config)
+            .expect_err("1024 is not a multiple of the ViT-H/14 head width");
+        assert!(
+            err.to_string().contains("multiple of 80"),
+            "error should name the rule, got: {err}"
+        );
+    }
+
+    /// The default configuration's widths, asserted without building the
+    /// 630 M-parameter tower [`build_clip_encoder`] would.
+    #[test]
+    fn default_config_projects_vit_h14_down_to_the_cross_attention_width() {
+        let config = DiffusionConfig::default();
+        assert_eq!(config.ip_adapter_context_dim(), config.cross_attention_dim);
+        assert_eq!(config.ip_adapter_context_dim(), 1024);
+        // The tower's own width is the projection's *input*, and it is not the
+        // same number — which is exactly why reading it as the `attn_ip`
+        // context width used to break every default-config run.
+        assert_eq!(ClipVisionConfig::default().embed_dim, config.clip_embed_dim);
+        assert_ne!(config.clip_embed_dim, config.ip_adapter_context_dim());
     }
 }

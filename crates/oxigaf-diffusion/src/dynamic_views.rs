@@ -604,7 +604,7 @@ pub fn recommend_view_count(
     image_height: usize,
     image_width: usize,
 ) -> SupportedViewCount {
-    let num_heads = 128;
+    let num_heads = 8;
     let head_dim = 64;
 
     for &vc in SupportedViewCount::all().iter().rev() {
@@ -622,9 +622,9 @@ pub fn recommend_view_count(
 ///
 /// Checks that:
 /// 1. Image dimensions are non-zero (via [`ViewCountConfig::validate`]).
-/// 2. The view count is one of the officially supported values (always true if
-///    constructed via [`ViewCountConfig::new`], but may be violated by manual
-///    field mutation).
+/// 2. `use_cross_view_attention` is `false` when `num_views` is
+///    [`SupportedViewCount::One`] (cross-view attention has nothing to
+///    attend across in single-view mode).
 ///
 /// # Errors
 ///
@@ -1017,6 +1017,38 @@ mod tests {
         // The recommended view count should always be valid
         let mid = recommend_view_count(64 * 1024 * 1024, 256, 256);
         assert!(SupportedViewCount::from_usize(mid.as_usize()).is_ok());
+    }
+
+    #[test]
+    fn test_recommend_view_count_uses_num_heads_8_not_128() {
+        // Regression test: the rustdoc promises num_heads=8. Pick a budget
+        // that fits Eight views under that assumption but not under the
+        // old (buggy) num_heads=128 assumption, and confirm the function
+        // now recommends Eight for it.
+        let image_height = 512;
+        let image_width = 512;
+        let config = ViewCountConfig::new(SupportedViewCount::Eight)
+            .with_resolution(image_height, image_width);
+        let seq_len = config.latent_height() * config.latent_width();
+
+        let estimate_correct = estimate_memory(&config, seq_len, 8, 64);
+        let estimate_buggy = estimate_memory(&config, seq_len, 128, 64);
+        // Sanity check: the two estimates must actually differ, or this
+        // test would not be able to distinguish the fixed behaviour from
+        // the old one.
+        assert!(estimate_buggy.total_bytes > estimate_correct.total_bytes);
+
+        let budget = (estimate_correct.total_bytes + estimate_buggy.total_bytes) / 2;
+        assert!(budget >= estimate_correct.total_bytes);
+        assert!(budget < estimate_buggy.total_bytes);
+
+        let recommended = recommend_view_count(budget, image_height, image_width);
+        assert_eq!(
+            recommended,
+            SupportedViewCount::Eight,
+            "recommend_view_count should use num_heads=8 per its documented \
+             assumption and recommend Eight for this budget"
+        );
     }
 
     #[test]

@@ -722,8 +722,15 @@ fn test_buffer_pool_clear() {
 
 #[test]
 fn test_size_classes_valid() {
-    // Verify size classes are in expected order and values
-    assert_eq!(SIZE_CLASSES.len(), 8);
+    // Verify size classes are in expected order and values.
+    //
+    // The table was extended from 8 classes (1KB..16MB) to 10 (1KB..256MB):
+    // every request above the old 16MB ceiling used to fall outside the
+    // table, so the pool was inert for any full-resolution readback (a
+    // 1920x1080 RGBA f32 readback is ~33MB, a 2560x1440 one ~59MB). See
+    // `SIZE_CLASSES` and `BufferPoolInner::size_class_index` in
+    // `crates/oxigaf-render/src/pool.rs`.
+    assert_eq!(SIZE_CLASSES.len(), 10);
     assert_eq!(SIZE_CLASSES[0], 1024); // 1KB
     assert_eq!(SIZE_CLASSES[1], 4 * 1024); // 4KB
     assert_eq!(SIZE_CLASSES[2], 16 * 1024); // 16KB
@@ -732,6 +739,8 @@ fn test_size_classes_valid() {
     assert_eq!(SIZE_CLASSES[5], 1024 * 1024); // 1MB
     assert_eq!(SIZE_CLASSES[6], 4 * 1024 * 1024); // 4MB
     assert_eq!(SIZE_CLASSES[7], 16 * 1024 * 1024); // 16MB
+    assert_eq!(SIZE_CLASSES[8], 64 * 1024 * 1024); // 64MB
+    assert_eq!(SIZE_CLASSES[9], 256 * 1024 * 1024); // 256MB
 }
 
 #[test]

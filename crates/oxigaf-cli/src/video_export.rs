@@ -1,8 +1,9 @@
 //! Video export for OxiGAF rendered frames.
 //!
-//! Supports frame sequence output (PNG / JPEG), GIF (frames stored as PNG),
-//! and JSON manifest generation.  An optional HTML viewer can be generated
-//! from a manifest for browser-based playback.
+//! Supports frame sequence output (PNG / JPEG), a single animated GIF
+//! (assembled in pure Rust via the `image`/`gif` crates — no external tools
+//! required), and JSON manifest generation.  An optional HTML viewer can be
+//! generated from a manifest for browser-based playback.
 //!
 //! # Example
 //!
@@ -34,8 +35,11 @@ pub enum VideoFormat {
     /// Save every frame as an image file.  `extension` must be `"png"` or
     /// `"jpg"`.
     FrameSequence { extension: String },
-    /// Store frames as PNG images (full GIF combiner not included in this
-    /// version; frames can be assembled by external tools).
+    /// Assemble every frame into a single animated `.gif` file. Frames are
+    /// buffered in memory as they are added and encoded (with the pure-Rust
+    /// `image`/`gif` codec stack) when [`FrameCollector::finalize`] is
+    /// called. Frame delay derives from [`VideoExportConfig::fps`] and
+    /// looping from [`VideoExportConfig::loop_gif`].
     Gif,
     /// Write only the JSON manifest, skip individual frame files.
     Manifest,
@@ -97,7 +101,7 @@ impl VideoExportConfig {
         )
     }
 
-    /// Convenience constructor: GIF (frames stored as PNG files).
+    /// Convenience constructor: single animated GIF.
     #[must_use]
     pub fn gif(width: u32, height: u32, output_dir: PathBuf) -> Self {
         Self::new(VideoFormat::Gif, width, height, output_dir)
@@ -165,6 +169,11 @@ pub struct FrameCollector {
     pub config: VideoExportConfig,
     frames: Vec<FrameMetadata>,
     total_frames_added: usize,
+    /// Buffered RGBA pixel data for frames destined for a combined
+    /// animated GIF. Only populated when `config.format` is
+    /// [`VideoFormat::Gif`]; assembled into a single `.gif` file by
+    /// [`FrameCollector::finalize`].
+    gif_frame_buffers: Vec<Vec<u8>>,
 }
 
 impl FrameCollector {
@@ -183,6 +192,7 @@ impl FrameCollector {
             config,
             frames: Vec::new(),
             total_frames_added: 0,
+            gif_frame_buffers: Vec::new(),
         })
     }
 
@@ -227,11 +237,12 @@ impl FrameCollector {
                 (path, sz)
             }
             VideoFormat::Gif => {
-                // Frames saved as PNG; GIF assembly delegated to external tool.
-                let filename = format!("{}_{:06}.png", self.config.filename_prefix, frame_index);
-                let path = self.config.output_dir.join(&filename);
-                let sz = self.save_frame_image(pixels, &path, "png")?;
-                (path, sz)
+                // Buffered in memory; assembled into a single animated GIF
+                // file at `finalize()` rather than written per frame. The
+                // reported path is where that combined file will land; its
+                // size is unknown until the GIF is actually encoded.
+                self.gif_frame_buffers.push(pixels.to_vec());
+                (self.gif_output_path(), 0u64)
             }
         };
 
@@ -261,8 +272,22 @@ impl FrameCollector {
         self.frames.iter().map(|m| m.size_bytes).sum()
     }
 
-    /// Finalize the export: write the JSON manifest and return a summary result.
+    /// Finalize the export: assemble the animated GIF (if applicable),
+    /// write the JSON manifest, and return a summary result.
     pub fn finalize(&self) -> Result<VideoExportResult, CliError> {
+        // For `VideoFormat::Gif`, the combined animated GIF is only
+        // assembled now (rather than per-frame) since every frame's pixels
+        // are needed to write a single multi-frame file.
+        let gif_size_bytes = if matches!(self.config.format, VideoFormat::Gif)
+            && !self.gif_frame_buffers.is_empty()
+        {
+            let gif_path = self.gif_output_path();
+            self.write_gif(&gif_path)?;
+            Some(fs::metadata(&gif_path).map(|m| m.len()).unwrap_or(0))
+        } else {
+            None
+        };
+
         let manifest = VideoManifest::from_collector(self);
 
         let manifest_filename = format!("{}_manifest.json", self.config.filename_prefix);
@@ -270,7 +295,7 @@ impl FrameCollector {
         manifest.save(&manifest_path)?;
 
         let frame_count = self.frames.len();
-        let total_size = self.total_size_bytes();
+        let total_size = gif_size_bytes.unwrap_or_else(|| self.total_size_bytes());
         let duration_ms = if self.config.fps > 0 && frame_count > 0 {
             frame_count as f64 * 1000.0 / self.config.fps as f64
         } else {
@@ -294,6 +319,65 @@ impl FrameCollector {
     // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
+
+    /// Path of the single combined animated GIF file for
+    /// [`VideoFormat::Gif`] exports.
+    fn gif_output_path(&self) -> PathBuf {
+        self.config
+            .output_dir
+            .join(format!("{}.gif", self.config.filename_prefix))
+    }
+
+    /// Assemble all buffered frames into a single animated GIF at `path`,
+    /// using the pure-Rust `image`/`gif` codec stack (no external tools or
+    /// C dependencies). Frame delay derives from `config.fps` and looping
+    /// from `config.loop_gif`.
+    fn write_gif(&self, path: &Path) -> Result<(), CliError> {
+        use image::codecs::gif::{GifEncoder, Repeat};
+        use image::Delay;
+        use image::Frame as GifAnimationFrame;
+
+        let file = fs::File::create(path).map_err(|e| {
+            CliError::VideoExport(format!(
+                "Failed to create GIF file '{}': {e}",
+                path.display()
+            ))
+        })?;
+        let mut encoder = GifEncoder::new(std::io::BufWriter::new(file));
+
+        let repeat = if self.config.loop_gif {
+            Repeat::Infinite
+        } else {
+            Repeat::Finite(0)
+        };
+        encoder
+            .set_repeat(repeat)
+            .map_err(|e| CliError::VideoExport(format!("Failed to set GIF repeat mode: {e}")))?;
+
+        // fps=0 is rejected by `VideoExportConfig::validate`, but guard
+        // against a directly-constructed config bypassing it.
+        let delay = Delay::from_numer_denom_ms(1000, self.config.fps.max(1));
+
+        for pixels in &self.gif_frame_buffers {
+            let rgba_image =
+                image::RgbaImage::from_raw(self.config.width, self.config.height, pixels.clone())
+                    .ok_or_else(|| {
+                    CliError::VideoExport(format!(
+                    "Failed to construct RgbaImage ({}x{}) for GIF frame: buffer may be too small",
+                    self.config.width, self.config.height
+                ))
+                })?;
+            let frame = GifAnimationFrame::from_parts(rgba_image, 0, 0, delay);
+            encoder.encode_frame(frame).map_err(|e| {
+                CliError::VideoExport(format!(
+                    "GIF frame encoding failed for '{}': {e}",
+                    path.display()
+                ))
+            })?;
+        }
+
+        Ok(())
+    }
 
     /// Save RGBA pixels to `path` as PNG or JPEG.
     ///
@@ -750,10 +834,14 @@ mod tests {
         let cfg = VideoExportConfig::frame_sequence_png(128, 64, PathBuf::from("/tmp/x"));
         assert_eq!(cfg.width, 128);
         assert_eq!(cfg.height, 64);
-        match &cfg.format {
-            VideoFormat::FrameSequence { extension } => assert_eq!(extension, "png"),
-            other => panic!("unexpected format: {other:?}"),
-        }
+        assert!(
+            matches!(
+                &cfg.format,
+                VideoFormat::FrameSequence { extension } if extension == "png"
+            ),
+            "unexpected format: {:?}",
+            cfg.format
+        );
     }
 
     // ------------------------------------------------------------------
@@ -1066,5 +1154,95 @@ mod tests {
             bytes.starts_with(png_sig),
             "PNG file must start with PNG signature bytes"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // GIF assembly — regression tests for a real animated GIF encoder.
+    //
+    // `VideoFormat::Gif` used to only ever write individual PNG files
+    // (identical to `FrameSequence`) and never actually produced a `.gif`
+    // container. These tests lock in that a genuine, decodable, multi-frame
+    // animated GIF is written by `finalize()`.
+    // ------------------------------------------------------------------
+
+    fn solid_rgba_frame(width: u32, height: u32, rgba: [u8; 4]) -> Vec<u8> {
+        let mut px = vec![0u8; width as usize * height as usize * 4];
+        for chunk in px.chunks_mut(4) {
+            chunk.copy_from_slice(&rgba);
+        }
+        px
+    }
+
+    #[test]
+    fn test_gif_export_creates_real_animated_gif() {
+        let dir = unique_temp_dir("gif_export_real");
+        let cfg = VideoExportConfig::gif(2, 2, dir.clone());
+        let mut collector = FrameCollector::new(cfg).expect("create collector");
+
+        let red = solid_rgba_frame(2, 2, [255, 0, 0, 255]);
+        let blue = solid_rgba_frame(2, 2, [0, 0, 255, 255]);
+        collector.add_frame(&red, 0).expect("add frame 0");
+        collector.add_frame(&blue, 1).expect("add frame 1");
+
+        let result = collector.finalize().expect("finalize");
+
+        let gif_path = dir.join("frame.gif");
+        assert!(
+            gif_path.exists(),
+            "combined animated GIF file must be created at {}",
+            gif_path.display()
+        );
+
+        let bytes = fs::read(&gif_path).expect("read GIF file");
+        assert!(
+            bytes.starts_with(b"GIF89a") || bytes.starts_with(b"GIF87a"),
+            "GIF file must start with a GIF header signature"
+        );
+        assert!(result.total_size_bytes > 0, "reported GIF size must be > 0");
+
+        // Decode it back and verify it really contains 2 animation frames
+        // (not just 2 loose still images under a misleading name).
+        use image::codecs::gif::GifDecoder;
+        use image::AnimationDecoder;
+        let decoder = GifDecoder::new(std::io::Cursor::new(bytes)).expect("construct GIF decoder");
+        let frames = decoder
+            .into_frames()
+            .collect_frames()
+            .expect("decode GIF frames");
+        assert_eq!(frames.len(), 2, "decoded GIF must contain 2 frames");
+    }
+
+    #[test]
+    fn test_gif_export_no_per_frame_png_files() {
+        // For `VideoFormat::Gif`, individual frames must not be written as
+        // separate PNG files on disk (that was the pre-fix behavior); only
+        // the combined `.gif` file and the manifest should appear.
+        let dir = unique_temp_dir("gif_export_no_pngs");
+        let cfg = VideoExportConfig::gif(2, 2, dir.clone());
+        let mut collector = FrameCollector::new(cfg).expect("create collector");
+        let pixels = solid_rgba_frame(2, 2, [10, 20, 30, 255]);
+        collector.add_frame(&pixels, 0).expect("add frame 0");
+        collector.add_frame(&pixels, 1).expect("add frame 1");
+        collector.finalize().expect("finalize");
+
+        assert!(
+            !dir.join("frame_000000.png").exists(),
+            "GIF export must not leave per-frame PNG files behind"
+        );
+        assert!(
+            !dir.join("frame_000001.png").exists(),
+            "GIF export must not leave per-frame PNG files behind"
+        );
+    }
+
+    #[test]
+    fn test_gif_export_empty_writes_no_gif_file() {
+        // finalize() with zero frames added should not fabricate an empty
+        // .gif file.
+        let dir = unique_temp_dir("gif_export_empty");
+        let cfg = VideoExportConfig::gif(2, 2, dir.clone());
+        let collector = FrameCollector::new(cfg).expect("create collector");
+        collector.finalize().expect("finalize");
+        assert!(!dir.join("frame.gif").exists());
     }
 }

@@ -1,8 +1,13 @@
 //! Scene analysis utilities for 3D Gaussian Splatting scenes.
 //!
 //! Computes spatial statistics, opacity distributions, scale profiles,
-//! color statistics, and a composite quality score. Used by the CLI's
-//! `oxigaf info` command and automated quality assessment pipelines.
+//! color statistics, and a composite quality score, for automated quality
+//! assessment pipelines.
+//!
+//! Not currently wired into any `oxigaf` subcommand — `oxigaf info`
+//! (`crates/oxigaf-cli/src/info.rs`) computes its own statistics by hand
+//! rather than calling into this module. Call [`analyze_scene`] directly if
+//! you need these statistics from library code.
 //!
 //! # Example
 //! ```rust,no_run
@@ -64,6 +69,17 @@ pub struct SceneData {
     pub colors: Vec<f32>,
 }
 
+/// Returns `InvalidData` naming the first non-finite (NaN or Inf) entry in
+/// `values`, if any.
+fn check_all_finite(field: &str, values: &[f32]) -> Result<(), AnalysisError> {
+    if let Some((i, v)) = values.iter().enumerate().find(|(_, v)| !v.is_finite()) {
+        return Err(AnalysisError::InvalidData(format!(
+            "field '{field}' contains a non-finite value ({v}) at index {i}"
+        )));
+    }
+    Ok(())
+}
+
 impl SceneData {
     /// Number of Gaussians in the scene (derived from opacities length).
     #[must_use]
@@ -71,10 +87,15 @@ impl SceneData {
         self.opacities.len()
     }
 
-    /// Validate that all field lengths are consistent with `num_gaussians()`.
+    /// Validate that all field lengths are consistent with `num_gaussians()`
+    /// and that every numeric field is finite.
     ///
     /// Returns `DimensionError` for any field whose length does not match the
-    /// expected multiple.
+    /// expected multiple, or `InvalidData` if any field contains a NaN or
+    /// infinite value — such values would otherwise silently propagate into
+    /// every downstream statistic (bounding box, centroid, quality score)
+    /// and produce a `to_json()` payload with bare `NaN`/`inf` tokens that no
+    /// JSON parser accepts.
     pub fn validate(&self) -> Result<(), AnalysisError> {
         let n = self.num_gaussians();
 
@@ -94,6 +115,13 @@ impl SceneData {
                 });
             }
         }
+
+        check_all_finite("positions", &self.positions)?;
+        check_all_finite("log_scales", &self.log_scales)?;
+        check_all_finite("rotations", &self.rotations)?;
+        check_all_finite("opacities", &self.opacities)?;
+        check_all_finite("colors", &self.colors)?;
+
         Ok(())
     }
 
@@ -156,8 +184,11 @@ pub struct SpatialStats {
 
 /// Compute spatial statistics for a scene.
 ///
-/// Uses a deterministic evenly-spaced sample of up to 100 Gaussians for the
-/// nearest-neighbour estimate to keep complexity bounded.
+/// Nearest-neighbour distance is *queried* from a deterministic evenly-spaced
+/// sample of up to 100 Gaussians (to keep complexity bounded at O(100n)
+/// rather than O(n²)), but each query is matched against the *full* position
+/// array — otherwise the result would just be the spacing of the 100-point
+/// sample lattice itself, not the scene's actual local density.
 pub fn compute_spatial_stats(scene: &SceneData) -> Result<SpatialStats, AnalysisError> {
     let n = scene.num_gaussians();
     if n == 0 {
@@ -215,7 +246,12 @@ pub fn compute_spatial_stats(scene: &SceneData) -> Result<SpatialStats, Analysis
             let zi = scene.positions[base_i + 2];
 
             let mut min_sq = f32::INFINITY;
-            for &j in &sampled_indices {
+            // Match against every Gaussian in the scene, not just the other
+            // sampled points — searching only the sample would report the
+            // spacing of the `sample_count`-point lattice itself rather than
+            // the scene's true nearest-neighbour distance. `sample_count>1`
+            // here implies `n>=2`, so at least one `j != i` is always found.
+            for j in 0..n {
                 if j == i {
                     continue;
                 }
@@ -681,6 +717,11 @@ impl SceneReport {
     }
 
     /// Hand-rolled JSON representation of the report (no serde dependency).
+    ///
+    /// Every `f32` field is routed through `json_num`, which maps NaN/Inf
+    /// to `null` — `SceneData::validate` already rejects non-finite inputs,
+    /// but this keeps `to_json`'s output valid JSON even if some derived
+    /// statistic (e.g. a 0/0 ratio) turns non-finite despite finite inputs.
     #[must_use]
     pub fn to_json(&self) -> String {
         let s = &self.spatial;
@@ -731,48 +772,59 @@ impl SceneReport {
              \"quality_score\": {qs}\
              }}",
             num_gaussians = s.num_gaussians,
-            bbx0 = s.bounding_box_min[0],
-            bbx1 = s.bounding_box_min[1],
-            bbx2 = s.bounding_box_min[2],
-            bbx3 = s.bounding_box_max[0],
-            bbx4 = s.bounding_box_max[1],
-            bbx5 = s.bounding_box_max[2],
-            cx = s.centroid[0],
-            cy = s.centroid[1],
-            cz = s.centroid[2],
-            diam = s.scene_diameter,
-            nn = s.mean_nearest_neighbor_dist,
-            vol_est = s.volume_estimate,
-            mo = o.mean_opacity,
-            so = o.std_opacity,
-            ft = o.fraction_transparent,
-            fo = o.fraction_opaque,
-            fm = o.fraction_midrange,
-            p50o = o.p50_opacity,
-            p95o = o.p95_opacity,
+            bbx0 = json_num(s.bounding_box_min[0]),
+            bbx1 = json_num(s.bounding_box_min[1]),
+            bbx2 = json_num(s.bounding_box_min[2]),
+            bbx3 = json_num(s.bounding_box_max[0]),
+            bbx4 = json_num(s.bounding_box_max[1]),
+            bbx5 = json_num(s.bounding_box_max[2]),
+            cx = json_num(s.centroid[0]),
+            cy = json_num(s.centroid[1]),
+            cz = json_num(s.centroid[2]),
+            diam = json_num(s.scene_diameter),
+            nn = json_num(s.mean_nearest_neighbor_dist),
+            vol_est = json_num(s.volume_estimate),
+            mo = json_num(o.mean_opacity),
+            so = json_num(o.std_opacity),
+            ft = json_num(o.fraction_transparent),
+            fo = json_num(o.fraction_opaque),
+            fm = json_num(o.fraction_midrange),
+            p50o = json_num(o.p50_opacity),
+            p95o = json_num(o.p95_opacity),
             hist = hist_json,
-            mms = sc.mean_max_scale,
-            sms = sc.std_max_scale,
-            min_ms = sc.min_max_scale,
-            max_ms = sc.max_max_scale,
-            mvol = sc.mean_volume,
-            fts = sc.fraction_too_small,
-            ftl = sc.fraction_too_large,
-            ma = sc.mean_anisotropy,
-            p50s = sc.p50_scale,
-            p95s = sc.p95_scale,
-            mr = c.mean_r,
-            mg = c.mean_g,
-            mb = c.mean_b,
-            sr = c.std_r,
-            sg = c.std_g,
-            sb = c.std_b,
-            ml = c.mean_luminance,
-            cd = c.color_diversity,
-            fd = c.fraction_dark,
-            fb = c.fraction_bright,
-            qs = self.quality_score,
+            mms = json_num(sc.mean_max_scale),
+            sms = json_num(sc.std_max_scale),
+            min_ms = json_num(sc.min_max_scale),
+            max_ms = json_num(sc.max_max_scale),
+            mvol = json_num(sc.mean_volume),
+            fts = json_num(sc.fraction_too_small),
+            ftl = json_num(sc.fraction_too_large),
+            ma = json_num(sc.mean_anisotropy),
+            p50s = json_num(sc.p50_scale),
+            p95s = json_num(sc.p95_scale),
+            mr = json_num(c.mean_r),
+            mg = json_num(c.mean_g),
+            mb = json_num(c.mean_b),
+            sr = json_num(c.std_r),
+            sg = json_num(c.std_g),
+            sb = json_num(c.std_b),
+            ml = json_num(c.mean_luminance),
+            cd = json_num(c.color_diversity),
+            fd = json_num(c.fraction_dark),
+            fb = json_num(c.fraction_bright),
+            qs = json_num(self.quality_score),
         )
+    }
+}
+
+/// Format an `f32` for JSON output. Non-finite values (NaN, +Inf, -Inf) have
+/// no JSON token, so they are mapped to `null` rather than emitting the bare
+/// `NaN`/`inf` text that `f32`'s `Display` impl would otherwise produce.
+fn json_num(v: f32) -> String {
+    if v.is_finite() {
+        v.to_string()
+    } else {
+        "null".to_string()
     }
 }
 
@@ -944,6 +996,33 @@ mod tests {
             AnalysisError::DimensionError { ref field, expected: 8, got: 9 }
             if field == "rotations"
         ));
+    }
+
+    #[test]
+    fn test_validate_rejects_nan_position() {
+        // Regression test: NaN in any numeric field must be rejected by
+        // `validate()` rather than silently propagating into every
+        // downstream statistic.
+        let mut scene = make_scene(2, -2.0, 0.0, [0.5, 0.5, 0.5]);
+        scene.positions[3] = f32::NAN;
+        let err = scene.validate().unwrap_err();
+        assert!(matches!(err, AnalysisError::InvalidData(ref msg) if msg.contains("positions")));
+    }
+
+    #[test]
+    fn test_validate_rejects_infinite_opacity() {
+        let mut scene = make_scene(2, -2.0, 0.0, [0.5, 0.5, 0.5]);
+        scene.opacities[1] = f32::INFINITY;
+        let err = scene.validate().unwrap_err();
+        assert!(matches!(err, AnalysisError::InvalidData(ref msg) if msg.contains("opacities")));
+    }
+
+    #[test]
+    fn test_analyze_scene_rejects_nan_scene() {
+        let mut scene = make_scene(3, -2.0, 0.0, [0.5, 0.5, 0.5]);
+        scene.colors[0] = f32::NAN;
+        let err = analyze_scene(&scene).unwrap_err();
+        assert!(matches!(err, AnalysisError::InvalidData(_)));
     }
 
     // -----------------------------------------------------------------------
@@ -1361,6 +1440,61 @@ mod tests {
     }
 
     #[test]
+    fn test_scene_report_to_json_maps_non_finite_to_null() {
+        // Regression test: even though `SceneData::validate` now rejects
+        // non-finite inputs, `to_json` must still degrade gracefully (emit
+        // `null`) rather than write a bare `NaN`/`inf` token that breaks
+        // every JSON parser, in case some derived statistic (e.g. a 0/0
+        // ratio) ever turns non-finite despite finite inputs.
+        let scene = make_scene(5, -1.0, 0.0, [0.4, 0.6, 0.2]);
+        let mut report = analyze_scene(&scene).expect("ok");
+        report.quality_score = f32::NAN;
+        report.spatial.scene_diameter = f32::INFINITY;
+        report.color.mean_r = f32::NEG_INFINITY;
+
+        let json = report.to_json();
+
+        // Parse rather than substring-scan the raw text. A bare `NaN`/`inf`
+        // token is exactly what no JSON parser accepts, so a successful
+        // parse *is* the property under test — and a text scan cannot state
+        // it: an earlier version of this test asserted the document contains
+        // no "nan" anywhere and therefore always failed on the perfectly
+        // valid key `mean_lumi(nan)ce`.
+        let parsed: serde_json::Value = serde_json::from_str(&json)
+            .map_err(|e| format!("{e} — document was: {json}"))
+            .expect("to_json must emit parseable JSON");
+        let object = parsed
+            .as_object()
+            .expect("to_json must emit a JSON object at the top level");
+
+        const NON_FINITE: [&str; 3] = ["quality_score", "scene_diameter", "mean_r"];
+        for key in NON_FINITE {
+            assert_eq!(
+                object.get(key),
+                Some(&serde_json::Value::Null),
+                "non-finite {key} must be emitted as null: {json}"
+            );
+        }
+        // Every other leaf must still be a finite number, so `null` marks
+        // genuinely non-finite statistics and nothing else.
+        for (key, value) in object {
+            let acceptable = match value {
+                serde_json::Value::Null => NON_FINITE.contains(&key.as_str()),
+                serde_json::Value::Number(n) => n.as_f64().is_some_and(f64::is_finite),
+                serde_json::Value::Array(items) => items
+                    .iter()
+                    .all(|item| item.as_f64().is_some_and(f64::is_finite)),
+                _ => false,
+            };
+            assert!(
+                acceptable,
+                "every field must be a finite number (or null only where the statistic \
+                 really is non-finite); {key} is {value}: {json}"
+            );
+        }
+    }
+
+    #[test]
     fn test_scene_report_format_detailed_contains_sections() {
         let scene = make_scene(5, -1.0, 0.0, [0.4, 0.6, 0.2]);
         let report = analyze_scene(&scene).expect("ok");
@@ -1385,6 +1519,25 @@ mod tests {
         assert!(
             (stats.mean_nearest_neighbor_dist - 5.0).abs() < 1e-4,
             "NN distance should be 5.0, got {}",
+            stats.mean_nearest_neighbor_dist
+        );
+    }
+
+    #[test]
+    fn test_spatial_stats_nn_distance_searches_full_array_beyond_sample() {
+        // Regression test: with more than 100 Gaussians, the nearest-
+        // neighbour *query* points are a deterministic 100-point subsample,
+        // but each query must be matched against the *entire* scene. On a
+        // perfectly evenly-spaced line of 200 points (spacing 1.0), every
+        // point's true nearest neighbour is 1.0 away. The old code searched
+        // only among the other ~100 sampled (stride-2) points, so it would
+        // have reported ~2.0 instead.
+        let scene = make_line_scene(200);
+        let stats = compute_spatial_stats(&scene).expect("ok");
+        assert!(
+            (stats.mean_nearest_neighbor_dist - 1.0).abs() < 1e-3,
+            "NN distance on an evenly-spaced line should be ~1.0 (the true \
+             spacing), not ~2.0 (the sampled-lattice spacing); got {}",
             stats.mean_nearest_neighbor_dist
         );
     }

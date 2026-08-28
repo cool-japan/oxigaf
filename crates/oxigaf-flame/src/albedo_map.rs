@@ -198,8 +198,18 @@ impl AlbedoTexture {
     /// Sample the texture using bilinear interpolation with clamp-to-edge wrapping.
     ///
     /// `u` and `v` are in `[0, 1]`; out-of-range values are clamped to the edge.
+    ///
+    /// Returns [`AlbedoColor::black`] for a texture with zero width, zero
+    /// height, or otherwise no pixel data, rather than panicking.
     #[must_use]
     pub fn sample_bilinear(&self, u: f32, v: f32) -> AlbedoColor {
+        // A zero-sized (or otherwise empty) texture has no pixels to sample;
+        // guard here so `get_pixel_unchecked` below never indexes an empty
+        // `data` vector.
+        if self.width == 0 || self.height == 0 || self.data.len() < 3 {
+            return AlbedoColor::black();
+        }
+
         // Clamp UV to [0, 1]
         let u = u.clamp(0.0, 1.0);
         let v = v.clamp(0.0, 1.0);
@@ -338,11 +348,16 @@ const SH_C2_0: f32 = 0.315_391_56; // √(5/(16π))    for m=0: 3z²-1 term
 const SH_C2_1: f32 = 1.092_548_5; // √(15/(4π))    for m=±1
 const SH_C2_2: f32 = 0.546_274_22; // √(15/(16π))   for m=±2
 
-// Band-3 (l=3)
-const SH_C3_0: f32 = 0.373_176_33; // √(7/(16π))    for m=0
-const SH_C3_1: f32 = 1.445_305_7; // √(21/(4π))/2  for m=±1
-const SH_C3_2: f32 = 0.590_043_6; // √(105/(4π))/2 for m=±2  (corrected)
-const SH_C3_3: f32 = 0.590_043_6; // √(35/(16π))·√3 for m=±3 (same constant)
+// Band-3 (l=3). Four distinct normalisers are required: m=±1 share one
+// value and m=±3 share another, but m=-2 and m=+2 differ from each other
+// (and from the m=±1/±3 values) by more than a sign, so they each need
+// their own constant — a single shared constant for m=±2 is a bug (see
+// `test_sh_band3_matches_reference_formula`).
+const SH_C3_0: f32 = 0.373_176_33; // √(7/(16π))         for m=0
+const SH_C3_M1_P1: f32 = 0.457_045_8; // (1/4)√(21/(2π)) for m=±1
+const SH_C3_M2: f32 = 2.890_611_4; // (1/2)√(105/π)      for m=-2
+const SH_C3_P2: f32 = 1.445_305_7; // (1/4)√(105/π)      for m=+2
+const SH_C3_M3_P3: f32 = 0.590_043_6; // (1/4)√(35/(2π)) for m=±3
 
 // ---------------------------------------------------------------------------
 // Public functions
@@ -433,13 +448,13 @@ pub fn sh_to_rgb(
         let x2 = dir_x * dir_x;
         let y2 = dir_y * dir_y;
         let z2 = dir_z * dir_z;
-        let b3_0 = SH_C3_3 * dir_y * (3.0 * x2 - y2);
-        let b3_1 = SH_C3_2 * dir_x * dir_y * dir_z;
-        let b3_2 = SH_C3_1 * dir_y * (4.0 * z2 - x2 - y2);
+        let b3_0 = SH_C3_M3_P3 * dir_y * (3.0 * x2 - y2);
+        let b3_1 = SH_C3_M2 * dir_x * dir_y * dir_z;
+        let b3_2 = SH_C3_M1_P1 * dir_y * (4.0 * z2 - x2 - y2);
         let b3_3 = SH_C3_0 * dir_z * (2.0 * z2 - 3.0 * x2 - 3.0 * y2);
-        let b3_4 = SH_C3_1 * dir_x * (4.0 * z2 - x2 - y2);
-        let b3_5 = SH_C3_2 * (x2 - y2) * dir_z;
-        let b3_6 = SH_C3_3 * dir_x * (x2 - 3.0 * y2);
+        let b3_4 = SH_C3_M1_P1 * dir_x * (4.0 * z2 - x2 - y2);
+        let b3_5 = SH_C3_P2 * (x2 - y2) * dir_z;
+        let b3_6 = SH_C3_M3_P3 * dir_x * (x2 - 3.0 * y2);
 
         red += coeff(9, 0) * b3_0
             + coeff(10, 0) * b3_1
@@ -485,10 +500,16 @@ pub fn per_vertex_albedo_from_texture(
 ///
 /// For each face corner `(vertex_idx, (u, v))` in `face_uvs`, the corresponding
 /// vertex accumulates the sampled texture color.  Vertices not covered by any
-/// face corner receive `config.default_albedo`.
+/// face corner receive `config.default_albedo`.  Every returned color
+/// (sampled or default) is scaled by `config.ambient_scale`.
+///
+/// This entry point does not evaluate spherical harmonics; use
+/// [`bake_vertex_albedo_sh`] when `config.use_sh_approximation` should be
+/// honored.
 ///
 /// # Errors
 ///
+/// Returns [`AlbedoMapError::InvalidConfig`] if `config.validate()` fails.
 /// Returns [`AlbedoMapError::UvError`] if `vertex_idx >= num_vertices`.
 pub fn bake_vertex_albedo(
     num_vertices: usize,
@@ -496,6 +517,8 @@ pub fn bake_vertex_albedo(
     texture: &AlbedoTexture,
     config: &AlbedoConfig,
 ) -> Result<Vec<AlbedoColor>, AlbedoMapError> {
+    config.validate()?;
+
     let mut accum_r = vec![0.0f32; num_vertices];
     let mut accum_g = vec![0.0f32; num_vertices];
     let mut accum_b = vec![0.0f32; num_vertices];
@@ -514,18 +537,72 @@ pub fn bake_vertex_albedo(
         counts[vertex_idx] += 1;
     }
 
+    let scale = config.ambient_scale;
     let result = (0..num_vertices)
         .map(|i| {
-            if counts[i] == 0 {
+            let c = if counts[i] == 0 {
                 config.default_albedo
             } else {
                 let n = counts[i] as f32;
                 AlbedoColor::new(accum_r[i] / n, accum_g[i] / n, accum_b[i] / n)
-            }
+            };
+            AlbedoColor::new(c.r * scale, c.g * scale, c.b * scale)
         })
         .collect();
 
     Ok(result)
+}
+
+/// Bake per-vertex albedo colors, optionally modulated by a spherical
+/// harmonics irradiance approximation evaluated at each vertex normal.
+///
+/// The texture-based base color is computed exactly as in
+/// [`bake_vertex_albedo`] (including the `config.ambient_scale` factor).
+/// When `config.use_sh_approximation` is `true`, each vertex's base color is
+/// additionally multiplied, channel-wise, by
+/// `sh_to_rgb(sh_coeffs, vertex_normals[i], config.sh_bands)`. When `false`,
+/// `vertex_normals` and `sh_coeffs` are ignored and the result is identical
+/// to [`bake_vertex_albedo`].
+///
+/// # Errors
+///
+/// Returns [`AlbedoMapError::InvalidConfig`] if `config.validate()` fails.
+/// Returns [`AlbedoMapError::UvError`] if `vertex_idx >= num_vertices`.
+/// Returns [`AlbedoMapError::DimensionMismatch`] if `config.use_sh_approximation`
+/// is `true` and `vertex_normals.len() != num_vertices`, or if `sh_coeffs` has
+/// the wrong length for `config.sh_bands` (see [`sh_to_rgb`]).
+pub fn bake_vertex_albedo_sh(
+    num_vertices: usize,
+    face_uvs: &[(usize, (f32, f32))],
+    texture: &AlbedoTexture,
+    vertex_normals: &[[f32; 3]],
+    sh_coeffs: &[f32],
+    config: &AlbedoConfig,
+) -> Result<Vec<AlbedoColor>, AlbedoMapError> {
+    let base = bake_vertex_albedo(num_vertices, face_uvs, texture, config)?;
+
+    if !config.use_sh_approximation {
+        return Ok(base);
+    }
+
+    if vertex_normals.len() != num_vertices {
+        return Err(AlbedoMapError::DimensionMismatch {
+            expected: num_vertices,
+            actual: vertex_normals.len(),
+        });
+    }
+
+    base.iter()
+        .zip(vertex_normals.iter())
+        .map(|(albedo, &normal)| {
+            let irradiance = sh_to_rgb(sh_coeffs, normal, config.sh_bands)?;
+            Ok(AlbedoColor::new(
+                albedo.r * irradiance.r,
+                albedo.g * irradiance.g,
+                albedo.b * irradiance.b,
+            ))
+        })
+        .collect()
 }
 
 /// Flatten an albedo color slice to a raw float array for GPU upload.
@@ -883,6 +960,32 @@ mod tests {
         assert!((mid.r - 0.5).abs() < 1e-5, "mid.r = {}", mid.r);
     }
 
+    #[test]
+    fn test_albedo_texture_bilinear_zero_sized_no_panic() {
+        // A 0x0 texture (as `AlbedoTexture::new(0, 0, ..)`,
+        // `AlbedoTexture::from_data(0, 0, vec![])`, or `checker_texture(0,
+        // 0, ..)` can all legitimately produce) must not panic when
+        // sampled; it should degrade to black.
+        let tex = AlbedoTexture::new(0, 0, AlbedoColor::white());
+        assert_eq!(tex.sample_bilinear(0.5, 0.5), AlbedoColor::black());
+
+        let tex2 = AlbedoTexture::from_data(0, 0, vec![]).expect("0x0 is a valid size");
+        assert_eq!(tex2.sample_bilinear(0.0, 0.0), AlbedoColor::black());
+
+        let tex3 = checker_texture(0, 0, 2, AlbedoColor::white(), AlbedoColor::black());
+        assert_eq!(tex3.sample_bilinear(0.25, 0.75), AlbedoColor::black());
+
+        // The public helpers built on top of `sample_bilinear` must also
+        // return cleanly instead of propagating a panic.
+        let per_vertex = per_vertex_albedo_from_texture(&[(0.5f32, 0.5f32)], &tex);
+        assert_eq!(per_vertex, vec![AlbedoColor::black()]);
+
+        let cfg = AlbedoConfig::default();
+        let baked = bake_vertex_albedo(1, &[(0usize, (0.5f32, 0.5f32))], &tex, &cfg)
+            .expect("must not panic on a zero-sized texture");
+        assert_eq!(baked, vec![AlbedoColor::black()]);
+    }
+
     // -----------------------------------------------------------------------
     // AlbedoConfig
     // -----------------------------------------------------------------------
@@ -997,6 +1100,88 @@ mod tests {
         let face_uvs = vec![(5usize, (0.5f32, 0.5f32))]; // vertex 5 out of range for num_vertices=3
         let err = bake_vertex_albedo(3, &face_uvs, &tex, &cfg).expect_err("should fail");
         assert!(matches!(err, AlbedoMapError::UvError(_)));
+    }
+
+    #[test]
+    fn test_bake_vertex_albedo_ambient_scale_applied() {
+        // `ambient_scale` must actually scale both sampled and default
+        // colors; previously the field was documented but never read.
+        let fill = AlbedoColor::new(0.2, 0.4, 0.1);
+        let tex = AlbedoTexture::new(4, 4, fill);
+        let cfg = AlbedoConfig {
+            ambient_scale: 2.0,
+            ..Default::default()
+        };
+        let face_uvs = vec![(0usize, (0.5f32, 0.5f32))];
+        // Vertex 0 is covered (scaled sample); vertex 1 is not (scaled default).
+        let result = bake_vertex_albedo(2, &face_uvs, &tex, &cfg).expect("ok");
+        assert!((result[0].r - 0.4).abs() < 1e-5, "r={}", result[0].r);
+        assert!((result[0].g - 0.8).abs() < 1e-5, "g={}", result[0].g);
+        assert!((result[0].b - 0.2).abs() < 1e-5, "b={}", result[0].b);
+        assert!(
+            (result[1].r - cfg.default_albedo.r * 2.0).abs() < 1e-5,
+            "default r={}",
+            result[1].r
+        );
+    }
+
+    #[test]
+    fn test_bake_vertex_albedo_rejects_invalid_config() {
+        // `AlbedoConfig::validate()` was previously never called from
+        // `bake_vertex_albedo`, so an invalid `sh_bands` went unnoticed.
+        let tex = AlbedoTexture::new(4, 4, AlbedoColor::white());
+        let cfg = AlbedoConfig {
+            sh_bands: 0,
+            ..Default::default()
+        };
+        let err = bake_vertex_albedo(1, &[], &tex, &cfg).expect_err("invalid config must error");
+        assert!(matches!(err, AlbedoMapError::InvalidConfig(_)));
+    }
+
+    #[test]
+    fn test_bake_vertex_albedo_sh_disabled_matches_base() {
+        let tex = AlbedoTexture::new(4, 4, AlbedoColor::new(0.3, 0.3, 0.3));
+        let cfg = AlbedoConfig::default(); // use_sh_approximation = false
+        let face_uvs = vec![(0usize, (0.5f32, 0.5f32))];
+        let base = bake_vertex_albedo(1, &face_uvs, &tex, &cfg).expect("ok");
+        let sh = bake_vertex_albedo_sh(1, &face_uvs, &tex, &[], &[], &cfg).expect("ok");
+        assert_eq!(base, sh);
+    }
+
+    #[test]
+    fn test_bake_vertex_albedo_sh_modulates_by_irradiance() {
+        let tex = AlbedoTexture::new(4, 4, AlbedoColor::white());
+        let cfg = AlbedoConfig {
+            use_sh_approximation: true,
+            sh_bands: 1,
+            ..Default::default()
+        };
+        let face_uvs = vec![(0usize, (0.5f32, 0.5f32))];
+        let normals = vec![[0.0f32, 0.0, 1.0]];
+        // Band-1 SH with only the DC term set: constant irradiance = SH_C0 * dc.
+        let mut sh_coeffs = vec![0.0f32; 4 * 3];
+        sh_coeffs[0] = 1.0;
+        sh_coeffs[1] = 1.0;
+        sh_coeffs[2] = 1.0;
+        let result =
+            bake_vertex_albedo_sh(1, &face_uvs, &tex, &normals, &sh_coeffs, &cfg).expect("ok");
+        // White (1,1,1) base albedo modulated by a constant SH_C0 irradiance.
+        assert!((result[0].r - SH_C0).abs() < 1e-5, "r={}", result[0].r);
+        assert!((result[0].g - SH_C0).abs() < 1e-5, "g={}", result[0].g);
+        assert!((result[0].b - SH_C0).abs() < 1e-5, "b={}", result[0].b);
+    }
+
+    #[test]
+    fn test_bake_vertex_albedo_sh_rejects_normal_length_mismatch() {
+        let tex = AlbedoTexture::new(4, 4, AlbedoColor::white());
+        let cfg = AlbedoConfig {
+            use_sh_approximation: true,
+            ..Default::default()
+        };
+        let sh_coeffs = vec![0.0f32; 4 * 3];
+        let err = bake_vertex_albedo_sh(2, &[], &tex, &[[0.0, 0.0, 1.0]], &sh_coeffs, &cfg)
+            .expect_err("normal count must match vertex count");
+        assert!(matches!(err, AlbedoMapError::DimensionMismatch { .. }));
     }
 
     // -----------------------------------------------------------------------
@@ -1198,6 +1383,74 @@ mod tests {
         let coeffs = vec![0.0f32; 5]; // wrong
         let err = sh_to_rgb(&coeffs, [0.0, 0.0, 1.0], 1).expect_err("wrong length");
         assert!(matches!(err, AlbedoMapError::DimensionMismatch { .. }));
+    }
+
+    #[test]
+    fn test_sh_band3_matches_reference_formula() {
+        // Reference (standard) real-spherical-harmonic band-3 constants,
+        // written independently of this module's internal `SH_C3_*`
+        // constants so this test would catch a mis-assigned constant — e.g.
+        // the historical bug where a single constant was shared between the
+        // m=-2 and m=+2 basis functions, which must differ (they are not
+        // related by a sign flip like the m=-1/+1 and m=-3/+3 pairs are).
+        const REF_M3_P3: f32 = 0.590_043_6; // m = -3, +3
+        const REF_M2: f32 = 2.890_611_4; // m = -2
+        const REF_M1_P1: f32 = 0.457_045_8; // m = -1, +1
+        const REF_0: f32 = 0.373_176_33; // m = 0
+        const REF_P2: f32 = 1.445_305_7; // m = +2
+
+        // basis index (9..=15) -> reference Y_3^m(x, y, z)
+        fn reference_basis(basis: usize, x: f32, y: f32, z: f32) -> f32 {
+            let x2 = x * x;
+            let y2 = y * y;
+            let z2 = z * z;
+            match basis {
+                9 => REF_M3_P3 * y * (3.0 * x2 - y2),
+                10 => REF_M2 * x * y * z,
+                11 => REF_M1_P1 * y * (4.0 * z2 - x2 - y2),
+                12 => REF_0 * z * (2.0 * z2 - 3.0 * x2 - 3.0 * y2),
+                13 => REF_M1_P1 * x * (4.0 * z2 - x2 - y2),
+                14 => REF_P2 * (x2 - y2) * z,
+                15 => REF_M3_P3 * x * (x2 - 3.0 * y2),
+                _ => panic!("basis {basis} out of band-3 range"),
+            }
+        }
+
+        let directions: [[f32; 3]; 4] = [
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            // Unit vector (2,3,6)/7 with all components nonzero and
+            // distinct in magnitude, so every band-3 term is exercised.
+            [2.0 / 7.0, 3.0 / 7.0, 6.0 / 7.0],
+        ];
+
+        for basis in 9..=15usize {
+            // One-hot coefficient: only the red channel of this basis
+            // function is nonzero, isolating its contribution.
+            let mut coeffs = vec![0.0f32; 16 * 3];
+            coeffs[basis * 3] = 1.0;
+
+            for &dir in &directions {
+                let [x, y, z] = dir;
+                let expected = reference_basis(basis, x, y, z);
+                let color =
+                    sh_to_rgb(&coeffs, dir, 3).expect("bands=3 with correct length is valid");
+                assert!(
+                    (color.r - expected).abs() < 1e-4,
+                    "basis {basis} dir {dir:?}: got r={}, expected {expected}",
+                    color.r
+                );
+                assert_eq!(
+                    color.g, 0.0,
+                    "basis {basis} dir {dir:?}: g should be untouched"
+                );
+                assert_eq!(
+                    color.b, 0.0,
+                    "basis {basis} dir {dir:?}: b should be untouched"
+                );
+            }
+        }
     }
 
     // -----------------------------------------------------------------------

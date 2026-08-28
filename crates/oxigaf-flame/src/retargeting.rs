@@ -389,13 +389,14 @@ pub fn retarget_sequence(
 ///
 /// # Errors
 ///
-/// Returns [`RetargetingError::EmptyParams`] if `sequence` is empty and
-/// [`RetargetingError::InvalidConfig`] if `decay` is not in `[0, 1)`.
-///
-/// # Panics
-///
-/// Cannot panic in practice; the internal `unreachable!` path protects a
-/// loop invariant that holds by construction.
+/// Returns [`RetargetingError::EmptyParams`] if `sequence` is empty,
+/// [`RetargetingError::InvalidConfig`] if `decay` is not in `[0, 1)`, and
+/// [`RetargetingError::DimensionMismatch`] if any frame's length differs
+/// from `sequence[0]`'s. Frame lengths are validated up front rather than
+/// silently truncated to the shortest one seen: because each output frame
+/// is smoothed against the *previous output* frame, truncating on a single
+/// short frame would cascade and permanently shrink every later output
+/// frame, even once the source frames return to full length.
 pub fn smooth_expression_sequence(
     sequence: &[Vec<f32>],
     decay: f32,
@@ -408,22 +409,28 @@ pub fn smooth_expression_sequence(
             "decay must be in [0, 1), got {decay}"
         )));
     }
+    let expected_len = sequence[0].len();
+    for frame in sequence {
+        if frame.len() != expected_len {
+            return Err(RetargetingError::DimensionMismatch {
+                expected: expected_len,
+                got: frame.len(),
+            });
+        }
+    }
 
     let mut output: Vec<Vec<f32>> = Vec::with_capacity(sequence.len());
     output.push(sequence[0].clone());
 
-    for frame in &sequence[1..] {
-        // Safety: output was just pushed before the loop and we push at the end of
-        // each iteration, so `last()` always returns Some.
-        let prev = output
-            .last()
-            .unwrap_or_else(|| unreachable!("output is non-empty at this point"));
-        // prev and frame may have different lengths only if the caller supplied
-        // inconsistent frames — we handle that gracefully by using the minimum length.
-        let len = prev.len().min(frame.len());
-        let smoothed: Vec<f32> = prev[..len]
+    // Index into `output` directly instead of `.last()` + unwrap: every
+    // frame is now known to share `expected_len` (validated above), and
+    // `output[i - 1]` is provably in bounds because exactly one element is
+    // pushed per iteration starting from index 0 — no fallible lookup, no
+    // `unreachable!` panic path.
+    for i in 1..sequence.len() {
+        let smoothed: Vec<f32> = output[i - 1]
             .iter()
-            .zip(frame[..len].iter())
+            .zip(sequence[i].iter())
             .map(|(&p, &f)| decay * p + (1.0 - decay) * f)
             .collect();
         output.push(smoothed);
@@ -1015,6 +1022,42 @@ mod tests {
     fn test_smooth_expression_sequence_empty() {
         let result = smooth_expression_sequence(&[], 0.5);
         assert!(matches!(result, Err(RetargetingError::EmptyParams)));
+    }
+
+    #[test]
+    fn test_smooth_expression_sequence_ragged_frame_is_rejected() {
+        // Regression: a single malformed (short) frame must be rejected
+        // up front with a diagnosable error, not silently truncate every
+        // subsequent output frame to its length.
+        let seq = vec![
+            vec![1.0_f32, 2.0, 3.0],
+            vec![4.0, 5.0], // shorter than the rest
+            vec![6.0, 7.0, 8.0],
+        ];
+        let result = smooth_expression_sequence(&seq, 0.5);
+        assert!(
+            matches!(
+                result,
+                Err(RetargetingError::DimensionMismatch {
+                    expected: 3,
+                    got: 2
+                })
+            ),
+            "expected DimensionMismatch{{expected: 3, got: 2}}, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_smooth_expression_sequence_does_not_cascade_truncate() {
+        // Even a sequence whose frames are all the SAME length (so no
+        // DimensionMismatch fires) must fully preserve every dimension
+        // across all output frames -- guards against any reintroduction of
+        // length-based truncation.
+        let seq = vec![vec![1.0_f32, 2.0, 3.0, 4.0]; 5];
+        let result = smooth_expression_sequence(&seq, 0.5).expect("uniform lengths must succeed");
+        for frame in &result {
+            assert_eq!(frame.len(), 4, "no output frame may be truncated");
+        }
     }
 
     // -----------------------------------------------------------------------

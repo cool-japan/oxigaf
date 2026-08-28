@@ -1,0 +1,147 @@
+# deny.toml — COOLJAPAN Pure-Rust policy enforcement for OxiGAF
+# Verify with: cargo deny check bans
+
+[graph]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = [
+    # RUSTSEC-2023-0071 (Marvin Attack: rsa timing side-channel on private-key
+    # operations). Forced transitively by oxitls-rustcrypto-provider 0.3.0
+    # (oxigaf-cli's pure-Rust rustls CryptoProvider, ~/work/oxitls) as an
+    # unconditional, non-feature-gated dependency needed for RSA-signed TLS
+    # certificate *verification*. No safe upgrade exists upstream as of this
+    # writing (RustCrypto/RSA#626 tracks a constant-time rewrite).
+    #
+    # Accepted risk, reviewed 2026-08-28: oxigaf-cli only uses this
+    # CryptoProvider as a TLS *client* verifying server certificates during
+    # asset downloads (see CHANGELOG [0.1.2] Fixed -> "C OpenSSL, and later
+    # `ring`, removed from oxigaf-cli's HTTP stack"). It never holds or
+    # performs private-key operations with an RSA key itself -- the timing
+    # side-channel this advisory describes targets whoever holds the private
+    # key, which is the remote server being verified, not this client. Revisit
+    # if oxigaf-cli ever gains a server role or otherwise handles an RSA
+    # private key, or when oxitls-rustcrypto-provider ships a fix/opt-out.
+    "RUSTSEC-2023-0071",
+
+    # RUSTSEC-2024-0436 ("unmaintained", not a vulnerability): `paste`'s
+    # author archived it as feature-complete. Pulled in transitively by
+    # several large, unrelated third-party dependency trees (gemm via
+    # oxicandle-core/oxiblas, oxitls-rustcrypto-provider directly), none of
+    # which are in this project's control. `paste` is a tiny, stable
+    # token-pasting proc-macro with no runtime component; "unmaintained"
+    # here means finished, not broken. Revisit if a maintained fork (e.g.
+    # `pastey`) becomes the de facto replacement across those upstreams.
+    "RUSTSEC-2024-0436",
+]
+
+[licenses]
+version = 2
+allow = [
+    "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "MIT",
+    "BSD-2-Clause", "BSD-3-Clause", "ISC", "Zlib",
+    "Unicode-3.0", "MPL-2.0", "CC0-1.0", "BSL-1.0",
+    # Mozilla's CA root bundle data license (webpki-roots, pulled in via
+    # ureq -> rustls-webpki-roots for the pure-Rust oxigaf-cli HTTP stack).
+    # Permissive data license, not copyleft.
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Internal path deps (oxigaf-* referencing each other) carry no version and
+# would otherwise trip the wildcard check.
+allow-wildcard-paths = true
+deny = [
+    # --- compression: use oxiarc-* ---
+    # Phase-1 exceptions ("wrappers" = the only direct parents allowed to pull
+    # the banned crate in). Every wrapper below is a TODO with a named
+    # prerequisite; remove the wrappers list as soon as its migration lands.
+    #   zip 8.6 <- oxicandle-core (.pth/pickle loading; upstream oxiarc swap)
+    #   zip 6.0 <- ndarray-npy `npz` (oxiarc-archive-backed .npz reader)
+    #   flate2/miniz_oxide <- image's png/tiff/exr decoders
+    #     (pure-Rust, but COOLJAPAN prefers oxiarc-deflate; EXR output is a
+    #     live CLI feature so `exr` cannot just be dropped)
+    { name = "zip",                 reason = "COOLJAPAN: use oxiarc-archive", wrappers = ["oxicandle-core", "ndarray-npy"] },
+    { name = "flate2",              reason = "COOLJAPAN: use oxiarc-deflate", wrappers = ["png", "tiff", "zip"] },
+    { name = "miniz_oxide",         reason = "COOLJAPAN: use oxiarc-deflate", wrappers = ["exr", "flate2", "png"] },
+    { name = "zstd",                reason = "COOLJAPAN: use oxiarc-zstd" },
+    { name = "zstd-safe",           reason = "C wrapper; use oxiarc-zstd" },
+    { name = "zstd-sys",            reason = "C libzstd; use oxiarc-zstd" },
+    { name = "bzip2",               reason = "COOLJAPAN: use oxiarc-bzip2" },
+    { name = "bzip2-sys",           reason = "C libbz2; use oxiarc-bzip2" },
+    { name = "lz4",                 reason = "COOLJAPAN: use oxiarc-lz4" },
+    { name = "lz4-sys",             reason = "C liblz4; use oxiarc-lz4" },
+    { name = "lz4_flex",            reason = "COOLJAPAN: use oxiarc-lz4" },
+    { name = "tar",                 reason = "COOLJAPAN: use oxiarc-archive" },
+    { name = "snap",                reason = "COOLJAPAN: use oxiarc-snappy" },
+    { name = "brotli",              reason = "COOLJAPAN: use oxiarc-brotli" },
+    { name = "brotli-decompressor", reason = "COOLJAPAN: use oxiarc-brotli" },
+    { name = "xz2",                 reason = "C liblzma; use oxiarc-lzma" },
+    { name = "lzma-sys",            reason = "C liblzma; use oxiarc-lzma" },
+    { name = "libz-sys",            reason = "C zlib" },
+    { name = "libz-ng-sys",         reason = "C zlib-ng" },
+
+    # --- serialization / numerics / solvers ---
+    { name = "bincode",             reason = "COOLJAPAN: use oxicode" },
+    { name = "rustfft",             reason = "COOLJAPAN: use oxifft" },
+    { name = "realfft",             reason = "COOLJAPAN: use oxifft" },
+    { name = "z3",                  reason = "COOLJAPAN: use oxiz" },
+    { name = "z3-sys",              reason = "C++ Z3; use oxiz" },
+    { name = "rusqlite",            reason = "COOLJAPAN: use oxisql-sqlite-compat" },
+    { name = "libsqlite3-sys",      reason = "C SQLite; use oxisql-sqlite-compat" },
+
+    # --- BLAS / LAPACK / Fortran ---
+    { name = "openblas-src",        reason = "C/Fortran; use oxiblas" },
+    { name = "openblas-build",      reason = "C/Fortran; use oxiblas" },
+    { name = "blas-src",            reason = "FFI shim; use oxiblas" },
+    { name = "lapack-src",          reason = "FFI shim; use oxiblas" },
+    { name = "netlib-src",          reason = "Fortran; use oxiblas" },
+    { name = "intel-mkl-src",       reason = "C/Fortran; use oxiblas" },
+    { name = "accelerate-src",      reason = "Apple C framework; use oxiblas" },
+    { name = "cblas-sys",           reason = "C; use oxiblas" },
+    { name = "blas",                reason = "FFI shim; use oxiblas" },
+    { name = "lapack",              reason = "FFI shim; use oxiblas" },
+
+    # --- regex / tokenizer C backends ---
+    { name = "onig",                reason = "C Oniguruma; use oxicandle-* (fancy-regex)" },
+    { name = "onig_sys",            reason = "C Oniguruma; use oxicandle-* (fancy-regex)" },
+    # esaxx-rs compiles C++ only behind its `cpp` feature (tokenizers'
+    # `esaxx_fast`). oxicandle-core pins tokenizers with default-features =
+    # false + ["fancy-regex"], so the pure-Rust path is what builds here.
+    { name = "esaxx-rs",            reason = "C++ behind its `cpp` feature; pure-Rust path only", wrappers = ["tokenizers"] },
+
+    # --- TLS / crypto native code ---
+    { name = "openssl",             reason = "C OpenSSL; use rustls" },
+    { name = "openssl-sys",         reason = "C OpenSSL; use rustls" },
+    { name = "native-tls",          reason = "pulls C OpenSSL / SChannel; use rustls" },
+    { name = "aws-lc-sys",          reason = "C/asm crypto" },
+    { name = "aws-lc-rs",           reason = "wraps aws-lc-sys (C)" },
+    # ring was eliminated: hf-hub was replaced by ureq built with
+    # `rustls-no-provider` + `rustls-webpki-roots`, and the process-default
+    # CryptoProvider comes from oxitls-rustcrypto-provider (pure RustCrypto).
+    # Residual C/asm on the default feature set: NONE. (Dev/bench-only:
+    # criterion -> alloca, below.)
+    { name = "ring",                reason = "C + hand-written asm; use oxitls-rustcrypto-provider" },
+
+    # --- misc native shims ---
+    # TODO(pure-rust, dev-only): criterion -> alloca (compiles alloca.c).
+    # Prerequisite: criterion dropping alloca, or a different bench harness.
+    { name = "alloca",              reason = "compiles alloca.c through cc", wrappers = ["criterion"] },
+    { name = "libfuzzer-sys",       reason = "C++ libFuzzer" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

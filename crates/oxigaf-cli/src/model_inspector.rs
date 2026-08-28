@@ -17,6 +17,7 @@
 //! println!("{}", format_inspection_report(&report));
 //! ```
 
+use rayon::prelude::*;
 use thiserror::Error;
 
 // ---------------------------------------------------------------------------
@@ -188,7 +189,21 @@ impl QueryResult {
 // ---------------------------------------------------------------------------
 
 /// A trained 3DGS model in flat-array form, ready for inspection.
+///
+/// # Invariant
+///
+/// Every query/inspection function in this module (including
+/// [`InspectableModel::activated_scale`]) assumes `positions.len() == n * 3`,
+/// `scales.len() == n * 3`, `colors.len() == n * 3`, and `opacities.len() ==
+/// n`. [`InspectableModel::new`] validates this; because the fields below
+/// are `pub`, a struct-literal construction can still bypass that check, so
+/// prefer `new` unless the caller can already guarantee the invariant holds
+/// (as this module's own tests do, e.g. for a trivially-consistent empty
+/// model). `#[non_exhaustive]` does not stop struct-literal construction
+/// within this crate, only from an external one -- it is a defensive marker,
+/// not itself a guarantee.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct InspectableModel {
     /// Flat positions \[N*3\]: (x, y, z) per Gaussian.
     pub positions: Vec<f32>,
@@ -244,9 +259,28 @@ impl InspectableModel {
     }
 
     /// Get the activated (exp) scale for Gaussian `i` along `axis` (0=x, 1=y, 2=z).
-    #[must_use]
-    pub fn activated_scale(&self, i: usize, axis: usize) -> f32 {
-        self.scales[i * 3 + axis].exp()
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InspectorError::InvalidQuery`] if `axis >= 3`, or
+    /// [`InspectorError::IndexOutOfBounds`] if `i` is out of range for the
+    /// backing `scales` array. Bounds-checked against `self.scales.len()`
+    /// directly (not `self.n`) so this cannot panic even if the invariant
+    /// documented on [`InspectableModel`] has been violated via a
+    /// struct-literal construction that bypassed [`InspectableModel::new`].
+    pub fn activated_scale(&self, i: usize, axis: usize) -> Result<f32, InspectorError> {
+        if axis >= 3 {
+            return Err(InspectorError::InvalidQuery(format!(
+                "axis {axis} out of range: must be < 3 (0=x, 1=y, 2=z)"
+            )));
+        }
+        self.scales
+            .get(i * 3 + axis)
+            .map(|s| s.exp())
+            .ok_or(InspectorError::IndexOutOfBounds {
+                index: i,
+                count: self.n,
+            })
     }
 
     /// Get all inspectable properties for a single Gaussian by index.
@@ -264,9 +298,9 @@ impl InspectableModel {
             self.positions[index * 3 + 2],
         ];
         let opacity = self.opacities[index];
-        let sx = self.activated_scale(index, 0);
-        let sy = self.activated_scale(index, 1);
-        let sz = self.activated_scale(index, 2);
+        let sx = self.activated_scale(index, 0)?;
+        let sy = self.activated_scale(index, 1)?;
+        let sz = self.activated_scale(index, 2)?;
 
         let max_scale = sx.max(sy).max(sz);
         let min_scale = sx.min(sy).min(sz);
@@ -403,12 +437,21 @@ pub fn find_low_opacity(model: &InspectableModel, threshold: f32) -> QueryResult
 }
 
 /// Find Gaussians with anisotropy (max_scale / (min_scale + 1e-8)) above `threshold`.
+///
+/// A Gaussian whose scale cannot be read (see [`InspectableModel::activated_scale`];
+/// only reachable for `i < model.n` if the model's invariant was violated via
+/// a struct-literal bypass of [`InspectableModel::new`]) is excluded rather
+/// than panicking or fabricating a value for it.
 pub fn find_high_anisotropy(model: &InspectableModel, threshold: f32) -> QueryResult {
     let indices: Vec<usize> = (0..model.n)
         .filter(|&i| {
-            let sx = model.activated_scale(i, 0);
-            let sy = model.activated_scale(i, 1);
-            let sz = model.activated_scale(i, 2);
+            let (Ok(sx), Ok(sy), Ok(sz)) = (
+                model.activated_scale(i, 0),
+                model.activated_scale(i, 1),
+                model.activated_scale(i, 2),
+            ) else {
+                return false;
+            };
             let max_s = sx.max(sy).max(sz);
             let min_s = sx.min(sy).min(sz);
             let anisotropy = max_s / (min_s + 1e-8);
@@ -419,12 +462,18 @@ pub fn find_high_anisotropy(model: &InspectableModel, threshold: f32) -> QueryRe
 }
 
 /// Find Gaussians with max scale (world units) above `threshold`.
+///
+/// See [`find_high_anisotropy`] for how an unreadable scale is handled.
 pub fn find_large_gaussians(model: &InspectableModel, threshold: f32) -> QueryResult {
     let indices: Vec<usize> = (0..model.n)
         .filter(|&i| {
-            let sx = model.activated_scale(i, 0);
-            let sy = model.activated_scale(i, 1);
-            let sz = model.activated_scale(i, 2);
+            let (Ok(sx), Ok(sy), Ok(sz)) = (
+                model.activated_scale(i, 0),
+                model.activated_scale(i, 1),
+                model.activated_scale(i, 2),
+            ) else {
+                return false;
+            };
             sx.max(sy).max(sz) > threshold
         })
         .collect();
@@ -433,10 +482,19 @@ pub fn find_large_gaussians(model: &InspectableModel, threshold: f32) -> QueryRe
 
 /// Find spatial outliers: Gaussians whose nearest neighbor distance exceeds `distance_threshold`.
 ///
-/// Uses O(n²) brute-force nearest-neighbor search; suitable for model inspection
-/// (not performance-critical paths). For each Gaussian, computes the distance to
-/// its closest neighbour; if that distance exceeds the threshold the Gaussian is
-/// flagged as a spatial outlier.
+/// For each Gaussian, computes the distance to its closest neighbour; if that
+/// distance exceeds the threshold the Gaussian is flagged as a spatial outlier.
+///
+/// Uses O(n²) brute-force nearest-neighbor search for `n < 1000` (fast enough
+/// that a spatial index would only add overhead), and a uniform spatial hash
+/// keyed on `distance_threshold` for `n >= 1000`, mirroring the
+/// `scene_optimizer::so_deduplicate_near` helper's strategy for the same
+/// class of problem (not currently part of this crate's module tree; not an
+/// intra-doc link for that reason). A brute-force O(n²) scan on a realistic
+/// 3DGS avatar (500k-1M Gaussians) is 2.5e11-1e12 distance evaluations --
+/// effectively a hang; the spatial hash reduces this to expected O(n) for
+/// roughly uniformly distributed points, additionally parallelised with
+/// `rayon` across Gaussians.
 pub fn find_spatial_outliers(
     model: &InspectableModel,
     distance_threshold: f32,
@@ -449,26 +507,93 @@ pub fn find_spatial_outliers(
         return Ok(QueryResult::new(vec![0], model.n));
     }
 
-    let indices: Vec<usize> = (0..model.n)
-        .filter(|&i| {
-            let mut min_dist2 = f32::INFINITY;
-            for j in 0..model.n {
-                if j == i {
-                    continue;
-                }
-                let dx = model.positions[i * 3] - model.positions[j * 3];
-                let dy = model.positions[i * 3 + 1] - model.positions[j * 3 + 1];
-                let dz = model.positions[i * 3 + 2] - model.positions[j * 3 + 2];
-                let d2 = dx * dx + dy * dy + dz * dz;
-                if d2 < min_dist2 {
-                    min_dist2 = d2;
-                }
-            }
-            min_dist2.sqrt() > distance_threshold
-        })
-        .collect();
+    let n = model.n;
+    let positions = &model.positions;
 
-    Ok(QueryResult::new(indices, model.n))
+    // Cell size == distance_threshold: any two points within distance_threshold
+    // of each other necessarily fall in the same or a face/edge/corner-adjacent
+    // cell (standard uniform-grid neighbour-search argument: if |x - y| <= R
+    // then |floor(x/R) - floor(y/R)| <= 1 per axis), so scanning the 3×3×3
+    // neighbourhood around a point's cell is sufficient to determine whether
+    // its nearest neighbour is within the threshold -- without visiting every
+    // other point. Only valid for a well-defined positive cell size, so small
+    // `n` (where brute force is already fast) and non-positive thresholds
+    // (which `1.0 / distance_threshold` cannot handle) both use the brute-force
+    // path instead, matching the original behaviour exactly for those cases.
+    let is_outlier: Vec<bool> = if n < 1000 || distance_threshold <= 0.0 {
+        (0..n)
+            .map(|i| {
+                let mut min_dist2 = f32::INFINITY;
+                for j in 0..n {
+                    if j == i {
+                        continue;
+                    }
+                    let dx = positions[i * 3] - positions[j * 3];
+                    let dy = positions[i * 3 + 1] - positions[j * 3 + 1];
+                    let dz = positions[i * 3 + 2] - positions[j * 3 + 2];
+                    let d2 = dx * dx + dy * dy + dz * dz;
+                    if d2 < min_dist2 {
+                        min_dist2 = d2;
+                    }
+                }
+                min_dist2.sqrt() > distance_threshold
+            })
+            .collect()
+    } else {
+        let inv_r = 1.0 / distance_threshold;
+        let cell_of = |i: usize| -> (i64, i64, i64) {
+            (
+                (positions[i * 3] * inv_r).floor() as i64,
+                (positions[i * 3 + 1] * inv_r).floor() as i64,
+                (positions[i * 3 + 2] * inv_r).floor() as i64,
+            )
+        };
+
+        let mut cell_map: std::collections::HashMap<(i64, i64, i64), Vec<usize>> =
+            std::collections::HashMap::with_capacity(n);
+        for i in 0..n {
+            cell_map.entry(cell_of(i)).or_default().push(i);
+        }
+
+        (0..n)
+            .into_par_iter()
+            .map(|i| {
+                let xi = positions[i * 3];
+                let yi = positions[i * 3 + 1];
+                let zi = positions[i * 3 + 2];
+                let (cx, cy, cz) = cell_of(i);
+                let mut min_dist2 = f32::INFINITY;
+
+                for nx in -1i64..=1 {
+                    for ny in -1i64..=1 {
+                        for nz in -1i64..=1 {
+                            let nc = (cx + nx, cy + ny, cz + nz);
+                            let Some(neighbours) = cell_map.get(&nc) else {
+                                continue;
+                            };
+                            for &j in neighbours {
+                                if j == i {
+                                    continue;
+                                }
+                                let dx = xi - positions[j * 3];
+                                let dy = yi - positions[j * 3 + 1];
+                                let dz = zi - positions[j * 3 + 2];
+                                let d2 = dx * dx + dy * dy + dz * dz;
+                                if d2 < min_dist2 {
+                                    min_dist2 = d2;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                min_dist2.sqrt() > distance_threshold
+            })
+            .collect()
+    };
+
+    let indices: Vec<usize> = (0..n).filter(|&i| is_outlier[i]).collect();
+    Ok(QueryResult::new(indices, n))
 }
 
 // ---------------------------------------------------------------------------
@@ -698,9 +823,9 @@ pub fn inspect_model(model: &InspectableModel) -> Result<InspectionReport, Inspe
             transparent_count += 1;
         }
 
-        let sx = model.activated_scale(i, 0);
-        let sy = model.activated_scale(i, 1);
-        let sz = model.activated_scale(i, 2);
+        let sx = model.activated_scale(i, 0)?;
+        let sy = model.activated_scale(i, 1)?;
+        let sz = model.activated_scale(i, 2)?;
         let max_s = sx.max(sy).max(sz);
         let min_s = sx.min(sy).min(sz);
         let anisotropy = max_s / (min_s + 1e-8);
@@ -1079,6 +1204,58 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // InspectableModel::activated_scale
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_activated_scale_valid() {
+        let m = make_line_model(3);
+        // scales are all -1.0 in make_line_model, so exp(-1) for every axis.
+        let sx = m.activated_scale(1, 0).expect("valid index/axis");
+        assert!((sx - (-1.0f32).exp()).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_activated_scale_index_out_of_bounds_errors_instead_of_panicking() {
+        // Regression: this used to index `self.scales[i * 3 + axis]`
+        // directly with no bounds check, panicking on an out-of-range `i`.
+        let m = make_line_model(3);
+        let result = m.activated_scale(100, 0);
+        assert!(matches!(
+            result,
+            Err(InspectorError::IndexOutOfBounds { .. })
+        ));
+    }
+
+    #[test]
+    fn test_activated_scale_axis_out_of_bounds_errors_instead_of_panicking() {
+        let m = make_line_model(3);
+        let result = m.activated_scale(0, 3);
+        assert!(matches!(result, Err(InspectorError::InvalidQuery(_))));
+    }
+
+    #[test]
+    fn test_activated_scale_bounds_checked_against_real_scales_len_not_n() {
+        // Regression: a model whose public fields were set directly (bypassing
+        // `InspectableModel::new`'s validation) so that `n` overstates the
+        // real `scales` array must still not panic -- the check is against
+        // `scales.len()`, not the (here, lying) `n` field.
+        let m = InspectableModel {
+            positions: vec![0.0, 0.0, 0.0],
+            opacities: vec![0.5],
+            scales: vec![-1.0, -1.0, -1.0],
+            colors: vec![1.0, 0.0, 0.0],
+            n: 10, // lies: only 1 Gaussian's worth of data actually present
+        };
+        assert!(m.activated_scale(0, 0).is_ok());
+        let result = m.activated_scale(5, 0);
+        assert!(matches!(
+            result,
+            Err(InspectorError::IndexOutOfBounds { .. })
+        ));
+    }
+
+    // -----------------------------------------------------------------------
     // InspectableModel::bounding_box
     // -----------------------------------------------------------------------
 
@@ -1320,6 +1497,46 @@ mod tests {
     fn test_find_spatial_outliers_dense_cluster() {
         // All within threshold → no outliers.
         let m = make_line_model(5); // x=0..4, nearest neighbour always 1 unit
+        let result = find_spatial_outliers(&m, 5.0).expect("ok");
+        assert_eq!(result.count, 0);
+    }
+
+    #[test]
+    fn test_find_spatial_outliers_large_n_uses_spatial_hash_path() {
+        // Regression: forces n >= 1000 so this exercises the spatial-hash +
+        // rayon branch (previously an O(n^2) brute-force scan regardless of
+        // n, which for a realistic 500k-1M Gaussian model was effectively a
+        // hang: 2.5e11-1e12 distance evaluations). A line of 1200 points 1
+        // unit apart (every point has a neighbour within 1) plus one
+        // isolated point far outside the line's coordinate range must find
+        // exactly the isolated point as an outlier.
+        let line_n = 1200;
+        let m = make_line_model(line_n);
+        let mut positions = m.positions.clone();
+        positions.extend_from_slice(&[5000.0, 0.0, 0.0]); // far past x=0..line_n-1
+        let mut opacities = m.opacities.clone();
+        opacities.push(0.8);
+        let mut scales = m.scales.clone();
+        scales.extend_from_slice(&[-1.0, -1.0, -1.0]);
+        let mut colors = m.colors.clone();
+        colors.extend_from_slice(&[1.0, 0.0, 0.0]);
+
+        let full =
+            InspectableModel::new(positions, opacities, scales, colors).expect("valid model");
+        assert!(full.n >= 1000, "test must exercise the n >= 1000 code path");
+
+        let result = find_spatial_outliers(&full, 5.0).expect("ok");
+        assert_eq!(result.count, 1);
+        assert_eq!(result.indices[0], line_n);
+    }
+
+    #[test]
+    fn test_find_spatial_outliers_large_n_all_dense_no_outliers() {
+        // Companion to the above: a purely dense large-n cloud (every point
+        // within threshold of a neighbour) must report zero outliers via
+        // the spatial-hash path too, not just the "one isolated point" case.
+        let m = make_line_model(1500); // x=0..1499, nearest neighbour always 1 unit
+        assert!(m.n >= 1000, "test must exercise the n >= 1000 code path");
         let result = find_spatial_outliers(&m, 5.0).expect("ok");
         assert_eq!(result.count, 0);
     }

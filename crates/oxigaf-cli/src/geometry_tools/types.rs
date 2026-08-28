@@ -72,13 +72,29 @@ impl GeometryStats {
     }
 }
 /// Rigid body transform: uniform scale, rotation (unit quaternion, w-last), translation.
+///
+/// `scale` and `rotation` only affect a Gaussian's *centre* when applied via
+/// [`crate::geometry_tools::transform_positions`]/[`RigidTransform::apply_to_point`] — the
+/// Gaussian's own physical extent is stored separately as a per-Gaussian
+/// log-scale array, not here. Applying a transform whose `scale != 1.0` (or
+/// whose `rotation` is non-identity, since orientation matters for
+/// anisotropic Gaussians) to positions alone moves every centre without
+/// resizing the Gaussians themselves, tearing the scene apart rather than
+/// scaling it uniformly. Use [`crate::geometry_tools::transform_scales`]
+/// alongside [`crate::geometry_tools::transform_positions`] (and
+/// [`crate::geometry_tools::transform_rotations`]) so all arrays describing
+/// the scene stay consistent with the same transform.
 #[derive(Debug, Clone, Copy)]
 pub struct RigidTransform {
     /// Unit quaternion `[qx, qy, qz, qw]` representing the rotation part.
     pub rotation: [f32; 4],
     /// World-space translation applied after rotation.
     pub translation: [f32; 3],
-    /// Uniform scale factor (default `1.0`).
+    /// Uniform scale factor (default `1.0`), applied to positions by
+    /// [`RigidTransform::apply_to_point`]. Apply the same factor to a
+    /// scene's per-Gaussian log-scales with
+    /// [`crate::geometry_tools::transform_scales`] — see the struct-level
+    /// documentation.
     pub scale: f32,
 }
 impl RigidTransform {

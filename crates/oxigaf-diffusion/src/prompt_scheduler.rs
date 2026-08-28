@@ -62,7 +62,11 @@ impl PromptEmbedding {
 
     /// Create an all-zeros embedding of the given dimension.
     ///
-    /// Panics (in debug) if `dim == 0`; callers should guarantee `dim > 0`.
+    /// `dim` is clamped to a minimum of `1`: this constructor never panics
+    /// and never produces an embedding with `dim() == 0` (unlike
+    /// [`Self::new`], which rejects empty data with an error). Callers that
+    /// need to detect a mis-sized `dim == 0` config value rather than have
+    /// it silently become `1` should check `dim` themselves before calling.
     pub fn zeros(dim: usize, label: impl Into<String>) -> Self {
         Self {
             data: vec![0.0_f32; dim.max(1)],
@@ -149,8 +153,11 @@ pub enum InterpolationMode {
 
 /// Interpolate between two embeddings at parameter `t ∈ [0, 1]`.
 ///
-/// `t = 0` returns the start embedding (possibly normalized for Slerp),
-/// `t = 1` returns the end embedding.
+/// `t = 0` returns the start embedding, `t = 1` returns the end embedding
+/// (exactly, magnitude included, for every mode — [`InterpolationMode::Slerp`]
+/// rescales its unit-sphere interpolation back to the linearly-interpolated
+/// magnitude of the two inputs, so it does not discontinuously collapse to
+/// unit norm; see `slerp_interp`).
 pub fn interpolate_embeddings(
     start: &PromptEmbedding,
     end: &PromptEmbedding,
@@ -210,8 +217,20 @@ fn linear_interp(a: &[f32], b: &[f32], t: f32) -> Vec<f32> {
 
 /// Spherical linear interpolation between two raw vectors.
 ///
-/// Both vectors are normalized before computing the arc. Falls back to linear
-/// interpolation when the vectors are (anti-)parallel or either has zero norm.
+/// The *direction* is interpolated on the unit sphere (both vectors are
+/// normalized before computing the arc), but the result is rescaled back to
+/// the linearly-interpolated *magnitude* `(1-t)*|a| + t*|b|` before being
+/// returned — matching [`linear_interp`] and this function's own
+/// (anti-)parallel/zero-norm fallback branches (both of which return
+/// magnitude-preserving results), and matching
+/// `latent_walk::spherical_walk`'s convention. Without this rescaling, a
+/// non-unit-norm embedding (CLIP embeddings typically have norm far from 1)
+/// would be discontinuously collapsed to unit norm by this branch alone,
+/// while nearby `t`/input values that hit the fallback branches would keep
+/// their original scale.
+///
+/// Falls back to linear interpolation (which already preserves magnitude)
+/// when the vectors are (anti-)parallel or either has zero norm.
 fn slerp_interp(a: &[f32], b: &[f32], t: f32) -> Vec<f32> {
     // Compute norms.
     let norm_a = a.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -243,11 +262,15 @@ fn slerp_interp(a: &[f32], b: &[f32], t: f32) -> Vec<f32> {
     let w_a = ((1.0 - t) * theta).sin() / sin_theta;
     let w_b = (t * theta).sin() / sin_theta;
 
-    // Slerp on normalized vectors.
+    // Interpolated magnitude, so the result is continuous with the linear
+    // fallback branches above instead of jumping to unit norm.
+    let mag = (1.0 - t) * norm_a + t * norm_b;
+
+    // Slerp on normalized vectors, rescaled to the interpolated magnitude.
     a_norm
         .iter()
         .zip(b_norm.iter())
-        .map(|(x, y)| w_a * x + w_b * y)
+        .map(|(x, y)| mag * (w_a * x + w_b * y))
         .collect()
 }
 
@@ -534,9 +557,12 @@ pub fn embedding_diversity(embeddings: &[PromptEmbedding]) -> Result<f32, Prompt
     let mut total_distance = 0.0_f32;
     for i in 0..n {
         for j in (i + 1)..n {
-            let cos_sim = embeddings[i]
-                .cosine_similarity(&embeddings[j])
-                .unwrap_or(0.0);
+            // Propagate a dimension mismatch as an error instead of
+            // silently treating it as a cosine similarity of 0.0 (i.e. a
+            // "plausible" cosine distance of exactly 1.0): mixing, say,
+            // 768-d and 1024-d embeddings is a caller bug, not evidence of
+            // real diversity.
+            let cos_sim = embeddings[i].cosine_similarity(&embeddings[j])?;
             // Cosine distance = 1 - cosine_similarity.
             total_distance += 1.0 - cos_sim;
         }
@@ -700,9 +726,31 @@ mod tests {
         PromptEmbedding::new(data, "test").expect("valid embedding")
     }
 
-    #[allow(dead_code)]
     fn zero_embed(dim: usize) -> PromptEmbedding {
         PromptEmbedding::zeros(dim, "zero")
+    }
+
+    // `PromptEmbedding::zeros` had no coverage at all: `zero_embed` was
+    // written for it, then suppressed as dead code rather than used. Its two
+    // documented promises — the `dim.max(1)` clamp, and a genuinely all-zero
+    // vector whose `norm()` is 0 and whose `normalize()` is a no-op — are the
+    // ones a caller relies on.
+    #[test]
+    fn test_embedding_zeros_is_all_zero_and_clamps_dim() {
+        let embed = zero_embed(4);
+        assert_eq!(embed.dim(), 4);
+        assert_eq!(embed.label, "zero");
+        assert!(embed.data.iter().all(|v| *v == 0.0));
+        assert_eq!(embed.norm(), 0.0);
+
+        // Unlike `new`, which rejects empty data, `zeros` clamps to 1.
+        assert_eq!(zero_embed(0).dim(), 1);
+
+        // Normalizing a zero vector must leave it alone rather than divide by
+        // its zero norm.
+        let mut zero = zero_embed(3);
+        zero.normalize();
+        assert!(zero.data.iter().all(|v| *v == 0.0));
     }
 
     // Test 1: new() with empty data → EmptyEmbedding error
@@ -806,6 +854,43 @@ mod tests {
         // At t=0, should equal the normalized start.
         assert!((result.data[0] - start.data[0]).abs() < 1e-5);
         assert!((result.data[1] - start.data[1]).abs() < 1e-5);
+    }
+
+    // Regression test: Slerp used to always return a unit-norm vector,
+    // discontinuously shrinking non-unit-norm embeddings (CLIP embeddings
+    // typically have norm far from 1). It must now rescale back to the
+    // linearly-interpolated magnitude, matching t=0/t=1 exactly and giving
+    // continuous magnitude for interior t.
+    #[test]
+    fn test_interpolate_slerp_preserves_non_unit_magnitude() {
+        // Two well-separated (not (anti-)parallel), non-unit-norm vectors.
+        let start = embed(vec![3.0, 0.0, 0.0]); // norm 3
+        let end = embed(vec![0.0, 6.0, 0.0]); // norm 6
+
+        // t=0 must equal `start` exactly (magnitude included), not a
+        // unit-norm version of it.
+        let at_0 =
+            interpolate_embeddings(&start, &end, 0.0, InterpolationMode::Slerp).expect("valid");
+        for (got, want) in at_0.data.iter().zip(start.data.iter()) {
+            assert!((got - want).abs() < 1e-4, "t=0: got {got}, want {want}");
+        }
+
+        // t=1 must equal `end` exactly.
+        let at_1 =
+            interpolate_embeddings(&start, &end, 1.0, InterpolationMode::Slerp).expect("valid");
+        for (got, want) in at_1.data.iter().zip(end.data.iter()) {
+            assert!((got - want).abs() < 1e-4, "t=1: got {got}, want {want}");
+        }
+
+        // Interior t: magnitude should be the linear interpolation of the
+        // two input norms (4.5 at t=0.5), not 1.0.
+        let mid =
+            interpolate_embeddings(&start, &end, 0.5, InterpolationMode::Slerp).expect("valid");
+        let mid_norm = mid.norm();
+        assert!(
+            (mid_norm - 4.5).abs() < 1e-3,
+            "expected interpolated magnitude ~4.5, got {mid_norm}"
+        );
     }
 
     // Test 11: interpolate Step t<0.5 → start, t>=0.5 → end
@@ -1009,6 +1094,21 @@ mod tests {
             "identical embeddings should have 0 diversity, got {}",
             d
         );
+    }
+
+    // Regression test: a dimension mismatch between two embeddings used to
+    // be silently swallowed as a cosine similarity of 0.0 (cosine distance
+    // 1.0), producing a plausible-looking diversity score instead of the
+    // error the function is capable of returning.
+    #[test]
+    fn test_embedding_diversity_propagates_dim_mismatch() {
+        let a = embed(vec![1.0, 0.0]);
+        let b = embed(vec![1.0, 0.0, 0.0]); // different dimension
+        let result = embedding_diversity(&[a, b]);
+        assert!(matches!(
+            result,
+            Err(PromptSchedulerError::DimMismatch { .. })
+        ));
     }
 
     // Test 23: make_strengthening_schedule has exactly 2 keyframes

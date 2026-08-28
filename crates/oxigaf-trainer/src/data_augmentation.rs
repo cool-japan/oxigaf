@@ -39,10 +39,11 @@ pub fn xorshift64(state: &mut u64) -> u64 {
     *state
 }
 
-/// Uniform float in [0, 1) with 53 bits of precision.
+/// Uniform float in [0, 1) with 24 bits of precision (matches `f32`'s
+/// mantissa width, so the result can never round up to exactly 1.0).
 #[inline]
 pub fn xorshift_f32(state: &mut u64) -> f32 {
-    (xorshift64(state) >> 11) as f32 / (1u64 << 53) as f32
+    ((xorshift64(state) >> 40) as f32) / (1u64 << 24) as f32
 }
 
 // ---- Image statistics ---------------------------------------------------------
@@ -238,6 +239,15 @@ pub fn aug_separable_convolve(
     height: usize,
     kernel: &[f32],
 ) -> Vec<f32> {
+    let expected = width * height * 3;
+    let got = img.len();
+    if got != expected {
+        tracing::warn!(
+            "aug_separable_convolve: img.len()={got} does not match \
+             width*height*3={expected} ({width}x{height}); returning input unchanged"
+        );
+        return img.to_vec();
+    }
     let k_len = kernel.len();
     let half = (k_len / 2) as i32;
     let n = width * height * 3;
@@ -281,6 +291,15 @@ pub fn aug_separable_convolve(
 
 /// Flip the image horizontally (mirror left-right).
 pub fn horizontal_flip(img: &[f32], width: usize, height: usize) -> Vec<f32> {
+    let expected = width * height * 3;
+    let got = img.len();
+    if got != expected {
+        tracing::warn!(
+            "horizontal_flip: img.len()={got} does not match width*height*3={expected} \
+             ({width}x{height}); returning input unchanged"
+        );
+        return img.to_vec();
+    }
     let mut out = vec![0.0f32; img.len()];
     for y in 0..height {
         for x in 0..width {
@@ -296,6 +315,15 @@ pub fn horizontal_flip(img: &[f32], width: usize, height: usize) -> Vec<f32> {
 
 /// Flip the image vertically (mirror top-bottom).
 pub fn vertical_flip(img: &[f32], width: usize, height: usize) -> Vec<f32> {
+    let expected = width * height * 3;
+    let got = img.len();
+    if got != expected {
+        tracing::warn!(
+            "vertical_flip: img.len()={got} does not match width*height*3={expected} \
+             ({width}x{height}); returning input unchanged"
+        );
+        return img.to_vec();
+    }
     let mut out = vec![0.0f32; img.len()];
     for y in 0..height {
         for x in 0..width {
@@ -326,6 +354,15 @@ pub fn aug_color_jitter(
     hue: f32,
     state: &mut u64,
 ) -> Vec<f32> {
+    let expected = width * height * 3;
+    let got = img.len();
+    if got != expected {
+        tracing::warn!(
+            "aug_color_jitter: img.len()={got} does not match width*height*3={expected} \
+             ({width}x{height}); returning input unchanged"
+        );
+        return img.to_vec();
+    }
     let n_pixels = width * height;
     let mut out = img.to_vec();
 
@@ -433,6 +470,15 @@ pub fn aug_random_crop(
     crop_h: usize,
     state: &mut u64,
 ) -> Result<Vec<f32>, AugmentError> {
+    let expected = width * height * 3;
+    if img.len() != expected {
+        return Err(AugmentError::SizeMismatch {
+            got: img.len(),
+            width,
+            height,
+            channels: 3,
+        });
+    }
     if crop_w == 0 || crop_h == 0 {
         return Err(AugmentError::InvalidParam(
             "crop dimensions must be > 0".into(),
@@ -554,6 +600,15 @@ pub fn aug_random_erasing(
     max_area: f32,
     state: &mut u64,
 ) -> Vec<f32> {
+    let expected = width * height * 3;
+    let got = img.len();
+    if got != expected {
+        tracing::warn!(
+            "aug_random_erasing: img.len()={got} does not match width*height*3={expected} \
+             ({width}x{height}); returning input unchanged"
+        );
+        return img.to_vec();
+    }
     let total_area = (width * height) as f32;
     let stats = aug_image_stats(img);
 
@@ -756,8 +811,15 @@ impl ImageAugmenter {
         let mut cur_h = height;
         let mut last_was_normalize = false;
 
-        for (op, prob) in &self.config.ops.clone() {
-            let u = xorshift_f32(&mut self.rng_state);
+        // Split the borrow instead of cloning the op list: `ops` is an
+        // immutable borrow of `self.config.ops` and `rng_state` is a
+        // disjoint mutable borrow of `self.rng_state`, so both can be held
+        // at once without a per-image allocation of the whole op list.
+        let ops = &self.config.ops;
+        let rng_state = &mut self.rng_state;
+
+        for (op, prob) in ops {
+            let u = xorshift_f32(rng_state);
             if u >= *prob {
                 continue;
             }
@@ -785,26 +847,19 @@ impl ImageAugmenter {
                         *contrast,
                         *saturation,
                         *hue,
-                        &mut self.rng_state,
+                        rng_state,
                     );
                 }
                 AugmentOp::GaussianNoise { std } => {
-                    current = aug_add_gaussian_noise(&current, *std, &mut self.rng_state);
+                    current = aug_add_gaussian_noise(&current, *std, rng_state);
                 }
                 AugmentOp::RandomCrop { crop_w, crop_h } => {
-                    current = aug_random_crop(
-                        &current,
-                        cur_w,
-                        cur_h,
-                        *crop_w,
-                        *crop_h,
-                        &mut self.rng_state,
-                    )?;
+                    current = aug_random_crop(&current, cur_w, cur_h, *crop_w, *crop_h, rng_state)?;
                     cur_w = *crop_w;
                     cur_h = *crop_h;
                 }
                 AugmentOp::RandomRotation90 => {
-                    let times = (xorshift64(&mut self.rng_state) % 4) as u32;
+                    let times = (xorshift64(rng_state) % 4) as u32;
                     let (rotated, new_w, new_h) = aug_rotate_90(&current, cur_w, cur_h, times);
                     current = rotated;
                     cur_w = new_w;
@@ -814,14 +869,8 @@ impl ImageAugmenter {
                     current = aug_gaussian_blur(&current, cur_w, cur_h, *kernel_size, *sigma)?;
                 }
                 AugmentOp::RandomErasing { min_area, max_area } => {
-                    current = aug_random_erasing(
-                        &current,
-                        cur_w,
-                        cur_h,
-                        *min_area,
-                        *max_area,
-                        &mut self.rng_state,
-                    );
+                    current =
+                        aug_random_erasing(&current, cur_w, cur_h, *min_area, *max_area, rng_state);
                 }
                 AugmentOp::Normalize { mean, std } => {
                     current = aug_normalize(&current, mean, std)?;
@@ -1755,6 +1804,78 @@ mod tests {
         let out = aug_gaussian_blur(&img, 4, 4, 1, 1.0).unwrap();
         for (a, b) in img.iter().zip(out.iter()) {
             assert!((a - b).abs() < 1e-5, "kernel_size=1 should be identity");
+        }
+    }
+
+    // ---- Size-mismatch guards (buffer shorter than width*height*3) ----------
+
+    #[test]
+    fn test_horizontal_flip_size_mismatch_returns_unchanged() {
+        let img = vec![0.0f32; 10];
+        let out = horizontal_flip(&img, 100, 100);
+        assert_eq!(
+            out, img,
+            "size mismatch should return input unchanged, not panic"
+        );
+    }
+
+    #[test]
+    fn test_vertical_flip_size_mismatch_returns_unchanged() {
+        let img = vec![0.0f32; 10];
+        let out = vertical_flip(&img, 100, 100);
+        assert_eq!(out, img);
+    }
+
+    #[test]
+    fn test_aug_color_jitter_size_mismatch_returns_unchanged() {
+        let img = vec![0.5f32; 10];
+        let mut state = 1u64;
+        let out = aug_color_jitter(&img, 100, 100, 0.5, 0.5, 0.5, 0.5, &mut state);
+        assert_eq!(out, img);
+    }
+
+    #[test]
+    fn test_aug_random_erasing_size_mismatch_returns_unchanged() {
+        let img = vec![0.5f32; 10];
+        let mut state = 1u64;
+        let out = aug_random_erasing(&img, 100, 100, 0.1, 0.5, &mut state);
+        assert_eq!(out, img);
+    }
+
+    #[test]
+    fn test_aug_separable_convolve_size_mismatch_returns_unchanged() {
+        let img = vec![0.5f32; 10];
+        let kernel = vec![0.0f32, 1.0, 0.0];
+        let out = aug_separable_convolve(&img, 100, 100, &kernel);
+        assert_eq!(out, img);
+    }
+
+    #[test]
+    fn test_aug_random_crop_size_mismatch_errors() {
+        let img = vec![0.5f32; 10];
+        let mut state = 1u64;
+        let result = aug_random_crop(&img, 100, 100, 4, 4, &mut state);
+        assert!(matches!(
+            result,
+            Err(AugmentError::SizeMismatch { got: 10, .. })
+        ));
+    }
+
+    // ---- xorshift_f32 24-bit precision (never rounds up to exactly 1.0) -----
+
+    #[test]
+    fn test_xorshift_f32_never_reaches_one() {
+        // The top 24 bits of a u64 stream exhaust every representable f32
+        // mantissa value in [0, 1) after at most 2^24 draws; scan enough
+        // draws from several seeds to be confident the quotient never rounds
+        // up to exactly 1.0 (which would incorrectly skip a probability-1.0
+        // augmentation op in `ImageAugmenter::augment`).
+        for seed in [1u64, 42, 999_999, u64::MAX] {
+            let mut state = seed;
+            for _ in 0..200_000 {
+                let v = xorshift_f32(&mut state);
+                assert!(v < 1.0, "xorshift_f32 must never reach 1.0, got {v}");
+            }
         }
     }
 }

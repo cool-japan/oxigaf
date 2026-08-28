@@ -469,6 +469,12 @@ pub struct StylePalette {
     /// Number of latent channels expected by all stored styles.
     pub n_channels: usize,
     /// Per-style: `(means_per_channel, stds_per_channel)`.
+    ///
+    /// Every entry must have exactly `n_channels` elements in both vectors —
+    /// [`Self::apply_style`] and [`Self::blend_styles`] index them
+    /// unconditionally and will panic on a shorter entry. Prefer
+    /// [`Self::push_style`] or [`Self::add_from_latent`], which validate the
+    /// length before inserting, over pushing onto this field directly.
     pub styles: Vec<(Vec<f32>, Vec<f32>)>,
     /// Human-readable name for each style.
     pub names: Vec<String>,
@@ -497,6 +503,38 @@ impl StylePalette {
         let stats = channel_statistics(latent, self.n_channels)?;
         let means: Vec<f32> = stats.iter().map(|&(m, _)| m).collect();
         let stds: Vec<f32> = stats.iter().map(|&(_, s)| s).collect();
+        self.push_style(means, stds, name)
+    }
+
+    /// Add a style directly from precomputed per-channel `(means, stds)`.
+    ///
+    /// Unlike pushing onto the public [`Self::styles`] field by hand, this
+    /// validates both vectors have exactly `n_channels` entries before
+    /// accepting them — a shorter vector would otherwise panic later inside
+    /// [`Self::apply_style`] or [`Self::blend_styles`].
+    ///
+    /// # Errors
+    ///
+    /// [`StyleTransferError::DimensionMismatch`] if `means.len()` or
+    /// `stds.len()` is not exactly `self.n_channels`.
+    pub fn push_style(
+        &mut self,
+        means: Vec<f32>,
+        stds: Vec<f32>,
+        name: impl Into<String>,
+    ) -> Result<(), StyleTransferError> {
+        if means.len() != self.n_channels {
+            return Err(StyleTransferError::DimensionMismatch {
+                expected: self.n_channels,
+                got: means.len(),
+            });
+        }
+        if stds.len() != self.n_channels {
+            return Err(StyleTransferError::DimensionMismatch {
+                expected: self.n_channels,
+                got: stds.len(),
+            });
+        }
         self.styles.push((means, stds));
         self.names.push(name.into());
         Ok(())
@@ -540,7 +578,10 @@ impl StylePalette {
 
     /// Blend multiple styles via a weighted mean of their per-channel statistics.
     ///
-    /// `weights` must have the same length as `self.styles`.
+    /// `weights` must have the same length as `self.styles`. Weights need
+    /// not already sum to 1 — they are normalised internally, so passing
+    /// e.g. `[1.0, 1.0]` blends the two styles evenly rather than doubling
+    /// the result.
     ///
     /// # Returns
     ///
@@ -548,7 +589,9 @@ impl StylePalette {
     ///
     /// # Errors
     ///
-    /// - [`StyleTransferError::InvalidConfig`] if the palette is empty.
+    /// - [`StyleTransferError::InvalidConfig`] if the palette is empty, or
+    ///   if `weights` sums to a non-positive value (the normalisation would
+    ///   divide by zero or flip signs).
     /// - [`StyleTransferError::DimensionMismatch`] if `weights.len() != self.styles.len()`.
     pub fn blend_styles(
         &self,
@@ -565,6 +608,20 @@ impl StylePalette {
                 got: weights.len(),
             });
         }
+        let weight_sum: f32 = weights.iter().sum();
+        // `weight_sum.is_nan() || weight_sum <= 0.0` (rather than the
+        // clippy-flagged `!(weight_sum > 0.0)`) is deliberate, not just a
+        // style swap: `NaN <= 0.0` is `false`, so a bare `<= 0.0` rewrite
+        // would let a NaN sum (e.g. from a NaN weight) fall through to the
+        // divide below and silently poison `blended_means`/`blended_stds`
+        // with NaN. The explicit `is_nan()` check keeps NaN rejected, same
+        // as the original negated-comparison form (`NaN > 0.0` is `false`,
+        // so `!(NaN > 0.0)` was already `true` and errored).
+        if weight_sum.is_nan() || weight_sum <= 0.0 {
+            return Err(StyleTransferError::InvalidConfig(format!(
+                "blend_styles weights must sum to a positive value, got {weight_sum}"
+            )));
+        }
         let mut blended_means = vec![0.0f32; self.n_channels];
         let mut blended_stds = vec![0.0f32; self.n_channels];
         for (w, (means, stds)) in weights.iter().zip(self.styles.iter()) {
@@ -572,6 +629,10 @@ impl StylePalette {
                 blended_means[c] += w * means[c];
                 blended_stds[c] += w * stds[c];
             }
+        }
+        for c in 0..self.n_channels {
+            blended_means[c] /= weight_sum;
+            blended_stds[c] /= weight_sum;
         }
         Ok((blended_means, blended_stds))
     }
@@ -625,13 +686,17 @@ pub fn compute_style_stats(
         });
     }
 
-    // content_deviation = L2(content, output) / len
-    let content_deviation = content
+    // content_deviation = RMSE(content, output), matching the "per-element
+    // L2 distance" doc on the field: sqrt(mean((c - o)^2)), not the bare
+    // mean-squared-error (which has squared units and under-reports for any
+    // deviation smaller than 1.0).
+    let mse = content
         .iter()
         .zip(output.iter())
         .map(|(&c, &o)| (c - o).powi(2))
         .sum::<f32>()
         / content.len() as f32;
+    let content_deviation = mse.sqrt();
 
     // Per-channel stats for output and style
     let out_stats = channel_statistics(output, n_channels)?;
@@ -1093,6 +1158,73 @@ mod tests {
         }
     }
 
+    /// Regression test: `blend_styles([1.0, 1.0])` must average the two
+    /// styles, not sum them. Previously the weighted accumulation was never
+    /// divided by the weight sum, so equal unit weights doubled both the
+    /// blended means and stds instead of averaging them.
+    #[test]
+    fn test_style_palette_blend_styles_equal_weights_averages_not_sums() {
+        let mut palette = StylePalette::new(1);
+        palette.push_style(vec![2.0], vec![4.0], "a").unwrap();
+        palette.push_style(vec![6.0], vec![8.0], "b").unwrap();
+
+        let (bm, bs) = palette.blend_styles(&[1.0, 1.0]).unwrap();
+        assert!(
+            (bm[0] - 4.0).abs() < 1e-5,
+            "mean should be the average (2+6)/2=4, got {}",
+            bm[0]
+        );
+        assert!(
+            (bs[0] - 6.0).abs() < 1e-5,
+            "std should be the average (4+8)/2=6, got {}",
+            bs[0]
+        );
+    }
+
+    #[test]
+    fn test_style_palette_blend_styles_nonpositive_weight_sum_err() {
+        let mut palette = StylePalette::new(1);
+        palette.push_style(vec![2.0], vec![4.0], "a").unwrap();
+        palette.push_style(vec![6.0], vec![8.0], "b").unwrap();
+
+        let result = palette.blend_styles(&[1.0, -1.0]);
+        assert!(matches!(result, Err(StyleTransferError::InvalidConfig(_))));
+    }
+
+    #[test]
+    fn test_style_palette_blend_styles_nan_weight_sum_err() {
+        // Regression for the clippy `neg_cmp_op_on_partial_ord` fix: the
+        // check used to read `!(weight_sum > 0.0)`. The naive rewrite
+        // `weight_sum <= 0.0` is NOT behavior-preserving for NaN, because
+        // `NaN <= 0.0` is `false` in IEEE 754 — it would let a NaN weight
+        // sum fall through to the divide and silently poison
+        // `blended_means`/`blended_stds` with NaN instead of erroring. A NaN
+        // weight sum must still be rejected, exactly as it was before.
+        let mut palette = StylePalette::new(1);
+        palette.push_style(vec![2.0], vec![4.0], "a").unwrap();
+        palette.push_style(vec![6.0], vec![8.0], "b").unwrap();
+
+        let result = palette.blend_styles(&[f32::NAN, 1.0]);
+        assert!(
+            matches!(result, Err(StyleTransferError::InvalidConfig(_))),
+            "a NaN weight sum must be rejected, not silently propagated into \
+             the blended output: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_style_palette_push_style_wrong_length_err() {
+        let mut palette = StylePalette::new(4);
+        let result = palette.push_style(vec![1.0, 2.0], vec![1.0, 2.0, 3.0, 4.0], "bad");
+        assert!(matches!(
+            result,
+            Err(StyleTransferError::DimensionMismatch {
+                expected: 4,
+                got: 2
+            })
+        ));
+    }
+
     #[test]
     fn test_style_palette_blend_styles_wrong_weights_length() {
         let mut palette = StylePalette::new(4);
@@ -1123,6 +1255,24 @@ mod tests {
         assert!(
             stats.content_deviation.abs() < 1e-6,
             "deviation={}",
+            stats.content_deviation
+        );
+    }
+
+    /// Regression test: `content_deviation` is documented as a per-element
+    /// L2 distance (RMSE), not a mean squared error. A constant offset of 3
+    /// between every element of `content` and `output` must report 3.0, not
+    /// 9.0 (which is what the un-rooted mean-squared-error would give).
+    #[test]
+    fn test_compute_style_stats_content_deviation_is_rmse_not_mse() {
+        let content = vec![0.0f32; 8];
+        let output = vec![3.0f32; 8];
+        let style: Vec<f32> = linspace(5.0, 12.0, 8);
+        let stats = compute_style_stats(&content, &style, &output, 2).unwrap();
+        assert!(
+            (stats.content_deviation - 3.0).abs() < 1e-5,
+            "expected RMSE=3.0 (constant offset), got {} (9.0 would indicate \
+             an un-rooted MSE)",
             stats.content_deviation
         );
     }

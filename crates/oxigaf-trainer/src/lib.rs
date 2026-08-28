@@ -2,14 +2,292 @@
 //!
 //! GAF optimization pipeline — iterative denoising distillation.
 //!
-//! Provides:
-//! - Gaussian initialization on FLAME mesh surfaces
-//! - Per-parameter Adam optimizer with group-wise learning rates
-//! - Photometric + structural loss computation (L1, SSIM)
-//! - Adaptive density control (split / clone / prune)
-//! - Checkpoint save / load (JSON + flat f32 arrays)
-//! - Metric tracking (PSNR, SSIM history)
-//! - Main training loop orchestrating render ↔ diffusion distillation
+//! ## The shipped training pipeline
+//!
+//! [`Trainer`] is the only optimisation loop in this crate.  It drives — directly
+//! or transitively — exactly the modules below, plus [`init`], which builds the
+//! Gaussian model handed to [`Trainer::new`]:
+//!
+//! - [`init`] — Gaussian initialization on FLAME mesh surfaces
+//! - [`optimizer`] — per-parameter Adam with group-wise learning rates
+//! - [`loss`] / [`lpips`] — photometric + structural loss (L1, SSIM, LPIPS)
+//! - [`image_gradient`] — pixel-space gradient of the configured photometric
+//!   loss, fed straight to the backward rasterizer pass (this is what makes
+//!   `LossConfig`'s weights actually change what gets optimized, not just what
+//!   gets logged)
+//! - [`density`] — adaptive density control (split / clone / prune)
+//! - [`diffusion_target`] — render ↔ diffusion distillation targets (SDS)
+//! - [`mixed_precision`] — loss scaling and precision mode
+//! - [`checkpoint`] — checkpoint save / load (JSON + flat f32 arrays)
+//! - [`metrics`] — metric tracking (PSNR, SSIM history)
+//! - [`tensorboard`] / [`profiler_integration`] — logging and phase profiling
+//! - [`config`] — the [`TrainingConfig`] tree parameterising all of the above
+//!
+//! Four more are built by [`Trainer::new`] and consumed inside
+//! [`Trainer::train_step`], but only when configured — each is a no-op by
+//! default:
+//!
+//! - [`lr_scheduler`] — learning-rate multiplier schedule
+//!   (`TrainingConfig::lr_schedule`, default [`config::LrScheduleConfig::Fixed`])
+//! - [`gradient_clipping`] — global / per-group / value / adaptive clipping
+//!   (`TrainingConfig::gradient_clip`, default [`config::GradientClipConfig::Disabled`])
+//! - [`gradient_accumulation`] — micro-batch gradient accumulation
+//!   (`TrainingConfig::gradient_accumulation_steps`, default `1`)
+//! - [`ema`] — EMA shadow weights (`TrainingConfig::ema_decay`, default `None`)
+//!
+//! ## Opt-in components (not driven by `Trainer`)
+//!
+//! Every *other* module in this crate is a standalone, independently tested
+//! building block that [`Trainer`] does **not** invoke: layer freezing
+//! ([`layer_freezing`]), curriculum sampling, diagnostics, calibration,
+//! landscape analysis, and so on.
+//!
+//! They are exported so callers can compose their own loops, but importing one
+//! has **no** effect on [`Trainer::train_step`] — using it means driving it from
+//! your own loop.
+//!
+//! # Examples
+//!
+//! These mirror `README.md` and are compiled on every `cargo test`, so a README
+//! example cannot silently rot into code that no longer builds.  The ones that
+//! need a GPU or files on disk are `no_run`: they are type-checked, not
+//! executed.
+//!
+//! ## Basic training loop
+//!
+//! ```no_run
+//! use oxigaf_render::RasterConfig;
+//! use oxigaf_trainer::init::GaussianInitializer;
+//! use oxigaf_trainer::{LossConfig, OptimizerConfig, Trainer, TrainingConfig};
+//! use rand::SeedableRng;
+//!
+//! # async fn run() -> Result<(), oxigaf_trainer::TrainerError> {
+//! let config = TrainingConfig {
+//!     total_iterations: 1000,
+//!     checkpoint_interval: 100,
+//!     optimizer: OptimizerConfig::default(),
+//!     loss: LossConfig::default(),
+//!     ..Default::default()
+//! };
+//! config.validate()?;
+//!
+//! // Load a FLAME model and sample the initial Gaussians on its surface.
+//! let flame_model = oxigaf_flame::FlameModel::load("path/to/flame/model")?;
+//! let mesh = flame_model.forward(&oxigaf_flame::FlameParams::neutral());
+//! let mut init_rng = rand::rngs::StdRng::seed_from_u64(42);
+//! let model = GaussianInitializer::initialize(&mesh, &config.init, &mut init_rng)?;
+//!
+//! // `Trainer::new` takes an already-created wgpu device/queue.
+//! let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+//! let adapter = instance
+//!     .request_adapter(&wgpu::RequestAdapterOptions::default())
+//!     .await
+//!     .map_err(|e| oxigaf_trainer::TrainerError::Init(format!("no GPU adapter: {e}")))?;
+//! let (device, queue) = adapter
+//!     .request_device(&wgpu::DeviceDescriptor::default())
+//!     .await
+//!     .map_err(|e| oxigaf_trainer::TrainerError::Init(e.to_string()))?;
+//!
+//! let raster_config = RasterConfig::new()
+//!     .with_sh_degree(config.init.sh_degree)
+//!     .with_resolution(512, 512);
+//! let mut trainer = Trainer::new(config.clone(), model, raster_config, device, queue, 42)?;
+//!
+//! for _ in 0..config.total_iterations {
+//!     let output = trainer.train_step()?;
+//!     if output.iteration.is_multiple_of(config.log_interval) {
+//!         println!(
+//!             "Iteration {}: loss={:.4}, {} Gaussians",
+//!             output.iteration, output.loss.total, output.num_gaussians
+//!         );
+//!     }
+//! }
+//! trainer.save_checkpoint(std::path::Path::new("final_model.json"))?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## Custom learning rates
+//!
+//! ```
+//! use oxigaf_trainer::{OptimizerConfig, TrainingConfig};
+//!
+//! # fn main() -> Result<(), oxigaf_trainer::TrainerError> {
+//! let optimizer = OptimizerConfig {
+//!     lr_position: 1.6e-4,
+//!     lr_position_final: 1.6e-6,
+//!     lr_rotation: 1e-3,
+//!     lr_scale: 5e-3,
+//!     lr_opacity: 5e-2,
+//!     lr_sh: 2.5e-3,
+//!     lr_offset: 1e-4,
+//!     beta1: 0.9,
+//!     beta2: 0.999,
+//!     epsilon: 1e-15,
+//!     position_lr_decay_steps: 30_000,
+//! };
+//! let config = TrainingConfig {
+//!     optimizer,
+//!     ..Default::default()
+//! };
+//! config.validate()?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## Custom loss weights
+//!
+//! ```
+//! use oxigaf_trainer::{LossConfig, TrainingConfig};
+//!
+//! # fn main() -> Result<(), oxigaf_trainer::TrainerError> {
+//! let loss = LossConfig {
+//!     w_l1: 0.8,
+//!     w_ssim: 0.2,
+//!     w_ms_ssim: 0.0,
+//!     w_lpips: 0.05,
+//!     w_position_reg: 0.01,
+//!     w_scale_reg: 0.01,
+//!     w_opacity_reg: 0.001,
+//!     w_normal: 0.05,
+//!     w_gradient_penalty: 0.0,
+//!     gradient_penalty_threshold: 100.0,
+//!     // World-space scale above which `w_scale_reg` starts to charge.
+//!     w_scale_reg_max_scale: oxigaf_trainer::loss::MAX_REASONABLE_WORLD_SCALE,
+//! };
+//! let config = TrainingConfig {
+//!     loss,
+//!     ..Default::default()
+//! };
+//! config.validate()?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## Adaptive density control
+//!
+//! ```
+//! use oxigaf_trainer::{DensityConfig, TrainingConfig};
+//!
+//! # fn main() -> Result<(), oxigaf_trainer::TrainerError> {
+//! let density = DensityConfig {
+//!     grad_threshold: 0.0002,
+//!     min_opacity: 0.005,
+//!     max_screen_size: 20.0,
+//!     split_scale_threshold: 0.01,
+//!     max_gaussians: 500_000,
+//! };
+//! let config = TrainingConfig {
+//!     density,
+//!     density_control_start: 1_000,
+//!     density_control_end: 12_000,
+//!     density_control_interval: 500,
+//!     ..Default::default()
+//! };
+//! config.validate()?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## Optional loop components
+//!
+//! Learning-rate scheduling, gradient clipping, micro-batch accumulation and
+//! EMA shadow weights are all off by default and switched on from the config.
+//!
+//! ```
+//! use oxigaf_trainer::config::{GradientClipConfig, LrScheduleConfig};
+//! use oxigaf_trainer::TrainingConfig;
+//!
+//! # fn main() -> Result<(), oxigaf_trainer::TrainerError> {
+//! let config = TrainingConfig {
+//!     total_iterations: 15_000,
+//!     lr_schedule: LrScheduleConfig::WarmupCosine {
+//!         warmup_steps: 500,
+//!         total_steps: 0, // 0 = use `total_iterations`
+//!         min_factor: 0.05,
+//!     },
+//!     gradient_clip: GradientClipConfig::GlobalNorm { max_norm: 1.0 },
+//!     gradient_accumulation_steps: 4,
+//!     ema_decay: Some(0.999),
+//!     ..Default::default()
+//! };
+//! config.validate()?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## Checkpoints
+//!
+//! ```no_run
+//! use oxigaf_render::RasterConfig;
+//! use oxigaf_trainer::checkpoint::try_load_checkpoint_with_fallback;
+//! use oxigaf_trainer::{Trainer, TrainingConfig};
+//! use std::path::Path;
+//!
+//! # fn save(trainer: &Trainer, iteration: u32) -> Result<(), oxigaf_trainer::TrainerError> {
+//! let path = format!("checkpoints/training_{iteration:06}.json");
+//! trainer.save_checkpoint(Path::new(&path))?;
+//! # Ok(())
+//! # }
+//! # fn resume(
+//! #     config: TrainingConfig,
+//! #     checkpoint_path: &Path,
+//! #     raster_config: RasterConfig,
+//! #     device: wgpu::Device,
+//! #     queue: wgpu::Queue,
+//! # ) -> Result<(), oxigaf_trainer::TrainerError> {
+//! // Reads the primary file, falling back to `*.backup.json`.
+//! let checkpoint = try_load_checkpoint_with_fallback(checkpoint_path)?;
+//! println!("resuming from iteration {}", checkpoint.iteration);
+//!
+//! let mut trainer =
+//!     Trainer::from_checkpoint(config, checkpoint_path, raster_config, device, queue, 42)?;
+//! trainer.run(Some(Path::new("checkpoints")))?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## TensorBoard logging
+//!
+//! ```
+//! use oxigaf_trainer::{TensorBoardConfig, TrainingConfig};
+//!
+//! # fn main() -> Result<(), oxigaf_trainer::TrainerError> {
+//! let config = TrainingConfig {
+//!     tensorboard: TensorBoardConfig::new(std::env::temp_dir().join("runs/experiment_1"))
+//!         .with_run_name("run1"),
+//!     ..Default::default()
+//! };
+//! config.validate()?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## LPIPS perceptual loss
+//!
+//! ```no_run
+//! use oxigaf_trainer::loss::LossComputer;
+//! use oxigaf_trainer::{LossConfig, LpipsLossComputer};
+//! use std::path::Path;
+//!
+//! # fn main() -> Result<(), oxigaf_trainer::TrainerError> {
+//! let loss_config = LossConfig {
+//!     w_l1: 0.75,
+//!     w_lpips: 0.05,
+//!     ..Default::default()
+//! };
+//! let computer = LossComputer::new(loss_config);
+//!
+//! // LPIPS needs VGG weights on disk; it is reported as `0.0` until loaded.
+//! let mut lpips = LpipsLossComputer::new();
+//! lpips.init_uniform(Path::new("weights/vgg16.safetensors"))?;
+//! assert!(lpips.is_initialized());
+//!
+//! // The differentiated objective is always the one this computer reports.
+//! assert_eq!(computer.config().w_lpips, 0.05);
+//! # Ok(())
+//! # }
+//! ```
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 #![cfg_attr(not(test), deny(clippy::expect_used))]
@@ -21,6 +299,45 @@
 // A named struct would require a public type for a purely internal function.
 #![allow(clippy::type_complexity)]
 
+// ---------------------------------------------------------------------------
+// Pipeline modules — the shipped training path.
+//
+// These are the modules `trainer::Trainer` actually reaches during
+// `train_step` / `run` (plus `init`, which produces the model it is handed).
+// Changing one changes what the shipped training loop does. The last four
+// (`ema`, `gradient_accumulation`, `gradient_clipping`, `lr_scheduler`) are
+// built by `Trainer::new` and consumed inside `train_step` only when their
+// `TrainingConfig` field is set away from its no-op default — see the
+// `Trainer` doc comment above for which field gates which module.
+// ---------------------------------------------------------------------------
+
+pub mod checkpoint;
+pub mod config;
+pub mod density;
+pub mod diffusion_target;
+pub mod ema;
+pub mod gradient_accumulation;
+pub mod gradient_clipping;
+pub mod image_gradient;
+pub mod init;
+pub mod loss;
+pub mod lpips;
+pub mod lr_scheduler;
+pub mod metrics;
+pub mod mixed_precision;
+pub mod optimizer;
+pub mod profiler_integration;
+pub mod tensorboard;
+pub mod trainer;
+
+// ---------------------------------------------------------------------------
+// Opt-in components — NOT driven by `Trainer`.
+//
+// Independently tested building blocks for callers composing their own
+// training / analysis loops.  Nothing here is reachable from
+// `Trainer::train_step`; enabling one means calling it yourself.
+// ---------------------------------------------------------------------------
+
 pub mod activation_maps;
 pub mod adaptive_loss;
 pub mod adaptive_loss_weighting;
@@ -28,10 +345,8 @@ pub mod anomaly_detection;
 pub mod augmentation;
 pub mod callback;
 pub mod camera_sampling;
-pub mod checkpoint;
 pub mod checkpoint_interpolation;
 pub mod checkpoint_manager;
-pub mod config;
 pub mod continual_learning;
 pub mod contrastive_learning;
 pub mod contrastive_loss;
@@ -40,45 +355,38 @@ pub mod curriculum;
 pub mod curriculum_learning;
 pub mod data_augmentation;
 pub mod data_parallel;
-pub mod density;
 pub mod diagnostics;
-pub mod diffusion_target;
 pub mod domain_adaptation;
-pub mod ema;
 pub mod feature_bank;
 pub mod few_shot_adaptation;
-pub mod gradient_accumulation;
-pub mod gradient_clipping;
 pub mod gradient_flow;
 pub mod gradient_surgery;
 pub mod hparam_search;
-pub mod init;
 pub mod knowledge_distillation;
 pub mod layer_freezing;
-pub mod loss;
 pub mod loss_landscape;
 pub mod loss_reweighting;
-pub mod lpips;
-pub mod lr_scheduler;
 pub mod meta_learning;
-pub mod metrics;
-pub mod mixed_precision;
+/// A [`meta_learning::MetaModel`] over a real Gaussian avatar.
+///
+/// Lives at `src/meta_learning/avatar.rs`; it is attached here rather than
+/// declared inside [`meta_learning`] so that module needs no edit.  Read it as
+/// `meta_learning::avatar` — the path is the only difference.
+#[path = "meta_learning/avatar.rs"]
+pub mod meta_learning_avatar;
 pub mod multi_resolution_loss;
 pub mod noise_injection;
 pub mod ohem;
 pub mod online_hard_example_mining;
 pub mod online_learning;
-pub mod optimizer;
 pub mod pose_conditioning;
-pub mod profiler_integration;
 pub mod progressive_training;
 pub mod pruning;
 pub mod regularization;
 pub mod session_recorder;
 pub mod spectral_norm;
 pub mod synthetic_data;
-pub mod tensorboard;
-pub mod trainer;
+pub mod temperature_scaling;
 pub mod training_config;
 pub mod uncertainty_estimation;
 pub mod validation_split;
@@ -223,6 +531,12 @@ pub use adaptive_loss::{
     AdaptiveLossController, AdaptiveLossWeights, GradNormEntry, GradNormTracker, LossComponent,
     LossHistory, WeightingStrategy,
 };
+pub use adaptive_loss_weighting::{
+    alw_clip_weights, alw_format_history_summary, alw_format_weights, alw_imbalance_ratio,
+    alw_normalize_weights, alw_relative_training_rate, alw_weighted_sum, GradNormWeighter,
+    HomoscedasticWeighter, LossStatTracker, LossTask, LossWeightError, ScheduledWeighter,
+    TaskWeightSchedule, WeightHistory, WeightScheduleKind,
+};
 pub use anomaly_detection::{
     anom_check_convergence, anom_check_gradient_norm, anom_check_gradient_numerical,
     anom_check_loss_divergence, anom_check_loss_spike, anom_check_mode_collapse,
@@ -262,6 +576,41 @@ pub use continual_learning::{
     ContinualLearningError, ContinualLearningStats, EwcConfig, EwcRegularizer, FisherInformation,
     ReplayBuffer, TaskMask,
 };
+pub use contrastive_learning::{
+    cl_alignment,
+    cl_cosine_sim,
+    cl_dot,
+    cl_format_config,
+    cl_format_stats,
+    // InfoNCE loss
+    cl_info_nce_loss,
+    cl_l2_distance,
+    // Hard negative mining
+    cl_mine_hard_negatives,
+    cl_mine_semi_hard_negatives,
+    // Primitive utilities
+    cl_normalize,
+    // NT-Xent (SimCLR) loss
+    cl_nt_xent_loss,
+    cl_similarity_matrix,
+    // Supervised contrastive loss
+    cl_supcon_loss,
+    // Triplet loss
+    cl_triplet_loss,
+    cl_triplet_loss_from_config,
+    cl_uniformity,
+    cl_uniformity_sampled,
+    cl_update_geometry_stats,
+    cl_update_stats,
+    // Error type
+    ContrastiveError,
+    // Config (renamed to avoid conflict with contrastive_loss::ContrastiveConfig)
+    ContrastiveLearningConfig,
+    // Statistics and tracking
+    ContrastiveStats,
+    // Memory queue
+    EmbeddingQueue,
+};
 pub use contrastive_loss::{
     contrastive_loss_batch,
     contrastive_loss_pair,
@@ -285,7 +634,7 @@ pub use contrastive_loss::{
     TripletIndex,
 };
 pub use convergence_analysis::{
-    compute_loss_percentile, compute_loss_slope, compute_oscillation_score,
+    compute_loss_percentile, compute_loss_slope, compute_loss_slope_xy, compute_oscillation_score,
     compute_relative_improvement, detect_convergence_phase, detect_phase_transitions,
     ema_smooth_losses, estimate_steps_to_convergence, format_convergence_report,
     generate_convergence_report, loss_improvement_rate, ConvergenceAnalyzer, ConvergenceConfig,
@@ -308,7 +657,10 @@ pub use data_augmentation::{
     vertical_flip, xorshift64, xorshift_f32, AugImageStats, AugmentConfig, AugmentError, AugmentOp,
     ImageAugmenter,
 };
-pub use data_parallel::{DataParallelConfig, GradientAggregator, SyncMode, SyncReport};
+pub use data_parallel::{
+    compress_gradients, ring_all_reduce_bytes, run_parallel_step, DataParallelConfig,
+    GradientAggregator, GradientBucket, StepOutcome, SyncMode, SyncReport, DEFAULT_BUCKET_SIZE_MB,
+};
 pub use diagnostics::{
     DensityStats, EmaTracker, GradientNormTracker, LossTracker, TrainingDiagnostics,
 };
@@ -316,10 +668,25 @@ pub use diffusion_target::{
     DiffusionTargetConfig, DiffusionTargetGenerator, SdsLoss, SdsWeighting, TemporalConsistency,
     ViewConsistencyLoss,
 };
+pub use domain_adaptation::{
+    da_center_features, da_combined_loss, da_compute_stats, da_confidence_threshold_mask,
+    da_coral_loss, da_covariance, da_dann_loss, da_domain_accuracy, da_entropy, da_entropy_loss,
+    da_feature_mean, da_format_config, da_format_stats, da_frobenius_sq, da_gaussian_kernel,
+    da_median_bandwidth, da_mmd_biased, da_mmd_multiscale, da_mmd_unbiased, da_pseudo_label_loss,
+    da_reversal_loss_scale, AdaptationStats, DannConfig, DomainAdaptConfig, DomainAdaptMethod,
+    DomainAdaptationError, DomainBatch, DomainDiscriminator, MmdConfig,
+};
 pub use ema::GaussianEma;
 pub use feature_bank::{
     compute_bank_stats, sample_negatives, sample_positive, BankConfig, BankStatistics, FeatureBank,
     FeatureBankError, FeatureEntry, MomentumEncoder,
+};
+pub use few_shot_adaptation::{
+    fsa_class_indices, fsa_compute_stats, fsa_episode_accuracy, fsa_format_config,
+    fsa_format_result, fsa_format_stats, fsa_inner_gradient, fsa_inner_loss, fsa_lora_apply,
+    fsa_maml_adapt, fsa_maml_query_loss, fsa_proto_accuracy, fsa_proto_loss, fsa_run_episodes,
+    fsa_sample_episode, AdaptationResult, Episode, FewShotConfig, FewShotError, FewShotStats,
+    LoraAdapter, MamlState, PrototypicalNet, QuerySet, SupportSet,
 };
 pub use gradient_accumulation::{
     gradients_have_inf, gradients_have_nan, scale_loss, unscale_gradients, AccumulationConfig,
@@ -354,8 +721,9 @@ pub use knowledge_distillation::{
 };
 pub use layer_freezing::{
     apply_frozen_mask, back_frozen_mask, check_frozen_gradients_zeroed, front_frozen_mask,
-    frozen_compute_savings, progressive_mask, split_into_groups, unfreeze_fraction, FreezeConfig,
-    FreezingError, FrozenMask, GaussianParamGroup, ParameterFreezer, ProgressiveUnfreezeSchedule,
+    frozen_compute_savings, non_empty_group_sizes, progressive_mask, unfreeze_fraction,
+    FreezeConfig, FreezingError, FrozenMask, GaussianParamGroup, ParameterFreezer,
+    ProgressiveUnfreezeSchedule,
 };
 pub use loss::LpipsLossComputer;
 pub use loss_landscape::{
@@ -379,11 +747,13 @@ pub use lr_scheduler::{
     WarmupCosineSchedule, WarmupLinearSchedule,
 };
 pub use meta_learning::{
-    aggregate_meta_stats, apply_gradient_update, clip_gradient, compute_meta_gradient,
-    evaluate_query_loss, grad_norm, inner_loop_adapt, meta_update_step, mse_loss_and_grad,
-    run_meta_training, FewShotTask, LinearModel, MamlConfig, MetaLearningError, MetaTrainingStats,
-    TaskSampler,
+    adapt_on_support, aggregate_meta_stats, apply_gradient_update, clip_gradient,
+    compute_meta_gradient, evaluate_query_loss, grad_norm, inner_loop_adapt, meta_gradient,
+    meta_step, meta_update_step, mse_loss_and_grad, query_loss_with_params, run_meta_training,
+    FewShotTask, LinearModel, MamlConfig, MetaLearningError, MetaModel, MetaTask,
+    MetaTrainingStats, RegressionBatch, TaskSampler,
 };
+pub use metrics::{psnr, psnr_from_mse, ssim, MetricEntry, MetricTracker};
 pub use mixed_precision::{LossScaler, LossScalerStats, MixedPrecisionTrainer, TrainingPrecision};
 pub use noise_injection::{
     analyze_noise, inject_additive_noise, inject_multiplicative_noise, perturb_rotations,
@@ -477,16 +847,41 @@ pub use synthetic_data::{
     DifficultyLevel, FlameParamSampler, FlameParamSamplerConfig, GaussianCloudConfig,
     SyntheticBatch, SyntheticDataError, SyntheticFlameParams, SyntheticGaussianCloud,
 };
+pub use temperature_scaling::{
+    ts_binary_nll,
+    ts_brier_score,
+    ts_compute_stats,
+    ts_ece,
+    ts_format_reliability_diagram,
+    ts_format_result,
+    ts_format_stats,
+    ts_golden_section_search,
+    ts_log_loss,
+    ts_mce,
+    ts_overconfidence_error,
+    ts_pav_isotonic,
+    ts_reliability_diagram,
+    CalibrationConfig,
+    CalibrationError,
+    // CalibrationResult aliased to avoid collision with uncertainty_estimation::CalibrationResult
+    CalibrationResult as TsCalibrationResult,
+    CalibrationStats,
+    IsotonicCalibrator,
+    PlattScaler,
+    ReliabilityDiagram,
+    TemperatureScaler,
+};
 pub use tensorboard::{LearningRates, TensorBoardConfig, TensorBoardWriter, TrainingMetricsLogger};
 pub use trainer::{StepOutput, Trainer};
 pub use training_config::{TrainingProfile, TrainingProfileConfig};
 pub use uncertainty_estimation::{
     aggregate_region_uncertainty, apply_dropout_mask, bald_score, compute_calibration,
-    decompose_uncertainty, ensemble_variance, high_uncertainty_indices, mc_dropout_stats,
-    per_gaussian_position_uncertainty, prediction_entropy, reliability_diagram_points,
-    stable_softmax, temperature_scale, uncertainty_weighted_loss, variance_to_confidence,
-    CalibrationResult, ConfidenceMap, PredictionUncertainty, RegionUncertainty, UncertaintyConfig,
-    UncertaintyDecomposition, UncertaintyError,
+    decompose_uncertainty, decompose_uncertainty_with_variances, ensemble_variance,
+    high_uncertainty_indices, mc_dropout_stats, per_gaussian_position_uncertainty,
+    prediction_entropy, reliability_diagram_points, stable_softmax, temperature_scale,
+    uncertainty_weighted_loss, variance_to_confidence, CalibrationResult, ConfidenceMap,
+    PredictionUncertainty, RegionUncertainty, UncertaintyConfig, UncertaintyDecomposition,
+    UncertaintyError,
 };
 pub use validation_split::{
     DataSplit, EarlyStopper, EarlyStopperConfig, MonitorMetric, SplitError, SplitStrategy,
@@ -513,82 +908,4 @@ pub use weight_averaging::{
     compute_weight_stats, count_params, weights_cosine_similarity, weights_l2_distance, ModelSoup,
     ModelWeights, PolyakAverager, StochasticWeightAverager, SwaConfig, WeightAveragingError,
     WeightStats,
-};
-pub mod temperature_scaling;
-pub use adaptive_loss_weighting::{
-    alw_clip_weights, alw_format_history_summary, alw_format_weights, alw_imbalance_ratio,
-    alw_normalize_weights, alw_relative_training_rate, alw_weighted_sum, GradNormWeighter,
-    HomoscedasticWeighter, LossStatTracker, LossTask, LossWeightError, ScheduledWeighter,
-    TaskWeightSchedule, WeightHistory, WeightScheduleKind,
-};
-pub use contrastive_learning::{
-    cl_alignment,
-    cl_cosine_sim,
-    cl_dot,
-    cl_format_config,
-    cl_format_stats,
-    // InfoNCE loss
-    cl_info_nce_loss,
-    cl_l2_distance,
-    // Hard negative mining
-    cl_mine_hard_negatives,
-    cl_mine_semi_hard_negatives,
-    // Primitive utilities
-    cl_normalize,
-    // NT-Xent (SimCLR) loss
-    cl_nt_xent_loss,
-    cl_similarity_matrix,
-    // Supervised contrastive loss
-    cl_supcon_loss,
-    // Triplet loss
-    cl_triplet_loss,
-    cl_uniformity,
-    cl_update_stats,
-    // Error type
-    ContrastiveError,
-    // Config (renamed to avoid conflict with contrastive_loss::ContrastiveConfig)
-    ContrastiveLearningConfig,
-    // Statistics and tracking
-    ContrastiveStats,
-    // Memory queue
-    EmbeddingQueue,
-};
-pub use domain_adaptation::{
-    da_center_features, da_combined_loss, da_compute_stats, da_confidence_threshold_mask,
-    da_coral_loss, da_covariance, da_dann_loss, da_domain_accuracy, da_entropy, da_entropy_loss,
-    da_feature_mean, da_format_config, da_format_stats, da_frobenius_sq, da_gaussian_kernel,
-    da_median_bandwidth, da_mmd_biased, da_mmd_multiscale, da_mmd_unbiased, da_pseudo_label_loss,
-    da_reversal_loss_scale, AdaptationStats, DannConfig, DomainAdaptConfig, DomainAdaptMethod,
-    DomainAdaptationError, DomainBatch, DomainDiscriminator, MmdConfig,
-};
-pub use few_shot_adaptation::{
-    fsa_class_indices, fsa_compute_stats, fsa_episode_accuracy, fsa_format_config,
-    fsa_format_result, fsa_format_stats, fsa_inner_gradient, fsa_inner_loss, fsa_lora_apply,
-    fsa_maml_adapt, fsa_maml_query_loss, fsa_proto_accuracy, fsa_proto_loss, fsa_sample_episode,
-    AdaptationResult, Episode, FewShotConfig, FewShotError, FewShotStats, LoraAdapter, MamlState,
-    PrototypicalNet, QuerySet, SupportSet,
-};
-pub use temperature_scaling::{
-    ts_binary_nll,
-    ts_brier_score,
-    ts_compute_stats,
-    ts_ece,
-    ts_format_reliability_diagram,
-    ts_format_result,
-    ts_format_stats,
-    ts_golden_section_search,
-    ts_log_loss,
-    ts_mce,
-    ts_overconfidence_error,
-    ts_pav_isotonic,
-    ts_reliability_diagram,
-    CalibrationConfig,
-    CalibrationError,
-    // CalibrationResult aliased to avoid collision with uncertainty_estimation::CalibrationResult
-    CalibrationResult as TsCalibrationResult,
-    CalibrationStats,
-    IsotonicCalibrator,
-    PlattScaler,
-    ReliabilityDiagram,
-    TemperatureScaler,
 };

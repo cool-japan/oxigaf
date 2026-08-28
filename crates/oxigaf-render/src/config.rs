@@ -1,5 +1,7 @@
 //! Rasterizer configuration.
 
+use crate::rasterizer::RASTERIZE_TILE_SIZE;
+use crate::RenderError;
 use serde::{Deserialize, Serialize};
 
 /// GPU architecture preset for optimal workgroup sizes.
@@ -9,6 +11,37 @@ use serde::{Deserialize, Serialize};
 /// - AMD: 64 threads (64 threads/wavefront)
 /// - Apple Silicon: 32-64 threads (SIMD width varies)
 /// - Intel: 32 threads (8 EU threads × 4 SIMD lanes)
+///
+/// # What the rasterizer actually honours
+///
+/// [`Rasterizer::from_device`](crate::Rasterizer::from_device) resolves
+/// [`RasterConfig::effective_preprocess_wg_size`] (this preset, or
+/// [`RasterConfig::preprocess_workgroup_size`] when set) and compiles it
+/// into every 1-D kernel whose `@workgroup_size` is pure dispatch geometry
+/// — the `preprocess` variants, `preprocess_bwd`, `tile_assign`,
+/// `tile_ranges` and `atomic_to_f32` — by substituting the attribute into
+/// the WGSL source before creating the shader module, then derives the
+/// dispatch grid from the same number via
+/// [`WorkgroupConfig::for_linear_size`](crate::workgroup::WorkgroupConfig::for_linear_size).
+///
+/// Three kinds of kernel are deliberately **excluded**, because their thread
+/// count is baked into their bodies rather than just their attribute:
+///
+/// * `prefix_sum` / `prefix_sum_add` (a 512-element shared-memory block and
+///   literal 256/512 strides) and `radix_histogram` / `radix_scatter`
+///   (workgroup-sized shared histograms) — retargeting these silently
+///   corrupts their output;
+/// * `rasterize_fwd` / `rasterize_bwd` / `cov2d_bwd`, whose
+///   `@workgroup_size(16, 16)` *is* the tile size (one thread per tile
+///   pixel) and is therefore fixed by `RASTERIZE_TILE_SIZE`, not by
+///   [`RasterConfig::rasterize_workgroup_size`].
+///
+/// [`Self::rasterize_workgroup_size`] and
+/// [`Self::prefix_sum_workgroup_size`] consequently remain advisory: they
+/// describe what a GPU class would prefer, and
+/// [`crate::workgroup::WorkgroupBenchmarker::recommend_on_device`] can rank
+/// candidates on real hardware, but the shipped kernels for those stages
+/// cannot take the value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum GpuPreset {
     /// Automatically detect based on adapter info.
@@ -160,12 +193,21 @@ pub struct RasterConfig {
     pub output_normals: bool,
 
     // --- Performance options ---
-    /// GPU architecture preset for workgroup sizes.
+    /// GPU architecture preset for workgroup sizes. Supplies the default
+    /// 1-D workgroup size the rasterizer compiles into its retargetable
+    /// kernels — see [`GpuPreset`]'s doc for exactly which stages honour it.
     pub gpu_preset: GpuPreset,
-    /// Override preprocess workgroup size (None = use preset).
+    /// Override the 1-D (preprocess-class) workgroup size; `None` uses the
+    /// preset. Compiled into the retargetable kernels and used for their
+    /// dispatch grid — see [`GpuPreset`]'s doc.
     pub preprocess_workgroup_size: Option<u32>,
-    /// Override rasterize workgroup size (None = use preset).
+    /// Preferred rasterize workgroup size (None = use preset).
     /// Format: [width, height].
+    ///
+    /// Advisory only: the rasterization kernels' `@workgroup_size(16, 16)`
+    /// *is* [`crate::rasterizer::RASTERIZE_TILE_SIZE`] (one thread per tile
+    /// pixel), so it cannot vary independently of `tile_size`. See
+    /// [`GpuPreset`]'s doc.
     pub rasterize_workgroup_size: Option<[u32; 2]>,
 
     // --- Culling options ---
@@ -174,6 +216,13 @@ pub struct RasterConfig {
     pub transmittance_threshold: f32,
     /// Enable hierarchical tile culling (default: true).
     /// Skips tiles with no visible Gaussians.
+    ///
+    /// Not yet consulted by the rasterizer: no dispatch code reads this
+    /// field, so tile culling behaviour does not currently change when it
+    /// is toggled. Honouring it needs a coarse pre-pass plus an indirect
+    /// dispatch in `rasterize_fwd.wgsl`; until then the per-tile early-out
+    /// on an empty `tile_ranges` entry is the only culling in effect, and it
+    /// is unconditional.
     pub hierarchical_culling: bool,
 
     // --- Memory options ---
@@ -298,21 +347,28 @@ impl RasterConfig {
         self
     }
 
-    /// Set GPU preset for workgroup sizes.
+    /// Set GPU preset for workgroup sizes. Supplies the 1-D workgroup size
+    /// the rasterizer compiles into its retargetable kernels — see
+    /// [`GpuPreset`]'s doc.
     #[must_use]
     pub const fn with_gpu_preset(mut self, preset: GpuPreset) -> Self {
         self.gpu_preset = preset;
         self
     }
 
-    /// Override preprocess workgroup size.
+    /// Override the 1-D (preprocess-class) workgroup size.
+    ///
+    /// Must be a power of two the device supports;
+    /// [`Rasterizer::from_device`](crate::Rasterizer::from_device) rejects
+    /// anything else rather than failing later in shader compilation.
     #[must_use]
     pub const fn with_preprocess_workgroup_size(mut self, size: u32) -> Self {
         self.preprocess_workgroup_size = Some(size);
         self
     }
 
-    /// Override rasterize workgroup size.
+    /// Set the preferred rasterize workgroup size. Advisory only — see
+    /// [`Self::rasterize_workgroup_size`].
     #[must_use]
     pub const fn with_rasterize_workgroup_size(mut self, size: [u32; 2]) -> Self {
         self.rasterize_workgroup_size = Some(size);
@@ -357,7 +413,9 @@ impl RasterConfig {
 
     /// Get effective preprocess workgroup size.
     ///
-    /// Returns custom override if set, otherwise uses preset.
+    /// Returns the explicit override if set, otherwise the preset's value.
+    /// This is the number compiled into the retargetable 1-D kernels and
+    /// used for their dispatch grid — see [`GpuPreset`]'s doc.
     #[inline]
     #[must_use]
     pub fn effective_preprocess_wg_size(&self) -> u32 {
@@ -367,7 +425,9 @@ impl RasterConfig {
 
     /// Get effective rasterize workgroup size.
     ///
-    /// Returns custom override if set, otherwise uses preset.
+    /// Returns the override if set, otherwise the preset's value. Advisory:
+    /// the rasterization kernels are locked to the tile size — see
+    /// [`Self::rasterize_workgroup_size`].
     #[inline]
     #[must_use]
     pub fn effective_rasterize_wg_size(&self) -> [u32; 2] {
@@ -375,14 +435,18 @@ impl RasterConfig {
             .unwrap_or_else(|| self.gpu_preset.rasterize_workgroup_size())
     }
 
-    /// Get effective prefix sum workgroup size.
+    /// Get effective prefix sum workgroup size. Advisory: `prefix_sum.wgsl`
+    /// bakes its thread count into shared-memory sizing — see
+    /// [`GpuPreset`]'s doc.
     #[inline]
     #[must_use]
     pub fn effective_prefix_sum_wg_size(&self) -> u32 {
         self.gpu_preset.prefix_sum_workgroup_size()
     }
 
-    /// Compute number of workgroups needed for preprocess dispatch.
+    /// Compute number of workgroups needed for preprocess dispatch, from
+    /// [`Self::effective_preprocess_wg_size`] — the same size the rasterizer
+    /// compiles into the preprocess kernel.
     #[inline]
     #[must_use]
     pub fn preprocess_workgroups(&self, n_gaussians: u32) -> u32 {
@@ -450,6 +514,93 @@ impl RasterConfig {
     #[must_use]
     pub const fn memory_budget_bytes(&self) -> u64 {
         (self.max_gpu_memory_mb as u64) * 1024 * 1024
+    }
+
+    /// Validate that this configuration's values are internally consistent.
+    ///
+    /// All fields are public and the type derives `Deserialize`, so a
+    /// config loaded from an untrusted file (or built by hand) can carry
+    /// values that would otherwise panic deep inside a consumer — e.g.
+    /// `tile_size: 0` reaches a `div_ceil` panic in [`Self::tiles_x`] /
+    /// [`Self::tiles_y`] / [`Self::num_tiles`] instead of failing here with
+    /// a clear message.
+    ///
+    /// This checks only what is *internally* consistent. The extra
+    /// constraints the compiled GPU shaders impose (notably the fixed tile
+    /// size) live in [`Self::validate_for_rasterizer`], which
+    /// [`Rasterizer::from_device`](crate::Rasterizer::from_device) calls.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RenderError::Rasterize`] describing the first invalid
+    /// field found:
+    /// - `tile_size == 0`.
+    /// - `sh_degree > 3` — only degrees 0-3 have a defined SH basis; a
+    ///   larger value would silently desync [`Self::sh_coeffs_per_gaussian`]'s
+    ///   stride from what shaders and CPU code expect.
+    /// - `image_width * image_height` does not fit in `u32` — the width
+    ///   and height are multiplied directly in [`Self::num_pixels`].
+    /// - `near_plane >= far_plane` — a degenerate or inverted clip range.
+    pub fn validate(&self) -> Result<(), RenderError> {
+        if self.tile_size == 0 {
+            return Err(RenderError::Rasterize(
+                "RasterConfig: tile_size must be > 0".to_string(),
+            ));
+        }
+        if self.sh_degree > 3 {
+            return Err(RenderError::Rasterize(format!(
+                "RasterConfig: sh_degree must be in [0, 3], got {}",
+                self.sh_degree
+            )));
+        }
+        if (u64::from(self.image_width)) * (u64::from(self.image_height)) > u64::from(u32::MAX) {
+            return Err(RenderError::Rasterize(format!(
+                "RasterConfig: image_width * image_height ({} * {}) overflows u32",
+                self.image_width, self.image_height
+            )));
+        }
+        // `partial_cmp` rather than `>=`: a NaN plane compares as neither, and
+        // must be rejected rather than silently accepted.
+        if self.near_plane.partial_cmp(&self.far_plane) != Some(std::cmp::Ordering::Less) {
+            return Err(RenderError::Rasterize(format!(
+                "RasterConfig: near_plane ({}) must be < far_plane ({})",
+                self.near_plane, self.far_plane
+            )));
+        }
+        Ok(())
+    }
+
+    /// Validate this configuration against the **compiled GPU rasterizer**.
+    ///
+    /// Runs every [`Self::validate`] check and additionally rejects a
+    /// `tile_size` other than [`RASTERIZE_TILE_SIZE`]: `rasterize_fwd.wgsl`
+    /// and `rasterize_bwd.wgsl` declare `@workgroup_size(16, 16)`, which
+    /// WGSL fixes at shader-compile time, and one workgroup covers exactly
+    /// one tile — so any other tile size desyncs the tile grid from the
+    /// workgroup grid and silently renders garbage.
+    ///
+    /// This is deliberately separate from [`Self::validate`]: a config used
+    /// for CPU-side tiling maths (or by a future shader variant) is not
+    /// wrong just because it does not match the shipped shaders, but a
+    /// config handed to [`Rasterizer`](crate::Rasterizer) is.
+    ///
+    /// # Errors
+    ///
+    /// Everything [`Self::validate`] reports, plus [`RenderError::Rasterize`]
+    /// when `tile_size != RASTERIZE_TILE_SIZE`.
+    pub fn validate_for_rasterizer(&self) -> Result<(), RenderError> {
+        self.validate()?;
+        if self.tile_size != RASTERIZE_TILE_SIZE {
+            return Err(RenderError::Rasterize(format!(
+                "RasterConfig::tile_size must be {RASTERIZE_TILE_SIZE}, got {}: \
+                 rasterize_fwd.wgsl and rasterize_bwd.wgsl declare \
+                 @workgroup_size({RASTERIZE_TILE_SIZE}, {RASTERIZE_TILE_SIZE}) at \
+                 shader-compile time, so any other tile size desyncs the tile grid \
+                 from the workgroup grid",
+                self.tile_size
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -568,5 +719,118 @@ mod tests {
         // Degree 3: (3+1)^2 * 3 = 48
         let config = RasterConfig::new().with_sh_degree(3);
         assert_eq!(config.sh_coeffs_per_gaussian(), 48);
+    }
+
+    #[test]
+    fn test_validate_default_is_ok() {
+        assert!(RasterConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_rejects_zero_tile_size() {
+        let config = RasterConfig {
+            tile_size: 0,
+            ..RasterConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_rejects_sh_degree_above_three() {
+        let mut config = RasterConfig {
+            sh_degree: 4,
+            ..RasterConfig::default()
+        };
+        assert!(config.validate().is_err());
+        // The documented range [0, 3] is inclusive.
+        config.sh_degree = 3;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_rejects_pixel_count_overflow() {
+        let config = RasterConfig {
+            image_width: u32::MAX,
+            image_height: 2,
+            ..RasterConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_rejects_inverted_clip_range() {
+        let mut config = RasterConfig {
+            near_plane: 10.0,
+            far_plane: 1.0,
+            ..RasterConfig::default()
+        };
+        assert!(config.validate().is_err());
+
+        config.near_plane = 5.0;
+        config.far_plane = 5.0; // equal is also degenerate
+        assert!(config.validate().is_err());
+
+        // NaN compares as neither less nor greater and must not slip through.
+        config.near_plane = f32::NAN;
+        config.far_plane = 100.0;
+        assert!(config.validate().is_err());
+    }
+
+    /// Regression (F300): a deserialized config with a tile size the shipped
+    /// rasterization shaders were not compiled for must be rejected by the
+    /// rasterizer-facing validator, not silently render a desynced tile grid.
+    #[test]
+    fn test_validate_for_rasterizer_rejects_foreign_tile_size() {
+        let mut config = RasterConfig::default();
+        assert!(config.validate_for_rasterizer().is_ok());
+
+        config.tile_size = 8;
+        // Internally consistent...
+        assert!(config.validate().is_ok());
+        // ...but not something the compiled shaders can rasterize.
+        let err = config
+            .validate_for_rasterizer()
+            .expect_err("a non-16 tile size must be rejected for the GPU rasterizer");
+        let msg = err.to_string();
+        assert!(msg.contains("tile_size"), "{msg}");
+        assert!(msg.contains("16"), "{msg}");
+    }
+
+    /// The rasterizer-facing validator must still catch everything the
+    /// general one does (it is what `Rasterizer::from_device` calls).
+    #[test]
+    fn test_validate_for_rasterizer_subsumes_general_validation() {
+        let zero_tile = RasterConfig {
+            tile_size: 0,
+            ..RasterConfig::default()
+        };
+        assert!(zero_tile.validate_for_rasterizer().is_err());
+
+        let bad_degree = RasterConfig {
+            sh_degree: 4,
+            ..RasterConfig::default()
+        };
+        assert!(bad_degree.validate_for_rasterizer().is_err());
+
+        let inverted_clip = RasterConfig {
+            near_plane: 10.0,
+            far_plane: 1.0,
+            ..RasterConfig::default()
+        };
+        assert!(inverted_clip.validate_for_rasterizer().is_err());
+    }
+
+    #[test]
+    fn test_validate_rejects_would_have_panicked_tiles_x() {
+        // Regression guard: before `validate()` existed, tile_size = 0
+        // would panic inside `tiles_x()`'s `div_ceil`. Confirm `validate()`
+        // catches it before any such call is made.
+        let config = RasterConfig {
+            tile_size: 0,
+            ..RasterConfig::default()
+        };
+        assert!(config.validate().is_err());
+        // (Not calling `config.tiles_x()` here: that panic is exactly what
+        // callers are expected to avoid by checking `validate()` first.)
     }
 }

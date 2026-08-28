@@ -7,6 +7,10 @@
 
 use thiserror::Error;
 
+use oxigaf_flame::FlameParams;
+use oxigaf_render::color_to_sh_dc;
+use oxigaf_render::gaussian::{GaussianAttributes, GaussianModel};
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Error type
 // ─────────────────────────────────────────────────────────────────────────────
@@ -119,6 +123,29 @@ impl SyntheticFlameParams {
     /// Returns `true` when every pose value has absolute value less than `threshold`.
     pub fn is_neutral(&self, threshold: f32) -> bool {
         self.pose.iter().all(|v| v.abs() < threshold)
+    }
+}
+
+impl From<SyntheticFlameParams> for FlameParams {
+    /// Convert into the real [`oxigaf_flame::FlameParams`] used by the
+    /// trainer/renderer, so synthetic samples can drive the training
+    /// pipeline directly instead of requiring a hand-written field-by-field
+    /// copy at every call site.
+    ///
+    /// `translation` is coerced to exactly 3 components: missing trailing
+    /// values default to `0.0`, extra values are dropped.
+    fn from(p: SyntheticFlameParams) -> Self {
+        let translation = [
+            p.translation.first().copied().unwrap_or(0.0),
+            p.translation.get(1).copied().unwrap_or(0.0),
+            p.translation.get(2).copied().unwrap_or(0.0),
+        ];
+        FlameParams {
+            shape: p.shape,
+            expression: p.expression,
+            pose: p.pose,
+            translation,
+        }
     }
 }
 
@@ -504,6 +531,66 @@ impl SyntheticGaussianCloud {
         }
         let sum: f32 = (0..n).map(|i| self.opacity(i)).sum();
         sum / n as f32
+    }
+
+    /// Convert into a renderer-ready [`oxigaf_render::gaussian::GaussianModel`]
+    /// so a synthetic cloud can drive the trainer/renderer end-to-end.
+    ///
+    /// RGB `colors` become degree-0 spherical-harmonics DC coefficients via
+    /// [`oxigaf_render::color_to_sh_dc`]; any higher-order SH bands (degree
+    /// `1..=sh_degree`) are filled with `0.0`, matching the convention used
+    /// by [`GaussianInitializer`](crate::init::GaussianInitializer) for a
+    /// fresh mesh-bound init. The FLAME-binding arrays (`face_indices`,
+    /// `barycentric`, `local_offsets`, `is_rigid`) have no synthetic mesh to
+    /// bind to, so they are filled with identity placeholders: face `0`,
+    /// barycentric `[1/3, 1/3, 1/3]`, zero local offset, and `is_rigid =
+    /// true` for every Gaussian — enough for the renderer and loss
+    /// machinery to run end-to-end on synthetic data.
+    pub fn into_gaussian_model(self, sh_degree: u32) -> GaussianModel {
+        let n = self.num_gaussians();
+        let sh_channels = ((sh_degree + 1) * (sh_degree + 1) * 3) as usize;
+
+        let mut gaussians = Vec::with_capacity(n);
+        let mut sh_coeffs = Vec::with_capacity(n * sh_channels);
+        let mut face_indices = Vec::with_capacity(n);
+        let mut barycentric = Vec::with_capacity(n);
+        let mut local_offsets = Vec::with_capacity(n);
+        let mut is_rigid = Vec::with_capacity(n);
+
+        for i in 0..n {
+            let rgb = self.color(i);
+            let dc = color_to_sh_dc(rgb[0], rgb[1], rgb[2]);
+
+            gaussians.push(GaussianAttributes {
+                position: self.position(i),
+                _pad0: 0.0,
+                rotation: self.rotation(i),
+                scale: self.log_scale(i),
+                opacity: self.opacities[i],
+            });
+
+            sh_coeffs.extend(
+                dc.iter()
+                    .copied()
+                    .chain(std::iter::repeat(0.0))
+                    .take(sh_channels),
+            );
+
+            face_indices.push(0);
+            barycentric.push([1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0]);
+            local_offsets.push([0.0, 0.0, 0.0]);
+            is_rigid.push(true);
+        }
+
+        GaussianModel {
+            gaussians,
+            sh_coeffs,
+            sh_degree,
+            face_indices,
+            barycentric,
+            local_offsets,
+            is_rigid,
+        }
     }
 }
 
@@ -1238,5 +1325,162 @@ mod tests {
             hard_mag > easy_mag,
             "hard ({hard_mag}) should have larger expression magnitude than easy ({easy_mag})"
         );
+    }
+
+    // ── Conversions to real training-pipeline types ──────────────────────────
+
+    #[test]
+    fn test_synthetic_flame_params_into_flame_params() {
+        let synth = SyntheticFlameParams::new(
+            vec![0.1, 0.2, 0.3],
+            vec![0.4, 0.5],
+            vec![0.0; 15],
+            vec![1.0, 2.0, 3.0],
+        );
+        let real: FlameParams = synth.into();
+        assert_eq!(real.shape, vec![0.1, 0.2, 0.3]);
+        assert_eq!(real.expression, vec![0.4, 0.5]);
+        assert_eq!(real.pose.len(), 15);
+        assert_eq!(real.translation, [1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn test_synthetic_flame_params_into_flame_params_short_translation() {
+        // Defensive: a translation vector shorter than 3 should zero-fill
+        // rather than panic when coerced into the fixed-size array.
+        let synth = SyntheticFlameParams::new(vec![], vec![], vec![0.0; 15], vec![9.0]);
+        let real: FlameParams = synth.into();
+        assert_eq!(real.translation, [9.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn test_synthetic_gaussian_cloud_into_gaussian_model_shapes() {
+        let cfg = GaussianCloudConfig {
+            num_gaussians: 25,
+            ..Default::default()
+        };
+        let cloud = sample_gaussian_cloud(&cfg).expect("valid");
+        let n = cloud.num_gaussians();
+        let sh_degree = 2u32;
+        let model = cloud.into_gaussian_model(sh_degree);
+
+        let expected_sh_channels = ((sh_degree + 1) * (sh_degree + 1) * 3) as usize;
+        assert_eq!(model.gaussians.len(), n);
+        assert_eq!(model.sh_coeffs.len(), n * expected_sh_channels);
+        assert_eq!(model.sh_degree, sh_degree);
+        assert_eq!(model.face_indices.len(), n);
+        assert_eq!(model.barycentric.len(), n);
+        assert_eq!(model.local_offsets.len(), n);
+        assert_eq!(model.is_rigid.len(), n);
+        assert!(model.is_rigid.iter().all(|&r| r));
+        assert!(model.face_indices.iter().all(|&f| f == 0));
+        for bary in &model.barycentric {
+            for v in bary {
+                assert!((*v - 1.0 / 3.0).abs() < 1e-6);
+            }
+        }
+    }
+
+    #[test]
+    fn test_synthetic_gaussian_cloud_into_gaussian_model_sh_dc_roundtrip() {
+        // The DC (degree-0) SH coefficients must invert back to the original
+        // colour through the renderer's own `sh_dc_to_color`.
+        let cfg = GaussianCloudConfig {
+            num_gaussians: 5,
+            random_colors: true,
+            seed: 321,
+            ..Default::default()
+        };
+        let cloud = sample_gaussian_cloud(&cfg).expect("valid");
+        let original_colors: Vec<[f32; 3]> =
+            (0..cloud.num_gaussians()).map(|i| cloud.color(i)).collect();
+
+        let model = cloud.into_gaussian_model(0);
+        let sh_channels = 3usize; // degree 0 → 1 band × 3 channels
+        for (i, orig) in original_colors.iter().enumerate() {
+            let base = i * sh_channels;
+            let dc = [
+                model.sh_coeffs[base],
+                model.sh_coeffs[base + 1],
+                model.sh_coeffs[base + 2],
+            ];
+            let recovered = oxigaf_render::sh_dc_to_color(dc[0], dc[1], dc[2]);
+            for c in 0..3 {
+                assert!(
+                    (recovered[c] - orig[c]).abs() < 1e-4,
+                    "channel {c}: recovered {} vs original {}",
+                    recovered[c],
+                    orig[c]
+                );
+            }
+        }
+    }
+
+    // Regression: `into_gaussian_model` fills each Gaussian's SH coefficients
+    // as `[dc[0], dc[1], dc[2], 0.0, ..., 0.0]`. The previous range-loop form
+    // (`for c in 0..sh_channels { push(if c < 3 { dc[c] } else { 0.0 }) }`)
+    // and the iterator-chain rewrite it was replaced with must agree
+    // per-index, not just on total length — `test_..._shapes` above only
+    // checks `sh_coeffs.len()`, so this exercises `sh_degree > 0` (where the
+    // zero-padding tail is actually reached) at the value level.
+    #[test]
+    fn test_synthetic_gaussian_cloud_into_gaussian_model_sh_padding_is_dc_then_zeros() {
+        let cfg = GaussianCloudConfig {
+            num_gaussians: 6,
+            random_colors: true,
+            seed: 99,
+            ..Default::default()
+        };
+        let cloud = sample_gaussian_cloud(&cfg).expect("valid");
+        let n = cloud.num_gaussians();
+        let colors: Vec<[f32; 3]> = (0..n).map(|i| cloud.color(i)).collect();
+
+        let sh_degree = 2u32;
+        let sh_channels = ((sh_degree + 1) * (sh_degree + 1) * 3) as usize;
+        assert!(
+            sh_channels > 3,
+            "test requires a degree with padding to check"
+        );
+
+        let model = cloud.into_gaussian_model(sh_degree);
+        assert_eq!(model.sh_coeffs.len(), n * sh_channels);
+
+        for (i, rgb) in colors.iter().enumerate() {
+            let expected_dc = color_to_sh_dc(rgb[0], rgb[1], rgb[2]);
+            let base = i * sh_channels;
+            let coeffs = &model.sh_coeffs[base..base + sh_channels];
+            let dc = [coeffs[0], coeffs[1], coeffs[2]];
+
+            assert_eq!(dc, expected_dc, "gaussian {i}: degree-0 DC band mismatch");
+            assert!(
+                coeffs[3..].iter().all(|&v| v == 0.0),
+                "gaussian {i}: higher-order SH bands must be zero-filled, got {:?}",
+                &coeffs[3..]
+            );
+        }
+    }
+
+    #[test]
+    fn test_synthetic_gaussian_cloud_into_gaussian_model_preserves_geometry() {
+        let cfg = GaussianCloudConfig {
+            num_gaussians: 10,
+            seed: 7,
+            ..Default::default()
+        };
+        let cloud = sample_gaussian_cloud(&cfg).expect("valid");
+        let positions: Vec<[f32; 3]> = (0..cloud.num_gaussians())
+            .map(|i| cloud.position(i))
+            .collect();
+        let rotations: Vec<[f32; 4]> = (0..cloud.num_gaussians())
+            .map(|i| cloud.rotation(i))
+            .collect();
+        let opacities = cloud.opacities.clone();
+
+        let model = cloud.into_gaussian_model(3);
+        for (i, g) in model.gaussians.iter().enumerate() {
+            assert_eq!(g.position, positions[i]);
+            assert_eq!(g.rotation, rotations[i]);
+            assert_eq!(g.opacity, opacities[i]);
+        }
     }
 }

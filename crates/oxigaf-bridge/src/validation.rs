@@ -3,7 +3,9 @@
 //! This module provides validation for converted GAF checkpoints to ensure they are
 //! compatible with oxigaf-diffusion pipeline.
 
-use crate::{BridgeError, Result};
+#[cfg(any(feature = "test-fixtures", test))]
+use crate::BridgeError;
+use crate::Result;
 use std::path::Path;
 
 /// Validation report for a converted checkpoint
@@ -103,7 +105,12 @@ impl Default for ValidationReport {
 ///
 /// # Errors
 ///
-/// Returns error if file cannot be read or parsed
+/// A missing file or a file that fails to parse as safetensors is *not*
+/// reported through `Err` -- it comes back through the returned
+/// [`ValidationReport`] instead (`file_exists` / `safetensors_valid` set to
+/// `false`; check [`ValidationReport::is_valid`] or the individual fields).
+/// This function only returns `Err` if the file exists but cannot be read
+/// (e.g. a permissions error).
 ///
 /// # Examples
 ///
@@ -152,71 +159,94 @@ pub fn validate_converted_checkpoint(path: &Path) -> Result<ValidationReport> {
         }
     }
 
-    // 4. Validate layer names (should use dots, not slashes)
+    // 4. Single pass over every tensor: name validity, shape validity, and
+    // NaN/Inf, fetching each tensor once instead of three separate
+    // `names()` walks each re-fetching every tensor.
     for name in safetensors.names() {
         if name.contains('/') {
             report
                 .invalid_names
                 .push(format!("{} (contains '/')", name));
         }
-    }
 
-    // 5. Validate tensor shapes
-    for name in safetensors.names() {
-        if let Ok(tensor) = safetensors.tensor(name) {
-            if !is_valid_shape(tensor.shape()) {
-                report
-                    .invalid_shapes
-                    .push((name.to_string(), tensor.shape().to_vec()));
-            }
-        }
-    }
+        let Ok(tensor) = safetensors.tensor(name) else {
+            continue;
+        };
 
-    // 6. Check for NaN/Inf values
-    for name in safetensors.names() {
-        if let Ok(tensor) = safetensors.tensor(name) {
-            let dtype = tensor.dtype();
-            match dtype {
-                safetensors::tensor::Dtype::F32 => {
-                    let data: &[f32] = bytemuck::cast_slice(tensor.data());
-                    if data.iter().any(|x| x.is_nan() || x.is_infinite()) {
-                        report.has_nan_inf.push(name.to_string());
-                    }
-                }
-                safetensors::tensor::Dtype::F16 => {
-                    // Cast to u16 and convert to f16 for checking
-                    let data_u16: &[u16] = bytemuck::cast_slice(tensor.data());
-                    for &bits in data_u16 {
-                        let f = half::f16::from_bits(bits);
-                        if f.is_nan() || f.is_infinite() {
-                            report.has_nan_inf.push(name.to_string());
-                            break;
-                        }
-                    }
-                }
-                safetensors::tensor::Dtype::BF16 => {
-                    // Cast to u16 and convert to bf16 for checking
-                    let data_u16: &[u16] = bytemuck::cast_slice(tensor.data());
-                    for &bits in data_u16 {
-                        let f = half::bf16::from_bits(bits);
-                        if f.is_nan() || f.is_infinite() {
-                            report.has_nan_inf.push(name.to_string());
-                            break;
-                        }
-                    }
-                }
-                _ => {
-                    // Other dtypes - skip NaN check
-                    report.warnings.push(format!(
-                        "Skipping NaN check for {} (dtype: {:?})",
-                        name, dtype
-                    ));
-                }
-            }
+        if !is_valid_shape(tensor.shape()) {
+            report
+                .invalid_shapes
+                .push((name.to_string(), tensor.shape().to_vec()));
         }
+
+        check_nan_inf(name, &tensor, &mut report);
     }
 
     Ok(report)
+}
+
+/// Checks `tensor` for NaN/Inf values, recording a hit in
+/// `report.has_nan_inf`. Dtypes this function cannot interpret record a
+/// warning instead of being silently skipped; a tensor whose byte slice is
+/// not aligned or long enough for its dtype -- which `bytemuck::cast_slice`
+/// would panic on -- is reported as a warning rather than aborting the
+/// whole validation, matching how every other defect class here degrades
+/// gracefully instead of crashing the validator on the malformed input it
+/// exists to check.
+fn check_nan_inf(
+    name: &str,
+    tensor: &safetensors::tensor::TensorView<'_>,
+    report: &mut ValidationReport,
+) {
+    use safetensors::tensor::Dtype;
+
+    match tensor.dtype() {
+        Dtype::F32 => match bytemuck::try_cast_slice::<u8, f32>(tensor.data()) {
+            Ok(data) => {
+                if data.iter().any(|x| x.is_nan() || x.is_infinite()) {
+                    report.has_nan_inf.push(name.to_string());
+                }
+            }
+            Err(e) => report.warnings.push(format!(
+                "Could not check {} for NaN/Inf: F32 data is unaligned or truncated ({})",
+                name, e
+            )),
+        },
+        Dtype::F16 => match bytemuck::try_cast_slice::<u8, u16>(tensor.data()) {
+            Ok(data_u16) => {
+                if data_u16.iter().any(|&bits| {
+                    half::f16::from_bits(bits).is_nan() || half::f16::from_bits(bits).is_infinite()
+                }) {
+                    report.has_nan_inf.push(name.to_string());
+                }
+            }
+            Err(e) => report.warnings.push(format!(
+                "Could not check {} for NaN/Inf: F16 data is unaligned or truncated ({})",
+                name, e
+            )),
+        },
+        Dtype::BF16 => match bytemuck::try_cast_slice::<u8, u16>(tensor.data()) {
+            Ok(data_u16) => {
+                if data_u16.iter().any(|&bits| {
+                    half::bf16::from_bits(bits).is_nan()
+                        || half::bf16::from_bits(bits).is_infinite()
+                }) {
+                    report.has_nan_inf.push(name.to_string());
+                }
+            }
+            Err(e) => report.warnings.push(format!(
+                "Could not check {} for NaN/Inf: BF16 data is unaligned or truncated ({})",
+                name, e
+            )),
+        },
+        other => {
+            // Other dtypes - skip NaN check
+            report.warnings.push(format!(
+                "Skipping NaN check for {} (dtype: {:?})",
+                name, other
+            ));
+        }
+    }
 }
 
 /// Get list of required U-Net layers (minimal set for validation)
@@ -254,14 +284,24 @@ fn is_valid_shape(shape: &[usize]) -> bool {
         return false;
     }
 
-    // Check total size is reasonable (< 10GB for safety)
-    let total_elements: usize = shape.iter().product();
-    const MAX_ELEMENTS: usize = 10 * 1024 * 1024 * 1024 / 4; // 10GB / 4 bytes per f32
-    if total_elements > MAX_ELEMENTS {
-        return false;
-    }
+    // 10GB / 4 bytes per f32. Computed as `u64`: the intermediate
+    // `10 * 1024 * 1024 * 1024` (10,737,418,240) exceeds `u32::MAX`, so as
+    // a `usize` constant this fails to const-evaluate at all on a 32-bit
+    // target.
+    const MAX_ELEMENTS: u64 = 10 * 1024 * 1024 * 1024 / 4;
 
-    true
+    // Multiply with overflow checking: a malformed safetensors header
+    // declaring e.g. `[usize::MAX, 2]` must be rejected outright, not
+    // silently wrap to a small, spuriously "valid" product in a release
+    // build (`Iterator::product` performs unchecked multiplication).
+    let Some(total_elements) = shape
+        .iter()
+        .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))
+    else {
+        return false;
+    };
+
+    total_elements as u64 <= MAX_ELEMENTS
 }
 
 #[cfg(test)]
@@ -319,6 +359,60 @@ mod tests {
     }
 
     #[test]
+    fn test_is_valid_shape_rejects_overflowing_product_instead_of_wrapping() {
+        // Regression test: `shape.iter().product::<usize>()` wraps silently
+        // in a release build, so a malformed header declaring e.g.
+        // `[usize::MAX, 2]` used to produce a small, spuriously "valid"
+        // product. `checked_mul` must catch this instead.
+        assert!(!is_valid_shape(&[usize::MAX, 2]));
+        assert!(!is_valid_shape(&[usize::MAX / 2 + 1, 2]));
+    }
+
+    #[test]
+    fn test_validate_converted_checkpoint_does_not_panic_on_misaligned_tensor_data() {
+        // Regression test: `bytemuck::cast_slice` panics (rather than
+        // returning an error) when a tensor's byte slice is not aligned for
+        // its target type. `safetensors` does not guarantee dtype-aligned
+        // data offsets, so a hand-crafted (or third-party) checkpoint can
+        // trigger this. The validator's entire purpose is to accept
+        // possibly-corrupt input and report on it, not abort the process.
+        let temp_dir = tempfile::tempdir().expect("test: failed to create temp dir");
+        let path = temp_dir.path().join("misaligned.safetensors");
+
+        std::fs::write(&path, build_misaligned_f32_safetensors_bytes())
+            .expect("test: write should succeed");
+
+        let report = validate_converted_checkpoint(&path)
+            .expect("validation must not panic or error on misaligned data");
+        assert!(report.file_exists);
+        assert!(report.safetensors_valid);
+        assert!(
+            !report.warnings.is_empty(),
+            "misaligned tensor data should be reported as a warning, not silently ignored"
+        );
+    }
+
+    /// Hand-crafts a minimal, otherwise-valid safetensors byte buffer (not
+    /// produced via `safetensors::serialize`, which is free to align tensor
+    /// data) containing a single F32 tensor whose data is deliberately
+    /// *not* 4-byte aligned within the buffer.
+    fn build_misaligned_f32_safetensors_bytes() -> Vec<u8> {
+        let mut header = String::from(r#"{"t":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#);
+        // Pad with insignificant trailing JSON whitespace until the total
+        // prefix length (8 header-length bytes + header bytes) is *not* a
+        // multiple of 4, so the tensor data starts at a misaligned offset.
+        while (8 + header.len()) % 4 == 0 {
+            header.push(' ');
+        }
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(&1.0f32.to_le_bytes());
+        bytes
+    }
+
+    #[test]
     fn test_get_required_unet_layers() {
         let layers = get_required_unet_layers();
         assert!(!layers.is_empty());
@@ -332,8 +426,20 @@ mod tests {
     }
 }
 
-/// Create a synthetic GAF checkpoint for testing (exposed for integration tests)
-#[cfg(feature = "torsh")]
+/// Create a synthetic GAF checkpoint for testing.
+///
+/// Gated behind the `test-fixtures` feature (which implies `torsh`) so it is
+/// not part of this crate's stable public surface: it is a test fixture, and
+/// changing what it generates must not be a semver-breaking change for
+/// ordinary consumers. This crate's own `#[cfg(test)]` modules and
+/// `tests/` targets reach it because `dev-dependencies`-style feature
+/// selection enables `test-fixtures` for test builds.
+///
+/// # Errors
+///
+/// Returns [`BridgeError::Conversion`] if the generated state cannot be
+/// serialized to `output`.
+#[cfg(any(feature = "test-fixtures", test))]
 pub fn create_synthetic_gaf_checkpoint(output: &Path) -> Result<()> {
     use torsh_nn::serialization::{ModelMetadata, ModelState, SerializableTensor};
 
@@ -448,124 +554,13 @@ pub fn create_synthetic_gaf_checkpoint(output: &Path) -> Result<()> {
 #[cfg(test)]
 mod torsh_tests {
     use super::*;
-    use torsh_nn::serialization::{ModelMetadata, ModelState, SerializableTensor};
 
-    /// Create a synthetic GAF checkpoint for testing (test-only wrapper)
-    ///
-    /// This generates a minimal but valid checkpoint with:
-    /// - GAF metadata
-    /// - Minimal U-Net layers (down, mid, up blocks)
-    /// - Small random weights
-    ///
-    /// Used for testing when real checkpoints are unavailable.
-    pub fn create_synthetic_gaf_checkpoint(output: &Path) -> Result<()> {
-        let mut state = ModelState::new("GAF".to_string());
-        state.metadata = ModelMetadata {
-            architecture: "GAF".to_string(),
-            version: "0.1.0".to_string(),
-            created_at: "2026-02-11T00:00:00Z".to_string(),
-            framework_version: "torsh-0.1.0".to_string(),
-            tags: vec!["test".to_string(), "synthetic".to_string()],
-        };
-
-        // Helper to create a tensor
-        let mut rng_state = 12345u64; // Simple LCG for deterministic random
-        let mut next_random = || -> f32 {
-            rng_state = rng_state.wrapping_mul(1103515245).wrapping_add(12345);
-            ((rng_state / 65536) % 32768) as f32 / 32768.0 * 0.02 - 0.01
-        };
-
-        let mut create_tensor = |shape: Vec<usize>| -> SerializableTensor {
-            let size: usize = shape.iter().product();
-            let data: Vec<f32> = (0..size).map(|_| next_random()).collect();
-            SerializableTensor {
-                shape,
-                dtype: "f32".to_string(),
-                data,
-                requires_grad: false,
-            }
-        };
-
-        // Input conv
-        state.parameters.insert(
-            "conv_in/weight".to_string(),
-            create_tensor(vec![320, 8, 3, 3]),
-        );
-
-        // Time embedding
-        state.parameters.insert(
-            "time_embedding/linear_1/weight".to_string(),
-            create_tensor(vec![1280, 320]),
-        );
-        state.parameters.insert(
-            "time_embedding/linear_2/weight".to_string(),
-            create_tensor(vec![1280, 1280]),
-        );
-
-        // Camera embedding
-        state.parameters.insert(
-            "camera_embedding/linear_1/weight".to_string(),
-            create_tensor(vec![1280, 16]),
-        );
-
-        // Down blocks (minimal - just first block, first resnet)
-        state.parameters.insert(
-            "down_blocks/0/resnets/0/norm1/weight".to_string(),
-            create_tensor(vec![320]),
-        );
-        state.parameters.insert(
-            "down_blocks/0/resnets/0/conv1/weight".to_string(),
-            create_tensor(vec![320, 320, 3, 3]),
-        );
-        state.parameters.insert(
-            "down_blocks/0/resnets/0/time_emb_proj/weight".to_string(),
-            create_tensor(vec![320, 1280]),
-        );
-        state.parameters.insert(
-            "down_blocks/0/resnets/0/norm2/weight".to_string(),
-            create_tensor(vec![320]),
-        );
-        state.parameters.insert(
-            "down_blocks/0/resnets/0/conv2/weight".to_string(),
-            create_tensor(vec![320, 320, 3, 3]),
-        );
-
-        // Mid block
-        state.parameters.insert(
-            "mid_block/resnets/0/norm1/weight".to_string(),
-            create_tensor(vec![1280]),
-        );
-        state.parameters.insert(
-            "mid_block/resnets/0/conv1/weight".to_string(),
-            create_tensor(vec![1280, 1280, 3, 3]),
-        );
-
-        // Up blocks (minimal - just first block, first resnet)
-        state.parameters.insert(
-            "up_blocks/0/resnets/0/norm1/weight".to_string(),
-            create_tensor(vec![320]),
-        );
-        state.parameters.insert(
-            "up_blocks/0/resnets/0/conv1/weight".to_string(),
-            create_tensor(vec![320, 640, 3, 3]),
-        );
-
-        // Output conv
-        state.parameters.insert(
-            "conv_out/weight".to_string(),
-            create_tensor(vec![4, 320, 3, 3]),
-        );
-        state
-            .parameters
-            .insert("conv_norm_out/weight".to_string(), create_tensor(vec![320]));
-
-        // Save to file
-        state.save_to_safetensors(output).map_err(|e| {
-            BridgeError::Conversion(format!("Failed to save synthetic checkpoint: {}", e))
-        })?;
-
-        Ok(())
-    }
+    // `create_synthetic_gaf_checkpoint` used to be redefined here verbatim
+    // (~110 lines, byte-for-byte identical to the `pub fn` above), shadowing
+    // the real one for this module's tests. Any future change to the
+    // fixture had to be made twice or the tests would silently drift from
+    // the shipped generator; `use super::*` already brings the real one
+    // into scope, so the tests below just call it directly.
 
     #[test]
     fn test_synthetic_checkpoint_generation() {

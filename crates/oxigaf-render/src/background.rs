@@ -668,7 +668,10 @@ fn patch_seed(bg_type: &BackgroundType, new_seed: u64) -> BackgroundType {
 ///
 /// 1. Solid black.
 /// 2. Solid white.
-/// 3. A random solid color (seeded per `sample()` call).
+/// 3. Per-pixel random noise ([`BackgroundType::RandomPixels`], an aggressive
+///    augmentation whose seed is re-patched on every `sample()` call, so
+///    every generated background is a fresh, independent noise field rather
+///    than a single random solid color).
 /// 4. A dark-to-light vertical gradient.
 ///
 /// Uses a fixed base seed of `0x3141592653589793` for reproducibility.
@@ -787,8 +790,18 @@ impl BackgroundEnvMap {
         self.sample_uv_bilinear(u, v)
     }
 
-    /// Sample at UV coordinates using bilinear interpolation with clamp-to-edge.
+    /// Sample at UV coordinates using bilinear interpolation. The horizontal
+    /// (`u`, azimuth) axis **wraps** — `u = 0` and `u = 1` are the same
+    /// seam-free direction, since azimuth is periodic — while the vertical
+    /// (`v`, elevation) axis is **clamped to edge**, since the poles are not
+    /// periodic.
     fn sample_uv_bilinear(&self, u: f32, v: f32) -> [f32; 3] {
+        if self.width == 0 || self.height == 0 {
+            // Defensive: the sole caller (`sample`) already guards this, but
+            // `width.rem_euclid` below would panic on a zero divisor if that
+            // ever changes.
+            return [0.0, 0.0, 0.0];
+        }
         let w = self.width as f32;
         let h = self.height as f32;
 
@@ -801,9 +814,13 @@ impl BackgroundEnvMap {
         let tx = (fx - fx.floor()).clamp(0.0, 1.0);
         let ty = (fy - fy.floor()).clamp(0.0, 1.0);
 
-        // Clamp to edge.
-        let px0 = x0.clamp(0, self.width as i64 - 1) as usize;
-        let px1 = (x0 + 1).clamp(0, self.width as i64 - 1) as usize;
+        // u (azimuth) wraps around the seam instead of clamping, so a
+        // direction just past +/-PI blends across the back of the sphere
+        // instead of collapsing onto a single boundary column.
+        let width_i = self.width as i64;
+        let px0 = x0.rem_euclid(width_i) as usize;
+        let px1 = (x0 + 1).rem_euclid(width_i) as usize;
+        // v (elevation) clamps to edge: the poles are not periodic.
         let py0 = y0.clamp(0, self.height as i64 - 1) as usize;
         let py1 = (y0 + 1).clamp(0, self.height as i64 - 1) as usize;
 
@@ -836,13 +853,13 @@ impl BackgroundEnvMap {
     /// world space. `fov_x` is the horizontal field of view in radians.
     ///
     /// For each pixel `(x, y)`:
-    /// 1. Compute the normalised device coordinate: `ndc_x = (x + 0.5) / width * 2 - 1`,
-    ///    `ndc_y = (y + 0.5) / height * 2 - 1`.
-    /// 2. Compute the ray direction in camera space:
-    ///    `d_cam = [ndc_x * tan(fov_x/2), ndc_y * tan(fov_y/2) * (height/width), -1]`
-    ///    (y is negated to convert from image-top-left to y-up camera space).
-    ///    Wait — `fov_y` isn't a separate parameter, so we derive it from the aspect ratio:
-    ///    `tan_half_fov_y = tan(fov_x/2) * height / width`.
+    /// 1. Compute the normalised device coordinate: `ndc_x = (x + 0.5) / width * 2 - 1`
+    ///    (−1 at left, +1 at right), `ndc_y = 1 - (y + 0.5) / height * 2` (+1 at top,
+    ///    −1 at bottom — flipped from image-space row order to a y-up camera space).
+    /// 2. Derive the vertical FOV from the aspect ratio, since only `fov_x` is a
+    ///    parameter: `aspect = width / height`, `tan_half_fov_y = tan(fov_x / 2) / aspect`.
+    ///    Compute the ray direction in camera space:
+    ///    `d_cam = [ndc_x * tan(fov_x / 2), ndc_y * tan_half_fov_y, -1]`.
     /// 3. Transform to world space using `camera_rotation`.
     /// 4. Sample the environment map.
     ///
@@ -1255,6 +1272,66 @@ mod tests {
         assert!(approx_eq(r, 1.0, 1e-3), "r={r}");
         assert!(approx_eq(g, 0.0, 1e-3), "g={g}");
         assert!(approx_eq(b, 0.0, 1e-3), "b={b}");
+    }
+
+    // ─── Test 18b: BackgroundEnvMap u-axis (azimuth) wraps at the seam ────────
+
+    #[test]
+    fn test_env_map_sample_uv_wraps_azimuth_seam() {
+        // width=4, height=2: column 0 = red, columns 1-2 = black, column 3 = blue.
+        // u=0 sits exactly at the seam between column 3 ("u=1" side, wrapping
+        // around) and column 0; a correct equirectangular sampler blends red
+        // with blue there instead of collapsing onto a single column.
+        let mut pixels = Vec::with_capacity(4 * 2 * 3);
+        for _row in 0..2 {
+            pixels.extend_from_slice(&[1.0, 0.0, 0.0]); // column 0: red
+            pixels.extend_from_slice(&[0.0, 0.0, 0.0]); // column 1: black
+            pixels.extend_from_slice(&[0.0, 0.0, 0.0]); // column 2: black
+            pixels.extend_from_slice(&[0.0, 0.0, 1.0]); // column 3: blue
+        }
+        let env = BackgroundEnvMap {
+            width: 4,
+            height: 2,
+            pixels,
+        };
+
+        let [r, g, b] = env.sample_uv_bilinear(0.0, 0.5);
+        assert!(
+            approx_eq(r, 0.5, 0.05) && approx_eq(b, 0.5, 0.05) && approx_eq(g, 0.0, 1e-5),
+            "u=0 seam should blend column 3 (blue) with column 0 (red) via \
+             wraparound, got [{r}, {g}, {b}] (clamp-to-edge would give pure \
+             red [1, 0, 0])"
+        );
+    }
+
+    #[test]
+    fn test_env_map_sample_uv_v_axis_still_clamps() {
+        // width=2, height=4: row 0 = red, rows 1-2 = black, row 3 = blue.
+        // Elevation (v) must clamp to edge, not wrap like azimuth — the
+        // poles are not periodic.
+        let rows: [[f32; 3]; 4] = [
+            [1.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ];
+        let mut pixels = Vec::with_capacity(2 * 4 * 3);
+        for row_color in rows {
+            pixels.extend_from_slice(&row_color); // column 0
+            pixels.extend_from_slice(&row_color); // column 1
+        }
+        let env = BackgroundEnvMap {
+            width: 2,
+            height: 4,
+            pixels,
+        };
+
+        let [r, g, b] = env.sample_uv_bilinear(0.5, 0.0);
+        assert!(
+            approx_eq(r, 1.0, 0.05) && approx_eq(b, 0.0, 0.05) && approx_eq(g, 0.0, 1e-5),
+            "v=0 (top edge) should clamp to row 0 (red), not wrap to row 3 \
+             (blue), got [{r}, {g}, {b}]"
+        );
     }
 
     // ─── Test 19: BackgroundEnvMap::render_background valid dimensions ────────

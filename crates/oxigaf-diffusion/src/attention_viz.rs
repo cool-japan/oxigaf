@@ -389,11 +389,31 @@ pub fn normalize_attention(weights: &[f32]) -> Vec<f32> {
 /// Weights are normalized to `[0, 1]` before colour-mapping.  Alpha is always
 /// 255.  When `weights.len() != height * width` a zero-filled (black) buffer
 /// is returned.
+///
+/// This always normalizes; see [`heatmap_to_rgba_normalized`] to make that
+/// optional (e.g. to honour [`AttentionVizConfig::normalize_per_map`]).
 pub fn heatmap_to_rgba(
     weights: &[f32],
     height: usize,
     width: usize,
     colormap: AttentionColormap,
+) -> Vec<u8> {
+    heatmap_to_rgba_normalized(weights, height, width, colormap, true)
+}
+
+/// Convert a flat weight array to an RGBA byte image using `colormap`.
+///
+/// Identical to [`heatmap_to_rgba`], except normalization is optional: when
+/// `normalize` is `false`, raw weights are passed straight to
+/// [`apply_colormap`], which clamps to `[0, 1]` internally. Alpha is always
+/// 255.  When `weights.len() != height * width` a zero-filled (black) buffer
+/// is returned.
+pub fn heatmap_to_rgba_normalized(
+    weights: &[f32],
+    height: usize,
+    width: usize,
+    colormap: AttentionColormap,
+    normalize: bool,
 ) -> Vec<u8> {
     let num_pixels = height * width;
     let mut output = vec![0u8; num_pixels * 4];
@@ -406,8 +426,14 @@ pub fn heatmap_to_rgba(
         return output;
     }
 
-    let normalized = normalize_attention(weights);
-    for (p, &v) in normalized.iter().enumerate() {
+    let normalized;
+    let source: &[f32] = if normalize {
+        normalized = normalize_attention(weights);
+        &normalized
+    } else {
+        weights
+    };
+    for (p, &v) in source.iter().enumerate() {
         let [r, g, b] = apply_colormap(v, colormap);
         output[p * 4] = r;
         output[p * 4 + 1] = g;
@@ -469,7 +495,13 @@ pub fn attention_map_to_image(map: &AttentionMap, config: &AttentionVizConfig) -
     let src_h = map.key_height;
     let src_w = map.key_width;
 
-    let heatmap = heatmap_to_rgba(&agg, src_h, src_w, config.colormap);
+    let heatmap = heatmap_to_rgba_normalized(
+        &agg,
+        src_h,
+        src_w,
+        config.colormap,
+        config.normalize_per_map,
+    );
 
     match config.upsample_to {
         None => heatmap,
@@ -502,14 +534,32 @@ pub fn overlay_attention_on_image(base_image: &[u8], attention_rgba: &[u8], alph
         .collect()
 }
 
+/// Blend an attention RGBA heatmap over a base RGBA image using
+/// `config.overlay_alpha` for the blend weight.
+///
+/// Identical to [`overlay_attention_on_image`], except the alpha comes from
+/// `config` instead of being passed explicitly.
+pub fn overlay_attention_on_image_with_config(
+    base_image: &[u8],
+    attention_rgba: &[u8],
+    config: &AttentionVizConfig,
+) -> Vec<u8> {
+    overlay_attention_on_image(base_image, attention_rgba, config.overlay_alpha)
+}
+
 /// Format a human-readable statistics string for an `AttentionMap`.
 ///
-/// Format: `"Attention map [QH×QW → KH×KW]: min=X.XXX max=X.XXX mean=X.XXX entropy=X.XXX"`
+/// Format: `"Attention map [QH×QW → KH×KW]: min=X.XXX max=X.XXX mean=X.XXX mean_entropy=X.XXX"`
+///
+/// `mean_entropy` is the per-query Shannon entropy (in bits) averaged over all
+/// `query_len()` queries — *not* the raw sum over the whole flat `weights`
+/// buffer, which would scale with the number of queries and not be comparable
+/// between maps of different sizes.
 pub fn format_attention_stats(map: &AttentionMap) -> String {
     let w = &map.weights;
     if w.is_empty() {
         return format!(
-            "Attention map [{}×{} → {}×{}]: min=0.000 max=0.000 mean=0.000 entropy=0.000",
+            "Attention map [{}×{} → {}×{}]: min=0.000 max=0.000 mean=0.000 mean_entropy=0.000",
             map.query_height, map.query_width, map.key_height, map.key_width
         );
     }
@@ -528,18 +578,22 @@ pub fn format_attention_stats(map: &AttentionMap) -> String {
     }
     let mean = sum / w.len() as f32;
 
-    // Shannon entropy: H = -sum(w * log2(w + eps))
+    // Shannon entropy summed over every (query, key) entry: since each of the
+    // query_len() rows is a post-softmax distribution summing to 1, this sum
+    // is query_len() independent per-row entropies added together. Divide by
+    // query_len() to report the mean per-query entropy instead.
     const EPS: f32 = 1e-10;
-    let entropy = w
+    let entropy_sum = w
         .iter()
         .map(|&v| {
             let v_eps = v + EPS;
             -v * v_eps.log2()
         })
         .sum::<f32>();
+    let mean_entropy = entropy_sum / map.query_len().max(1) as f32;
 
     format!(
-        "Attention map [{}×{} → {}×{}]: min={:.3} max={:.3} mean={:.3} entropy={:.3}",
+        "Attention map [{}×{} → {}×{}]: min={:.3} max={:.3} mean={:.3} mean_entropy={:.3}",
         map.query_height,
         map.query_width,
         map.key_height,
@@ -547,7 +601,7 @@ pub fn format_attention_stats(map: &AttentionMap) -> String {
         min_val,
         max_val,
         mean,
-        entropy
+        mean_entropy
     )
 }
 
@@ -924,7 +978,22 @@ mod tests {
         assert!(stats.contains("min="), "got: {}", stats);
         assert!(stats.contains("max="), "got: {}", stats);
         assert!(stats.contains("mean="), "got: {}", stats);
-        assert!(stats.contains("entropy="), "got: {}", stats);
+        assert!(stats.contains("mean_entropy="), "got: {}", stats);
+    }
+
+    #[test]
+    fn test_format_attention_stats_entropy_is_per_query_mean() {
+        // 4 queries (2x2), each a uniform distribution over 4 keys (2x2):
+        // per-query entropy = log2(4) = 2 bits. The raw (unfixed) sum over
+        // all 16 entries would instead report 4 * 2.0 = 8.0.
+        let weights = vec![0.25_f32; 16];
+        let map = AttentionMap::new(weights, 2, 2, 2, 2, 1, None).expect("valid map");
+        let stats = format_attention_stats(&map);
+        assert!(
+            stats.contains("mean_entropy=2.000"),
+            "expected mean_entropy=2.000 (per-query, not summed over queries), got: {}",
+            stats
+        );
     }
 
     #[test]
@@ -933,5 +1002,79 @@ mod tests {
         let map = AttentionMap::new(vec![0.0_f32; 4], 2, 1, 2, 1, 1, None).expect("valid map");
         let stats = format_attention_stats(&map);
         assert!(stats.contains("min=0.000"), "got: {}", stats);
+        assert!(stats.contains("mean_entropy=0.000"), "got: {}", stats);
+    }
+
+    // -----------------------------------------------------------------------
+    // heatmap_to_rgba_normalized / normalize_per_map
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_heatmap_to_rgba_normalized_false_skips_normalization() {
+        // Raw weights already small (e.g. post-softmax means); with
+        // normalize=false they should map through apply_colormap unscaled,
+        // differing from the normalize=true result (which rescales to [0,1]).
+        let weights = vec![0.1_f32, 0.2, 0.05, 0.4];
+        let normalized_on =
+            heatmap_to_rgba_normalized(&weights, 2, 2, AttentionColormap::Grayscale, true);
+        let normalized_off =
+            heatmap_to_rgba_normalized(&weights, 2, 2, AttentionColormap::Grayscale, false);
+        assert_ne!(
+            normalized_on, normalized_off,
+            "normalize_per_map=false should produce a different (unnormalized) heatmap"
+        );
+    }
+
+    #[test]
+    fn test_heatmap_to_rgba_matches_normalized_true() {
+        let weights = vec![0.1_f32, 0.2, 0.05, 0.4];
+        let via_default = heatmap_to_rgba(&weights, 2, 2, AttentionColormap::Viridis);
+        let via_explicit =
+            heatmap_to_rgba_normalized(&weights, 2, 2, AttentionColormap::Viridis, true);
+        assert_eq!(via_default, via_explicit);
+    }
+
+    #[test]
+    fn test_attention_map_to_image_respects_normalize_per_map_false() {
+        let weights = vec![0.1_f32, 0.2, 0.05, 0.4, 0.1, 0.2, 0.05, 0.4];
+        let map = AttentionMap::new(weights, 1, 2, 2, 2, 1, None).expect("valid map");
+        let img_off = attention_map_to_image(
+            &map,
+            &AttentionVizConfig {
+                normalize_per_map: false,
+                ..AttentionVizConfig::default()
+            },
+        );
+        let img_on = attention_map_to_image(
+            &map,
+            &AttentionVizConfig {
+                normalize_per_map: true,
+                ..AttentionVizConfig::default()
+            },
+        );
+        assert_ne!(
+            img_off, img_on,
+            "normalize_per_map should change the rendered heatmap"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // overlay_attention_on_image_with_config / overlay_alpha
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_overlay_attention_on_image_with_config_uses_configured_alpha() {
+        let base = vec![0u8, 0, 0, 255];
+        let attention = vec![255u8, 255, 255, 255];
+        let config = AttentionVizConfig {
+            overlay_alpha: 0.25,
+            ..AttentionVizConfig::default()
+        };
+        let via_config = overlay_attention_on_image_with_config(&base, &attention, &config);
+        let via_explicit = overlay_attention_on_image(&base, &attention, 0.25);
+        assert_eq!(via_config, via_explicit);
+        // And it must actually differ from the *default* overlay_alpha (0.7).
+        let via_default_alpha = overlay_attention_on_image(&base, &attention, 0.7);
+        assert_ne!(via_config, via_default_alpha);
     }
 }

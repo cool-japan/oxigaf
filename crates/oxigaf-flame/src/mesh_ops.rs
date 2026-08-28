@@ -6,6 +6,30 @@
 use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
+// Error type
+// ---------------------------------------------------------------------------
+
+/// Errors that can occur during mesh subdivision.
+#[derive(Debug, thiserror::Error)]
+pub enum MeshOpsError {
+    /// A face references a vertex index outside the supplied vertex array.
+    #[error(
+        "face {face} references vertex index {index}, but mesh has only {vertex_count} vertices"
+    )]
+    InvalidFaceIndex {
+        /// Index (0-based) of the offending face.
+        face: usize,
+        /// The out-of-range vertex index found in the face.
+        index: u32,
+        /// Total number of vertices (valid indices are `0..vertex_count`).
+        vertex_count: usize,
+    },
+}
+
+/// A subdivided mesh: new vertex positions plus the new triangle index list.
+pub type SubdividedMesh = (Vec<[f32; 3]>, Vec<[u32; 3]>);
+
+// ---------------------------------------------------------------------------
 // Configuration types
 // ---------------------------------------------------------------------------
 
@@ -341,6 +365,15 @@ pub fn taubin_smooth(
 ///
 /// `c` is the vertex opposite to edge `(a, b)`.
 /// Returns `cot(angle at c)` = `dot(ca, cb) / |ca × cb|`, clamped to `[0, 10]`.
+///
+/// A degenerate (zero-area / collinear) triangle returns `0.0` rather than
+/// saturating to the top of the clamp range: it carries no reliable surface
+/// information, so it must not be able to out-weigh well-formed neighbors in
+/// `compute_laplacian_cotangent`. Note the clamp itself is intentionally
+/// one-sided (`[0, 10]`, discarding the negative cotangents of obtuse
+/// triangles) -- this is a common practical stabilization for the
+/// cotangent Laplacian, not the unclamped discrete Laplace-Beltrami
+/// operator.
 #[must_use]
 fn cotangent_weight(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> f32 {
     let ca = vec3_sub(a, c);
@@ -348,8 +381,8 @@ fn cotangent_weight(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> f32 {
     let dot = vec3_dot(ca, cb);
     let cross_mag = vec3_len(vec3_cross(ca, cb));
     if cross_mag < 1e-10 {
-        // Degenerate triangle: clamp to maximum value
-        return 10.0;
+        // Degenerate triangle: contributes no weight.
+        return 0.0;
     }
     (dot / cross_mag).clamp(0.0, 10.0)
 }
@@ -512,17 +545,46 @@ fn get_or_create_midpoint(
     mid_idx
 }
 
+/// Validate that every face index is within `0..vertices_len`, matching the
+/// check `mesh_subdivision::validate_mesh_for_subdivision` performs for its
+/// own subdivision entry points.
+///
+/// Without this, `get_or_create_midpoint` / `loop_compute_edge_midpoints`
+/// index `vertices[idx as usize]` unchecked and panic on a malformed face;
+/// running it once up front lets both `midpoint_subdivide` and
+/// `loop_subdivide` assume in-range indices everywhere downstream.
+fn validate_face_indices(vertices_len: usize, faces: &[[u32; 3]]) -> Result<(), MeshOpsError> {
+    for (fi, face) in faces.iter().enumerate() {
+        for &idx in face {
+            if idx as usize >= vertices_len {
+                return Err(MeshOpsError::InvalidFaceIndex {
+                    face: fi,
+                    index: idx,
+                    vertex_count: vertices_len,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Simple midpoint subdivision (no smoothing).
 ///
 /// Splits each triangle into 4 sub-triangles by inserting midpoints at each
 /// edge center without applying Loop's weighting.
 ///
 /// The new vertex count is `V + E` and the new face count is `4 * F`.
-#[must_use]
+///
+/// # Errors
+///
+/// Returns [`MeshOpsError::InvalidFaceIndex`] if any face references a
+/// vertex index outside `0..vertices.len()`.
 pub fn midpoint_subdivide(
     vertices: &[[f32; 3]],
     faces: &[[u32; 3]],
-) -> (Vec<[f32; 3]>, Vec<[u32; 3]>) {
+) -> Result<SubdividedMesh, MeshOpsError> {
+    validate_face_indices(vertices.len(), faces)?;
+
     let mut new_vertices = vertices.to_vec();
     let mut edge_midpoints: HashMap<(u32, u32), u32> = HashMap::new();
     let mut new_faces: Vec<[u32; 3]> = Vec::with_capacity(faces.len() * 4);
@@ -544,7 +606,7 @@ pub fn midpoint_subdivide(
         new_faces.push([m_ab, m_bc, m_ca]);
     }
 
-    (new_vertices, new_faces)
+    Ok((new_vertices, new_faces))
 }
 
 /// Perform one iteration of Loop subdivision.
@@ -562,10 +624,23 @@ pub fn midpoint_subdivide(
 /// - Interior vertex with `n` neighbors:
 ///   - `beta = 3/16` if `n == 3`; otherwise `beta = 3/(8*n)`
 ///   - `updated = (1 - n*beta)*v + beta*sum(neighbors)`
-/// - Boundary vertex: `(6/8)*v + (1/8)*(prev + next)` (adjacent boundary neighbors)
-#[must_use]
-pub fn loop_subdivide(vertices: &[[f32; 3]], faces: &[[u32; 3]]) -> (Vec<[f32; 3]>, Vec<[u32; 3]>) {
+/// - Boundary vertex: `(6/8)*v + (1/8)*(prev + next)`, where `prev`/`next`
+///   are the two neighbors reachable via a genuine boundary EDGE (an edge
+///   belonging to exactly one face) -- not merely any neighbor that happens
+///   to also touch the boundary somewhere else (see
+///   `boundary_edge_neighbors`).
+///
+/// # Errors
+///
+/// Returns [`MeshOpsError::InvalidFaceIndex`] if any face references a
+/// vertex index outside `0..vertices.len()`.
+pub fn loop_subdivide(
+    vertices: &[[f32; 3]],
+    faces: &[[u32; 3]],
+) -> Result<SubdividedMesh, MeshOpsError> {
     let n_verts = vertices.len();
+    validate_face_indices(n_verts, faces)?;
+
     let mut edge_faces: HashMap<(u32, u32), Vec<usize>> = HashMap::new();
     for (fi, face) in faces.iter().enumerate() {
         for edge in [
@@ -579,9 +654,42 @@ pub fn loop_subdivide(vertices: &[[f32; 3]], faces: &[[u32; 3]]) -> (Vec<[f32; 3
     let boundary_vertex_mask = find_boundary_vertices(n_verts, faces);
     let edge_midpoint_pos =
         loop_compute_edge_midpoints(faces, vertices, &edge_faces, &boundary_vertex_mask);
+    let boundary_nbrs = boundary_edge_neighbors(n_verts, &edge_faces);
     let adjacency = build_adjacency(vertices, faces);
-    let updated_vertices = loop_update_vertices(vertices, &adjacency, &boundary_vertex_mask);
+    let updated_vertices = loop_update_vertices(vertices, &adjacency, &boundary_nbrs);
     loop_build_output(faces, updated_vertices, &edge_midpoint_pos)
+}
+
+/// Build, for each vertex, the list of neighbors reachable via a genuine
+/// boundary edge (an edge belonging to exactly one face).
+///
+/// Unlike `boundary_vertex_mask` (which only records whether a vertex
+/// touches *some* boundary edge somewhere in the mesh), this identifies the
+/// specific edges, so Loop subdivision's boundary rule averages against the
+/// (at most two) neighbors actually connected to `v` along the boundary --
+/// not any boundary-marked vertex that happens to also be in the 1-ring.
+/// Without this distinction, a vertex whose 1-ring contains three or more
+/// boundary-marked vertices (common wherever the 1-ring includes vertices
+/// from a different part of the same boundary loop, e.g. near a
+/// high-curvature boundary or a pinch point) picks two arbitrary
+/// lowest-index neighbors instead of its true boundary predecessor/successor.
+fn boundary_edge_neighbors(
+    n_verts: usize,
+    edge_faces: &HashMap<(u32, u32), Vec<usize>>,
+) -> Vec<Vec<u32>> {
+    let mut neighbors: Vec<Vec<u32>> = vec![Vec::new(); n_verts];
+    for (&(a, b), owning_faces) in edge_faces {
+        if owning_faces.len() != 1 {
+            continue;
+        }
+        if (a as usize) < n_verts {
+            neighbors[a as usize].push(b);
+        }
+        if (b as usize) < n_verts {
+            neighbors[b as usize].push(a);
+        }
+    }
+    neighbors
 }
 
 /// Compute Loop midpoint position for each edge (step 2 of loop subdivision).
@@ -642,103 +750,130 @@ fn loop_compute_edge_midpoints(
 }
 
 /// Update original vertices with Loop subdivision weights (step 3).
+///
+/// `boundary_edge_nbrs[v]` holds the (at most two, for a well-formed
+/// 2-manifold-with-boundary mesh) neighbors reachable from `v` via a
+/// genuine boundary edge -- see `boundary_edge_neighbors`. A vertex with
+/// zero such neighbors is interior; exactly two means the standard boundary
+/// rule applies; any other count (a non-manifold or dangling boundary
+/// vertex) is left unmoved rather than averaged against an arbitrary or
+/// undercounted set.
 fn loop_update_vertices(
     vertices: &[[f32; 3]],
     adjacency: &[Vec<usize>],
-    boundary_vertex_mask: &[bool],
+    boundary_edge_nbrs: &[Vec<u32>],
 ) -> Vec<[f32; 3]> {
     vertices
         .iter()
         .enumerate()
         .map(|(vert_i, &vi)| {
-            let neighbors = &adjacency[vert_i];
-            let neighbor_count = neighbors.len();
-            if boundary_vertex_mask[vert_i] {
-                let bnd_nbrs: Vec<usize> = neighbors
-                    .iter()
-                    .copied()
-                    .filter(|&j| boundary_vertex_mask[j])
-                    .collect();
-                if bnd_nbrs.len() >= 2 {
-                    let prev = vertices[bnd_nbrs[0]];
-                    let next = vertices[bnd_nbrs[1]];
-                    [
-                        (6.0 / 8.0) * vi[0] + (1.0 / 8.0) * (prev[0] + next[0]),
-                        (6.0 / 8.0) * vi[1] + (1.0 / 8.0) * (prev[1] + next[1]),
-                        (6.0 / 8.0) * vi[2] + (1.0 / 8.0) * (prev[2] + next[2]),
-                    ]
-                } else {
+            let bnd_nbrs = &boundary_edge_nbrs[vert_i];
+            if bnd_nbrs.is_empty() {
+                let neighbors = &adjacency[vert_i];
+                let neighbor_count = neighbors.len();
+                if neighbor_count == 0 {
                     vi
-                }
-            } else if neighbor_count == 0 {
-                vi
-            } else {
-                let beta = if neighbor_count == 3 {
-                    3.0_f32 / 16.0
                 } else {
-                    3.0 / (8.0 * neighbor_count as f32)
-                };
-                let alpha = 1.0 - neighbor_count as f32 * beta;
-                let sum = neighbors.iter().fold([0.0f32; 3], |mut acc, &j| {
-                    let vj = vertices[j];
-                    acc[0] += vj[0];
-                    acc[1] += vj[1];
-                    acc[2] += vj[2];
-                    acc
-                });
+                    let beta = if neighbor_count == 3 {
+                        3.0_f32 / 16.0
+                    } else {
+                        3.0 / (8.0 * neighbor_count as f32)
+                    };
+                    let alpha = 1.0 - neighbor_count as f32 * beta;
+                    let sum = neighbors.iter().fold([0.0f32; 3], |mut acc, &j| {
+                        let vj = vertices[j];
+                        acc[0] += vj[0];
+                        acc[1] += vj[1];
+                        acc[2] += vj[2];
+                        acc
+                    });
+                    [
+                        alpha * vi[0] + beta * sum[0],
+                        alpha * vi[1] + beta * sum[1],
+                        alpha * vi[2] + beta * sum[2],
+                    ]
+                }
+            } else if bnd_nbrs.len() == 2 {
+                let prev = vertices[bnd_nbrs[0] as usize];
+                let next = vertices[bnd_nbrs[1] as usize];
                 [
-                    alpha * vi[0] + beta * sum[0],
-                    alpha * vi[1] + beta * sum[1],
-                    alpha * vi[2] + beta * sum[2],
+                    (6.0 / 8.0) * vi[0] + (1.0 / 8.0) * (prev[0] + next[0]),
+                    (6.0 / 8.0) * vi[1] + (1.0 / 8.0) * (prev[1] + next[1]),
+                    (6.0 / 8.0) * vi[2] + (1.0 / 8.0) * (prev[2] + next[2]),
                 ]
+            } else {
+                vi
             }
         })
         .collect()
 }
 
 /// Assign edge-midpoint indices and build the 4× subdivided face list (steps 4–5).
+///
+/// # Errors
+///
+/// Returns [`MeshOpsError::InvalidFaceIndex`] if `edge_midpoint_pos` is
+/// missing an entry for an edge derived from `faces`. Given the validation
+/// `loop_subdivide` performs up front and that `edge_midpoint_pos` is always
+/// built from the same `faces` list (in `loop_compute_edge_midpoints`),
+/// this should be unreachable in practice; it exists so a caller-visible
+/// internal inconsistency is reported as a typed error instead of silently
+/// fabricating a vertex at the origin or a face with a repeated index (both
+/// of which the previous `unwrap_or` fallbacks did).
 fn loop_build_output(
     faces: &[[u32; 3]],
     updated_vertices: Vec<[f32; 3]>,
     edge_midpoint_pos: &HashMap<(u32, u32), [f32; 3]>,
-) -> (Vec<[f32; 3]>, Vec<[u32; 3]>) {
+) -> Result<SubdividedMesh, MeshOpsError> {
     let mut edge_midpoint_idx: HashMap<(u32, u32), u32> = HashMap::new();
     let mut all_vertices = updated_vertices;
-    for face in faces {
+    let n_original = all_vertices.len();
+
+    for (fi, face) in faces.iter().enumerate() {
         for edge in [
             canonical_edge(face[0], face[1]),
             canonical_edge(face[1], face[2]),
             canonical_edge(face[2], face[0]),
         ] {
-            edge_midpoint_idx.entry(edge).or_insert_with(|| {
-                let pos = edge_midpoint_pos.get(&edge).copied().unwrap_or([0.0; 3]);
-                let idx = all_vertices.len() as u32;
-                all_vertices.push(pos);
-                idx
-            });
+            if edge_midpoint_idx.contains_key(&edge) {
+                continue;
+            }
+            let Some(&pos) = edge_midpoint_pos.get(&edge) else {
+                return Err(MeshOpsError::InvalidFaceIndex {
+                    face: fi,
+                    index: edge.0,
+                    vertex_count: n_original,
+                });
+            };
+            let idx = all_vertices.len() as u32;
+            all_vertices.push(pos);
+            edge_midpoint_idx.insert(edge, idx);
         }
     }
+
     let mut new_faces: Vec<[u32; 3]> = Vec::with_capacity(faces.len() * 4);
-    for face in faces {
+    for (fi, face) in faces.iter().enumerate() {
         let (fa, fb, fc) = (face[0], face[1], face[2]);
-        let m_ab = edge_midpoint_idx
+        let missing = |index: u32| MeshOpsError::InvalidFaceIndex {
+            face: fi,
+            index,
+            vertex_count: n_original,
+        };
+        let m_ab = *edge_midpoint_idx
             .get(&canonical_edge(fa, fb))
-            .copied()
-            .unwrap_or(fa);
-        let m_bc = edge_midpoint_idx
+            .ok_or_else(|| missing(fa))?;
+        let m_bc = *edge_midpoint_idx
             .get(&canonical_edge(fb, fc))
-            .copied()
-            .unwrap_or(fb);
-        let m_ca = edge_midpoint_idx
+            .ok_or_else(|| missing(fb))?;
+        let m_ca = *edge_midpoint_idx
             .get(&canonical_edge(fc, fa))
-            .copied()
-            .unwrap_or(fc);
+            .ok_or_else(|| missing(fc))?;
         new_faces.push([fa, m_ab, m_ca]);
         new_faces.push([fb, m_bc, m_ab]);
         new_faces.push([fc, m_ca, m_bc]);
         new_faces.push([m_ab, m_bc, m_ca]);
     }
-    (all_vertices, new_faces)
+    Ok((all_vertices, new_faces))
 }
 
 // ---------------------------------------------------------------------------
@@ -1062,16 +1197,45 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_cotangent_weight_clamp() {
-        // Degenerate triangle: c is collinear with a and b → cross product ≈ 0 → clamped to 10
+    fn test_cotangent_weight_degenerate_triangle_returns_zero() {
+        // Degenerate triangle: c is collinear with a and b → cross product ≈ 0.
+        // A zero-area triangle carries no surface information and must not
+        // be able to out-weigh well-formed neighbors, so it contributes
+        // 0.0 rather than saturating to the top of the clamp range.
         let a = [0.0f32, 0.0, 0.0];
         let b = [2.0f32, 0.0, 0.0];
         let c = [1.0f32, 0.0, 0.0]; // collinear
         let w = cotangent_weight(a, b, c);
-        assert_eq!(
-            w, 10.0,
-            "degenerate cotangent weight should be clamped to 10.0, got {w}"
-        );
+        assert_eq!(w, 0.0, "degenerate cotangent weight should be 0.0, got {w}");
+    }
+
+    #[test]
+    fn test_compute_laplacian_cotangent_ignores_degenerate_sliver_face() {
+        // A degenerate (duplicate-vertex) "sliver" face touching an
+        // existing triangle's vertices must contribute nothing to the
+        // cotangent Laplacian. Previously it injected a large spurious
+        // displacement because `cotangent_weight` saturated to the clamp's
+        // maximum (10.0) for a degenerate triangle instead of returning
+        // 0.0 -- this test would fail under that behavior (the two
+        // Laplacians would differ), and passes now that the degenerate
+        // face is correctly weightless.
+        let verts = triangle_verts();
+        let faces_clean = triangle_faces();
+        let mut faces_with_sliver = faces_clean.clone();
+        faces_with_sliver.push([0, 0, 1]); // degenerate: vertex 0 repeated
+
+        let laplacian_clean = compute_laplacian_cotangent(&verts, &faces_clean);
+        let laplacian_with_sliver = compute_laplacian_cotangent(&verts, &faces_with_sliver);
+
+        for (clean, with_sliver) in laplacian_clean.iter().zip(laplacian_with_sliver.iter()) {
+            for k in 0..3 {
+                assert!(
+                    (clean[k] - with_sliver[k]).abs() < 1e-6,
+                    "a degenerate sliver face must not change the Laplacian: \
+                     clean={clean:?} with_sliver={with_sliver:?}"
+                );
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1097,7 +1261,7 @@ mod tests {
     fn test_midpoint_subdivide_triangle_count() {
         let verts = triangle_verts();
         let faces = triangle_faces();
-        let (_, new_faces) = midpoint_subdivide(&verts, &faces);
+        let (_, new_faces) = midpoint_subdivide(&verts, &faces).expect("valid mesh");
         assert_eq!(
             new_faces.len(),
             4,
@@ -1115,7 +1279,7 @@ mod tests {
         // For a single triangle: V=3, E=3 → V'=3+3=6
         let verts = triangle_verts();
         let faces = triangle_faces();
-        let (new_verts, _) = midpoint_subdivide(&verts, &faces);
+        let (new_verts, _) = midpoint_subdivide(&verts, &faces).expect("valid mesh");
         assert_eq!(
             new_verts.len(),
             6,
@@ -1131,7 +1295,7 @@ mod tests {
     #[test]
     fn test_loop_subdivide_triangle_count() {
         let (verts, faces) = tetrahedron();
-        let (_, new_faces) = loop_subdivide(&verts, &faces);
+        let (_, new_faces) = loop_subdivide(&verts, &faces).expect("valid mesh");
         assert_eq!(
             new_faces.len(),
             faces.len() * 4,
@@ -1147,7 +1311,7 @@ mod tests {
     #[test]
     fn test_loop_subdivide_valid_indices() {
         let (verts, faces) = tetrahedron();
-        let (new_verts, new_faces) = loop_subdivide(&verts, &faces);
+        let (new_verts, new_faces) = loop_subdivide(&verts, &faces).expect("valid mesh");
         let max_idx = new_verts.len() as u32;
         for face in &new_faces {
             for &idx in face {
@@ -1182,5 +1346,109 @@ mod tests {
         assert!((config.mu - (-0.52)).abs() < 1e-6);
         assert!(config.preserve_boundary);
         assert_eq!(config.weight_mode, WeightMode::Cotangent);
+    }
+
+    // -----------------------------------------------------------------------
+    // Subdivision: out-of-range face indices are rejected, not panics
+    // (regression for `MeshOpsError`).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_midpoint_subdivide_rejects_out_of_range_face_index() {
+        let verts = triangle_verts();
+        let faces: Vec<[u32; 3]> = vec![[0, 1, 99]];
+        let result = midpoint_subdivide(&verts, &faces);
+        assert!(matches!(
+            result,
+            Err(MeshOpsError::InvalidFaceIndex { index: 99, .. })
+        ));
+    }
+
+    #[test]
+    fn test_loop_subdivide_rejects_out_of_range_face_index() {
+        let verts = triangle_verts();
+        let faces: Vec<[u32; 3]> = vec![[0, 1, 99]];
+        let result = loop_subdivide(&verts, &faces);
+        assert!(matches!(
+            result,
+            Err(MeshOpsError::InvalidFaceIndex { index: 99, .. })
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Loop boundary rule: true boundary-edge neighbors, not lowest indices
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_loop_boundary_rule_uses_true_boundary_edge_neighbors_not_lowest_indices() {
+        // Open triangle fan around a hub vertex C (index 0), with rim
+        // vertices V0..V5 (indices 1..6). Only the two "end" spokes C-V0
+        // and C-V5 are boundary edges; C-V1..C-V4 are interior (shared by
+        // two fan triangles each). Every rim vertex is *also*
+        // boundary-marked (via the rim edges), so the old code -- which
+        // filtered C's sorted 1-ring neighbors by "is this neighbor ever
+        // boundary" and took the two lowest indices -- picked V0 and V1
+        // instead of the true boundary neighbors V0 and V5.
+        let c = [0.0f32, 0.0, 0.0];
+        let v0 = [1.0f32, 0.0, 0.0];
+        let v1 = [0.5f32, 0.87, 0.0];
+        let v2 = [-0.5f32, 0.87, 0.0];
+        let v3 = [-1.0f32, 0.0, 0.0];
+        let v4 = [-0.5f32, -0.87, 0.0];
+        let v5 = [0.5f32, -0.87, 0.0];
+        let vertices = vec![c, v0, v1, v2, v3, v4, v5];
+        let faces: Vec<[u32; 3]> = vec![[0, 1, 2], [0, 2, 3], [0, 3, 4], [0, 4, 5], [0, 5, 6]];
+
+        let mut edge_faces: HashMap<(u32, u32), Vec<usize>> = HashMap::new();
+        for (fi, face) in faces.iter().enumerate() {
+            for edge in [
+                canonical_edge(face[0], face[1]),
+                canonical_edge(face[1], face[2]),
+                canonical_edge(face[2], face[0]),
+            ] {
+                edge_faces.entry(edge).or_default().push(fi);
+            }
+        }
+        let boundary_nbrs = boundary_edge_neighbors(vertices.len(), &edge_faces);
+        let mut hub_bnd = boundary_nbrs[0].clone();
+        hub_bnd.sort_unstable();
+        assert_eq!(
+            hub_bnd,
+            vec![1, 6],
+            "hub should have exactly V0 (1) and V5 (6) as boundary-edge neighbors"
+        );
+
+        let adjacency = build_adjacency(&vertices, &faces);
+        let updated = loop_update_vertices(&vertices, &adjacency, &boundary_nbrs);
+
+        let expected_hub = [
+            (6.0 / 8.0) * c[0] + (1.0 / 8.0) * (v0[0] + v5[0]),
+            (6.0 / 8.0) * c[1] + (1.0 / 8.0) * (v0[1] + v5[1]),
+            (6.0 / 8.0) * c[2] + (1.0 / 8.0) * (v0[2] + v5[2]),
+        ];
+        // The old (buggy) rule would have used V0 and V1 (lowest two
+        // indices among *all* boundary-marked neighbors) instead of the
+        // true boundary-edge neighbors V0 and V5.
+        let old_buggy_hub = [
+            (6.0 / 8.0) * c[0] + (1.0 / 8.0) * (v0[0] + v1[0]),
+            (6.0 / 8.0) * c[1] + (1.0 / 8.0) * (v0[1] + v1[1]),
+            (6.0 / 8.0) * c[2] + (1.0 / 8.0) * (v0[2] + v1[2]),
+        ];
+
+        for k in 0..3 {
+            assert!(
+                (updated[0][k] - expected_hub[k]).abs() < 1e-6,
+                "hub coordinate {k}: expected {}, got {}",
+                expected_hub[k],
+                updated[0][k]
+            );
+        }
+        let diff: f32 = (0..3)
+            .map(|k| (old_buggy_hub[k] - expected_hub[k]).abs())
+            .sum();
+        assert!(
+            diff > 1e-3,
+            "sanity check: the fixed result must differ from the old buggy formula"
+        );
     }
 }

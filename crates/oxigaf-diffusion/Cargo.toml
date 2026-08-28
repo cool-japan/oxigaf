@@ -2,24 +2,29 @@
 name = "oxigaf-diffusion"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/oxigaf-diffusion"
 description = "Multi-view diffusion model inference for GAF"
 readme = "README.md"
 keywords = ["diffusion", "multi-view", "ai", "deep-learning", "generative"]
 categories = ["science", "multimedia", "algorithms"]
 
+[package.metadata.docs.rs]
+features = ["flash_attention", "mixed_precision", "gpu_debug"]
+rustdoc-args = ["--cfg", "docsrs"]
+
 [dependencies]
 candle-core = { workspace = true }
 candle-nn = { workspace = true }
-candle-transformers = { workspace = true }
 safetensors = { workspace = true }
 image = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-
-oxigaf-flame = { version = "0.1.1", path = "../oxigaf-flame" }
+rayon = { workspace = true, optional = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
@@ -31,23 +36,40 @@ criterion = { workspace = true }
 [[bench]]
 name = "diffusion_bench"
 harness = false
+# diffusion_bench.rs unconditionally imports FlashAttention/flash_attention
+# from this crate (no internal #[cfg] fallback like flash_attention_bench.rs
+# has), so it only compiles with the feature on. Required now that
+# flash_attention is no longer a default feature (see [features] below).
+required-features = ["flash_attention"]
 
 [[bench]]
 name = "flash_attention_bench"
 harness = false
 
 [features]
-# Default to CPU-only for compatibility on all platforms
-default = ["flash_attention"]
+# Default to CPU-only, no flash attention: keeps `cargo build` minimal and
+# makes the flash_attention/mixed_precision/gpu_debug forwarding features on
+# oxigaf and oxigaf-cli meaningful (previously flash_attention was on by
+# default here, so those forwarding features were no-ops that could never be
+# turned off).
+default = []
 # Flash attention for memory-efficient O(N) attention
 flash_attention = []
-# Mixed-precision inference (FP16/BF16 for reduced memory usage)
-# Note: Implementation is planned - currently a placeholder
+# Mixed-precision inference (FP16/BF16 for reduced memory usage).
+# Implemented in mixed_precision.rs; PrecisionMode defaults to BFloat16 when
+# this feature is on and Float32 otherwise.
 mixed_precision = []
 # Enable NaN/Inf debug hooks (DebugConfig::default() sets enabled=true when active)
 gpu_debug = []
+# Data-parallel CPU work via rayon. Purely a performance switch: every
+# parallelised routine is arithmetic-identical to its serial form, so enabling
+# this never changes results. Currently drives the per-sample ControlNet
+# feature injection in `unet.rs` (the batch dimension is embarrassingly
+# parallel: `ControlNetProcessor::apply_to_features` reads only its own
+# sample's slice plus the shared, immutable condition cache).
+parallel = ["dep:rayon"]
 # NOTE: Platform-specific GPU/BLAS backends (accelerate, metal, cuda) have been
-# removed from this crate. To enable them, configure candle-core directly:
-#   candle-core = { version = "0.9", features = ["accelerate"] }  # macOS BLAS
-#   candle-core = { version = "0.9", features = ["metal"] }       # macOS GPU
-#   candle-core = { version = "0.9", features = ["cuda"] }        # NVIDIA GPU
+# removed from this crate. To enable them, configure the candle fork directly:
+#   candle-core = { package = "oxicandle-core", version = "0.11.0", features = ["accelerate"] }  # macOS BLAS
+#   candle-core = { package = "oxicandle-core", version = "0.11.0", features = ["metal"] }       # macOS GPU
+#   candle-core = { package = "oxicandle-core", version = "0.11.0", features = ["cuda"] }        # NVIDIA GPU

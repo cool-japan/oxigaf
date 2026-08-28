@@ -29,7 +29,12 @@
 //!   - `compute_normals_batch_par()` - parallel normal computation
 //!   - Near-linear speedup with CPU core count
 //!
-//! - **`full`** (convenience): Enables both `simd` and `parallel` for maximum performance
+//! - **`full`** (convenience): Enables `parallel` and `npz` (both stable-Rust
+//!   features). `simd` is intentionally excluded, since it requires nightly
+//!   Rust -- see `full_nightly` below.
+//!
+//! - **`full_nightly`**: Enables `simd`, `parallel`, and `npz`. Requires
+//!   nightly Rust.
 //!
 //! Example usage:
 //! ```toml
@@ -72,9 +77,13 @@
 //! ## Coordinate System
 //!
 //! FLAME uses a **right-handed coordinate system**:
-//! - +X: Right (from the subject's perspective)
+//! - +X: Left (from the subject's perspective; the viewer's right)
 //! - +Y: Up
-//! - +Z: Forward (out of the face)
+//! - +Z: Forward (out of the face, toward the viewer)
+//!
+//! This matches [`vertex_mask::FaceRegion`] and `head_geometry`'s region
+//! classification, both of which place the subject's left eye/cheek/ear at
+//! positive X.
 //!
 //! Rotations are specified as **axis-angle** vectors and converted to rotation
 //! matrices using [Rodrigues' formula](https://en.wikipedia.org/wiki/Rodrigues%27_rotation_formula).
@@ -84,7 +93,8 @@
 //! The LBS forward pass is optimized for real-time performance:
 //! - ~1-2ms for standard FLAME mesh (5023 vertices) on modern CPUs
 //! - Critical path functions are marked with `#[inline]`
-//! - Uses `ndarray` for efficient BLAS-accelerated operations
+//! - Uses `ndarray` for efficient array operations (pure Rust, no BLAS
+//!   backend; see the COOLJAPAN Pure Rust policy)
 //!
 //! Run benchmarks with: `cargo bench -p oxigaf-flame`
 //!
@@ -206,9 +216,10 @@ pub use contact_detection::{
     analyze_contact, check_eye_contact, check_mouth_contact, classify_eye_state,
     classify_jaw_state, detect_mouth_transitions, detect_self_contact, find_contact_pairs,
     mean_distance_between_regions, mean_position, min_distance_between_regions,
-    smooth_mouth_openings, ContactConfig, ContactError, ContactPair, ContactReport, EyeState,
-    FlameContactRegions, JawState,
+    smooth_mouth_openings, ClippingStatus, ContactConfig, ContactError, ContactFlags, ContactPair,
+    ContactReport, EyeContactState, EyeState, FlameContactRegions, JawState, MouthContactState,
 };
+pub use conversion::{convert_npy_to_safetensors, convert_npy_to_safetensors_with_metadata};
 pub use depth_estimation::{
     blend_depth_maps, compute_depth_stats, depth_discontinuity_map, depth_to_point_cloud,
     front_depth_camera, project_point, render_conditioning_depth_maps, render_depth_map,
@@ -237,12 +248,12 @@ pub use expression_clustering::{
     ExpressionClusterError, ExpressionDataset, KMeansConfig,
 };
 pub use expression_retargeting::{
-    retar_blend_states, retar_compute_stats, retar_compute_variance, retar_expression_acceleration,
-    retar_expression_similarity, retar_expression_velocity, retar_find_neutral_frame,
-    retar_format_config, retar_format_stats, retar_mirror_expression, retar_resample_sequence,
-    retar_slerp_states, retar_smooth_sequence, retar_standardize, retar_unstandardize,
-    ExpressionState, ExpressionVarianceStats, LinearExpressionRetargeter, RetargetConfig,
-    RetargetError, RetargetPair, RetargetStats,
+    retar_blend_states, retar_build_expression_mirror_matrix, retar_compute_stats,
+    retar_compute_variance, retar_expression_acceleration, retar_expression_similarity,
+    retar_expression_velocity, retar_find_neutral_frame, retar_format_config, retar_format_stats,
+    retar_mirror_expression, retar_resample_sequence, retar_slerp_states, retar_smooth_sequence,
+    retar_standardize, retar_unstandardize, ExpressionState, ExpressionVarianceStats,
+    LinearExpressionRetargeter, RetargetConfig, RetargetError, RetargetPair, RetargetStats,
 };
 pub use expression_transfer::{
     blend_transferred, classify_intensity, direct_transfer, expression_intensity,
@@ -250,8 +261,8 @@ pub use expression_transfer::{
     ExpressionSpace, ExpressionTransferError,
 };
 pub use expressions::{
-    ConstraintViolation, ExpressionBlend, ExpressionExt, ExpressionLibrary, FlameParamConstraints,
-    NamedExpression,
+    ConstraintViolation, ExpressionBlend, ExpressionExt, ExpressionLibrary, ExpressionProvenance,
+    FlameParamConstraints, NamedExpression,
 };
 pub use face_atlas::{
     blit_into_atlas, compute_atlas_stats, create_flame_face_atlas, extract_from_atlas,
@@ -266,13 +277,13 @@ pub use face_normalization::{
 pub use facs::{ActionUnit, AuMapping, FacsIntensity, FacsLibrary, FacsPresets, FacsToFlame};
 pub use fitting::{
     fit_landmarks, FittingConfig, FittingError, FittingParams, FittingResult, FlameForward,
-    LandmarkObservation, MockFlameForward, PinholeCamera,
+    FlameLandmarkFitter, LandmarkObservation, MockFlameForward, PinholeCamera,
 };
 pub use geodesic::{
-    compute_geodesic_stats, dijkstra, geodesic_ball, geodesic_center, geodesic_diameter,
-    geodesic_voronoi, geodesic_weights, heat_geodesic, multi_source_dijkstra, pairwise_geodesic,
-    smooth_geodesic_path, GeodesicConfig, GeodesicError, GeodesicField, GeodesicMesh,
-    GeodesicStats,
+    compute_geodesic_stats, dijkstra, geodesic_ball, geodesic_center, geodesic_center_sampled,
+    geodesic_diameter, geodesic_voronoi, geodesic_weights, heat_geodesic, heat_geodesic_multi,
+    heat_time_step, multi_source_dijkstra, pairwise_geodesic, smooth_geodesic_path, GeodesicConfig,
+    GeodesicError, GeodesicField, GeodesicMesh, GeodesicStats, DEFAULT_CENTER_SAMPLES,
 };
 pub use gpu_buffers::{GpuBufferConfig, GpuMeshBuffers};
 pub use head_geometry::{
@@ -286,10 +297,22 @@ pub use head_geometry::{
 pub use head_tracker::{
     compute_trajectory_stats, detect_pose_jumps, ema_smooth_trajectory, head_coverage_score,
     interpolate_missing_frames, one_euro_filter_sequence, resample_trajectory, rotation_velocity,
-    segment_by_motion, slice_trajectory, sma_smooth_trajectory, HeadTrackFrame, HeadTracker,
-    HeadTrackerConfig, HeadTrackerError, HeadTrajectory, TrackingFilter, TrajectoryStats,
+    segment_by_motion, slice_trajectory, sma_smooth_trajectory, HeadTrackFrame, HeadTrackPose,
+    HeadTracker, HeadTrackerConfig, HeadTrackerError, HeadTrajectory, TrackingFilter,
+    TrajectoryStats,
 };
-pub use landmarks::{Landmark, LandmarkExtractor, LandmarkGroup, NUM_LANDMARKS};
+// `io::load_flame_model` is the file-loading primitive behind
+// `FlameModel::load` (see `model.rs`); it is re-exported here too, purely
+// for consistency with every other module in this crate root (all of which
+// are flattened even where a nicer wrapper exists, e.g. `rodrigues` next to
+// `FlameModel::forward`). `io_safetensors`'s pair has no inherent-method
+// equivalent on `FlameModel` at all -- this re-export is their only
+// crate-root entry point, not just a stylistic convenience.
+pub use io::load_flame_model;
+pub use io_safetensors::{load_flame_model_safetensors, save_flame_model_safetensors};
+pub use landmarks::{
+    BarycentricLandmark, Landmark, LandmarkExtractor, LandmarkGroup, NUM_LANDMARKS,
+};
 pub use lighting_model::{
     apply_rim_lighting, approximate_ambient_occlusion, lambertian_diffuse, phong_vertex,
     phong_vertex_point, reinhard_tone_map, shade_mesh_directional, shade_mesh_multi_light,
@@ -308,7 +331,19 @@ pub use mesh_morphing::{
     smooth_morph_sequence, MorphClip, MorphError, MorphInterpolation, MorphKeyframe, MorphLoopMode,
     MorphTarget, MorphTargetSet,
 };
-pub use mesh_ops::*;
+// Explicit re-export list (not `pub use mesh_ops::*`): `build_adjacency`,
+// `laplacian_smooth`, and `taubin_smooth` also exist in `mesh_smoothing`
+// with different signatures. A glob import here would be silently shadowed
+// by the explicit `mesh_smoothing` re-exports below wherever names collide,
+// making `mesh_ops`'s own versions of those three unreachable from the
+// crate root without any compiler diagnostic. Naming every export
+// explicitly (and omitting the three collisions) keeps that shadowing
+// impossible to reintroduce by accident.
+pub use mesh_ops::{
+    compute_laplacian_cotangent, compute_laplacian_uniform, cotangent_smooth,
+    find_boundary_vertices, laplacian_smooth_step, loop_subdivide, midpoint_subdivide,
+    MeshOpsError, MeshSmoothingConfig, WeightMode,
+};
 pub use mesh_repair::{
     repair_mesh, MeshRepairConfig, MeshRepairError, MeshRepairExt, MeshRepairResult,
     MeshRepairStats,
@@ -331,7 +366,8 @@ pub use model::{
 #[cfg(feature = "parallel")]
 pub use model::{compute_normals_batch_par, recompute_batch_normals_par};
 pub use multiresolution::{
-    compute_vertex_normals, DecimationConfig, MeshLevel, MultiResMesh, MultiResMeshBuilder,
+    compute_vertex_normals, DecimationConfig, MeshDecimator, MeshLevel, MultiResMesh,
+    MultiResMeshBuilder,
 };
 pub use normal_map::{Camera, NormalMapRenderer};
 pub use param_sampler::{
@@ -345,12 +381,13 @@ pub use phoneme_animation::{
     extract_jaw_sequence, format_phoneme_clip, format_phoneme_stats, generate_breath_animation,
     parse_phoneme_string, phoneme_clip_stats, smooth_phoneme_keyframes,
     synthesize_phoneme_animation, PhonemeClip, PhonemeError, PhonemeEvent, PhonemeKeyframe,
-    PhonemeLibrary, PhonemeParams, PhonemeStats, Viseme,
+    PhonemeLibrary, PhonemeParams, PhonemeStats, Viseme, VisemeExpressionTargets,
 };
 pub use pose_estimation::{
     count_inliers, estimate_pitch_from_vertical, estimate_pose_weak_perspective,
-    estimate_yaw_from_symmetry, reprojection_error, HeadPose, Landmark2D, Landmark3D,
-    PointCorrespondence, PoseConfig, PoseEstimationError, PosePinholeCamera, PoseTracker,
+    estimate_yaw_from_symmetry, reprojection_error, select_pitch_candidate, HeadPose, Landmark2D,
+    Landmark3D, PitchReference, PointCorrespondence, PoseConfig, PoseEstimationError,
+    PosePinholeCamera, PoseTracker,
 };
 pub use pose_prior::{
     aa_magnitude, aa_to_euler_approx, default_joint_limits, get_joint, set_joint,
@@ -369,6 +406,7 @@ pub use rigid_alignment::{
     IcpConfig, IcpResult, SimilarityTransform,
 };
 pub use sampler::{sample_mesh_surface, SurfacePoint};
+pub use sequence::{FlameSequence, SequenceIterator};
 pub use shape_analysis::{
     compute_shape_distance, path_arc_length, shape_interpolation_path, ShapeAnalysisError,
     ShapeDistanceMetric, ShapeOutlierDetector, ShapeSpacePca, ShapeStatistics,
@@ -393,15 +431,19 @@ pub use texture_baking::{
 pub use timeline::{
     timeline_from_clip, AnimationTimeline, BlendMode, TimelineError, TimelineLayer, TimelineMarker,
 };
-pub use traits::{DefaultSampler, MeshSurfaceSampler, NormalMapProvider, SurfaceSample};
+pub use traits::{
+    DefaultSampler, FlameNormalMapProvider, MeshSurfaceSampler, NormalMapProvider, SurfaceSample,
+};
 pub use uv::{UvAccessor, UvChartInfo, UvMeshExt};
 pub use uv_texture::{FilterMode, TextureMap, TextureMeshExt, UvTextureSampler, WrapMode};
-pub use vertex_mask::{FaceRegion, VertexMask};
+pub use vertex_mask::{FaceRegion, VertexMask, VertexMaskError};
 pub use visibility_culling::{
-    compute_face_visibility, compute_multi_view_visibility, compute_optimal_view_coverage,
+    compute_face_visibility, compute_greedy_view_selection, compute_multi_view_visibility,
+    compute_optimal_view_coverage, compute_per_view_coverage, compute_per_view_visibility,
     compute_vertex_visibility, compute_visibility_stats, find_view_dependent_vertices,
-    format_multi_view_stats, format_visibility_stats, select_maximally_covering_views,
-    FaceVisibility, MultiViewVisibility, VertexVisibility, VisibilityCullerConfig, VisibilityError,
+    format_multi_view_stats, format_visibility_stats, select_greedy_covering_views,
+    select_maximally_covering_views, select_top_coverage_views, FaceVisibility,
+    MultiViewVisibility, VertexVisibility, VisibilityCullerConfig, VisibilityError,
     VisibilityStats,
 };
 pub use visualize::{
@@ -430,3 +472,108 @@ pub use spectral_analysis::{
     spec_reconstruct, spec_smoothness, spec_taubin_smooth, LaplacianKind, MeshLaplacian,
     SpectralBasis, SpectralConfig, SpectralError, SpectralSignal, SpectralStats,
 };
+
+// ---------------------------------------------------------------------------
+// Crate-root re-export wiring
+// ---------------------------------------------------------------------------
+//
+// The `pub use` blocks above are this crate's public surface: every other
+// module gets one, flattening its types and functions to the crate root.
+// A name missing from one of them still compiles (the item stays reachable
+// via its module path) and so is never caught by `cargo check` -- it only
+// shows up as an inconsistency on the next audit. Pin every re-export added
+// here so a future edit that silently drops one (or changes its signature)
+// fails this file to compile instead.
+#[cfg(test)]
+mod crate_root_reexport_tests {
+    use std::collections::HashMap;
+    use std::path::Path;
+
+    #[test]
+    fn retar_build_expression_mirror_matrix_is_at_crate_root() {
+        type RetarBuildMirrorFn =
+            fn(&[f32], &[usize], usize) -> Result<Vec<f32>, crate::RetargetError>;
+        let _: RetarBuildMirrorFn = crate::retar_build_expression_mirror_matrix;
+    }
+
+    #[test]
+    fn geodesic_additions_are_at_crate_root() {
+        type HeatGeodesicMultiFn = fn(
+            &crate::GeodesicMesh,
+            &[usize],
+            usize,
+            Option<f32>,
+        )
+            -> Result<crate::GeodesicField, crate::GeodesicError>;
+        type GeodesicCenterSampledFn = fn(
+            &crate::GeodesicMesh,
+            &[usize],
+            usize,
+            &crate::GeodesicConfig,
+        ) -> Result<usize, crate::GeodesicError>;
+
+        let _: HeatGeodesicMultiFn = crate::heat_geodesic_multi;
+        let _: fn(&crate::GeodesicMesh) -> f32 = crate::heat_time_step;
+        let _: GeodesicCenterSampledFn = crate::geodesic_center_sampled;
+        let _: usize = crate::DEFAULT_CENTER_SAMPLES;
+    }
+
+    #[test]
+    fn pose_estimation_additions_are_at_crate_root() {
+        let _: fn([f32; 2], f32) -> f32 = crate::select_pitch_candidate;
+        let _: Option<crate::PitchReference> = None;
+    }
+
+    #[test]
+    fn visibility_culling_additions_are_at_crate_root() {
+        type PerViewCoverageFn = fn(
+            &crate::Mesh,
+            &[crate::Camera],
+            &crate::VisibilityCullerConfig,
+        ) -> Result<Vec<f32>, crate::VisibilityError>;
+        type PerViewVisibilityFn =
+            fn(
+                &crate::Mesh,
+                &[crate::Camera],
+                &crate::VisibilityCullerConfig,
+            ) -> Result<Vec<crate::VertexVisibility>, crate::VisibilityError>;
+        type GreedyViewSelectionFn = fn(
+            &crate::Mesh,
+            &[crate::Camera],
+            &crate::VisibilityCullerConfig,
+            usize,
+        ) -> Result<Vec<usize>, crate::VisibilityError>;
+
+        let _: PerViewCoverageFn = crate::compute_per_view_coverage;
+        let _: PerViewVisibilityFn = crate::compute_per_view_visibility;
+        let _: GreedyViewSelectionFn = crate::compute_greedy_view_selection;
+        let _: fn(&[f32], usize) -> Vec<usize> = crate::select_top_coverage_views;
+        let _: fn(&[crate::VertexVisibility], usize) -> Vec<usize> =
+            crate::select_greedy_covering_views;
+    }
+
+    #[test]
+    fn io_additions_are_at_crate_root() {
+        type SaveFlameModelSafetensorsFn = fn(
+            &crate::FlameModel,
+            &Path,
+            Option<&HashMap<String, String>>,
+        ) -> Result<(), crate::FlameError>;
+
+        let _: fn(&Path) -> Result<crate::FlameModel, crate::FlameError> = crate::load_flame_model;
+        let _: fn(&Path) -> Result<crate::FlameModel, crate::FlameError> =
+            crate::load_flame_model_safetensors;
+        let _: SaveFlameModelSafetensorsFn = crate::save_flame_model_safetensors;
+    }
+
+    #[test]
+    fn newly_wired_types_are_at_crate_root() {
+        let _: Option<crate::ExpressionProvenance> = None;
+        let _: Option<crate::VisemeExpressionTargets> = None;
+        let _: Option<crate::VertexMaskError> = None;
+        let _: Option<crate::HeadTrackPose> = None;
+        let _: Option<crate::MeshDecimator> = None;
+        let _: Option<crate::FlameNormalMapProvider> = None;
+        let _: Option<crate::FlameLandmarkFitter<'static>> = None;
+    }
+}

@@ -172,6 +172,21 @@ fn build_density_field(
 }
 
 /// Run Surface Nets to extract an isosurface triangle mesh from a scalar field.
+///
+/// # Sample placement
+/// `field[(ix,iy,iz)]` is the density measured at the *centre* of voxel
+/// `(ix, iy, iz)` (see [`build_density_field`]), i.e. at world position
+/// `origin[k] + (i_k + 0.5) * cell[k]`.  The half-cell term is applied here so
+/// that extracted vertices land on the isosurface that was actually sampled
+/// instead of being displaced by `-0.5 * cell` on every axis.
+///
+/// # Triangle orientation
+/// Quads are wound so that face normals point *outward*, i.e. away from the
+/// high-density interior (`density > iso`).  Each quad ring is taken
+/// counter-clockwise in the cyclic axis pair of the edge axis — `(y,z)` for X
+/// edges, `(z,x)` for Y edges, `(x,y)` for Z edges — which makes the three
+/// axes mutually consistent; the ring is then reversed when the far end of the
+/// edge is the interior one.
 fn surface_nets(
     field: &[f32],
     dims: [usize; 3],
@@ -247,9 +262,14 @@ fn surface_nets(
                         let bx = ix + (b & 1);
                         let by = iy + ((b >> 1) & 1);
                         let bz = iz + ((b >> 2) & 1);
-                        sum[0] += origin[0] + (ax as f32 * (1.0 - t) + bx as f32 * t) * cell[0];
-                        sum[1] += origin[1] + (ay as f32 * (1.0 - t) + by as f32 * t) * cell[1];
-                        sum[2] += origin[2] + (az as f32 * (1.0 - t) + bz as f32 * t) * cell[2];
+                        // `+ 0.5`: densities are sampled at voxel centres, so
+                        // sample index i sits at origin + (i + 0.5) * cell.
+                        sum[0] +=
+                            origin[0] + (ax as f32 * (1.0 - t) + bx as f32 * t + 0.5) * cell[0];
+                        sum[1] +=
+                            origin[1] + (ay as f32 * (1.0 - t) + by as f32 * t + 0.5) * cell[1];
+                        sum[2] +=
+                            origin[2] + (az as f32 * (1.0 - t) + bz as f32 * t + 0.5) * cell[2];
                         count += 1;
                     }
                 }
@@ -266,6 +286,18 @@ fn surface_nets(
     // Phase 2: emit quads (2 triangles each) for each axis-aligned edge that
     // crosses the isosurface. Each such edge is shared by exactly 4 cells; the
     // 4 cell-vertices form the quad corners.
+    //
+    // Winding: the ring (A,B,C,D) is listed counter-clockwise in the cyclic
+    // axis pair of the edge axis, so that `[A,B,C] + [A,C,D]` has a normal
+    // pointing along **+axis**:
+    //   * X edge → ring CCW in (y,z),  y × z = +x
+    //   * Y edge → ring CCW in (z,x),  z × x = +y
+    //   * Z edge → ring CCW in (x,y),  x × y = +z
+    // When the far end of the edge is the interior one (`da > iso`) the
+    // interior lies on the +axis side, so the ring is reversed to keep the
+    // normal pointing outward.  Using the cyclic pairs is what makes the three
+    // axes agree; a non-cyclic pair (e.g. (x,z) for Y) silently flips normals
+    // for that axis only.
     let mut triangles: Vec<[u32; 3]> = Vec::new();
     let get_v = |ix: usize, iy: usize, iz: usize| -> Option<u32> {
         cell_to_vertex.get(&(ix, iy, iz)).copied()
@@ -275,7 +307,7 @@ fn surface_nets(
         for iy in 0..ny.saturating_sub(1) {
             for ix in 0..nx.saturating_sub(1) {
                 // X-axis edge between voxels (ix,iy,iz) and (ix+1,iy,iz).
-                // The 4 cells sharing this edge are:
+                // The 4 cells sharing this edge, CCW in the (y,z) plane:
                 //   (ix,iy,iz), (ix,iy-1,iz), (ix,iy-1,iz-1), (ix,iy,iz-1)
                 if ix + 1 < nx && iy > 0 && iz > 0 {
                     let da = field[idx(ix + 1, iy, iz)];
@@ -298,16 +330,16 @@ fn surface_nets(
                 }
 
                 // Y-axis edge between voxels (ix,iy,iz) and (ix,iy+1,iz).
-                // The 4 cells sharing this edge are:
-                //   (ix,iy,iz), (ix-1,iy,iz), (ix-1,iy,iz-1), (ix,iy,iz-1)
+                // The 4 cells sharing this edge, CCW in the (z,x) plane:
+                //   (ix,iy,iz), (ix,iy,iz-1), (ix-1,iy,iz-1), (ix-1,iy,iz)
                 if iy + 1 < ny && ix > 0 && iz > 0 {
                     let da = field[idx(ix, iy + 1, iz)];
                     let db = field[idx(ix, iy, iz)];
                     if (da > iso) != (db > iso) {
                         let v0 = get_v(ix, iy, iz);
-                        let v1 = get_v(ix - 1, iy, iz);
+                        let v1 = get_v(ix, iy, iz - 1);
                         let v2 = get_v(ix - 1, iy, iz - 1);
-                        let v3 = get_v(ix, iy, iz - 1);
+                        let v3 = get_v(ix - 1, iy, iz);
                         if let (Some(a), Some(b), Some(c), Some(d)) = (v0, v1, v2, v3) {
                             if da > iso {
                                 triangles.push([a, c, b]);
@@ -321,16 +353,16 @@ fn surface_nets(
                 }
 
                 // Z-axis edge between voxels (ix,iy,iz) and (ix,iy,iz+1).
-                // The 4 cells sharing this edge are:
-                //   (ix,iy,iz), (ix,iy-1,iz), (ix-1,iy-1,iz), (ix-1,iy,iz)
+                // The 4 cells sharing this edge, CCW in the (x,y) plane:
+                //   (ix,iy,iz), (ix-1,iy,iz), (ix-1,iy-1,iz), (ix,iy-1,iz)
                 if iz + 1 < nz && ix > 0 && iy > 0 {
                     let da = field[idx(ix, iy, iz + 1)];
                     let db = field[idx(ix, iy, iz)];
                     if (da > iso) != (db > iso) {
                         let v0 = get_v(ix, iy, iz);
-                        let v1 = get_v(ix, iy - 1, iz);
+                        let v1 = get_v(ix - 1, iy, iz);
                         let v2 = get_v(ix - 1, iy - 1, iz);
-                        let v3 = get_v(ix - 1, iy, iz);
+                        let v3 = get_v(ix, iy - 1, iz);
                         if let (Some(a), Some(b), Some(c), Some(d)) = (v0, v1, v2, v3) {
                             if da > iso {
                                 triangles.push([a, c, b]);
@@ -896,6 +928,143 @@ mod tests {
             flat_len,
             mesh.vertices.iter().flat_map(|v| v.iter()).count(),
             "flat vertex coordinate count must be vertex_count * 3"
+        );
+    }
+
+    /// Build the mesh exactly the way [`export_mesh`] does, returning the mesh
+    /// together with the voxel size used to produce it.
+    fn mesh_with_cell(model: &GaussianModel, cfg: &MeshExportConfig) -> (TriMesh, [f32; 3]) {
+        let (gmin, gmax) = compute_bounds(model, cfg.padding).expect("bounds must exist");
+        let ext = [gmax[0] - gmin[0], gmax[1] - gmin[1], gmax[2] - gmin[2]];
+        let me = ext[0].max(ext[1]).max(ext[2]);
+        let res = cfg.resolution.min(256) as f32;
+        let dims = [
+            ((ext[0] / me) * res).round().max(2.0) as usize,
+            ((ext[1] / me) * res).round().max(2.0) as usize,
+            ((ext[2] / me) * res).round().max(2.0) as usize,
+        ];
+        let cell = [
+            ext[0] / dims[0] as f32,
+            ext[1] / dims[1] as f32,
+            ext[2] / dims[2] as f32,
+        ];
+        let field = build_density_field(model, cfg, gmin, gmax, dims);
+        (surface_nets(&field, dims, cell, gmin, cfg.iso), cell)
+    }
+
+    /// Regression test for the half-voxel offset bug.
+    ///
+    /// `build_density_field` samples at voxel *centres*, so `surface_nets` must
+    /// map sample index `i` back to `origin + (i + 0.5) * cell`.  Without the
+    /// half-cell term every vertex was displaced by exactly `-0.5 * cell` on
+    /// each axis, which for the symmetric single-Gaussian model below puts the
+    /// vertex centroid at `-0.5 * cell` instead of the origin.
+    #[test]
+    fn test_vertex_centroid_is_not_half_cell_offset() {
+        let model = make_sphere_model();
+        let cfg = MeshExportConfig {
+            resolution: 32,
+            iso: 0.3,
+            ..Default::default()
+        };
+        let (mesh, cell) = mesh_with_cell(&model, &cfg);
+        assert!(
+            !mesh.vertices.is_empty(),
+            "sphere must produce vertices at resolution 32"
+        );
+        let n = mesh.vertices.len() as f32;
+        let centroid = mesh.vertices.iter().fold([0.0_f32; 3], |mut acc, v| {
+            acc[0] += v[0] / n;
+            acc[1] += v[1] / n;
+            acc[2] += v[2] / n;
+            acc
+        });
+        for k in 0..3 {
+            assert!(
+                centroid[k].abs() < 0.25 * cell[k],
+                "axis {k}: centroid {:.6} is not within a quarter voxel ({:.6}) of the \
+                 Gaussian centre — a value near {:.6} means the half-cell offset is missing",
+                centroid[k],
+                0.25 * cell[k],
+                -0.5 * cell[k]
+            );
+        }
+    }
+
+    /// Regression test for inconsistent triangle winding across the three edge axes.
+    ///
+    /// On a consistently oriented closed mesh every *directed* edge `(u,v)`
+    /// occurs exactly once: the neighbouring face traverses it as `(v,u)`.
+    /// When one axis winds opposite to the others the shared edge is traversed
+    /// twice in the same direction, which this catches.  (The pre-existing
+    /// `test_closed_manifold` cannot: reversing a ring leaves the *undirected*
+    /// edge multiset unchanged.)
+    #[test]
+    fn test_consistent_triangle_winding() {
+        let model = make_sphere_model();
+        let cfg = MeshExportConfig {
+            resolution: 24,
+            iso: 0.3,
+            ..Default::default()
+        };
+        let (mesh, _) = mesh_with_cell(&model, &cfg);
+        assert!(
+            !mesh.triangles.is_empty(),
+            "sphere must produce triangles at resolution 24"
+        );
+        let mut directed: HashMap<(u32, u32), u32> = HashMap::new();
+        for &[a, b, c] in &mesh.triangles {
+            for key in [(a, b), (b, c), (c, a)] {
+                *directed.entry(key).or_insert(0) += 1;
+            }
+        }
+        for (&edge, &count) in &directed {
+            assert_eq!(
+                count, 1,
+                "directed edge {edge:?} traversed {count} times (expected 1 — \
+                 neighbouring faces must wind in opposite directions)"
+            );
+        }
+    }
+
+    /// Regression test that face normals point *outward*.
+    ///
+    /// For a closed, consistently wound mesh the signed volume
+    /// `V = 1/6 · Σ v0 · (v1 × v2)` is positive exactly when the winding is
+    /// counter-clockwise as seen from outside.  The quantity is translation
+    /// invariant, so the mesh need not be centred.
+    #[test]
+    fn test_mesh_signed_volume_is_positive() {
+        let model = make_sphere_model();
+        let cfg = MeshExportConfig {
+            resolution: 24,
+            iso: 0.3,
+            ..Default::default()
+        };
+        let (mesh, _) = mesh_with_cell(&model, &cfg);
+        assert!(
+            !mesh.triangles.is_empty(),
+            "sphere must produce triangles at resolution 24"
+        );
+        let mut volume = 0.0_f64;
+        for &[ia, ib, ic] in &mesh.triangles {
+            let a = mesh.vertices[ia as usize];
+            let b = mesh.vertices[ib as usize];
+            let c = mesh.vertices[ic as usize];
+            // v0 · (v1 × v2)
+            let cross = [
+                (b[1] as f64) * (c[2] as f64) - (b[2] as f64) * (c[1] as f64),
+                (b[2] as f64) * (c[0] as f64) - (b[0] as f64) * (c[2] as f64),
+                (b[0] as f64) * (c[1] as f64) - (b[1] as f64) * (c[0] as f64),
+            ];
+            volume +=
+                (a[0] as f64) * cross[0] + (a[1] as f64) * cross[1] + (a[2] as f64) * cross[2];
+        }
+        volume /= 6.0;
+        assert!(
+            volume > 0.0,
+            "signed volume {volume:.6} must be positive (negative means the \
+             faces are wound inside-out)"
         );
     }
 

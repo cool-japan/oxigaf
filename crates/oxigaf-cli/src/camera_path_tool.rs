@@ -4,11 +4,12 @@
 //! for use with 3D Gaussian avatar models.
 
 use std::f32::consts::PI;
+
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::arcball::{
-    look_at as arcball_look_at, vec3_add, vec3_dot, vec3_length, vec3_normalize, vec3_scale,
-    vec3_sub,
+    look_at as arcball_look_at, vec3_add, vec3_length, vec3_normalize, vec3_scale, vec3_sub,
 };
 
 // ---------------------------------------------------------------------------
@@ -303,13 +304,24 @@ pub struct CameraPath {
 impl CameraPath {
     /// Construct a `CameraPath` from a frame list.
     ///
-    /// Returns [`CameraPathError::EmptyPath`] if `frames` is empty.
+    /// Returns [`CameraPathError::EmptyPath`] if `frames` is empty, or
+    /// [`CameraPathError::InvalidConfig`] if `fps` is not a positive finite
+    /// number (this also rejects `NaN`, since every comparison with `NaN`
+    /// is `false`). A non-positive or non-finite fps would otherwise flow
+    /// straight into `self.fps` and later corrupt `trim`'s duration
+    /// calculation (`frames.len() / fps` → infinity or a negative value)
+    /// and `compute_path_stats`'s speed units.
     pub fn new(frames: Vec<CameraPose>, fps: f32) -> Result<Self, CameraPathError> {
         if frames.is_empty() {
             return Err(CameraPathError::EmptyPath);
         }
+        if fps.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
+            return Err(CameraPathError::InvalidConfig(format!(
+                "fps must be a positive finite number, got {fps}"
+            )));
+        }
         let n = frames.len();
-        let duration_secs = if fps > 0.0 { n as f32 / fps } else { n as f32 };
+        let duration_secs = n as f32 / fps;
         Ok(Self {
             frames,
             fps,
@@ -495,11 +507,37 @@ pub fn keyframe_path(
             got: keyframes.len(),
         });
     }
+    for kf in keyframes {
+        if !kf.time.is_finite() {
+            return Err(CameraPathError::InvalidConfig(format!(
+                "keyframe time must be finite, got {}",
+                kf.time
+            )));
+        }
+    }
+    for pair in keyframes.windows(2) {
+        if pair[0].time.partial_cmp(&pair[1].time) != Some(std::cmp::Ordering::Less) {
+            return Err(CameraPathError::InvalidConfig(format!(
+                "keyframe times must be strictly increasing, got {} then {}",
+                pair[0].time, pair[1].time
+            )));
+        }
+    }
+
+    // Keyframes need not span exactly [0, 1] — map frame progress into
+    // whichever [first_time, last_time] span they actually cover, so a
+    // caller normalising from e.g. timestamps isn't forced through an exact
+    // 0.0/1.0 boundary to be considered valid.
+    let first_time = keyframes[0].time;
+    let last_time = keyframes[keyframes.len() - 1].time;
+    let time_span = last_time - first_time; // > 0: guaranteed by the check above
+
     let n = config.total_frames().max(1);
     let mut frames = Vec::with_capacity(n);
 
     for frame_idx in 0..n {
-        let global_t = frame_idx as f32 / (n - 1).max(1) as f32;
+        let frac = frame_idx as f32 / (n - 1).max(1) as f32; // in [0, 1]
+        let global_t = first_time + frac * time_span;
 
         // Find which segment this frame belongs to
         let seg = find_segment(keyframes, global_t);
@@ -507,9 +545,9 @@ pub fn keyframe_path(
         let kf_b = &keyframes[seg + 1];
 
         // Local t within the segment
-        let span = kf_b.time - kf_a.time;
-        let local_t = if span > 1e-9 {
-            (global_t - kf_a.time) / span
+        let seg_span = kf_b.time - kf_a.time;
+        let local_t = if seg_span > 1e-9 {
+            (global_t - kf_a.time) / seg_span
         } else {
             0.0
         };
@@ -543,9 +581,18 @@ pub fn keyframe_path(
     CameraPath::new(frames, config.fps)
 }
 
-/// Find the segment index such that keyframes[seg].time <= t < keyframes[seg+1].time.
+/// Find the segment index such that `keyframes[seg].time <= t < keyframes[seg+1].time`,
+/// clamping to the first segment when `t` falls at or below the first
+/// keyframe's time.
+///
+/// Assumes `keyframes` is sorted by strictly ascending `time` — callers
+/// (namely [`keyframe_path`]) are responsible for validating that; without
+/// it, a segment could be selected that does not actually contain `t`.
 fn find_segment(keyframes: &[PathKeyframe], t: f32) -> usize {
     let last_seg = keyframes.len() - 2;
+    if t <= keyframes[0].time {
+        return 0;
+    }
     for i in 0..last_seg {
         if t < keyframes[i + 1].time {
             return i;
@@ -642,8 +689,18 @@ pub fn compute_path_stats(path: &CameraPath) -> Result<PathStats, CameraPathErro
             max_speed = speed;
         }
     }
-    let mean_speed = if duration_secs > 0.0 {
-        total_distance / duration_secs
+    // `total_distance` accumulates over `total_frames - 1` inter-frame
+    // gaps, so divide by the time actually spanned by those gaps
+    // (`(total_frames - 1) * dt`), not the nominal path duration
+    // (`total_frames / fps`) — otherwise `mean_speed` and `max_speed` are
+    // computed against different notions of elapsed time.
+    let elapsed_secs = if total_frames > 1 {
+        (total_frames - 1) as f32 * dt
+    } else {
+        0.0
+    };
+    let mean_speed = if elapsed_secs > 0.0 {
+        total_distance / elapsed_secs
     } else {
         0.0
     };
@@ -662,165 +719,103 @@ pub fn compute_path_stats(path: &CameraPath) -> Result<PathStats, CameraPathErro
 // path_to_json / path_from_json
 // ---------------------------------------------------------------------------
 
-/// Export a `CameraPath` to a JSON string (hand-rolled).
+/// On-the-wire representation of one frame, used only by [`path_to_json`] /
+/// [`path_from_json`]. Kept separate from [`CameraPose`] so the public
+/// struct's field order/derives aren't dictated by the JSON format.
+#[derive(Serialize, Deserialize)]
+struct JsonFrame {
+    position: [f32; 3],
+    target: [f32; 3],
+    /// Absent in JSON written before `up` was tracked; defaults to the
+    /// same `[0, 1, 0]` that [`CameraPose::new`] uses.
+    #[serde(default = "default_up")]
+    up: [f32; 3],
+    #[serde(default = "default_fov")]
+    fov_y: f32,
+}
+
+fn default_up() -> [f32; 3] {
+    [0.0, 1.0, 0.0]
+}
+
+fn default_fov() -> f32 {
+    45.0
+}
+
+#[derive(Serialize, Deserialize)]
+struct JsonPath {
+    /// Absent in JSON produced without an explicit fps (or by an older
+    /// writer); [`path_from_json`] falls back to its `fps` parameter only
+    /// in that case — an explicit-but-invalid `fps` is a real validation
+    /// error, surfaced by [`CameraPath::new`], not silently replaced.
+    #[serde(default)]
+    fps: Option<f32>,
+    frames: Vec<JsonFrame>,
+}
+
+/// Export a `CameraPath` to a JSON string.
 ///
 /// Format:
 /// ```json
-/// {"fps":30.0,"frames":[{"position":[x,y,z],"target":[x,y,z],"fov_y":45.0},...]}
+/// {"fps":30.0,"frames":[{"position":[x,y,z],"target":[x,y,z],"up":[x,y,z],"fov_y":45.0},...]}
 /// ```
+///
+/// Non-finite values (`NaN`, `±Infinity`) in a pose serialize as JSON
+/// `null` — serde_json's documented behaviour for non-finite floats —
+/// rather than the bare `NaN`/`inf` tokens a naive formatter would emit,
+/// which are not valid JSON and cannot be parsed by any standard JSON
+/// consumer. This keeps the output always-valid JSON, at the cost of a
+/// path containing non-finite values failing to *re-parse* via
+/// [`path_from_json`] (a JSON `null` for a `position`/`target`/`fov_y`
+/// field is a type error, not a missing key that a default can fill) —
+/// that trade-off is intentional: a path with non-finite poses was already
+/// unusable, and it is better to fail loudly on load than to silently emit
+/// unparseable output.
 pub fn path_to_json(path: &CameraPath) -> String {
-    let mut out = String::new();
-    out.push_str(&format!("{{\"fps\":{},\"frames\":[", path.fps));
-    for (i, frame) in path.frames.iter().enumerate() {
-        if i > 0 {
-            out.push(',');
-        }
-        out.push_str(&format!(
-            "{{\"position\":[{},{},{}],\"target\":[{},{},{}],\"fov_y\":{}}}",
-            frame.position[0],
-            frame.position[1],
-            frame.position[2],
-            frame.target[0],
-            frame.target[1],
-            frame.target[2],
-            frame.fov_y,
-        ));
-    }
-    out.push_str("]}");
-    out
+    let doc = JsonPath {
+        fps: Some(path.fps),
+        frames: path
+            .frames
+            .iter()
+            .map(|f| JsonFrame {
+                position: f.position,
+                target: f.target,
+                up: f.up,
+                fov_y: f.fov_y,
+            })
+            .collect(),
+    };
+    // Every field here is a plain f32 (or array of f32) with no custom
+    // Serialize impl, so the only failure modes documented for
+    // `serde_json::to_string` (a custom `Serialize::serialize` error, or an
+    // I/O error from the writer) cannot occur — but fall back to an empty,
+    // still-valid document instead of ever panicking.
+    serde_json::to_string(&doc).unwrap_or_else(|_| "{\"fps\":0,\"frames\":[]}".to_string())
 }
 
 /// Parse a `CameraPath` from a JSON string produced by [`path_to_json`].
 ///
 /// `fps` is used as a fallback only if the JSON does not contain `"fps"`.
 pub fn path_from_json(json: &str, fps: f32) -> Result<CameraPath, CameraPathError> {
-    let json = json.trim();
+    let doc: JsonPath = serde_json::from_str(json.trim())
+        .map_err(|e| CameraPathError::InvalidConfig(format!("invalid path JSON: {e}")))?;
 
-    // Extract fps from JSON if present
-    let actual_fps = extract_json_float(json, "fps").unwrap_or(fps);
-
-    // Extract the frames array content
-    let frames_start = json
-        .find("\"frames\":[")
-        .ok_or_else(|| CameraPathError::InvalidConfig("missing \"frames\" array".to_string()))?;
-    let array_start = frames_start
-        + json[frames_start..]
-            .find('[')
-            .ok_or_else(|| CameraPathError::InvalidConfig("missing '[' in frames".to_string()))?;
-    let array_end = find_matching_bracket(json, array_start)
-        .ok_or_else(|| CameraPathError::InvalidConfig("unmatched '[' in frames".to_string()))?;
-
-    let array_content = &json[array_start + 1..array_end];
-    if array_content.trim().is_empty() {
+    if doc.frames.is_empty() {
         return Err(CameraPathError::EmptyPath);
     }
 
-    let frame_objects = split_json_objects(array_content);
-    let mut frames = Vec::with_capacity(frame_objects.len());
-
-    for obj in frame_objects {
-        let position = extract_json_array3(obj, "position").ok_or_else(|| {
-            CameraPathError::InvalidConfig(format!(
-                "missing or invalid 'position' in frame: {}",
-                &obj[..obj.len().min(80)]
-            ))
-        })?;
-        let target = extract_json_array3(obj, "target").ok_or_else(|| {
-            CameraPathError::InvalidConfig(format!(
-                "missing or invalid 'target' in frame: {}",
-                &obj[..obj.len().min(80)]
-            ))
-        })?;
-        let fov_y = extract_json_float(obj, "fov_y").unwrap_or(45.0);
-        frames.push(CameraPose {
-            position,
-            target,
-            up: [0.0, 1.0, 0.0],
-            fov_y,
-        });
-    }
+    let actual_fps = doc.fps.unwrap_or(fps);
+    let frames = doc
+        .frames
+        .into_iter()
+        .map(|f| CameraPose {
+            position: f.position,
+            target: f.target,
+            up: f.up,
+            fov_y: f.fov_y,
+        })
+        .collect();
     CameraPath::new(frames, actual_fps)
-}
-
-// ---------------------------------------------------------------------------
-// JSON parsing helpers
-// ---------------------------------------------------------------------------
-
-/// Extract a float value from a JSON string by key.
-fn extract_json_float(json: &str, key: &str) -> Option<f32> {
-    let search = format!("\"{}\":", key);
-    let start = json.find(&search)? + search.len();
-    let rest = json[start..].trim_start();
-    let end = rest.find([',', '}', ']']).unwrap_or(rest.len());
-    rest[..end].trim().parse::<f32>().ok()
-}
-
-/// Find the closing bracket matching the `[` at `start` in `json`.
-fn find_matching_bracket(json: &str, start: usize) -> Option<usize> {
-    let bytes = json.as_bytes();
-    if bytes.get(start) != Some(&b'[') {
-        return None;
-    }
-    let mut depth = 0usize;
-    for (i, &b) in bytes.iter().enumerate().skip(start) {
-        match b {
-            b'[' => depth += 1,
-            b']' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-/// Split a JSON array body (without outer `[` `]`) into individual object strings.
-fn split_json_objects(content: &str) -> Vec<&str> {
-    let mut objects = Vec::new();
-    let bytes = content.as_bytes();
-    let mut depth = 0usize;
-    let mut start = None;
-
-    for (i, &b) in bytes.iter().enumerate() {
-        match b {
-            b'{' => {
-                if depth == 0 {
-                    start = Some(i);
-                }
-                depth += 1;
-            }
-            b'}' => {
-                depth = depth.saturating_sub(1);
-                if depth == 0 {
-                    if let Some(s) = start.take() {
-                        objects.push(&content[s..=i]);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    objects
-}
-
-/// Extract a `[f32; 3]` value from a JSON object string by key.
-fn extract_json_array3(json: &str, key: &str) -> Option<[f32; 3]> {
-    let search = format!("\"{}\":[", key);
-    let start = json.find(&search)? + search.len();
-    let rest = &json[start..];
-    let end = rest.find(']')?;
-    let arr_str = &rest[..end];
-    let parts: Vec<&str> = arr_str.split(',').collect();
-    if parts.len() < 3 {
-        return None;
-    }
-    let x = parts[0].trim().parse::<f32>().ok()?;
-    let y = parts[1].trim().parse::<f32>().ok()?;
-    let z = parts[2].trim().parse::<f32>().ok()?;
-    Some([x, y, z])
 }
 
 // ---------------------------------------------------------------------------
@@ -860,7 +855,11 @@ pub fn blend_paths(
 
 /// Apply velocity smoothing via a moving average of camera positions.
 ///
-/// `window` must be at least 1; window=1 returns an identical path.
+/// `window` must be at least 1; window=1 returns an identical path. Each
+/// output frame averages `half = window / 2` frames on either side of it
+/// (plus itself), so the *actual* span averaged is always the odd number
+/// `2 * half + 1` — an even `window` is therefore rounded up to the next
+/// odd size (e.g. `window=4` and `window=5` both average 5 frames).
 pub fn smooth_path(path: &CameraPath, window: usize) -> Result<CameraPath, CameraPathError> {
     if path.frames.is_empty() {
         return Err(CameraPathError::EmptyPath);
@@ -975,21 +974,14 @@ pub fn zoom_in_path(
     CameraPath::new(frames, config.fps)
 }
 
-// ---------------------------------------------------------------------------
-// Internal utilities
-// ---------------------------------------------------------------------------
-
-/// Clamp a value between lo and hi.
-#[allow(dead_code)]
-fn clamp(v: f32, lo: f32, hi: f32) -> f32 {
-    v.max(lo).min(hi)
-}
-
-/// Dot product alias for clarity.
-#[allow(dead_code)]
-fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
-    vec3_dot(a, b)
-}
+// Removed: a private `clamp(v, lo, hi)` and a `dot3` alias for
+// `crate::arcball::vec3_dot`, both unreachable and both held alive by
+// `#[allow(dead_code)]`. `clamp` duplicated `f32::clamp`, which this module
+// already calls directly (see the easing and `smooth_path` code above);
+// `dot3` renamed `vec3_dot` without changing it, and was its only caller —
+// hence `vec3_dot` is no longer imported above. Neither was ever called, so
+// both were deleted rather than re-suppressed: new code here should use
+// `f32::clamp` and re-import `crate::arcball::vec3_dot` directly.
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -1228,6 +1220,27 @@ mod tests {
     }
 
     #[test]
+    fn test_camera_path_new_rejects_zero_fps() {
+        let frames = vec![CameraPose::new([0.0, 0.0, 0.0], [1.0, 0.0, 0.0])];
+        let result = CameraPath::new(frames, 0.0);
+        assert!(matches!(result, Err(CameraPathError::InvalidConfig(_))));
+    }
+
+    #[test]
+    fn test_camera_path_new_rejects_negative_fps() {
+        let frames = vec![CameraPose::new([0.0, 0.0, 0.0], [1.0, 0.0, 0.0])];
+        let result = CameraPath::new(frames, -30.0);
+        assert!(matches!(result, Err(CameraPathError::InvalidConfig(_))));
+    }
+
+    #[test]
+    fn test_camera_path_new_rejects_nan_fps() {
+        let frames = vec![CameraPose::new([0.0, 0.0, 0.0], [1.0, 0.0, 0.0])];
+        let result = CameraPath::new(frames, f32::NAN);
+        assert!(matches!(result, Err(CameraPathError::InvalidConfig(_))));
+    }
+
+    #[test]
     fn test_camera_path_get_frame_ok() {
         let frames = vec![
             CameraPose::new([0.0, 0.0, 0.0], [1.0, 0.0, 0.0]),
@@ -1409,6 +1422,62 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn test_keyframe_path_rejects_unsorted_times() {
+        let config = PathConfig::default();
+        let kfs = vec![
+            PathKeyframe::new(0.0, CameraPose::new([0.0, 0.0, 0.0], [0.0, 0.0, 1.0])),
+            PathKeyframe::new(1.0, CameraPose::new([10.0, 0.0, 0.0], [0.0, 0.0, 1.0])),
+            PathKeyframe::new(0.5, CameraPose::new([5.0, 0.0, 0.0], [0.0, 0.0, 1.0])),
+        ];
+        let result = keyframe_path(&kfs, &config);
+        assert!(
+            matches!(result, Err(CameraPathError::InvalidConfig(_))),
+            "unsorted keyframe times must be rejected, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_keyframe_path_rejects_duplicate_times() {
+        let config = PathConfig::default();
+        let kfs = vec![
+            PathKeyframe::new(0.0, CameraPose::new([0.0, 0.0, 0.0], [0.0, 0.0, 1.0])),
+            PathKeyframe::new(0.0, CameraPose::new([10.0, 0.0, 0.0], [0.0, 0.0, 1.0])),
+        ];
+        let result = keyframe_path(&kfs, &config);
+        assert!(matches!(result, Err(CameraPathError::InvalidConfig(_))));
+    }
+
+    #[test]
+    fn test_keyframe_path_rejects_non_finite_time() {
+        let config = PathConfig::default();
+        let kfs = vec![
+            PathKeyframe::new(0.0, CameraPose::new([0.0, 0.0, 0.0], [0.0, 0.0, 1.0])),
+            PathKeyframe::new(f32::NAN, CameraPose::new([10.0, 0.0, 0.0], [0.0, 0.0, 1.0])),
+        ];
+        let result = keyframe_path(&kfs, &config);
+        assert!(matches!(result, Err(CameraPathError::InvalidConfig(_))));
+    }
+
+    #[test]
+    fn test_keyframe_path_non_unit_span_still_works() {
+        // Keyframe times need not span exactly [0, 1] — a caller may have
+        // normalised from e.g. timestamps into some other ascending range.
+        let config = PathConfig {
+            duration_secs: 1.0,
+            fps: 10.0,
+            smooth_tangents: false,
+        };
+        let kfs = vec![
+            PathKeyframe::new(0.2, CameraPose::new([0.0, 0.0, 0.0], [0.0, 0.0, 1.0])),
+            PathKeyframe::new(0.9, CameraPose::new([10.0, 0.0, 0.0], [0.0, 0.0, 1.0])),
+        ];
+        let path = keyframe_path(&kfs, &config).expect("non-[0,1] span should still be valid");
+        assert_eq!(path.total_frames(), 10);
+        assert!(approx3(path.frames[0].position, [0.0, 0.0, 0.0]));
+        assert!(approx3(path.frames[9].position, [10.0, 0.0, 0.0]));
+    }
+
     // --- catmull_rom ---
 
     #[test]
@@ -1498,6 +1567,28 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[test]
+    fn test_compute_path_stats_mean_speed_matches_max_speed_for_constant_velocity() {
+        // `total_distance` accumulates over `n - 1` inter-frame gaps, so
+        // `mean_speed` must divide by the time spanned by those gaps
+        // ((n-1)/fps), not the nominal path duration (n/fps) — otherwise
+        // mean_speed and max_speed disagree even for perfectly uniform
+        // motion. 10 frames, 1.0 unit apart, at 10 fps: every gap has
+        // speed exactly 10.0 units/s, so mean and max must match exactly.
+        let frames: Vec<CameraPose> = (0..10)
+            .map(|i| CameraPose::new([i as f32, 0.0, 0.0], [0.0, 0.0, 0.0]))
+            .collect();
+        let path = CameraPath::new(frames, 10.0).expect("ok");
+        let stats = compute_path_stats(&path).expect("ok");
+        assert!(
+            approx(stats.mean_speed, stats.max_speed),
+            "mean_speed ({}) should equal max_speed ({}) for constant velocity",
+            stats.mean_speed,
+            stats.max_speed
+        );
+        assert!(approx(stats.mean_speed, 10.0));
+    }
+
     // --- path_to_json / path_from_json ---
 
     #[test]
@@ -1528,13 +1619,91 @@ mod tests {
         for (a, b) in original.frames.iter().zip(restored.frames.iter()) {
             assert!(approx3(a.position, b.position), "position mismatch");
             assert!(approx3(a.target, b.target), "target mismatch");
+            assert!(approx3(a.up, b.up), "up mismatch");
         }
+    }
+
+    #[test]
+    fn test_path_round_trip_json_preserves_non_default_up() {
+        // Every pose built through `look_at` (and every path produced by
+        // `keyframe_path`, which interpolates `up`) can carry a non-default
+        // up vector — it must not be silently reset to [0,1,0] on save/load.
+        let frames = vec![
+            CameraPose::look_at([0.0, 0.0, 5.0], [0.0, 0.0, 0.0], [1.0, 0.0, 0.0]),
+            CameraPose::look_at([1.0, 0.0, 5.0], [0.0, 0.0, 0.0], [0.0, 0.0, 1.0]),
+        ];
+        let original = CameraPath::new(frames, 10.0).expect("ok");
+        let json = path_to_json(&original);
+        assert!(json.contains("\"up\""), "JSON missing up field: {json}");
+
+        let restored = path_from_json(&json, 10.0).expect("parse ok");
+        for (a, b) in original.frames.iter().zip(restored.frames.iter()) {
+            assert!(
+                approx3(a.up, b.up),
+                "up vector should round-trip: {:?} vs {:?}",
+                a.up,
+                b.up
+            );
+        }
+    }
+
+    #[test]
+    fn test_path_from_json_defaults_up_when_absent() {
+        // Backward compatibility: JSON written before `up` was tracked
+        // (or by any other producer that omits it) must still parse,
+        // defaulting to the same [0,1,0] that `CameraPose::new` uses.
+        let json = r#"{"fps":10.0,"frames":[
+            {"position":[0.0,0.0,0.0],"target":[1.0,0.0,0.0],"fov_y":45.0}
+        ]}"#;
+        let path = path_from_json(json, 10.0).expect("parse ok");
+        assert_eq!(path.frames[0].up, [0.0, 1.0, 0.0]);
+    }
+
+    #[test]
+    fn test_path_to_json_is_always_valid_json_even_with_non_finite_poses() {
+        // A naive `format!("{}", f32)` serializer emits the bare tokens
+        // `NaN` / `inf`, which are not valid JSON. serde_json instead
+        // writes `null` for non-finite floats, so the output must always
+        // parse as generic JSON — even though such a path cannot be fully
+        // reconstructed by `path_from_json` afterwards (see the
+        // `path_to_json` doc comment).
+        let frames = vec![CameraPose::new(
+            [f32::NAN, f32::INFINITY, 0.0],
+            [0.0, 0.0, 0.0],
+        )];
+        let path = CameraPath::new(frames, 10.0).expect("ok");
+        let json = path_to_json(&path);
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&json).is_ok(),
+            "output must always be syntactically valid JSON, got: {json}"
+        );
     }
 
     #[test]
     fn test_path_from_json_invalid() {
         let result = path_from_json("{bad json}", 30.0);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_path_from_json_falls_back_to_param_fps_when_absent() {
+        let json = r#"{"frames":[
+            {"position":[0.0,0.0,0.0],"target":[1.0,0.0,0.0],"up":[0.0,1.0,0.0],"fov_y":45.0},
+            {"position":[1.0,0.0,0.0],"target":[1.0,0.0,0.0],"up":[0.0,1.0,0.0],"fov_y":45.0}
+        ]}"#;
+        let path = path_from_json(json, 24.0).expect("parse ok");
+        assert!(approx(path.fps, 24.0));
+    }
+
+    #[test]
+    fn test_path_from_json_rejects_explicit_invalid_fps() {
+        // An explicit-but-invalid fps is a real validation error, not
+        // silently replaced by the fallback parameter.
+        let json = r#"{"fps":0.0,"frames":[
+            {"position":[0.0,0.0,0.0],"target":[1.0,0.0,0.0],"up":[0.0,1.0,0.0],"fov_y":45.0}
+        ]}"#;
+        let result = path_from_json(json, 24.0);
+        assert!(matches!(result, Err(CameraPathError::InvalidConfig(_))));
     }
 
     // --- blend_paths ---
@@ -1613,6 +1782,29 @@ mod tests {
             assert!(
                 approx3(orig.position, sm.position),
                 "window=1 should be identity"
+            );
+        }
+    }
+
+    #[test]
+    fn test_smooth_path_even_window_rounds_up_to_next_odd() {
+        // Documented behaviour: `half = window / 2`, so the actual span
+        // averaged is `2*half + 1`, always odd — window=4 and window=5
+        // both average 5 frames and must therefore produce identical
+        // output.
+        let frames: Vec<CameraPose> = (0..10)
+            .map(|i| CameraPose::new([i as f32, 0.0, 0.0], [0.0, 0.0, 0.0]))
+            .collect();
+        let path = CameraPath::new(frames, 10.0).expect("ok");
+
+        let smoothed_4 = smooth_path(&path, 4).expect("ok");
+        let smoothed_5 = smooth_path(&path, 5).expect("ok");
+        for (a, b) in smoothed_4.frames.iter().zip(smoothed_5.frames.iter()) {
+            assert!(
+                approx3(a.position, b.position),
+                "window=4 should behave like window=5 (both round to a 5-frame span): {:?} vs {:?}",
+                a.position,
+                b.position
             );
         }
     }

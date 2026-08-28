@@ -254,6 +254,17 @@ impl MetricBar {
         } else {
             format!("{:.1} {}", self.value, self.unit)
         };
+        // `fraction()` clamps to [0, 1], so a value past `max` (e.g. a scene
+        // that has grown past a fixed Gaussian-count display range) would
+        // otherwise just peg the bar at 100% with no indication that the
+        // real value is off the scale. Flag it explicitly.
+        let value_str = if self.value > self.max {
+            format!("{value_str}{}▲{}", ansi::FG_RED, ansi::RESET)
+        } else if self.value < self.min {
+            format!("{value_str}{}▼{}", ansi::FG_RED, ansi::RESET)
+        } else {
+            value_str
+        };
 
         format!(
             "{}{}{} [{}{}{}{}{}] {}",
@@ -540,6 +551,15 @@ pub struct DashboardConfig {
     ///
     /// Used to calculate the cursor-up escape on subsequent frames.
     pub num_lines: usize,
+    /// Display range `(min, max)` for the PSNR bar, in dB (default: `(0.0, 45.0)`).
+    pub psnr_range: (f32, f32),
+    /// Display range `(min, max)` for the Loss bar (default: `(0.0, 0.1)`).
+    pub loss_range: (f32, f32),
+    /// Display range `(min, max)` for the Gaussian-count bar
+    /// (default: `(0.0, 300_000.0)`). A scene that grows past `max` during
+    /// densification still renders correctly -- [`MetricBar::render`] clamps
+    /// the bar fill but appends an out-of-range marker to the value text.
+    pub gaussians_range: (f32, f32),
 }
 
 impl Default for DashboardConfig {
@@ -562,6 +582,9 @@ impl Default for DashboardConfig {
             //  1 - blank footer
             // = 11 total
             num_lines: 11,
+            psnr_range: (0.0, 45.0),
+            loss_range: (0.0, 0.1),
+            gaussians_range: (0.0, 300_000.0),
         }
     }
 }
@@ -593,17 +616,32 @@ impl DashboardRenderer {
 
     /// Render a complete dashboard frame with cursor control.
     ///
-    /// On the first call, renders the full frame.
-    /// On subsequent calls, prepends cursor-up to overwrite the previous frame.
+    /// On the first call, hides the cursor (see [`Self::finish`] to restore
+    /// it) and renders the full frame. On subsequent calls, prepends
+    /// cursor-up to overwrite the previous frame; every emitted line is
+    /// individually cleared first (see [`Self::render_frame_no_cursor`]), so
+    /// a frame that is shorter than its predecessor -- e.g. an ETA
+    /// shrinking from "1:23:45" to "45s" -- does not leave stale trailing
+    /// characters on screen.
     pub fn render_frame(&mut self, state: &DashboardState) -> String {
         let content = self.render_frame_no_cursor(state);
         let result = if self.num_renders == 0 {
-            content
+            format!("{}{}", ansi::HIDE_CURSOR, content)
         } else {
             format!("{}{}", ansi::cursor_up(self.config.num_lines), content)
         };
         self.num_renders += 1;
         result
+    }
+
+    /// Restore the cursor after the last [`Self::render_frame`] call.
+    ///
+    /// Callers driving a live dashboard should print this once the run ends
+    /// (including on early exit/error paths), since the first `render_frame`
+    /// call hides the cursor and nothing else in this type shows it again.
+    #[must_use]
+    pub fn finish(&self) -> String {
+        ansi::SHOW_CURSOR.to_string()
     }
 
     /// Render the dashboard without cursor control codes.
@@ -676,7 +714,8 @@ impl DashboardRenderer {
         // ------------------------------------------------------------------
         // Line 4: PSNR bar
         // ------------------------------------------------------------------
-        let psnr_bar = MetricBar::new("PSNR", state.psnr, 0.0, 45.0)
+        let (psnr_min, psnr_max) = self.config.psnr_range;
+        let psnr_bar = MetricBar::new("PSNR", state.psnr, psnr_min, psnr_max)
             .with_unit("dB")
             .with_color("green")
             .with_width(bar_w);
@@ -699,7 +738,8 @@ impl DashboardRenderer {
         // ------------------------------------------------------------------
         // Line 6: Loss bar
         // ------------------------------------------------------------------
-        let loss_bar = MetricBar::new("Loss", state.total_loss, 0.0, 0.1)
+        let (loss_min, loss_max) = self.config.loss_range;
+        let loss_bar = MetricBar::new("Loss", state.total_loss, loss_min, loss_max)
             .with_color("yellow")
             .with_width(bar_w);
         lines.push(loss_bar.render());
@@ -721,9 +761,15 @@ impl DashboardRenderer {
         // ------------------------------------------------------------------
         // Line 8: Gaussians bar
         // ------------------------------------------------------------------
-        let gauss_bar = MetricBar::new("Gaussians", state.num_gaussians as f32, 0.0, 300_000.0)
-            .with_color("blue")
-            .with_width(bar_w);
+        let (gauss_min, gauss_max) = self.config.gaussians_range;
+        let gauss_bar = MetricBar::new(
+            "Gaussians",
+            state.num_gaussians as f32,
+            gauss_min,
+            gauss_max,
+        )
+        .with_color("blue")
+        .with_width(bar_w);
         lines.push(gauss_bar.render());
 
         // ------------------------------------------------------------------
@@ -775,7 +821,18 @@ impl DashboardRenderer {
         // ------------------------------------------------------------------
         lines.push(std::iter::repeat_n('─', width).collect::<String>());
 
-        lines.join("\n")
+        // Prefix every line with `CLEAR_LINE` ("erase in line", independent
+        // of cursor column) so that overwriting a previous, longer frame
+        // (e.g. a step count going from 6 digits back to 5, or an ETA
+        // shrinking) cannot leave stale trailing characters on screen. Only
+        // line 9 (Speed/ETA) used to be defensively padded to `panel_width`
+        // for this; every other line was not, so this replaces that
+        // width-dependent workaround with a correct fix for all lines.
+        lines
+            .iter()
+            .map(|line| format!("{}{}", ansi::CLEAR_LINE, line))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// Format a duration in seconds as `"H:MM:SS"`, `"MM:SS"`, or `"Xs"`.
@@ -978,6 +1035,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_metric_bar_render_flags_over_range_value() {
+        // A value past `max` must be visibly flagged, not silently pegged at
+        // 100% fill with no indication anything is out of range.
+        let bar = MetricBar::new("Gaussians", 500_000.0, 0.0, 300_000.0);
+        let rendered = bar.render();
+        assert!(
+            rendered.contains('▲'),
+            "over-range value should carry an out-of-range marker: {rendered}"
+        );
+    }
+
+    #[test]
+    fn test_metric_bar_render_flags_under_range_value() {
+        let bar = MetricBar::new("Test", -5.0, 0.0, 10.0);
+        let rendered = bar.render();
+        assert!(
+            rendered.contains('▼'),
+            "under-range value should carry an out-of-range marker: {rendered}"
+        );
+    }
+
+    #[test]
+    fn test_metric_bar_render_in_range_has_no_marker() {
+        let bar = MetricBar::new("Test", 5.0, 0.0, 10.0);
+        let rendered = bar.render();
+        assert!(!rendered.contains('▲'));
+        assert!(!rendered.contains('▼'));
+    }
+
     // -----------------------------------------------------------------------
     // DashboardPanel tests
     // -----------------------------------------------------------------------
@@ -1142,6 +1229,82 @@ mod tests {
             frame2.contains("\x1b["),
             "second frame should contain cursor control escape"
         );
+    }
+
+    #[test]
+    fn test_render_frame_hides_cursor_on_first_call_only() {
+        let config = DashboardConfig::default();
+        let mut renderer = DashboardRenderer::new(config);
+        let state = DashboardState::new(1000);
+
+        let frame1 = renderer.render_frame(&state);
+        assert!(
+            frame1.contains(ansi::HIDE_CURSOR),
+            "first frame must hide the cursor"
+        );
+
+        let frame2 = renderer.render_frame(&state);
+        assert!(
+            !frame2.contains(ansi::HIDE_CURSOR),
+            "cursor should only be hidden once, on the first frame"
+        );
+    }
+
+    #[test]
+    fn test_finish_shows_cursor() {
+        let renderer = DashboardRenderer::new(DashboardConfig::default());
+        assert_eq!(renderer.finish(), ansi::SHOW_CURSOR);
+    }
+
+    #[test]
+    fn test_render_frame_no_cursor_clears_every_line() {
+        // Regression coverage for: only the Speed/ETA line used to be
+        // padded to `panel_width`; every other line was left unpadded, so a
+        // shorter frame overwriting a longer previous one left stale
+        // trailing characters on screen. Every emitted line must now start
+        // with `CLEAR_LINE`.
+        let config = DashboardConfig::default();
+        let renderer = DashboardRenderer::new(config.clone());
+        let mut state = DashboardState::new(30_000);
+        state.update_step(12345, 28.3, 0.012, 0.009, 0.003, 60_000);
+
+        let frame = renderer.render_frame_no_cursor(&state);
+        let lines: Vec<&str> = frame.split('\n').collect();
+        assert_eq!(lines.len(), config.num_lines);
+        for (i, line) in lines.iter().enumerate() {
+            assert!(
+                line.starts_with(ansi::CLEAR_LINE),
+                "line {i} should start with CLEAR_LINE: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_dashboard_config_custom_ranges_affect_render() {
+        // A Gaussian count above the *default* 300_000 ceiling would peg the
+        // bar at 100%; with a widened `gaussians_range` it should not be
+        // flagged as out-of-range.
+        let mut config = DashboardConfig::default();
+        config.gaussians_range = (0.0, 2_000_000.0);
+        let renderer = DashboardRenderer::new(config);
+        let mut state = DashboardState::new(30_000);
+        state.update_step(1, 20.0, 0.01, 0.005, 0.005, 500_000);
+
+        let frame = renderer.render_frame_no_cursor(&state);
+        assert!(
+            !frame.contains('▲'),
+            "500k Gaussians should be in-range once gaussians_range is widened to 2M"
+        );
+    }
+
+    #[test]
+    fn test_dashboard_config_default_ranges_match_previous_hardcoded_values() {
+        // Pin the defaults so this refactor cannot silently change behaviour
+        // for callers that never touch the new fields.
+        let config = DashboardConfig::default();
+        assert_eq!(config.psnr_range, (0.0, 45.0));
+        assert_eq!(config.loss_range, (0.0, 0.1));
+        assert_eq!(config.gaussians_range, (0.0, 300_000.0));
     }
 
     #[test]

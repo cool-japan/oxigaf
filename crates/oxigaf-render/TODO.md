@@ -20,10 +20,11 @@
 - ✅ **Prefix sum shader** (`prefix_sum.wgsl`, `prefix_sum_add.wgsl`)
   - Work-efficient Blelloch scan
   - Inclusive prefix sum over tile counts
-- ✅ **GPU radix sort** (`radix_sort.wgsl`, `radix_histogram.wgsl`, `radix_scatter.wgsl`)
+- ✅ **GPU radix sort** (`radix_histogram.wgsl`, `radix_scatter.wgsl`, driven from `sort.rs`)
   - 64-bit keys (tile_id << 32 | depth)
   - Fuchsia-based radix sort (adapted from web-splat)
   - Multi-pass sorting (histogram → prefix → scatter)
+  - 0.1.2: `RadixSorter::sort` no longer takes `device`/`keys`/`values` — that setup moved to a new `prepare()` step; `capacity()` now reports the sorter's live, growable buffer capacity instead of a fixed construction-time value
 - ✅ **Tile assignment** (`tile_assign.wgsl`)
   - Generate (tile_id, depth) keys for each Gaussian-tile intersection
   - Write to sort buffer
@@ -41,10 +42,19 @@
   - Reverse-order tile traversal
   - ∂L/∂color, ∂L/∂alpha, ∂L/∂conic, ∂L/∂mean2D
   - CAS-loop f32 atomicAdd for gradient accumulation
+  - Background's contribution to ∂L/∂alpha through final transmittance (0.1.2 fix — previously missing, biased training against any non-black background)
 - ✅ **Backward preprocess** (`preprocess_bwd.wgsl`)
   - ∂L/∂cov3D → ∂L/∂scale, ∂L/∂rotation
   - ∂L/∂color → ∂L/∂SH coefficients
   - ∂L/∂mean2D → ∂L/∂mean3D (projection chain rule)
+  - ∂L/∂color → ∂L/∂dir → ∂L/∂mean3D through view-dependent SH color (0.1.2 fix — previously missing for every `sh_degree >= 1` model)
+  - Cull guard against NaN gradients for Gaussians rejected by the near/far test (0.1.2 fix)
+
+> ⚠️ **0.1.1 → 0.1.2 correctness fixes.** Two bugs shipped in 0.1.1 and affected **every** training run that used these shaders, unconditionally:
+> 1. `rasterize_bwd.wgsl`'s backward tile kernel could accumulate a whole tile's gradient sum onto the *wrong* Gaussian. Its reverse-traversal loop bound was read per-pixel from `out_n_contrib`, so different threads in the same 16×16 workgroup ran the loop body — which contains `workgroupBarrier()` calls — a different number of times. That is non-uniform control flow around a barrier, which WGSL requires to be uniform. Fixed by computing a single workgroup-uniform loop bound (`tile_end`, via `workgroupUniformLoad`) with per-thread validity expressed as a `contributes` mask instead of a per-thread trip count.
+> 2. `preprocess_bwd.wgsl` omitted the position gradient through view-dependent SH color for every `sh_degree >= 1` model — only the projection path (`∂L/∂mean2D → ∂L/∂mean3D`) was differentiated, not the `∂L/∂color → ∂L/∂dir → ∂L/∂pos` path the forward pass's `dir = normalize(pos - cam_pos)` requires.
+>
+> **Retraining is the only remedy for both** — there is no way to recover the missing gradient signal from an already-trained model. See `CHANGELOG.md`'s `[0.1.2]` migration notes for full detail, including why the existing finite-difference test suite didn't catch either bug (a harness bug in `gpu_gradient_verify.rs` reported NaN/Infinity/empty comparisons as a "clean" `0.0` error — see Testing & Validation below).
 
 ### FLAME Mesh Binding
 - ✅ **Gaussian-to-mesh binding** (`binding.rs`)
@@ -52,16 +62,17 @@
   - Barycentric coordinate binding
   - Local offset support (learnable for flexible)
   - TBN matrix computation
-- ✅ **Deformation shader** (in preprocess/binding)
+- ✅ **Deformation shader** (`deform_gaussians.wgsl` + `src/deform.rs`)
   - Transform Gaussians with FLAME mesh updates
   - Per-frame mesh vertex upload
   - Position and rotation updates
 
 ### GPU Infrastructure
-- ✅ **Rasterizer orchestration** (`rasterizer.rs`, 775 lines)
+- ✅ **Rasterizer orchestration** (`rasterizer/` module: `mod.rs`, `bind_groups.rs`, `limits.rs` — split out of a single `rasterizer.rs` as the module grew)
   - Forward and backward dispatch
   - Buffer management
   - Pipeline state tracking
+  - 0.1.2: `limits.rs` adds device-limit validation (`rasterizer_device_limits`, see Debugging & Visualization below)
 - ✅ **Buffer pool** (`pool.rs`, 580 lines)
   - Memory-efficient buffer reuse
   - Automatic resizing for dynamic Gaussian counts
@@ -90,15 +101,16 @@
 - ✅ NaN/Inf detection
 
 ### Testing & Validation
-- ✅ 2393 tests total (v0.1.1):
-  - Unit tests (in src/, includes all post-processing, rendering pipeline, and utility modules)
-  - Integration tests
-  - Doc tests
-  - GPU tests (`#[ignore]` for CI)
-- ✅ **35 gradient verification tests** (`gpu_gradient_verify.rs`)
-  - Finite-difference vs analytical gradients, <1e-3 relative error
+- ✅ 2,903 `#[test]`-attributed tests total (v0.1.2), all passing:
+  - 2,887 run by default (`cargo nextest run -p oxigaf-render --all-features`)
+  - 16 more require real GPU hardware and are `#[ignore]`d (4 `deform`, 5 `multi_view`, 4 `cpu_gpu_compare`, 1 `pipeline`, 1 `sort`, plus 1 slow 100-Gaussian position-gradient check); run with `--run-ignored ignored-only` — all 16 pass when a GPU adapter is present
+  - 23 doc-tests passing, 3 `#[ignore]`d
+- ✅ **78 gradient verification tests** (`gpu_gradient_verify.rs` + `tests/gpu_gradient_verify/sh.rs` and `tests/gradient_verification/`)
+  - Finite-difference vs analytical gradients, median-relative-error metric: ≤5e-2 for most parameters, ≤2.5e-1 for position (tile-boundary discontinuities in the forward pass need a wider tolerance)
   - All parameters: position, rotation, scale, opacity, SH coefficients
   - FLAME binding backward (mesh-bound ∂L/∂local_offset)
+  - Includes the harness's own NaN/empty-input guard unit tests, added in 0.1.2 after the bug described above let a non-finite or empty comparison report a "clean" `0.0` error
+  - Most of these self-skip at runtime (not via `#[ignore]`) when no GPU adapter is available, rather than being permanently ignored — see `tests/gradient_verification/mod.rs`
 - ✅ Shape preservation tests
 - ✅ Buffer pool tests
 - ✅ Configuration tests
@@ -111,10 +123,10 @@
 - ✅ Memory pool efficiency
 
 ### Code Quality
-- ✅ No unwrap policy
+- ✅ No unwrap policy (verified: no `.unwrap()`/`.expect()` outside doc-comment examples and `#[cfg(test)]` code)
 - ✅ No expect in library code
-- ✅ All files under 800 lines (within 2000 line policy)
-- ✅ Total: 6,503 lines (3,851 Rust + 2,652 WGSL)
+- ✅ Largest file is 1,977 lines (`depth_of_field.rs`) — within the 2,000-line policy, though several files are close to it (`rasterizer/mod.rs` 1,926, `lens_distortion.rs` 1,905, `lod.rs`/`deform.rs` 1,884, `gaussian.rs` 1,845) and worth watching for a future split
+- ✅ Total: ~96,980 lines across 132 `.rs` files (77,937 code lines per `tokei`) + 4,296 lines across 17 `.wgsl` shaders
 - ✅ Clean module boundaries
 
 ### Post-Processing Pipeline (v0.1.1)
@@ -186,10 +198,11 @@ Currently none.
 ## 📋 Completed (added in v0.1.0, previously Missing)
 
 ### Gradient Verification ✅
-- ✅ **Finite-difference gradient checks** (`gpu_gradient_verify.rs`, 1,573 lines)
+- ✅ **Finite-difference gradient checks** (`gpu_gradient_verify.rs` + `tests/gpu_gradient_verify/sh.rs` and `tests/gradient_verification/`)
   - All parameters verified: positions, rotations, scales, opacities, SH
   - FLAME binding backward: ∂L/∂local_offset for mesh-bound Gaussians
-  - Tolerance: |analytical - numerical| < 1e-3 (35 tests, all passing)
+  - Median-relative-error tolerance: ≤5e-2 for most parameters, ≤2.5e-1 for position (78 tests total, all passing)
+  - 0.1.2: fixed a harness bug where a NaN, `Infinity`, or empty error set was reported as a "clean" `0.0` — this is why the two backward-shader gradient bugs fixed this release survived the 0.1.1 suite despite this section's own "DONE"
 
 ### FLAME Binding Backward ✅
 - ✅ **Backward pass through FLAME mesh binding** (`preprocess_bwd.wgsl`)
@@ -199,7 +212,7 @@ Currently none.
 ## 📋 Planned (future versions)
 
 ### Backward Pass Refinement
-- ✅ **cov2d_backward.rs** — CPU reference for 2D-covariance backward pass, 6 tests incl. finite-difference gradient check; `shaders/cov2d_bwd.wgsl` documents backward math
+- ✅ **cov2d_backward.rs** — CPU-only reference/test oracle for the 2D-covariance backward pass, 10 tests incl. a finite-difference gradient check; `shaders/cov2d_bwd.wgsl` documents the backward math but, like the CPU reference, is not compiled/dispatched as a GPU pipeline — the live GPU path stays inline in `preprocess_bwd.wgsl`
 - ⬜ **Cross-validation with gsplat (Python)**
   - Layer-by-layer gradient comparison
   - Save test data in `tests/reference/`
@@ -222,9 +235,11 @@ Currently none.
   - `save_safetensors()` and `load_safetensors()` storing all fields: positions, rotations, scales, opacities, sh_coeffs, face_indices, barycentric, local_offsets, is_rigid
   - Metadata: sh_degree, num_gaussians
   - 10 new tests added
+- ✅ **glTF export** (0.1.2) — new `gltf` module: `write_gltf`/`GltfError`, `EXTENSION_NAME = "OXIGAF_gaussian_splat"`. The single, spec-conformant glTF 2.0 writer, consolidating what were three independently-written, mutually-incompatible glTF emitters in the workspace (this crate had none before; `oxigaf-cli` had two). One buffer view per accessor, mandatory `min`/`max` on the `POSITION` accessor, asset-only document for an empty model. Only `POSITION` is a standard glTF mesh attribute; rotation/scale/opacity/SH each get their own accessor referenced by index from the `OXIGAF_gaussian_splat` node extension instead, since glTF has no standard per-vertex semantic for them
 
 ### Performance Optimization
 - ✅ **Occupancy tuning / Adaptive workgroup size** — `workgroup.rs` (388 lines). `WorkgroupSize` (x/y/z, linear/square/new, total(), dispatch_count_x/y). `WorkgroupProfile` (Mobile=32, Balanced=64, HighThroughput=256, Custom) with default_size/name/description. `WorkgroupConfig` (per-pass: preprocess/sort/rasterize/backward/tile) with from_profile/mobile/balanced/high_throughput/adaptive(num_gaussians)/validate/Default. `WorkgroupBenchResult` (mean_duration_us/min/samples). `WorkgroupBenchmarker` (with_candidates/with_warmup/with_measure/benchmark/best_of/recommend). 34 new tests.
+  - 0.1.2: `from_profile`'s tile dimensions changed from 4×4 to 16×16 (`WorkgroupConfig::SHIPPED_TILE`) to match the new `RASTERIZE_TILE_SIZE` constant, since `Rasterizer::from_device` now hard-errors on any other tile size instead of silently accepting it
 - ⬜ **Shared memory optimization**
   - Tile-local Gaussian data caching
   - Reduce global memory bandwidth
@@ -243,7 +258,7 @@ Currently none.
   - 22 new CPU-side tests (6 GPU tests `#[ignore]`)
 
 ### Integration Features
-- ⬜ **burn-autodiff custom op** — genuinely missing (no burn dep in crate)
+- ⬜ **burn-autodiff custom op** — genuinely missing; no `burn` dependency exists anywhere in the workspace (`grep -rn '^burn' */Cargo.toml` is empty), and the cross-framework tensor path actually in use goes through `oxigaf-bridge`'s torsh-core/torsh-tensor/torsh-nn stack instead (bumped 0.1.2 → 0.2.0 this release). This item may be superseded rather than pending — see "Priority for v1.0" below
 - ✅ **Mesh binding shader forward**
   - Dedicated `deform_gaussians.wgsl` + `src/deform.rs` (`DeformPipeline`)
   - TBN matrix from triangle geometry
@@ -263,16 +278,17 @@ Currently none.
   - `time()` closure-based recording, `all_stats()` sorted by total desc, `format_report()` table
   - `estimate_bandwidth_gbs()`, `ProfileScope<'a>` RAII guard (records in Drop)
   - 24 new tests; 174 unit + 60 integration + 4 doc tests passing
+- ✅ **GPU-side timestamp profiler** (0.1.2, complementing the CPU-side `PassProfiler` above)
+  - `profiler::GpuTimestampProfiler`, backed by `wgpu::Features::TIMESTAMP_QUERY` (`REQUIRED_FEATURES`, `DEFAULT_MAX_PASSES = 32`; `new`, `stats`, `period_ns`, `reserved_passes`, `pass_writes`, `resolve`, `collect`, `discard`)
+  - `Rasterizer::enable_gpu_timestamps()` / `disable_gpu_timestamps()` / `gpu_timestamps()`; `Rasterizer::new` requests the feature automatically whenever the adapter supports it, so `enable_gpu_timestamps()` cleanly returns `RenderError::GpuInit` rather than panicking on hardware that doesn't
+- ✅ **Device-limit validation** (0.1.2) — `rasterizer::rasterizer_device_limits`, `RASTERIZER_STORAGE_BUFFERS_PER_STAGE` (= 16), `RASTERIZE_FWD_WORKGROUP_STORAGE_BYTES` (= 17,408); `Rasterizer::from_device` now validates a caller-supplied `wgpu::Device`'s limits upfront instead of letting an under-provisioned device fail later as an opaque wgpu pipeline-validation error
 - ⬜ **Validation layers enhancements**
   - When gpu_debug enabled, validate all buffers
   - Check for NaN/Inf in gradients
   - Verify buffer sizes match expected shapes
 
 ### Documentation
-- ⬜ **Shader documentation**
-  - Add detailed comments to all .wgsl files
-  - Explain each dispatch's purpose
-  - Document buffer layouts
+- ✅ **Shader documentation** — no longer sparse: all 17 `.wgsl` files carry substantial comments (roughly 20-65% comment-only lines; the backward shaders are the most thorough, e.g. `cov2d_bwd.wgsl` ~65%, `rasterize_bwd.wgsl` ~45%, documenting both the gradient math and the 0.1.2 bug history). Not a formally reviewed "every dispatch explained" pass — just an honest correction of the previous "sparse" claim
 - ⬜ **Algorithm explanation**
   - Tile-based rasterization walkthrough
   - Backward pass gradient flow diagram
@@ -321,30 +337,30 @@ Currently none.
 
 ## 📊 Current Status
 
-### Implementation: ~99% complete (v0.1.1+, occupancy tuning done)
+### Implementation: ~99% complete (v0.1.2, occupancy tuning + glTF export + GPU timestamp profiler done)
 - ✅ Forward pass: 100%
-- ✅ Backward pass: 97% (cov2d_bwd separate shader still in preprocess_bwd; all gradients verified)
-- ✅ GPU infrastructure: 100%
+- ✅ Backward pass: gradients 100% verified (two gradient-correctness bugs were fixed in 0.1.2, see the callout under "Backward Pass (Differentiability)" above before assuming a pre-0.1.2 trained model is fine); the originally-planned *separate* cov2d-backward shader is still unbuilt — that math stays inline in `preprocess_bwd.wgsl` — see the Cov2D row in the Comparison table below
+- ✅ GPU infrastructure: 100% (0.1.2: device-limit validation, GPU timestamp profiler)
 - ✅ Buffer management: 100%
 - ✅ FLAME mesh binding: 100% (forward ✅ dedicated deform_gaussians.wgsl + DeformPipeline, backward ✅)
-- ✅ Adaptive density control: 100% (`density.rs`, 552 lines, 25 tests)
-- ✅ Gaussian I/O: 100% (PLY done; SafeTensors done)
-- ⬜ burn-autodiff integration: 0%
-- ✅ Multi-view batch rendering: 100% (`multi_view.rs`, 22 CPU tests + 6 GPU ignored)
+- ✅ Adaptive density control: 100% (`density.rs`, 25 tests)
+- ✅ Gaussian I/O: 100% (PLY done; SafeTensors done; glTF export done in 0.1.2)
+- ⬜ burn-autodiff integration: 0% (no `burn` dependency anywhere in the workspace; likely superseded by the torsh-based `oxigaf-bridge` path rather than pending)
+- ✅ Multi-view batch rendering: 100% (`multi_view.rs`, CPU + GPU-ignored tests)
 
-### Tests: 302 tests (all passing)
-- ✅ Unit tests: 208 (52 prior + 29 new debug_readback + 24 new profiler + 34 new workgroup + prior growth; 4 doc tests)
-- ✅ Integration tests: 60 integration + prior coverage
-- ✅ Gradient verification: 35 (`gpu_gradient_verify.rs`) — **DONE**
-- ✅ GPU tests (multi-view): 6 (`#[ignore]` for CI)
+### Tests: 2,903 tests (all passing)
+- ✅ 2,887 run by default: `cargo nextest run -p oxigaf-render --all-features`
+- ✅ 16 more require real GPU hardware, `#[ignore]`d; all 16 pass via `--run-ignored ignored-only`
+- ✅ 23 doc-tests passing, 3 `#[ignore]`d
+- ✅ Gradient verification: 78 (`gpu_gradient_verify.rs` + `tests/gpu_gradient_verify/sh.rs` and `tests/gradient_verification/`) — **DONE**, and the harness's own NaN/empty-guard bug is now covered too
 - ⬜ Cross-validation with Python: 0
-- Coverage: Excellent including backward pass, multi-view, density control, debug readback, GPU profiler, adaptive workgroup
+- Coverage: Excellent including backward pass, multi-view, density control, debug readback, GPU profiler (CPU- and GPU-side), adaptive workgroup, glTF export
 
 ### Documentation: Good
 - ✅ Rustdoc with feature explanations
 - ✅ Module-level documentation
 - ✅ Usage examples: 3 compilable examples (`render_ply.rs`, `benchmark.rs`, `flame_binding.rs`)
-- ⬜ Shader comments: Sparse
+- ✅ Shader comments: no longer sparse — see "Shader documentation" above
 - ⬜ Algorithm walkthrough: 0
 
 ### Benchmarks: Good
@@ -363,46 +379,49 @@ Currently none.
 | Tile ranges | ✅ | ✅ | Fully implemented |
 | Forward rasterization | ✅ | ✅ | Fully implemented |
 | Backward rasterization | ✅ | ✅ | Fully implemented |
-| Cov2D backward | ✅ Separate shader | ⬜ | Currently in preprocess_bwd |
+| Cov2D backward | ✅ Separate shader | ⬜ | Computed inline in preprocess_bwd; `cov2d_backward.rs` (CPU test oracle, 10 tests) and `cov2d_bwd.wgsl` (math docs) exist alongside it but neither is a compiled/dispatched GPU pipeline, so this row stays ⬜ |
 | Preprocess backward | ✅ | ✅ | Fully implemented |
 | FLAME binding forward | ✅ | ✅ | Fully implemented |
 | FLAME binding backward | ✅ | ✅ | **Done v0.1.0** (`preprocess_bwd.wgsl`) |
 | Buffer pool | ⬜ Not in plan | ✅ | **EXCEEDS PLAN** - Memory efficiency |
 | Specialized SH shaders | ⬜ Not in plan | ✅ | **EXCEEDS PLAN** - 10× speedup |
-| Adaptive density control | ✅ | ✅ | **Done** (`density.rs`, 552 lines, Clone/Split/Prune, 25 tests) |
-| PLY I/O | ✅ | ✅ | Done (save/load, binary LE, SH degree 0-3, 8 tests) |
+| Adaptive density control | ✅ | ✅ | **Done** (`density.rs`, Clone/Split/Prune, 25 tests) |
+| PLY I/O | ✅ | ✅ | Done (save/load, binary LE, SH degree 0-3, 8 tests). 0.1.2: `f_rest_*` property order fixed to channel-major — pre-0.1.2 `sh_degree >= 1` files load permuted, re-export them |
 | SafeTensors I/O | ✅ | ✅ | Done (all fields + metadata, 10 tests) |
-| Gradient verification | ✅ | ✅ | **Done v0.1.0** (35 tests, <1e-3 error) |
+| glTF export | ⬜ Not in plan | ✅ | **NEW 0.1.2** — `gltf::write_gltf`, spec-conformant glTF 2.0, replacing 2 incompatible emitters elsewhere in the workspace |
+| Gradient verification | ✅ | ✅ | **Done v0.1.0**, correctness fixed further in 0.1.2 (78 tests, ≤5e-2 median error / ≤2.5e-1 for position — see "Differentiability" in README) |
 | Mesh binding shader forward | ✅ | ✅ | **Done** (`deform_gaussians.wgsl` + `DeformPipeline`, 12 tests) |
-| Intermediate buffer readback | ⬜ | ✅ | **Done** (`debug_readback.rs` 386 lines, RasterizationSnapshot/Stats, tile viz, 29 tests) |
-| GPU profiler integration | ⬜ | ✅ | **Done** (`profiler.rs`, PassProfiler, EMA, RAII ProfileScope, bandwidth est., 24 tests) |
-| Occupancy tuning / Adaptive workgroup | ⬜ | ✅ | **Done** (`workgroup.rs` 388 lines, WorkgroupProfile/Config/Benchmarker, adaptive(num_gaussians), 34 tests) |
-| burn-autodiff integration | ✅ | ⬜ | Not started |
+| Intermediate buffer readback | ⬜ | ✅ | **Done** (`debug_readback.rs`, RasterizationSnapshot/Stats, tile viz, 29 tests) |
+| GPU profiler integration (CPU-side) | ⬜ | ✅ | **Done** (`profiler.rs`, PassProfiler, EMA, RAII ProfileScope, bandwidth est., 24 tests) |
+| GPU timestamp profiler (GPU-side) | ⬜ Not in plan | ✅ | **NEW 0.1.2** — `profiler::GpuTimestampProfiler` + `Rasterizer::enable_gpu_timestamps()`, `wgpu::Features::TIMESTAMP_QUERY` |
+| Device-limit validation | ⬜ Not in plan | ✅ | **NEW 0.1.2** — `rasterizer::rasterizer_device_limits`; `Rasterizer::from_device` validates upfront instead of failing later as an opaque pipeline error |
+| Occupancy tuning / Adaptive workgroup | ⬜ | ✅ | **Done** (`workgroup.rs`, WorkgroupProfile/Config/Benchmarker, adaptive(num_gaussians), 34 tests) |
+| burn-autodiff integration | ✅ | ⬜ | Not started; no `burn` dependency exists anywhere in the workspace — likely superseded by the torsh-based `oxigaf-bridge` integration rather than pending |
 
 ## 🎯 Priority for v1.0
 
-**All v1.0 critical blockers resolved ✅:**
-1. ✅ ~~**Gradient verification**~~ — Done (35 tests, all passing)
+**Every originally-scoped v1.0 blocker except burn-autodiff is resolved:**
+1. ✅ ~~**Gradient verification**~~ — Done (78 tests, all passing; correctness bugs fixed 0.1.2)
 2. ✅ ~~**FLAME binding backward shader**~~ — Done
 3. ✅ ~~**Mesh binding shader forward**~~ — Done (`deform_gaussians.wgsl` + `DeformPipeline`, 12 tests)
-4. ✅ ~~**Intermediate buffer readback**~~ — Done (`debug_readback.rs` 386 lines, 29 tests, 268 total)
-5. ✅ ~~**GPU profiler integration**~~ — Done (`profiler.rs`, PassProfiler/PassStats/ProfileScope, EMA α=0.1, 24 tests)
-6. ⬜ **burn-autodiff integration** — Connect to trainer
+4. ✅ ~~**Intermediate buffer readback**~~ — Done (`debug_readback.rs`, 29 tests)
+5. ✅ ~~**GPU profiler integration**~~ — Done (`profiler.rs`, PassProfiler/PassStats/ProfileScope, EMA α=0.1, 24 tests; GPU-side `GpuTimestampProfiler` added 0.1.2)
+6. ⬜ **burn-autodiff integration** — not started, and not actually blocking: no `burn` dependency exists anywhere in the workspace, and cross-framework tensor integration in practice goes through `oxigaf-bridge`'s torsh-core/torsh-tensor/torsh-nn stack instead. Kept here as an honest record of an originally-planned item that was never started, not as an active release blocker
 
 **High Priority:**
-4. ✅ ~~Adaptive density control~~ — Done (`density.rs`, 552 lines, Clone/Split/Prune, golden-ratio split, 25 tests)
-5. ✅ ~~PLY I/O~~ (done — save/load, binary LE, SH degree 0-3)
+4. ✅ ~~Adaptive density control~~ — Done (`density.rs`, Clone/Split/Prune, golden-ratio split, 25 tests)
+5. ✅ ~~PLY I/O~~ (done — save/load, binary LE, SH degree 0-3; 0.1.2: `f_rest_*` fixed to channel-major)
 6. ✅ ~~SafeTensors I/O~~ (done — all fields + metadata, 10 tests)
 7. ⬜ Cross-validation with gsplat
 
 **Medium Priority:**
-7. ✅ ~~Multi-view batch rendering~~ — Done (`multi_view.rs`, `render_turntable()`, 22 CPU + 6 GPU tests)
+7. ✅ ~~Multi-view batch rendering~~ — Done (`multi_view.rs`, `render_turntable()`, CPU + GPU-ignored tests)
 8. ⬜ Gaussian initialization utilities
 9. ✅ ~~Usage examples~~ — Done (3 compilable examples: `render_ply.rs`, `benchmark.rs`, `flame_binding.rs`)
 
 **Low Priority:**
-10. ⬜ Shader documentation
-11. ✅ ~~Occupancy tuning / adaptive workgroup~~ — Done (`workgroup.rs`, 388 lines, 34 tests)
+10. ✅ ~~Shader documentation~~ — no longer sparse; see "Shader documentation" above
+11. ✅ ~~Occupancy tuning / adaptive workgroup~~ — Done (`workgroup.rs`, 34 tests)
 12. ⬜ Advanced features (compression, LOD)
 
 ## 🏆 Implementation Highlights
@@ -428,13 +447,13 @@ Currently none.
    - Graceful degradation
 
 4. **Test Coverage** (more thorough than planned)
-   - 163 tests (plan didn't specify count)
-   - 35 gradient verification tests (finite-difference, <1e-3 error)
+   - 2,903 tests total (plan didn't specify count): 2,887 run by default + 16 GPU-hardware `#[ignore]`d, all passing
+   - 78 gradient verification tests (finite-difference, ≤5e-2 median error / ≤2.5e-1 for position)
    - 12 CPU-side mesh binding shader tests
    - Integration tests
 
 5. **Code Organization** (cleaner than planned)
-   - All files under 800 lines
+   - All files under the 2,000-line policy limit (largest is 1,977 lines)
    - Clear module boundaries
    - Pool abstraction for memory management
 
@@ -442,39 +461,48 @@ Currently none.
 - Forward-only rendering (visualization)
 - Gaussian rasterization at interactive framerates
 - FLAME mesh binding
+- Differentiable training (both gradient-correctness bugs found in this crate's backward shaders are fixed as of 0.1.2 — see the callout under "Backward Pass (Differentiability)")
 
 **Not yet ready for:**
-- Cross-framework integration (burn-autodiff)
+- Cross-framework integration via `burn` specifically — not started, and likely superseded rather than pending (see "Priority for v1.0")
 
-## 🚀 v1.1 Status: All density control, multi-view, debug, and profiler items done ✅
+## 🚀 Status through v0.1.2: density control, multi-view, debug, profiler, glTF export, and two critical gradient fixes all done ✅
 
 **Completed in v0.1.0+:**
-1. ✅ **Gradient Verification** — 35 finite-difference tests, all parameters, <1e-3 error
+1. ✅ **Gradient Verification** — 78 finite-difference tests, all parameters, ≤5e-2 median error / ≤2.5e-1 for position
 2. ✅ **FLAME Binding Backward** — ∂L/∂local_offset implemented and tested
 3. ✅ **Mesh Binding Shader Forward** — `deform_gaussians.wgsl` + `DeformPipeline`, TBN/barycentric/quaternion composition, 12 tests
 
 **Completed in v0.1.1:**
-4. ✅ **Batch Multi-View Rendering** — `multi_view.rs`, `MultiViewRenderer`, `render_turntable()`, sRGB gamma, 22 CPU + 6 GPU tests
-5. ✅ **Adaptive Density Control** — `density.rs` (552 lines), Clone/Split (golden-ratio 0.618)/Prune, exp()/sigmoid() comparisons, 25 tests
-6. ✅ **Intermediate Buffer Readback** — `debug_readback.rs` (386 lines), `RasterizationSnapshot`/`RasterizationStats`, AABB tile assignment, `tile_occupancy_image()`/`hotspot_tiles()`/`tile_for_pixel()`, 29 new tests (268 total)
-7. ✅ **GPU Profiler Integration** — `profiler.rs`, `PassProfiler` (Mutex+AtomicU64), `PassStats` (count/total/min/max/EMA α=0.1), `time()` closure, `ProfileScope<'a>` RAII guard, `estimate_bandwidth_gbs()`, 24 new tests (174 unit + 60 integration + 4 doc)
-8. ✅ **Occupancy Tuning / Adaptive Workgroup Size** — `workgroup.rs` (388 lines), `WorkgroupSize`/`WorkgroupProfile`/`WorkgroupConfig`/`WorkgroupBenchmarker`, `adaptive(num_gaussians)`, Mobile/Balanced/HighThroughput profiles, 34 new tests (302 total)
+4. ✅ **Batch Multi-View Rendering** — `multi_view.rs`, `MultiViewRenderer`, `render_turntable()`, sRGB gamma, CPU + GPU-ignored tests
+5. ✅ **Adaptive Density Control** — `density.rs`, Clone/Split (golden-ratio 0.618)/Prune, exp()/sigmoid() comparisons, 25 tests
+6. ✅ **Intermediate Buffer Readback** — `debug_readback.rs`, `RasterizationSnapshot`/`RasterizationStats`, AABB tile assignment, `tile_occupancy_image()`/`hotspot_tiles()`/`tile_for_pixel()`, 29 tests
+7. ✅ **GPU Profiler Integration (CPU-side)** — `profiler.rs`, `PassProfiler` (Mutex+AtomicU64), `PassStats` (count/total/min/max/EMA α=0.1), `time()` closure, `ProfileScope<'a>` RAII guard, `estimate_bandwidth_gbs()`, 24 tests
+8. ✅ **Occupancy Tuning / Adaptive Workgroup Size** — `workgroup.rs`, `WorkgroupSize`/`WorkgroupProfile`/`WorkgroupConfig`/`WorkgroupBenchmarker`, `adaptive(num_gaussians)`, Mobile/Balanced/HighThroughput profiles, 34 tests
+
+**Completed in v0.1.2:**
+9. ✅ **Two backward-shader gradient-correctness fixes** — wrong-Gaussian gradient accumulation in the tile kernel, and a missing position gradient through view-dependent SH color for `sh_degree >= 1` — see the callout under "Backward Pass (Differentiability)" above. Both affected every 0.1.1 training run; retraining is the only remedy
+10. ✅ **glTF export** — `gltf::write_gltf`/`GltfError`, spec-conformant glTF 2.0
+11. ✅ **GPU timestamp profiler** — `profiler::GpuTimestampProfiler` + `Rasterizer::enable_gpu_timestamps()`, complementing the CPU-side profiler above
+12. ✅ **Device-limit validation** — `rasterizer::rasterizer_device_limits`; `Rasterizer::from_device` now validates upfront and rejects `tile_size != 16`
+13. ✅ **PLY `f_rest_*` channel-major fix** — see the migration note in `CHANGELOG.md`; re-export pre-0.1.2 `sh_degree >= 1` PLYs
 
 **Remaining for future versions:**
-8. ⬜ **burn-autodiff Integration** (~3-4 days)
-   - Custom differentiable op interface
-   - Tensor interface
-   - Gradient flow validation
+14. ⬜ **burn-autodiff Integration** — not started; no `burn` dependency exists anywhere in the workspace, and is likely superseded by `oxigaf-bridge`'s torsh-based integration (see "Priority for v1.0" above) rather than genuinely pending
 
-9. ✅ ~~**PLY I/O**~~ — Done (`gaussian.rs`: `save_ply`/`load_ply`, binary LE, SH degree 0-3, 8 tests)
-   ✅ ~~**SafeTensors I/O**~~ — Done (`gaussian.rs`: `save_safetensors`/`load_safetensors`, all fields + metadata, 10 tests)
+15. ✅ ~~**PLY I/O**~~ — Done (`gaussian.rs`: `save_ply`/`load_ply`, binary LE, SH degree 0-3, 8 tests)
+    ✅ ~~**SafeTensors I/O**~~ — Done (`gaussian.rs`: `save_safetensors`/`load_safetensors`, all fields + metadata, 10 tests)
 
-**oxigaf-render v0.1.1 is fully functional for the GAF training pipeline with full debug and profiling support.**
+**oxigaf-render v0.1.2 is fully functional for the GAF training pipeline, with full debug/profiling support, glTF export, and — as of this release — a correctness-verified backward pass for `sh_degree >= 1` models.**
 
 ## 📝 Notes
 
 - **Nightly Rust**: Not required (unlike oxigaf-flame)
-- **wgpu version**: 28.0 (latest)
+- **wgpu version**: 30 (workspace `Cargo.toml`)
 - **Platform support**: Vulkan (Linux/Windows), Metal (macOS), DX12 (Windows), OpenGL ES (CPU fallback)
-- **MSRV**: Rust 1.92+ (wgpu requirement)
+- **MSRV**: Rust 1.87 (workspace `rust-version`)
 - **Pure Rust**: 100% (no C/Fortran dependencies)
+
+## 🤝 Contributions
+
+This is a one-person project. Contributions (issues, PRs) are welcome.

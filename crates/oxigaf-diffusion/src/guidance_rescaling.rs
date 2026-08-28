@@ -51,6 +51,10 @@ pub enum GuidanceRescalingError {
     /// Phi rescaling factor is outside [0, 1].
     #[error("Invalid rescale factor {factor}: must be in [0, 1]")]
     InvalidRescaleFactor { factor: f32 },
+
+    /// `clamp_range` bounds are reversed or non-finite.
+    #[error("Invalid clamp range ({lo}, {hi}): both bounds must be finite with lo <= hi")]
+    InvalidClampRange { lo: f32, hi: f32 },
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -105,6 +109,11 @@ impl RescalingConfig {
             return Err(GuidanceRescalingError::InvalidPercentile {
                 p: self.dynamic_threshold_pct,
             });
+        }
+        if let Some((lo, hi)) = self.clamp_range {
+            if !lo.is_finite() || !hi.is_finite() || lo > hi {
+                return Err(GuidanceRescalingError::InvalidClampRange { lo, hi });
+            }
         }
         Ok(())
     }
@@ -178,7 +187,10 @@ pub fn abs_percentile(values: &[f32], percentile: f32) -> Result<f32, GuidanceRe
     }
 
     let mut abs_vals: Vec<f32> = values.iter().map(|&x| x.abs()).collect();
-    abs_vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    // `total_cmp` is a genuine total order (unlike `partial_cmp` collapsed
+    // to `Equal` on NaN), so this can never panic and never silently
+    // reorders finite values around a NaN entry.
+    abs_vals.sort_by(f32::total_cmp);
 
     let n = abs_vals.len();
     // Exact float index in [0, n-1]
@@ -358,12 +370,13 @@ pub fn apply_rescaled_guidance(
 ) -> Result<Vec<f32>, GuidanceRescalingError> {
     config.validate()?;
 
-    // Step 1 — standard CFG
+    // Step 1 — standard CFG (computed once; step 2 reuses this buffer
+    // in place instead of recomputing CFG a second time via `phi_rescale`).
     let mut out = apply_cfg_guidance(cond, uncond, config.guidance_scale)?;
 
-    // Step 2 — phi-rescaling (rebuilds from cond/uncond to keep std accurate)
+    // Step 2 — phi-rescaling
     if config.use_phi_rescaling {
-        out = phi_rescale(cond, uncond, config.guidance_scale, config.rescale_factor)?;
+        phi_rescale_in_place(&mut out, std_dev(cond), config.rescale_factor);
     }
 
     // Step 3 — dynamic thresholding
@@ -379,15 +392,70 @@ pub fn apply_rescaled_guidance(
     Ok(out)
 }
 
+/// In-place equivalent of [`phi_rescale`] given an already-computed CFG
+/// vector and the conditional prediction's standard deviation, avoiding a
+/// second full CFG pass. See [`phi_rescale`] for the formula.
+fn phi_rescale_in_place(cfg: &mut [f32], std_cond: f32, phi: f32) {
+    let std_cfg = std_dev(cfg);
+    let factor = std_cond / (std_cfg + 1e-8);
+    for v in cfg.iter_mut() {
+        let rescaled = *v * factor;
+        *v = phi * rescaled + (1.0 - phi) * *v;
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Box blur and Self-Attention Guidance
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// 1-D box filter with clamped (edge-replicated) boundaries.
+///
+/// `get(i)` supplies the source sample at logical position `i ∈ [0, len)`.
+/// `out[i]` receives the mean of the `2*radius+1` samples centred at `i`,
+/// with out-of-range offsets clamped to the nearest edge — matching the
+/// boundary convention of a naive clamped 2-D box window exactly (the sum
+/// of `image[clamp(y+dy), clamp(x+dx)]` over a 2-D window separates into a
+/// horizontal pass followed by a vertical pass because each axis is
+/// clamped independently). Runs in `O(len)` time via a prefix sum,
+/// independent of `radius`.
+fn box_filter_1d(len: usize, radius: i64, get: impl Fn(usize) -> f32, out: &mut [f32]) {
+    if len == 0 {
+        return;
+    }
+    let mut prefix = vec![0.0f32; len + 1];
+    for i in 0..len {
+        prefix[i + 1] = prefix[i] + get(i);
+    }
+    let len_i = len as i64;
+    let total = (2 * radius + 1) as f32;
+    let first = get(0);
+    let last = get(len - 1);
+    for x in 0..len_i {
+        let lo = x - radius;
+        let hi = x + radius;
+        let interior_lo = lo.max(0);
+        let interior_hi = hi.min(len_i - 1);
+        let interior_sum = prefix[(interior_hi + 1) as usize] - prefix[interior_lo as usize];
+        let left_count = (interior_lo - lo).max(0) as f32;
+        let right_count = (hi - interior_hi).max(0) as f32;
+        let sum = left_count * first + interior_sum + right_count * last;
+        out[x as usize] = sum / total;
+    }
+}
 
 /// Box blur on a flat interleaved `f32` image buffer.
 ///
 /// Each output pixel is the arithmetic mean of all pixels within `radius` in
 /// each spatial dimension (inclusive). Boundary pixels are clamped rather than
 /// zero-padded to avoid artefacts at the edges.
+///
+/// Implemented as a separable filter (horizontal pass then vertical pass),
+/// which is mathematically identical to the naive `O(w*h*c*radius²)` 2-D
+/// window for this clamped-boundary convention but runs in `O(w*h*c)` time.
+/// `radius` is capped at `max(width, height)` — both because a larger
+/// radius cannot change the result (every sample is already in range) and
+/// to keep the internal `i64` arithmetic from overflowing for pathological
+/// inputs such as `radius = usize::MAX`.
 pub fn box_blur_guidance(
     image: &[f32],
     width: u32,
@@ -410,25 +478,41 @@ pub fn box_blur_guidance(
         });
     }
 
+    let radius_i64 = radius.min(w.max(h)) as i64;
+    if radius_i64 == 0 {
+        return Ok(image.to_vec());
+    }
+
+    let mut scratch = vec![0.0f32; w.max(h)];
+
+    // Horizontal pass: image -> temp.
+    let mut temp = vec![0.0f32; expected];
+    for y in 0..h {
+        for ch in 0..c {
+            box_filter_1d(
+                w,
+                radius_i64,
+                |x| image[(y * w + x) * c + ch],
+                &mut scratch[..w],
+            );
+            for x in 0..w {
+                temp[(y * w + x) * c + ch] = scratch[x];
+            }
+        }
+    }
+
+    // Vertical pass: temp -> output.
     let mut output = vec![0.0f32; expected];
-    let r = radius as i64;
-
-    for y in 0..h as i64 {
-        for x in 0..w as i64 {
-            for ch in 0..c {
-                let mut sum = 0.0f32;
-                let mut count = 0usize;
-
-                for dy in -r..=r {
-                    let ny = (y + dy).clamp(0, h as i64 - 1) as usize;
-                    for dx in -r..=r {
-                        let nx = (x + dx).clamp(0, w as i64 - 1) as usize;
-                        sum += image[(ny * w + nx) * c + ch];
-                        count += 1;
-                    }
-                }
-
-                output[(y as usize * w + x as usize) * c + ch] = sum / count as f32;
+    for x in 0..w {
+        for ch in 0..c {
+            box_filter_1d(
+                h,
+                radius_i64,
+                |y| temp[(y * w + x) * c + ch],
+                &mut scratch[..h],
+            );
+            for y in 0..h {
+                output[(y * w + x) * c + ch] = scratch[y];
             }
         }
     }
@@ -718,6 +802,19 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn test_abs_percentile_nan_input_does_not_panic() {
+        // Regression test: `partial_cmp(...).unwrap_or(Equal)` is not a
+        // total order when NaN is present (Rust >= 1.81's sort can panic
+        // on that); `total_cmp` must never panic here regardless of the
+        // percentile requested.
+        let values = vec![1.0f32, f32::NAN, -2.0, 3.0, f32::NAN];
+        let result = abs_percentile(&values, 50.0);
+        assert!(result.is_ok());
+        // The result may legitimately be NaN if the percentile lands on a
+        // NaN entry, but the call itself must not panic and must not error.
+    }
+
     // ═════════════════════════════════════════════════════════════════════════
     // l2_normalize
     // ═════════════════════════════════════════════════════════════════════════
@@ -884,6 +981,29 @@ mod tests {
     }
 
     #[test]
+    fn test_apply_rescaled_guidance_phi_rescaling_matches_standalone_phi_rescale() {
+        // Regression test for the CFG-computed-twice-then-discarded bug: the
+        // in-place fast path used inside apply_rescaled_guidance must still
+        // produce the exact same result as calling phi_rescale directly.
+        let cond: Vec<f32> = (0..16).map(|i| (i as f32 - 8.0) * 0.3).collect();
+        let uncond: Vec<f32> = vec![0.0; 16];
+        let config = RescalingConfig {
+            guidance_scale: 6.0,
+            rescale_factor: 0.6,
+            use_phi_rescaling: true,
+            use_dynamic_thresholding: false,
+            clamp_range: None,
+            ..Default::default()
+        };
+        let result = apply_rescaled_guidance(&cond, &uncond, &config).unwrap();
+        let expected = phi_rescale(&cond, &uncond, config.guidance_scale, config.rescale_factor)
+            .expect("phi_rescale failed");
+        for (r, e) in result.iter().zip(expected.iter()) {
+            assert!(approx_eq(*r, *e, 1e-4), "{} vs {}", r, e);
+        }
+    }
+
+    #[test]
     fn test_apply_rescaled_guidance_with_dynamic_threshold() {
         let cond: Vec<f32> = (0..20).map(|i| (i as f32 - 10.0) * 5.0).collect();
         let uncond: Vec<f32> = vec![0.0; 20];
@@ -951,6 +1071,67 @@ mod tests {
         let image = vec![1.0f32; (w * h * c) as usize];
         let blurred = box_blur_guidance(&image, w, h, c, 2).unwrap();
         assert_eq!(blurred.len(), image.len());
+    }
+
+    #[test]
+    fn test_box_blur_matches_naive_definition() {
+        // Cross-check the separable rewrite against the original
+        // O(w*h*c*radius^2) nested-loop definition for a small non-uniform
+        // image, so the separable implementation is verified correct (not
+        // just "runs without panicking").
+        let w = 5usize;
+        let h = 4usize;
+        let c = 2usize;
+        let image: Vec<f32> = (0..(w * h * c)).map(|i| (i as f32 * 0.37).sin()).collect();
+        let radius = 2usize;
+
+        let mut naive = vec![0.0f32; w * h * c];
+        let r = radius as i64;
+        for y in 0..h as i64 {
+            for x in 0..w as i64 {
+                for ch in 0..c {
+                    let mut sum = 0.0f32;
+                    let mut count = 0usize;
+                    for dy in -r..=r {
+                        let ny = (y + dy).clamp(0, h as i64 - 1) as usize;
+                        for dx in -r..=r {
+                            let nx = (x + dx).clamp(0, w as i64 - 1) as usize;
+                            sum += image[(ny * w + nx) * c + ch];
+                            count += 1;
+                        }
+                    }
+                    naive[(y as usize * w + x as usize) * c + ch] = sum / count as f32;
+                }
+            }
+        }
+
+        let blurred =
+            box_blur_guidance(&image, w as u32, h as u32, c as u32, radius).expect("blur failed");
+        for (a, b) in blurred.iter().zip(naive.iter()) {
+            assert!((a - b).abs() < 1e-4, "{} vs {} (naive)", a, b);
+        }
+    }
+
+    #[test]
+    fn test_box_blur_huge_radius_does_not_overflow_or_hang() {
+        // Regression test: `radius = usize::MAX` used to cast to `r = -1`,
+        // making `-r..=r` the empty range `1..=-1`, so `count` stayed 0 and
+        // every output became `0.0 / 0.0 = NaN`. The radius must be capped
+        // to the image extent instead of overflowing.
+        let w = 4u32;
+        let h = 4u32;
+        let c = 1u32;
+        let image: Vec<f32> = (0..16).map(|i| i as f32 * 0.1).collect();
+        let blurred =
+            box_blur_guidance(&image, w, h, c, usize::MAX).expect("blur with huge radius failed");
+        assert_eq!(blurred.len(), 16);
+        assert!(
+            blurred
+                .iter()
+                .all(|v| v.is_finite() && *v >= 0.0 && *v <= 1.6),
+            "got NaN/Inf/out-of-range: {:?}",
+            blurred
+        );
     }
 
     // ═════════════════════════════════════════════════════════════════════════
@@ -1078,6 +1259,49 @@ mod tests {
         assert!(matches!(
             err,
             GuidanceRescalingError::InvalidPercentile { .. }
+        ));
+    }
+
+    #[test]
+    fn test_rescaling_config_invalid_clamp_range_reversed() {
+        let cfg = RescalingConfig {
+            clamp_range: Some((1.0, -1.0)),
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            GuidanceRescalingError::InvalidClampRange { .. }
+        ));
+    }
+
+    #[test]
+    fn test_rescaling_config_invalid_clamp_range_nan() {
+        let cfg = RescalingConfig {
+            clamp_range: Some((f32::NAN, 1.0)),
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            GuidanceRescalingError::InvalidClampRange { .. }
+        ));
+    }
+
+    #[test]
+    fn test_apply_rescaled_guidance_reversed_clamp_range_errors_not_panics() {
+        // Regression test: an invalid clamp_range must be rejected by
+        // config validation instead of reaching `f32::clamp` and panicking.
+        let cond = vec![1.0f32, 2.0, 3.0];
+        let uncond = vec![0.0f32; 3];
+        let config = RescalingConfig {
+            clamp_range: Some((1.0, -1.0)),
+            ..Default::default()
+        };
+        let err = apply_rescaled_guidance(&cond, &uncond, &config).unwrap_err();
+        assert!(matches!(
+            err,
+            GuidanceRescalingError::InvalidClampRange { .. }
         ));
     }
 

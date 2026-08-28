@@ -50,7 +50,7 @@ if command -v nvidia-smi &> /dev/null; then
     echo "   Note: GPU tests may fail if real GAF checkpoint is not available"
     echo "   This is expected - these tests are for manual verification with real weights"
 
-    if cargo test -p oxigaf-bridge --features torsh test_converted_weights_load_in_diffusion --ignored; then
+    if cargo test -p oxigaf-bridge --features torsh test_converted_weights_load_in_diffusion -- --ignored; then
         echo "   ✓ GPU tests passed"
     else
         echo "   ⚠ GPU tests failed or skipped (this is OK for synthetic checkpoints)"

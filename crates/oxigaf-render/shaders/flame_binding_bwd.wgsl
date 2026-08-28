@@ -113,50 +113,23 @@ fn flame_binding_backward(
         dot(grad_pos, N)   // ∂L/∂offset.z
     );
 
-    // Write output gradient
-    // Note: For multiple Gaussians per vertex, we would need atomic accumulation
-    // For now, we assume one Gaussian per vertex or sequential writes
-    offset_grads[gaussian_id].grad = grad_offset;
-}
-
-/// Alternative kernel with atomic accumulation (for multiple Gaussians per vertex)
-@compute @workgroup_size(256)
-fn flame_binding_backward_atomic(
-    @builtin(global_invocation_id) gid: vec3<u32>
-) {
-    let gaussian_id = gid.x;
-
-    if gaussian_id >= uniforms.num_gaussians {
-        return;
-    }
-
-    let info = binding_info[gaussian_id];
-    let vertex_id = info.vertex_id;
-
-    let tbn = tbn_frames[vertex_id];
-    let T = tbn.tangent;
-    let B = tbn.bitangent;
-    let N = tbn.normal;
-
-    // Check for degenerate TBN
-    let tbn_valid = length(N) > 0.0001;
-    if !tbn_valid {
-        return; // Skip, don't write zero
-    }
-
-    let grad_pos = position_grads[gaussian_id].grad;
-
-    let grad_offset = vec3<f32>(
-        dot(grad_pos, T),
-        dot(grad_pos, B),
-        dot(grad_pos, N)
-    );
-
-    // Atomic accumulation for thread safety
-    // WebGPU doesn't have native f32 atomics, so we use bitcast to u32
-    // This is a simplified version - production code would need proper atomic ops
-
-    // For now, use simple write (assumes no conflicts)
-    // TODO: Implement proper atomic accumulation if needed
+    // Write output gradient.
+    //
+    // No atomic accumulation is needed and none would be correct here: the
+    // local offset is a PER-GAUSSIAN parameter and `offset_grads` is indexed by
+    // `gaussian_id`, so every slot has exactly one writer — the single thread
+    // that owns that Gaussian. `tbn_frames` is read-only and shared, so several
+    // Gaussians binding to the same vertex read the same frame without
+    // conflicting. `offset_gradients_cpu` (src/binding.rs) mirrors this
+    // one-entry-per-Gaussian contract.
+    //
+    // (A previous revision carried a second `flame_binding_backward_atomic`
+    // entry point advertised as "atomic accumulation for multiple Gaussians per
+    // vertex". Its body was a plain write identical to this one plus a TODO, and
+    // its premise was wrong for the reason above: per-Gaussian slots cannot
+    // race. It has been removed so nothing can select it expecting accumulation
+    // semantics. Aggregating gradients PER MESH VERTEX — a different quantity,
+    // useful for mesh-space regularisation — would need a `num_vertices`-sized
+    // output binding, which this pipeline layout does not have.)
     offset_grads[gaussian_id].grad = grad_offset;
 }

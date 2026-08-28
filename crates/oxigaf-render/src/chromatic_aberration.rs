@@ -84,15 +84,21 @@ pub fn radial_factor(r: f32, k1: f32, k2: f32) -> f32 {
 /// # Parameters
 /// - `px`, `py` – Source pixel coordinates.
 /// - `cx`, `cy` – Image centre in pixels.
-/// - `k1`, `k2` – Radial distortion coefficients (positive → barrel).
+/// - `k1`, `k2` – Radial distortion coefficients, Brown–Conrady convention
+///   (negative → barrel; positive → pincushion), matching
+///   `crate::chrom_post_effect::apply_barrel_distortion`'s `barrel_k1` doc.
 ///
 /// # Returns
 /// `(undistorted_x, undistorted_y)` in the same pixel coordinate system.
 pub fn undistort_pixel(px: f32, py: f32, cx: f32, cy: f32, k1: f32, k2: f32) -> (f32, f32) {
     let dx = px - cx;
     let dy = py - cy;
-    // Normalise radius by the larger of cx, cy (half-diagonal approximation).
-    let norm = cx.max(cy).max(1.0);
+    // Normalise radius by the half-diagonal, matching
+    // `chrom_post_effect::apply_barrel_distortion`'s `norm_r` (previously
+    // this used `cx.max(cy)`, a half-*side*, not a half-diagonal — the two
+    // functions normalised `r` differently, so the same k1 produced
+    // different distortion strengths in each).
+    let norm = (cx * cx + cy * cy).sqrt().max(1.0);
     let r = (dx * dx + dy * dy).sqrt() / norm;
     let factor = radial_factor(r, k1, k2);
     (cx + dx * factor, cy + dy * factor)
@@ -114,11 +120,13 @@ pub struct LateralChromaticConfig {
     pub green_scale: f32,
     /// Zoom scale for the blue channel.
     pub blue_scale: f32,
-    /// Radial distortion coefficient k1 for the red channel.
+    /// Radial distortion coefficient k1 for the red channel, combined with
+    /// `red_scale` in [`apply_lateral_ca`] (Brown–Conrady convention:
+    /// negative → barrel; positive → pincushion; see [`radial_factor`]).
     pub red_k1: f32,
-    /// Radial distortion coefficient k1 for the green channel.
+    /// Radial distortion coefficient k1 for the green channel; see `red_k1`.
     pub green_k1: f32,
-    /// Radial distortion coefficient k1 for the blue channel.
+    /// Radial distortion coefficient k1 for the blue channel; see `red_k1`.
     pub blue_k1: f32,
 }
 
@@ -415,7 +423,9 @@ fn validate_image(
 /// Apply lateral (transverse) chromatic aberration.
 ///
 /// Each colour channel is sampled from a slightly different zoom level around
-/// the image centre. Pixels are bilinearly interpolated with clamp-to-edge.
+/// the image centre, combined with an optional per-channel radial distortion
+/// (`red_k1`/`green_k1`/`blue_k1`, see [`radial_factor`]). Pixels are
+/// bilinearly interpolated with clamp-to-edge.
 ///
 /// # Parameters
 /// - `image`  – RGB f32 slice in row-major HWC order (len = `width * height * 3`).
@@ -449,7 +459,12 @@ pub fn apply_lateral_ca(
     }
 
     let scales = [config.red_scale, config.green_scale, config.blue_scale];
+    let k1s = [config.red_k1, config.green_k1, config.blue_k1];
     let planes = [r_plane.as_slice(), g_plane.as_slice(), b_plane.as_slice()];
+
+    // Half-diagonal normalisation for the radial-distortion term, matching
+    // `undistort_pixel` / `chrom_post_effect::apply_barrel_distortion`.
+    let half_diag = (cx * cx + cy * cy).sqrt().max(1.0);
 
     let mut output = vec![0.0f32; n_pixels * 3];
 
@@ -458,12 +473,30 @@ pub fn apply_lateral_ca(
             let fx = px as f32;
             let fy = py as f32;
             let pixel_idx = py * width + px;
+            let dx = fx - cx;
+            let dy = fy - cy;
+            let r = (dx * dx + dy * dy).sqrt() / half_diag;
 
-            for (ch, (&scale, plane)) in scales.iter().zip(planes.iter()).enumerate() {
-                // Source coordinates: divide displacement by scale so that a
-                // scale > 1 zooms the channel out (samples further from centre).
-                let src_x = cx + (fx - cx) / scale;
-                let src_y = cy + (fy - cy) / scale;
+            for (ch, ((&scale, &k1), plane)) in
+                scales.iter().zip(k1s.iter()).zip(planes.iter()).enumerate()
+            {
+                // Source coordinates: divide displacement by `scale *
+                // radial_factor(r, k1, 0)` so a scale > 1 zooms the channel
+                // out (samples further from centre) *and* a non-zero k1
+                // applies the documented per-channel radial distortion
+                // (previously `red_k1`/`green_k1`/`blue_k1` were read by no
+                // code path here, so setting them had no effect at all).
+                let radial = radial_factor(r, k1, 0.0);
+                let factor = scale * radial;
+                // Guard against a degenerate (near-zero) factor, matching
+                // `chrom_post_effect::apply_barrel_distortion`'s safeguard.
+                let safe_factor = if factor.abs() < 1e-6 {
+                    1e-6f32.copysign(factor)
+                } else {
+                    factor
+                };
+                let src_x = cx + dx / safe_factor;
+                let src_y = cy + dy / safe_factor;
 
                 let sampled = bilinear_sample_channel_plane(plane, width, height, src_x, src_y);
                 if let Some(slot) = output.get_mut(pixel_idx * 3 + ch) {
@@ -1293,5 +1326,71 @@ mod tests {
         assert!(map.is_empty());
     }
 
-    // Tests 31-60 live in chrom_post_effect::tests (see src/chrom_post_effect.rs)
+    // ── 31. apply_lateral_ca: nonzero k1 changes output vs k1=0 ──────────────
+
+    #[test]
+    fn test_apply_lateral_ca_nonzero_k1_changes_output() {
+        // Wiring regression: red_k1/green_k1/blue_k1 must actually affect
+        // the output (previously they were read by no code path in this
+        // crate, so setting them was silently a no-op).
+        let base_cfg = LateralChromaticConfig {
+            red_scale: 1.0,
+            green_scale: 1.0,
+            blue_scale: 1.0,
+            red_k1: 0.0,
+            green_k1: 0.0,
+            blue_k1: 0.0,
+        };
+        let k1_cfg = LateralChromaticConfig {
+            red_k1: 0.6,
+            blue_k1: -0.6,
+            ..base_cfg.clone()
+        };
+        let image = gradient_image(16, 16);
+        let base_out = apply_lateral_ca(&image, 16, 16, &base_cfg).expect("base CA failed");
+        let k1_out = apply_lateral_ca(&image, 16, 16, &k1_cfg).expect("k1 CA failed");
+
+        let n_different = base_out
+            .iter()
+            .zip(k1_out.iter())
+            .filter(|&(a, b)| (a - b).abs() > 1e-5)
+            .count();
+        assert!(
+            n_different > 0,
+            "nonzero k1 should change the output relative to k1=0"
+        );
+    }
+
+    // ── 32. apply_lateral_ca: k1 leaves the centre pixel unchanged ───────────
+
+    #[test]
+    fn test_apply_lateral_ca_k1_center_pixel_unchanged() {
+        // At the image centre r=0, so radial_factor(0, k1, 0) == 1
+        // regardless of k1: the centre pixel must stay fixed under any k1.
+        let cfg = LateralChromaticConfig {
+            red_scale: 1.0,
+            green_scale: 1.0,
+            blue_scale: 1.0,
+            red_k1: 0.8,
+            green_k1: -0.4,
+            blue_k1: 0.3,
+        };
+        let w = 9usize;
+        let h = 9usize;
+        let image = gradient_image(w, h);
+        let out = apply_lateral_ca(&image, w, h, &cfg).expect("apply_lateral_ca failed");
+        let cx = w / 2;
+        let cy = h / 2;
+        let pixel_idx = (cy * w + cx) * 3;
+        for ch in 0..3 {
+            let orig = image[pixel_idx + ch];
+            let result = out[pixel_idx + ch];
+            assert!(
+                approx_eq(orig, result, 1e-4),
+                "Centre pixel channel {ch} should be unchanged under k1: {orig} vs {result}"
+            );
+        }
+    }
+
+    // Tests 33-60 live in chrom_post_effect::tests (see src/chrom_post_effect.rs)
 }

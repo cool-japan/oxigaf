@@ -376,7 +376,12 @@ pub fn inject_additive_noise(
 
 /// Apply multiplicative noise: `params[i] *= (1 + noise[i])`.
 ///
-/// Good for scale parameters where a relative perturbation is desired.
+/// Good for **linear-space** parameters where a relative perturbation is
+/// desired. Do **not** use this on log-space buffers (e.g. `log_scale`) to
+/// get a relative perturbation in the corresponding linear quantity — that
+/// requires [`inject_additive_noise`] applied in log space instead, since
+/// `exp(l + e) ~= exp(l)*(1+e)` for small `e` while `exp(l*(1+e)) =
+/// exp(l)^(1+e)` scales the perturbation magnitude with `|l|`.
 /// Only applies to elements where a Bernoulli draw (probability `probability`)
 /// is true. Returns the number of elements modified.
 ///
@@ -602,7 +607,13 @@ impl NoiseInjector {
                 inject_additive_noise(positions, eff_std, prob, clip, step_seed)?
             }
             NoiseTarget::LogScales => {
-                inject_multiplicative_noise(log_scales, eff_std, prob, clip, step_seed)?
+                // Additive noise in log space *is* the relative (multiplicative)
+                // perturbation in linear space: exp(l + e) = exp(l)*exp(e) ~=
+                // s*(1+e) for small e. Routing this through
+                // `inject_multiplicative_noise` instead would compute
+                // s^(1+e), whose perturbation magnitude scales with |l|
+                // rather than being a fixed relative fraction.
+                inject_additive_noise(log_scales, eff_std, prob, clip, step_seed)?
             }
             NoiseTarget::Rotations => perturb_rotations(rotations, eff_std, prob, step_seed)?,
             NoiseTarget::Colors => inject_additive_noise(colors, eff_std, prob, clip, step_seed)?,
@@ -623,7 +634,10 @@ impl NoiseInjector {
                     )?;
                 }
                 if !log_scales.is_empty() {
-                    total += inject_multiplicative_noise(
+                    // See the `NoiseTarget::LogScales` arm above: additive
+                    // noise in log space is the correct relative
+                    // perturbation for scale parameters stored in log space.
+                    total += inject_additive_noise(
                         log_scales,
                         eff_std,
                         prob,
@@ -744,7 +758,10 @@ pub fn analyze_noise(
 
     let max_abs_noise = noise.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
 
-    let signal_rms = original.iter().map(|v| v * v).sum::<f32>().sqrt() / n as f32;
+    // RMS = sqrt(mean(x^2)) = ||x||_2 / sqrt(n) — NOT ||x||_2 / n, which
+    // previously understated the RMS (and so inflated the reported NSR) by
+    // a factor of sqrt(n).
+    let signal_rms = crate::regularization::rms(original);
     // Use std_noise as the noise power measure for NSR
     let noise_to_signal_ratio = std_noise / (signal_rms + 1e-8);
 
@@ -877,6 +894,55 @@ mod tests {
             assert!(
                 (factor - 1.0).abs() <= 0.35,
                 "factor {factor} out of reasonable range"
+            );
+        }
+    }
+
+    // ── Test 8b: NoiseTarget::LogScales gives a bounded relative perturbation
+    // regardless of magnitude (regression for the multiplicative-in-log-space bug)
+
+    #[test]
+    fn test_log_scales_target_perturbation_bounded_regardless_of_magnitude() {
+        // Regression: NoiseTarget::LogScales used to route through
+        // `inject_multiplicative_noise`, computing exp(l)^(1+e) instead of
+        // the correct exp(l)*(1+e) ~= exp(l + e). That made the *log-space*
+        // perturbation magnitude scale with |l|: a Gaussian at
+        // log_scale=-8.0 would be perturbed far more than one at -0.1 for
+        // the exact same noise draw. With additive noise in log space, the
+        // log-space delta is bounded by clip_sigma*eff_std regardless of
+        // the original magnitude.
+        let config = NoiseConfig::new(NoiseTarget::LogScales, 0.05)
+            .unwrap()
+            .with_probability(1.0)
+            .unwrap();
+        let mut injector = NoiseInjector::new(config).unwrap();
+
+        let mut log_scales = vec![-8.0_f32, -0.1];
+        let original = log_scales.clone();
+        let mut positions: Vec<f32> = vec![];
+        let mut rotations: Vec<f32> = vec![];
+        let mut colors: Vec<f32> = vec![];
+        let mut opacities: Vec<f32> = vec![];
+        injector
+            .step(
+                &mut positions,
+                &mut log_scales,
+                &mut rotations,
+                &mut colors,
+                &mut opacities,
+            )
+            .unwrap();
+
+        // clip_sigma defaults to 3.0, eff_std = 0.05 → |delta| <= 0.15.
+        // The old multiplicative-in-log-space bug would have produced a
+        // delta of up to `|orig| * clip_sigma * eff_std` for orig=-8.0,
+        // i.e. up to 1.2 — well outside this bound.
+        for (orig, new) in original.iter().zip(log_scales.iter()) {
+            let delta = (new - orig).abs();
+            assert!(
+                delta <= 0.15 + 1e-4,
+                "log-space delta should be bounded by clip_sigma*eff_std \
+                 regardless of magnitude: orig={orig}, delta={delta}"
             );
         }
     }
@@ -1166,6 +1232,33 @@ mod tests {
         );
         assert!(analysis.num_injected > 0);
         assert_eq!(analysis.num_total, 100);
+    }
+
+    // ── Test 23b: analyze_noise: signal_rms is sqrt(mean(x^2)), not ||x||/n ──
+
+    #[test]
+    fn test_analyze_noise_rms_not_inflated_by_sqrt_n() {
+        // Regression: signal_rms used to be computed as ||x||_2 / n instead
+        // of the correct sqrt(mean(x^2)) = ||x||_2 / sqrt(n), understating
+        // RMS (and inflating the reported NSR) by a factor of sqrt(n). For
+        // n=10000 unit-magnitude samples the true RMS is 1.0; the old
+        // formula returned 0.01, a 100x error.
+        let n = 10_000;
+        let original = vec![1.0_f32; n];
+        let mut noisy = original.clone();
+        for (i, v) in noisy.iter_mut().enumerate() {
+            *v += if i % 2 == 0 { 0.1 } else { -0.1 };
+        }
+        let analysis = analyze_noise(&original, &noisy).unwrap();
+        // True signal_rms = 1.0, std_noise = 0.1 (exact, by construction)
+        // → NSR ~= 0.1. The pre-fix formula would report NSR ~= 0.1 *
+        // sqrt(n) = 10.0 instead.
+        assert!(
+            (analysis.noise_to_signal_ratio - 0.1).abs() < 0.02,
+            "expected NSR ~0.1 (RMS-correct), got {} \
+             (would be ~10.0 under the sqrt(n)-inflation bug)",
+            analysis.noise_to_signal_ratio
+        );
     }
 
     // ── Bonus: analyze_noise length mismatch ─────────────────────────────────

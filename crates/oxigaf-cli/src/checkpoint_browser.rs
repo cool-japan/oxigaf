@@ -10,6 +10,19 @@ use thiserror::Error;
 // ---------------------------------------------------------------------------
 
 /// Errors that can arise during checkpoint browsing operations.
+///
+/// [`BrowserError::ParseError`] is returned by [`BrowserCheckpoint::try_from_path`]
+/// and [`BrowserError::CheckpointNotFound`] by
+/// [`CheckpointBrowser::find_at_step_exact`]. The remaining variants —
+/// [`BrowserError::NoCheckpoints`], [`BrowserError::InvalidParam`], and
+/// [`BrowserError::TooFewCheckpoints`] — are reserved for the CLI command
+/// layer that will eventually scan a directory and construct a
+/// [`CheckpointBrowser`] from it (that wiring does not exist yet —
+/// `checkpoint_browser` is not reachable from any subcommand): this module
+/// performs no directory I/O of its own (see the module doc), and the
+/// existing `find_psnr_elbow`/`estimate_steps_to_psnr` query functions
+/// already use `Option` idiomatically for "not enough data" rather than
+/// needing a typed error.
 #[derive(Debug, Error)]
 pub enum BrowserError {
     #[error("No checkpoints found in {0}")]
@@ -52,24 +65,43 @@ pub struct BrowserCheckpoint {
 }
 
 impl BrowserCheckpoint {
-    /// Construct a `BrowserCheckpoint` by parsing metadata from a path string.
-    ///
-    /// Only the filename component is used for parsing; no actual I/O is performed.
-    pub fn from_path(path: &str) -> Self {
-        let step = parse_step_from_path(path).unwrap_or(0);
-        let psnr = parse_psnr_from_path(path);
-        let tags = extract_tags_from_path(path);
+    /// Build a checkpoint record for `path` with an already-resolved `step`.
+    fn build(path: &str, step: usize) -> Self {
         Self {
             path: path.to_string(),
             step,
             epoch: None,
-            psnr,
+            psnr: parse_psnr_from_path(path),
             loss: None,
             n_gaussians: None,
             timestamp: None,
             file_size_bytes: 0,
-            tags,
+            tags: extract_tags_from_path(path),
         }
+    }
+
+    /// Construct a `BrowserCheckpoint` by parsing metadata from a path string.
+    ///
+    /// Only the filename component is used for parsing; no actual I/O is
+    /// performed. When the training step cannot be determined from the
+    /// path, this falls back to step `0` rather than failing — use
+    /// [`Self::try_from_path`] when an unparseable step should be treated
+    /// as an error instead.
+    pub fn from_path(path: &str) -> Self {
+        let step = parse_step_from_path(path).unwrap_or(0);
+        Self::build(path, step)
+    }
+
+    /// Like [`Self::from_path`], but returns [`BrowserError::ParseError`]
+    /// instead of silently defaulting to step `0` when no training step can
+    /// be determined from the path.
+    pub fn try_from_path(path: &str) -> Result<Self, BrowserError> {
+        let step = parse_step_from_path(path).ok_or_else(|| {
+            BrowserError::ParseError(format!(
+                "could not determine a training step from path '{path}'"
+            ))
+        })?;
+        Ok(Self::build(path, step))
     }
 
     /// Return `true` if this checkpoint is tagged or named as "best".
@@ -84,11 +116,17 @@ impl BrowserCheckpoint {
         lower.contains("final") || self.tags.iter().any(|t| t == "final")
     }
 
-    /// Composite quality score in `[0, 1]`.
+    /// Composite quality score, *typically* in `[0, 1]` but not clamped:
     ///
-    /// - PSNR available: `psnr / 50.0`
-    /// - Loss available: `1.0 - loss.min(1.0)`
+    /// - PSNR available: `psnr / 50.0` — unbounded above for PSNR > 50 dB
+    ///   (routine for a well-converged synthetic scene) and negative for a
+    ///   negative PSNR parsed from a filename.
+    /// - Loss available: `1.0 - loss.min(1.0)` — negative for loss > 1.0.
     /// - Neither: `0.0`
+    ///
+    /// [`BrowserSort::ByQualityScore`] still orders correctly regardless,
+    /// since it only compares these values against each other; a caller
+    /// that needs a normalised `[0, 1]` fraction should clamp explicitly.
     pub fn quality_score(&self) -> f32 {
         if let Some(psnr) = self.psnr {
             psnr / 50.0
@@ -328,6 +366,20 @@ impl CheckpointBrowser {
         self.find_nearest_step(step)
     }
 
+    /// Find the checkpoint at exactly `step`, without falling back to the
+    /// nearest one.
+    ///
+    /// Unlike [`Self::find_at_step`] (which silently substitutes the
+    /// nearest checkpoint when there is no exact match, giving the caller
+    /// no way to tell the two cases apart), this returns
+    /// [`BrowserError::CheckpointNotFound`] when `step` is not present.
+    pub fn find_at_step_exact(&self, step: usize) -> Result<&BrowserCheckpoint, BrowserError> {
+        self.checkpoints
+            .iter()
+            .find(|c| c.step == step)
+            .ok_or_else(|| BrowserError::CheckpointNotFound(step.to_string()))
+    }
+
     /// Find the checkpoint whose step is nearest to the target.
     pub fn find_nearest_step(&self, step: usize) -> Option<&BrowserCheckpoint> {
         self.checkpoints
@@ -509,6 +561,105 @@ pub fn find_psnr_elbow(checkpoints: &[BrowserCheckpoint]) -> Option<usize> {
     Some(trend[elbow_idx + 1].0)
 }
 
+/// Ordinary least-squares fit of `psnr = slope * step + intercept` over
+/// `trend`, extrapolated to find the number of *additional* steps (beyond
+/// the last observed one) needed to reach `target_psnr`.
+///
+/// Returns `None` when the trend has fewer than 2 points, the step values
+/// are degenerate (no variance — e.g. every checkpoint claims the same
+/// step), or the fitted slope is not positive, not finite (a NaN PSNR
+/// poisons the fit), or too flat to reach the target in a finite number of
+/// steps — in short, whenever the extrapolation would be a fiction.
+///
+/// The count is rounded up, but only past a tolerance derived from the f32
+/// quantisation of the PSNR samples: without it an exact answer of `k`
+/// steps reports `k + 1` whenever the fit lands a few ulps above `k`.
+///
+/// Accumulates in `f64` and centres `step` on its mean before forming the
+/// normal-equation denominator. The naive single-pass f32 formula
+/// (`n*Σx² - (Σx)²`) subtracts two nearly-equal ~1e10+ magnitude
+/// quantities for realistic step values (up to hundreds of thousands),
+/// which loses nearly all significant digits in f32's 24-bit mantissa —
+/// and the resulting near-zero-magnitude `f32::EPSILON` guard then fails
+/// to catch anything but an exactly-zero denominator. Centring computes the
+/// same quantity (`n * Σ(x-x̄)²`, by the standard sum-of-squares identity)
+/// directly, without cancellation, so the degeneracy guard below is
+/// actually meaningful.
+fn fit_steps_to_psnr(trend: &[(usize, f32)], target_psnr: f32) -> Option<usize> {
+    if trend.len() < 2 {
+        return None;
+    }
+
+    let n = trend.len() as f64;
+    let x_mean = trend.iter().map(|(s, _)| *s as f64).sum::<f64>() / n;
+    let y_mean = trend.iter().map(|(_, p)| *p as f64).sum::<f64>() / n;
+
+    let mut sxx = 0.0f64;
+    let mut sxy = 0.0f64;
+    for (step, psnr) in trend {
+        let dx = *step as f64 - x_mean;
+        let dy = *psnr as f64 - y_mean;
+        sxx += dx * dx;
+        sxy += dx * dy;
+    }
+
+    // Relative-to-magnitude guard: catches "all steps identical" (sxx
+    // exactly 0) without being fooled by the huge absolute scale of real
+    // step counts.
+    if sxx <= f64::EPSILON * x_mean.abs().max(1.0) {
+        return None;
+    }
+
+    let slope = sxy / sxx;
+    let intercept = y_mean - slope * x_mean;
+
+    // `slope <= 0.0` is *false* for NaN, so a checkpoint carrying a NaN PSNR
+    // would otherwise sail through this guard and produce a NaN
+    // `target_step` — which `as usize` silently saturates to 0, i.e. "you
+    // are already there". An unusable fit has to say so.
+    if !slope.is_finite() || slope <= 0.0 {
+        return None;
+    }
+
+    // target_psnr = slope * step + intercept → step = (target - intercept) / slope
+    let target_step = (target_psnr as f64 - intercept) / slope;
+    if !target_step.is_finite() {
+        return None;
+    }
+    let last_step = trend.last().map(|(s, _)| *s as f64).unwrap_or(0.0);
+
+    // Extrapolating a fit of f32 inputs and then rounding *up* turns the
+    // quantisation error into a whole extra step: a perfect line whose exact
+    // answer is 6 steps computes as 6.0000153 and reports 7. The tolerance
+    // below is that quantisation expressed in steps, so only genuine
+    // fractional demand survives the ceil.
+    //
+    // A PSNR sample carries an error of about one f32 ulp, `eps * |y|`. The
+    // OLS line inherits it at abscissa `x` scaled by the usual
+    // `sqrt(1/n + (x - x̄)²/sxx)` lever (1/n from the mean, the second term
+    // from the slope over the observed spread), the target value contributes
+    // one more ulp, and dividing by the slope converts PSNR into steps.
+    let y_scale = (target_psnr as f64).abs().max(y_mean.abs()).max(1.0);
+    let psnr_tolerance = f64::from(f32::EPSILON) * y_scale;
+    let lever = (1.0 / n + (target_step - x_mean).powi(2) / sxx).sqrt();
+    let step_tolerance = psnr_tolerance * (1.0 + lever) / slope;
+    // An absurdly distant extrapolation can overflow the lever to infinity;
+    // no tolerance at all is the safe reading there (it can only add steps,
+    // never invent them).
+    let step_tolerance = if step_tolerance.is_finite() {
+        step_tolerance
+    } else {
+        0.0
+    };
+
+    let extra = (target_step - last_step - step_tolerance).ceil();
+    if extra <= 0.0 {
+        // The target is already reached (or within one ulp of it).
+        return Some(0);
+    }
+    Some(extra as usize)
+}
+
 /// Estimate the number of additional steps required to reach a target PSNR.
 ///
 /// Uses linear extrapolation through the last available PSNR points.
@@ -519,37 +670,7 @@ pub fn estimate_steps_to_psnr(
     target_psnr: f32,
 ) -> Option<usize> {
     let trend = psnr_trend(checkpoints);
-    if trend.len() < 2 {
-        return None;
-    }
-
-    // Use all points for a simple linear regression (least squares)
-    let n = trend.len() as f32;
-    let sum_x: f32 = trend.iter().map(|(s, _)| *s as f32).sum();
-    let sum_y: f32 = trend.iter().map(|(_, p)| *p).sum();
-    let sum_xx: f32 = trend.iter().map(|(s, _)| (*s as f32).powi(2)).sum();
-    let sum_xy: f32 = trend.iter().map(|(s, p)| *s as f32 * *p).sum();
-
-    let denom = n * sum_xx - sum_x * sum_x;
-    if denom.abs() < f32::EPSILON {
-        return None;
-    }
-
-    let slope = (n * sum_xy - sum_x * sum_y) / denom;
-    let intercept = (sum_y - slope * sum_x) / n;
-
-    if slope <= 0.0 {
-        return None;
-    }
-
-    // target_psnr = slope * step + intercept → step = (target - intercept) / slope
-    let target_step = (target_psnr - intercept) / slope;
-    let last_step = trend.last().map(|(s, _)| *s as f32).unwrap_or(0.0);
-    if target_step <= last_step {
-        return Some(0);
-    }
-
-    Some((target_step - last_step).ceil() as usize)
+    fit_steps_to_psnr(&trend, target_psnr)
 }
 
 /// Compute statistics about the step spacing between checkpoints.
@@ -593,10 +714,64 @@ pub fn checkpoint_spacing_stats(checkpoints: &[BrowserCheckpoint]) -> SpacingSta
 // Parsing utilities
 // ---------------------------------------------------------------------------
 
+/// Returns `true` when `tok` is a poor step-number candidate because it
+/// looks like a date or a raw timestamp rather than a training step: purely
+/// numeric and either longer than 8 digits (implausible as a step count —
+/// more likely a Unix timestamp), or exactly 8 digits forming a plausible
+/// `YYYYMMDD` date.
+fn looks_like_date_or_timestamp(tok: &str) -> bool {
+    if tok.is_empty() || !tok.chars().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    if tok.len() > 8 {
+        return true;
+    }
+    if tok.len() == 8 {
+        let year = tok[0..4].parse::<u32>().unwrap_or(0);
+        let month = tok[4..6].parse::<u32>().unwrap_or(0);
+        let day = tok[6..8].parse::<u32>().unwrap_or(0);
+        return (1970..=9999).contains(&year)
+            && (1..=12).contains(&month)
+            && (1..=31).contains(&day);
+    }
+    false
+}
+
+/// Returns `true` if some token other than `tokens[skip]` is a plausible
+/// (non-date/timestamp-shaped) numeric step candidate.
+fn has_better_step_candidate(tokens: &[&str], skip: usize) -> bool {
+    tokens.iter().enumerate().any(|(idx, tok)| {
+        idx != skip
+            && !tok.is_empty()
+            && tok.chars().all(|c| c.is_ascii_digit())
+            && !looks_like_date_or_timestamp(tok)
+    })
+}
+
+/// Parse `tokens[idx]` as a step number, rejecting it in favour of `None`
+/// only when it looks like a date/timestamp *and* a better candidate exists
+/// elsewhere in `tokens` — a lone date-shaped number is still accepted
+/// (some evidence beats none), it just loses to a better alternative when
+/// one is available.
+fn accept_step_candidate(tokens: &[&str], tok: &str, idx: usize) -> Option<usize> {
+    let n = tok.parse::<usize>().ok()?;
+    if looks_like_date_or_timestamp(tok) && has_better_step_candidate(tokens, idx) {
+        None
+    } else {
+        Some(n)
+    }
+}
+
 /// Parse a step number from a checkpoint filename or path.
 ///
 /// Recognises patterns like: `"ckpt_1000"`, `"step_1000"`, `"checkpoint-1000"`,
 /// `"model_1000.json"`. Takes the last occurring number after a recognised prefix.
+///
+/// A numeric token that looks like a date (`YYYYMMDD`) or a raw timestamp
+/// (more than 8 digits) is treated as a poor step candidate and skipped
+/// whenever a more plausible numeric token exists elsewhere in the
+/// filename — e.g. `"checkpoint_20260101_1000.json"` yields `1000`, not the
+/// embedded date.
 pub fn parse_step_from_path(path: &str) -> Option<usize> {
     // Extract the filename component
     let filename = path.rsplit(['/', '\\']).next().unwrap_or(path);
@@ -618,12 +793,13 @@ pub fn parse_step_from_path(path: &str) -> Option<usize> {
         let lower = tokens[i].to_ascii_lowercase();
         if keywords.iter().any(|k| *k == lower) {
             if let Some(next) = tokens.get(i + 1) {
-                if let Ok(n) = next.parse::<usize>() {
+                if let Some(n) = accept_step_candidate(&tokens, next, i + 1) {
                     return Some(n);
                 }
-                // Skip over another keyword ("checkpoint_step_1000")
+                // Skip over another keyword, or a rejected date/timestamp
+                // ("checkpoint_step_1000", "checkpoint_20260101_1000")
                 if let Some(after) = tokens.get(i + 2) {
-                    if let Ok(n) = after.parse::<usize>() {
+                    if let Some(n) = accept_step_candidate(&tokens, after, i + 2) {
                         return Some(n);
                     }
                 }
@@ -632,22 +808,27 @@ pub fn parse_step_from_path(path: &str) -> Option<usize> {
         i += 1;
     }
 
-    // Fallback: last purely-numeric token after at least one non-numeric token
+    // Fallback: last purely-numeric token after at least one non-numeric
+    // token, preferring one that isn't date/timestamp-shaped.
     let mut found_non_numeric = false;
     let mut last_number: Option<usize> = None;
+    let mut last_plausible_number: Option<usize> = None;
     for tok in &tokens {
         let is_numeric = !tok.is_empty() && tok.chars().all(|c| c.is_ascii_digit());
         if is_numeric {
             if found_non_numeric {
                 if let Ok(n) = tok.parse::<usize>() {
                     last_number = Some(n);
+                    if !looks_like_date_or_timestamp(tok) {
+                        last_plausible_number = Some(n);
+                    }
                 }
             }
         } else if !tok.is_empty() {
             found_non_numeric = true;
         }
     }
-    last_number
+    last_plausible_number.or(last_number)
 }
 
 /// Parse a PSNR value from a checkpoint filename.
@@ -845,872 +1026,4 @@ pub fn format_spacing_stats(stats: &SpacingStats) -> String {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    // -----------------------------------------------------------------------
-    // parse_step_from_path
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_parse_step_ckpt_prefix() {
-        assert_eq!(parse_step_from_path("ckpt_1000.json"), Some(1000));
-    }
-
-    #[test]
-    fn test_parse_step_step_prefix() {
-        assert_eq!(parse_step_from_path("step_500"), Some(500));
-    }
-
-    #[test]
-    fn test_parse_step_checkpoint_dash() {
-        assert_eq!(parse_step_from_path("checkpoint-200"), Some(200));
-    }
-
-    #[test]
-    fn test_parse_step_checkpoint_underscore() {
-        assert_eq!(parse_step_from_path("checkpoint_300.bin"), Some(300));
-    }
-
-    #[test]
-    fn test_parse_step_model_prefix() {
-        assert_eq!(parse_step_from_path("model_1000.json"), Some(1000));
-    }
-
-    #[test]
-    fn test_parse_step_checkpoint_step_compound() {
-        assert_eq!(
-            parse_step_from_path("checkpoint_step_12345.json"),
-            Some(12345)
-        );
-    }
-
-    #[test]
-    fn test_parse_step_no_number() {
-        assert_eq!(parse_step_from_path("final_model.json"), None);
-    }
-
-    #[test]
-    fn test_parse_step_empty() {
-        assert_eq!(parse_step_from_path(""), None);
-    }
-
-    #[test]
-    fn test_parse_step_with_directory() {
-        assert_eq!(
-            parse_step_from_path("/run/train/ckpt_2000.json"),
-            Some(2000)
-        );
-    }
-
-    #[test]
-    fn test_parse_step_fallback_trailing_number() {
-        // "model_best_500" — last number after non-numeric tokens
-        assert_eq!(parse_step_from_path("model_best_500"), Some(500));
-    }
-
-    // -----------------------------------------------------------------------
-    // parse_psnr_from_path
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_parse_psnr_basic() {
-        let result = parse_psnr_from_path("ckpt_1000_psnr_28.5.json");
-        assert!(result.is_some());
-        let v = result.unwrap();
-        assert!((v - 28.5).abs() < 0.01, "expected 28.5, got {}", v);
-    }
-
-    #[test]
-    fn test_parse_psnr_no_psnr() {
-        assert!(parse_psnr_from_path("ckpt_1000.json").is_none());
-    }
-
-    #[test]
-    fn test_parse_psnr_attached() {
-        // "model_psnr28.5.bin"
-        let result = parse_psnr_from_path("model_psnr28.5.bin");
-        assert!(result.is_some());
-        let v = result.unwrap();
-        assert!((v - 28.5).abs() < 0.01, "expected 28.5, got {}", v);
-    }
-
-    #[test]
-    fn test_parse_psnr_dash_separator() {
-        let result = parse_psnr_from_path("ckpt-psnr-32.1.json");
-        assert!(result.is_some());
-        let v = result.unwrap();
-        assert!((v - 32.1).abs() < 0.01);
-    }
-
-    #[test]
-    fn test_parse_psnr_integer() {
-        let result = parse_psnr_from_path("ckpt_psnr_30.json");
-        assert!(result.is_some());
-        let v = result.unwrap();
-        assert!((v - 30.0).abs() < 0.01);
-    }
-
-    // -----------------------------------------------------------------------
-    // extract_tags_from_path
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_extract_tags_best() {
-        let tags = extract_tags_from_path("ckpt_best_1000.json");
-        assert!(tags.contains(&"best".to_string()));
-    }
-
-    #[test]
-    fn test_extract_tags_final() {
-        let tags = extract_tags_from_path("model_final.bin");
-        assert!(tags.contains(&"final".to_string()));
-    }
-
-    #[test]
-    fn test_extract_tags_latest() {
-        let tags = extract_tags_from_path("checkpoint_latest.json");
-        assert!(tags.contains(&"latest".to_string()));
-    }
-
-    #[test]
-    fn test_extract_tags_epoch() {
-        let tags = extract_tags_from_path("ckpt_epoch_10_step_1000.json");
-        assert!(tags.contains(&"epoch_10".to_string()));
-    }
-
-    #[test]
-    fn test_extract_tags_empty() {
-        let tags = extract_tags_from_path("ckpt_1000.json");
-        assert!(tags.is_empty());
-    }
-
-    #[test]
-    fn test_extract_tags_multiple() {
-        let tags = extract_tags_from_path("model_best_final.json");
-        assert!(tags.contains(&"best".to_string()));
-        assert!(tags.contains(&"final".to_string()));
-    }
-
-    // -----------------------------------------------------------------------
-    // BrowserCheckpoint
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_from_path_step_parsed() {
-        let c = BrowserCheckpoint::from_path("ckpt_step_5000.json");
-        assert_eq!(c.step, 5000);
-    }
-
-    #[test]
-    fn test_from_path_zero_step_fallback() {
-        let c = BrowserCheckpoint::from_path("model.json");
-        assert_eq!(c.step, 0);
-    }
-
-    #[test]
-    fn test_is_best_true() {
-        let c = BrowserCheckpoint::from_path("/checkpoints/ckpt_best_1000.json");
-        assert!(c.is_best());
-    }
-
-    #[test]
-    fn test_is_best_false() {
-        let c = BrowserCheckpoint::from_path("ckpt_1000.json");
-        assert!(!c.is_best());
-    }
-
-    #[test]
-    fn test_is_final_true() {
-        let c = BrowserCheckpoint::from_path("model_final.json");
-        assert!(c.is_final());
-    }
-
-    #[test]
-    fn test_is_final_false() {
-        let c = BrowserCheckpoint::from_path("ckpt_1000.json");
-        assert!(!c.is_final());
-    }
-
-    #[test]
-    fn test_quality_score_with_psnr() {
-        let mut c = BrowserCheckpoint::from_path("ckpt_1000.json");
-        c.psnr = Some(30.0);
-        let score = c.quality_score();
-        assert!((score - 0.6).abs() < 1e-5, "expected 0.6, got {}", score);
-    }
-
-    #[test]
-    fn test_quality_score_with_loss() {
-        let mut c = BrowserCheckpoint::from_path("ckpt_1000.json");
-        c.loss = Some(0.5);
-        let score = c.quality_score();
-        assert!((score - 0.5).abs() < 1e-5, "expected 0.5, got {}", score);
-    }
-
-    #[test]
-    fn test_quality_score_no_metrics() {
-        let c = BrowserCheckpoint::from_path("ckpt_1000.json");
-        assert!((c.quality_score() - 0.0).abs() < 1e-5);
-    }
-
-    #[test]
-    fn test_quality_score_psnr_priority_over_loss() {
-        let mut c = BrowserCheckpoint::from_path("ckpt_1000.json");
-        c.psnr = Some(25.0);
-        c.loss = Some(0.1);
-        // Should use PSNR: 25/50 = 0.5, not 1-0.1 = 0.9
-        let score = c.quality_score();
-        assert!((score - 0.5).abs() < 1e-5, "expected 0.5, got {}", score);
-    }
-
-    // -----------------------------------------------------------------------
-    // CheckpointBrowser construction
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_browser_empty() {
-        let browser = CheckpointBrowser::new(vec![], BrowserConfig::default());
-        assert!(browser.is_empty());
-        assert_eq!(browser.len(), 0);
-    }
-
-    #[test]
-    fn test_browser_from_paths() {
-        let paths = vec!["ckpt_100.json".to_string(), "ckpt_200.json".to_string()];
-        let browser = CheckpointBrowser::from_paths(paths, BrowserConfig::default());
-        assert_eq!(browser.len(), 2);
-    }
-
-    #[test]
-    fn test_browser_total_size_bytes() {
-        let mut c1 = BrowserCheckpoint::from_path("ckpt_100.json");
-        c1.file_size_bytes = 1024;
-        let mut c2 = BrowserCheckpoint::from_path("ckpt_200.json");
-        c2.file_size_bytes = 2048;
-        let browser = CheckpointBrowser::new(vec![c1, c2], BrowserConfig::default());
-        assert_eq!(browser.total_size_bytes(), 3072);
-    }
-
-    #[test]
-    fn test_browser_step_range() {
-        let c1 = BrowserCheckpoint::from_path("ckpt_100.json");
-        let c2 = BrowserCheckpoint::from_path("ckpt_500.json");
-        let c3 = BrowserCheckpoint::from_path("ckpt_300.json");
-        let browser = CheckpointBrowser::new(vec![c1, c2, c3], BrowserConfig::default());
-        assert_eq!(browser.step_range(), Some((100, 500)));
-    }
-
-    #[test]
-    fn test_browser_step_range_empty() {
-        let browser = CheckpointBrowser::new(vec![], BrowserConfig::default());
-        assert!(browser.step_range().is_none());
-    }
-
-    // -----------------------------------------------------------------------
-    // browse() — sort
-    // -----------------------------------------------------------------------
-
-    fn make_checkpoints_with_psnr() -> Vec<BrowserCheckpoint> {
-        let mut c1 = BrowserCheckpoint::from_path("ckpt_100.json");
-        c1.psnr = Some(25.0);
-        let mut c2 = BrowserCheckpoint::from_path("ckpt_300.json");
-        c2.psnr = Some(30.0);
-        let mut c3 = BrowserCheckpoint::from_path("ckpt_200.json");
-        c3.psnr = Some(27.5);
-        vec![c1, c2, c3]
-    }
-
-    #[test]
-    fn test_browse_sort_by_step() {
-        let config = BrowserConfig {
-            sort_by: BrowserSort::ByStep,
-            ..Default::default()
-        };
-        let browser = CheckpointBrowser::new(make_checkpoints_with_psnr(), config);
-        let result = browser.browse();
-        assert_eq!(result[0].step, 100);
-        assert_eq!(result[1].step, 200);
-        assert_eq!(result[2].step, 300);
-    }
-
-    #[test]
-    fn test_browse_sort_by_step_desc() {
-        let config = BrowserConfig {
-            sort_by: BrowserSort::ByStepDesc,
-            ..Default::default()
-        };
-        let browser = CheckpointBrowser::new(make_checkpoints_with_psnr(), config);
-        let result = browser.browse();
-        assert_eq!(result[0].step, 300);
-        assert_eq!(result[1].step, 200);
-        assert_eq!(result[2].step, 100);
-    }
-
-    #[test]
-    fn test_browse_sort_by_psnr() {
-        let config = BrowserConfig {
-            sort_by: BrowserSort::ByPsnr,
-            ..Default::default()
-        };
-        let browser = CheckpointBrowser::new(make_checkpoints_with_psnr(), config);
-        let result = browser.browse();
-        assert!((result[0].psnr.unwrap() - 30.0).abs() < 0.01);
-    }
-
-    #[test]
-    fn test_browse_max_display() {
-        let config = BrowserConfig {
-            max_display: 2,
-            ..Default::default()
-        };
-        let browser = CheckpointBrowser::new(make_checkpoints_with_psnr(), config);
-        let result = browser.browse();
-        assert_eq!(result.len(), 2);
-    }
-
-    // -----------------------------------------------------------------------
-    // browse() — filter
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_browse_filter_step_range() {
-        let mut config = BrowserConfig::default();
-        config.filter.min_step = Some(150);
-        config.filter.max_step = Some(250);
-        let browser = CheckpointBrowser::new(make_checkpoints_with_psnr(), config);
-        let result = browser.browse();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].step, 200);
-    }
-
-    #[test]
-    fn test_browse_filter_min_psnr() {
-        let mut config = BrowserConfig::default();
-        config.filter.min_psnr = Some(28.0);
-        let browser = CheckpointBrowser::new(make_checkpoints_with_psnr(), config);
-        let result = browser.browse();
-        // Only step=300 (psnr=30.0) passes; step=200 (27.5) does not
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].step, 300);
-    }
-
-    #[test]
-    fn test_browse_filter_max_loss() {
-        let mut c1 = BrowserCheckpoint::from_path("ckpt_100.json");
-        c1.loss = Some(0.8);
-        let mut c2 = BrowserCheckpoint::from_path("ckpt_200.json");
-        c2.loss = Some(0.3);
-        let mut config = BrowserConfig::default();
-        config.filter.max_loss = Some(0.5);
-        let browser = CheckpointBrowser::new(vec![c1, c2], config);
-        let result = browser.browse();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].step, 200);
-    }
-
-    #[test]
-    fn test_browse_filter_tags_required() {
-        let mut c1 = BrowserCheckpoint::from_path("ckpt_best_100.json");
-        c1.psnr = Some(25.0);
-        let mut c2 = BrowserCheckpoint::from_path("ckpt_200.json");
-        c2.psnr = Some(27.0);
-        let mut config = BrowserConfig::default();
-        config.filter.tags_required = vec!["best".to_string()];
-        let browser = CheckpointBrowser::new(vec![c1, c2], config);
-        let result = browser.browse();
-        assert_eq!(result.len(), 1);
-        assert!(result[0].is_best());
-    }
-
-    #[test]
-    fn test_browse_filter_tags_excluded() {
-        let c1 = BrowserCheckpoint::from_path("ckpt_best_100.json");
-        let c2 = BrowserCheckpoint::from_path("ckpt_200.json");
-        let mut config = BrowserConfig::default();
-        config.filter.tags_excluded = vec!["best".to_string()];
-        let browser = CheckpointBrowser::new(vec![c1, c2], config);
-        let result = browser.browse();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].step, 200);
-    }
-
-    // -----------------------------------------------------------------------
-    // find_best
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_find_best_by_psnr() {
-        let browser =
-            CheckpointBrowser::new(make_checkpoints_with_psnr(), BrowserConfig::default());
-        let best = browser.find_best().expect("should find best");
-        assert!((best.psnr.unwrap() - 30.0).abs() < 0.01);
-    }
-
-    #[test]
-    fn test_find_best_by_loss_when_no_psnr() {
-        let mut c1 = BrowserCheckpoint::from_path("ckpt_100.json");
-        c1.loss = Some(0.8);
-        let mut c2 = BrowserCheckpoint::from_path("ckpt_200.json");
-        c2.loss = Some(0.2);
-        let browser = CheckpointBrowser::new(vec![c1, c2], BrowserConfig::default());
-        let best = browser.find_best().expect("should find best");
-        assert_eq!(best.step, 200);
-    }
-
-    #[test]
-    fn test_find_best_empty() {
-        let browser = CheckpointBrowser::new(vec![], BrowserConfig::default());
-        assert!(browser.find_best().is_none());
-    }
-
-    // -----------------------------------------------------------------------
-    // find_latest
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_find_latest() {
-        let browser =
-            CheckpointBrowser::new(make_checkpoints_with_psnr(), BrowserConfig::default());
-        let latest = browser.find_latest().expect("should find latest");
-        assert_eq!(latest.step, 300);
-    }
-
-    #[test]
-    fn test_find_latest_empty() {
-        let browser = CheckpointBrowser::new(vec![], BrowserConfig::default());
-        assert!(browser.find_latest().is_none());
-    }
-
-    // -----------------------------------------------------------------------
-    // find_at_step / find_nearest_step
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_find_at_step_exact() {
-        let browser =
-            CheckpointBrowser::new(make_checkpoints_with_psnr(), BrowserConfig::default());
-        let found = browser.find_at_step(200).expect("should find step 200");
-        assert_eq!(found.step, 200);
-    }
-
-    #[test]
-    fn test_find_at_step_nearest() {
-        let browser =
-            CheckpointBrowser::new(make_checkpoints_with_psnr(), BrowserConfig::default());
-        // 175 is between 100 and 200; nearest is 200
-        let found = browser.find_at_step(175).expect("should find nearest");
-        assert_eq!(found.step, 200);
-    }
-
-    #[test]
-    fn test_find_nearest_step() {
-        let browser =
-            CheckpointBrowser::new(make_checkpoints_with_psnr(), BrowserConfig::default());
-        let found = browser.find_nearest_step(260).expect("should find nearest");
-        assert_eq!(found.step, 300);
-    }
-
-    // -----------------------------------------------------------------------
-    // at_percentile
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_at_percentile_zero() {
-        let browser =
-            CheckpointBrowser::new(make_checkpoints_with_psnr(), BrowserConfig::default());
-        let ckpt = browser.at_percentile(0.0).expect("should return first");
-        assert_eq!(ckpt.step, 100);
-    }
-
-    #[test]
-    fn test_at_percentile_one() {
-        let browser =
-            CheckpointBrowser::new(make_checkpoints_with_psnr(), BrowserConfig::default());
-        let ckpt = browser.at_percentile(1.0).expect("should return last");
-        assert_eq!(ckpt.step, 300);
-    }
-
-    #[test]
-    fn test_at_percentile_half() {
-        let browser =
-            CheckpointBrowser::new(make_checkpoints_with_psnr(), BrowserConfig::default());
-        let ckpt = browser.at_percentile(0.5).expect("should return middle");
-        assert_eq!(ckpt.step, 200);
-    }
-
-    #[test]
-    fn test_at_percentile_empty() {
-        let browser = CheckpointBrowser::new(vec![], BrowserConfig::default());
-        assert!(browser.at_percentile(0.5).is_none());
-    }
-
-    // -----------------------------------------------------------------------
-    // compare_checkpoints
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_compare_step_delta() {
-        let a = BrowserCheckpoint::from_path("ckpt_100.json");
-        let b = BrowserCheckpoint::from_path("ckpt_300.json");
-        let diff = compare_checkpoints(&a, &b);
-        assert_eq!(diff.step_delta, 200);
-    }
-
-    #[test]
-    fn test_compare_psnr_delta() {
-        let mut a = BrowserCheckpoint::from_path("ckpt_100.json");
-        a.psnr = Some(25.0);
-        let mut b = BrowserCheckpoint::from_path("ckpt_200.json");
-        b.psnr = Some(28.0);
-        let diff = compare_checkpoints(&a, &b);
-        assert!(diff.psnr_delta.is_some());
-        assert!((diff.psnr_delta.unwrap() - 3.0).abs() < 0.01);
-    }
-
-    #[test]
-    fn test_compare_loss_delta() {
-        let mut a = BrowserCheckpoint::from_path("ckpt_100.json");
-        a.loss = Some(0.5);
-        let mut b = BrowserCheckpoint::from_path("ckpt_200.json");
-        b.loss = Some(0.3);
-        let diff = compare_checkpoints(&a, &b);
-        assert!(diff.loss_delta.is_some());
-        assert!((diff.loss_delta.unwrap() - (-0.2)).abs() < 0.001);
-    }
-
-    #[test]
-    fn test_compare_tags_added_removed() {
-        let a = BrowserCheckpoint::from_path("ckpt_best_100.json");
-        let b = BrowserCheckpoint::from_path("ckpt_final_200.json");
-        let diff = compare_checkpoints(&a, &b);
-        assert!(diff.tags_added.contains(&"final".to_string()));
-        assert!(diff.tags_removed.contains(&"best".to_string()));
-    }
-
-    #[test]
-    fn test_compare_size_delta() {
-        let mut a = BrowserCheckpoint::from_path("ckpt_100.json");
-        a.file_size_bytes = 1000;
-        let mut b = BrowserCheckpoint::from_path("ckpt_200.json");
-        b.file_size_bytes = 2500;
-        let diff = compare_checkpoints(&a, &b);
-        assert_eq!(diff.size_delta, 1500);
-    }
-
-    // -----------------------------------------------------------------------
-    // psnr_trend
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_psnr_trend_sorted_by_step() {
-        let ckpts = make_checkpoints_with_psnr();
-        let trend = psnr_trend(&ckpts);
-        assert_eq!(trend.len(), 3);
-        // Should be sorted by step ascending
-        assert!(trend[0].0 < trend[1].0);
-        assert!(trend[1].0 < trend[2].0);
-    }
-
-    #[test]
-    fn test_psnr_trend_excludes_no_psnr() {
-        let mut ckpts = make_checkpoints_with_psnr();
-        let no_psnr = BrowserCheckpoint::from_path("ckpt_400.json");
-        ckpts.push(no_psnr);
-        let trend = psnr_trend(&ckpts);
-        assert_eq!(trend.len(), 3); // Only 3 have PSNR
-    }
-
-    #[test]
-    fn test_psnr_trend_empty() {
-        let trend = psnr_trend(&[]);
-        assert!(trend.is_empty());
-    }
-
-    // -----------------------------------------------------------------------
-    // find_psnr_elbow
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_find_psnr_elbow_basic() {
-        // Create a set with diminishing returns
-        let mut ckpts = Vec::new();
-        let psnrs = [20.0f32, 25.0, 28.0, 29.5, 29.9, 30.0];
-        for (i, &p) in psnrs.iter().enumerate() {
-            let mut c = BrowserCheckpoint::from_path(&format!("ckpt_{}.json", (i + 1) * 1000));
-            c.psnr = Some(p);
-            ckpts.push(c);
-        }
-        let elbow = find_psnr_elbow(&ckpts);
-        assert!(elbow.is_some());
-        // The elbow should be somewhere in the middle of training
-        let e = elbow.unwrap();
-        assert!(e > 0);
-    }
-
-    #[test]
-    fn test_find_psnr_elbow_too_few() {
-        let mut ckpts = Vec::new();
-        for i in 0..2 {
-            let mut c = BrowserCheckpoint::from_path(&format!("ckpt_{}.json", (i + 1) * 1000));
-            c.psnr = Some(25.0 + i as f32);
-            ckpts.push(c);
-        }
-        assert!(find_psnr_elbow(&ckpts).is_none());
-    }
-
-    // -----------------------------------------------------------------------
-    // estimate_steps_to_psnr
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_estimate_steps_to_psnr_improving() {
-        let mut ckpts = Vec::new();
-        // Linear PSNR: step=1000→psnr=20, step=2000→psnr=25
-        let mut c1 = BrowserCheckpoint::from_path("ckpt_1000.json");
-        c1.psnr = Some(20.0);
-        let mut c2 = BrowserCheckpoint::from_path("ckpt_2000.json");
-        c2.psnr = Some(25.0);
-        ckpts.push(c1);
-        ckpts.push(c2);
-        // slope = 5/1000 per step, to reach 30 need 1000 more steps
-        let estimate = estimate_steps_to_psnr(&ckpts, 30.0);
-        assert!(estimate.is_some());
-        let extra = estimate.unwrap();
-        // Should be approximately 1000 more steps
-        assert!(
-            extra > 500 && extra < 2000,
-            "expected ~1000 extra steps, got {}",
-            extra
-        );
-    }
-
-    #[test]
-    fn test_estimate_steps_to_psnr_declining() {
-        let mut c1 = BrowserCheckpoint::from_path("ckpt_1000.json");
-        c1.psnr = Some(30.0);
-        let mut c2 = BrowserCheckpoint::from_path("ckpt_2000.json");
-        c2.psnr = Some(25.0);
-        let ckpts = vec![c1, c2];
-        // Declining PSNR → None
-        assert!(estimate_steps_to_psnr(&ckpts, 35.0).is_none());
-    }
-
-    #[test]
-    fn test_estimate_steps_to_psnr_too_few() {
-        let mut c = BrowserCheckpoint::from_path("ckpt_1000.json");
-        c.psnr = Some(25.0);
-        assert!(estimate_steps_to_psnr(&[c], 30.0).is_none());
-    }
-
-    #[test]
-    fn test_estimate_steps_already_reached() {
-        let mut c1 = BrowserCheckpoint::from_path("ckpt_1000.json");
-        c1.psnr = Some(20.0);
-        let mut c2 = BrowserCheckpoint::from_path("ckpt_2000.json");
-        c2.psnr = Some(30.0);
-        let ckpts = vec![c1, c2];
-        // Target already reached
-        let estimate = estimate_steps_to_psnr(&ckpts, 25.0);
-        assert_eq!(estimate, Some(0));
-    }
-
-    // -----------------------------------------------------------------------
-    // checkpoint_spacing_stats
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_spacing_stats_regular() {
-        let paths = [
-            "ckpt_100.json",
-            "ckpt_200.json",
-            "ckpt_300.json",
-            "ckpt_400.json",
-        ];
-        let ckpts: Vec<_> = paths
-            .iter()
-            .map(|p| BrowserCheckpoint::from_path(p))
-            .collect();
-        let stats = checkpoint_spacing_stats(&ckpts);
-        assert!(stats.is_regular, "evenly spaced should be regular");
-        assert!((stats.mean_step_gap - 100.0).abs() < 0.01);
-        assert_eq!(stats.min_step_gap, 100);
-        assert_eq!(stats.max_step_gap, 100);
-        assert_eq!(stats.total_steps, 300);
-    }
-
-    #[test]
-    fn test_spacing_stats_irregular() {
-        let paths = ["ckpt_100.json", "ckpt_200.json", "ckpt_800.json"];
-        let ckpts: Vec<_> = paths
-            .iter()
-            .map(|p| BrowserCheckpoint::from_path(p))
-            .collect();
-        let stats = checkpoint_spacing_stats(&ckpts);
-        assert!(!stats.is_regular, "irregular spacing should not be regular");
-    }
-
-    #[test]
-    fn test_spacing_stats_single() {
-        let ckpts = vec![BrowserCheckpoint::from_path("ckpt_100.json")];
-        let stats = checkpoint_spacing_stats(&ckpts);
-        assert_eq!(stats.total_steps, 0);
-    }
-
-    #[test]
-    fn test_spacing_stats_empty() {
-        let stats = checkpoint_spacing_stats(&[]);
-        assert!(stats.is_regular);
-        assert_eq!(stats.total_steps, 0);
-    }
-
-    // -----------------------------------------------------------------------
-    // describe_checkpoint
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_describe_checkpoint_non_empty() {
-        let mut c = BrowserCheckpoint::from_path("ckpt_1000.json");
-        c.psnr = Some(28.5);
-        let desc = describe_checkpoint(&c);
-        assert!(!desc.is_empty());
-        assert!(desc.contains("step=1000"));
-        assert!(desc.contains("psnr=28.50"));
-    }
-
-    #[test]
-    fn test_describe_checkpoint_minimal() {
-        let c = BrowserCheckpoint::from_path("ckpt_0.json");
-        let desc = describe_checkpoint(&c);
-        assert!(!desc.is_empty());
-        assert!(desc.contains("step=0"));
-    }
-
-    // -----------------------------------------------------------------------
-    // format_checkpoint_table
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_format_checkpoint_table_non_empty() {
-        let ckpts = make_checkpoints_with_psnr();
-        let refs: Vec<&BrowserCheckpoint> = ckpts.iter().collect();
-        let table = format_checkpoint_table(&refs);
-        assert!(!table.is_empty());
-        assert!(table.contains("Step"));
-        assert!(table.contains("PSNR"));
-    }
-
-    #[test]
-    fn test_format_checkpoint_table_empty() {
-        let table = format_checkpoint_table(&[]);
-        assert!(!table.is_empty()); // Still has header
-        assert!(table.contains("Step"));
-    }
-
-    // -----------------------------------------------------------------------
-    // format_checkpoint_diff
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_format_checkpoint_diff_non_empty() {
-        let a = BrowserCheckpoint::from_path("ckpt_100.json");
-        let b = BrowserCheckpoint::from_path("ckpt_200.json");
-        let diff = compare_checkpoints(&a, &b);
-        let formatted = format_checkpoint_diff(&diff);
-        assert!(!formatted.is_empty());
-        assert!(formatted.contains("Step delta"));
-    }
-
-    // -----------------------------------------------------------------------
-    // format_spacing_stats
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_format_spacing_stats_non_empty() {
-        let paths = ["ckpt_100.json", "ckpt_200.json", "ckpt_300.json"];
-        let ckpts: Vec<_> = paths
-            .iter()
-            .map(|p| BrowserCheckpoint::from_path(p))
-            .collect();
-        let stats = checkpoint_spacing_stats(&ckpts);
-        let formatted = format_spacing_stats(&stats);
-        assert!(!formatted.is_empty());
-        assert!(formatted.contains("mean"));
-    }
-
-    // -----------------------------------------------------------------------
-    // BrowserError display
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_error_no_checkpoints_display() {
-        let e = BrowserError::NoCheckpoints("/tmp/ckpts".to_string());
-        let msg = format!("{}", e);
-        assert!(msg.contains("/tmp/ckpts"));
-    }
-
-    #[test]
-    fn test_error_too_few_checkpoints_display() {
-        let e = BrowserError::TooFewCheckpoints(1);
-        let msg = format!("{}", e);
-        assert!(msg.contains("1"));
-    }
-
-    #[test]
-    fn test_error_checkpoint_not_found() {
-        let e = BrowserError::CheckpointNotFound("ckpt_999.json".to_string());
-        let msg = format!("{}", e);
-        assert!(msg.contains("ckpt_999.json"));
-    }
-
-    // -----------------------------------------------------------------------
-    // browse() — sort by loss and quality score
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_browse_sort_by_loss() {
-        let mut c1 = BrowserCheckpoint::from_path("ckpt_100.json");
-        c1.loss = Some(0.8);
-        let mut c2 = BrowserCheckpoint::from_path("ckpt_200.json");
-        c2.loss = Some(0.2);
-        let mut c3 = BrowserCheckpoint::from_path("ckpt_300.json");
-        c3.loss = Some(0.5);
-        let config = BrowserConfig {
-            sort_by: BrowserSort::ByLoss,
-            ..Default::default()
-        };
-        let browser = CheckpointBrowser::new(vec![c1, c2, c3], config);
-        let result = browser.browse();
-        assert!((result[0].loss.unwrap() - 0.2).abs() < 0.001);
-    }
-
-    #[test]
-    fn test_browse_sort_by_quality_score() {
-        let mut c1 = BrowserCheckpoint::from_path("ckpt_100.json");
-        c1.psnr = Some(20.0);
-        let mut c2 = BrowserCheckpoint::from_path("ckpt_200.json");
-        c2.psnr = Some(35.0);
-        let config = BrowserConfig {
-            sort_by: BrowserSort::ByQualityScore,
-            ..Default::default()
-        };
-        let browser = CheckpointBrowser::new(vec![c1, c2], config);
-        let result = browser.browse();
-        assert_eq!(result[0].step, 200); // higher PSNR = higher quality
-    }
-
-    #[test]
-    fn test_browse_sort_by_file_size() {
-        let mut c1 = BrowserCheckpoint::from_path("ckpt_100.json");
-        c1.file_size_bytes = 500;
-        let mut c2 = BrowserCheckpoint::from_path("ckpt_200.json");
-        c2.file_size_bytes = 2000;
-        let config = BrowserConfig {
-            sort_by: BrowserSort::ByFileSize,
-            ..Default::default()
-        };
-        let browser = CheckpointBrowser::new(vec![c1, c2], config);
-        let result = browser.browse();
-        assert_eq!(result[0].step, 200); // largest first
-    }
-}
+mod tests;

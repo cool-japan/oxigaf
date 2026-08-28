@@ -47,8 +47,16 @@ pub type SymmetryMap = Vec<usize>;
 /// The pairing strategy approximates the real FLAME bilateral symmetry:
 ///
 /// - Vertices `0..num_vertices/4` are paired with `num_vertices-1-i` (left ↔ right).
-/// - Vertices `num_vertices/4..3*num_vertices/4` map to themselves (midline).
-/// - Vertices `3*num_vertices/4..num_vertices` are paired with `num_vertices-1-i`.
+/// - Vertices `num_vertices/4..num_vertices-num_vertices/4` map to themselves (midline).
+/// - Vertices `num_vertices-num_vertices/4..num_vertices` are paired with `num_vertices-1-i`.
+///
+/// `q3` is derived as `num_vertices - q1` (rather than `3*num_vertices/4`
+/// independently) so the two mirrored ranges `[0,q1)` and `[q3,num_vertices)`
+/// always have equal length `q1`, making `i -> num_vertices-1-i` an exact
+/// involution for every `num_vertices` -- not only multiples of 4. (With
+/// `q3 = 3*num_vertices/4` computed independently, the two ranges can have
+/// different lengths whenever `num_vertices % 4 != 0`, breaking the
+/// mapping: e.g. for FLAME's real n=5023, `map[map[3767]] != 3767`.)
 ///
 /// When `num_vertices < 4` every vertex maps to itself.
 #[must_use]
@@ -58,7 +66,7 @@ pub fn generate_synthetic_symmetry_map(num_vertices: usize) -> SymmetryMap {
     }
 
     let q1 = num_vertices / 4;
-    let q3 = 3 * num_vertices / 4;
+    let q3 = num_vertices - q1;
 
     let map: Vec<usize> = (0..num_vertices)
         .map(|vertex_idx| {
@@ -519,6 +527,24 @@ mod tests {
             for (i, &mapped) in map.iter().enumerate().take(n) {
                 assert_eq!(mapped, i);
             }
+        }
+    }
+
+    // Regression test for the non-involution bug: FLAME's real mesh has
+    // 5023 vertices, and 5023 % 4 == 3 -- exactly the non-multiple-of-4
+    // case that broke the old `q1 = n/4, q3 = 3*n/4` independent
+    // computation (map[map[3767]] != 3767 under the old formula).
+    #[test]
+    fn test_map_flame_vertex_count_is_involution() {
+        let map = generate_synthetic_symmetry_map(5023);
+        assert!(validate_symmetry_map(&map).is_ok());
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn prop_synthetic_symmetry_map_is_involution(num_vertices in 0usize..2000) {
+            let map = generate_synthetic_symmetry_map(num_vertices);
+            proptest::prop_assert!(validate_symmetry_map(&map).is_ok());
         }
     }
 

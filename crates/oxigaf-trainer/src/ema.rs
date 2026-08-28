@@ -15,6 +15,20 @@
 //! effective_decay = min(decay, (1 + step) / (10 + step))
 //! ```
 //!
+//! # Rotation quaternions are a special case
+//!
+//! The linear blend above is applied component-wise to positions, scales,
+//! opacities, and SH coefficients, but **not** to rotation quaternions as-is.
+//! Because `q` and `-q` represent the same rotation (the unit-quaternion
+//! double cover), a naive component-wise blend can average two quaternions
+//! that sit on opposite sides of that cover, interpolating *through the
+//! origin* and collapsing the shadow's norm instead of nlerp-ing between two
+//! nearby rotations. Rotations therefore use a sign-aligned normalized
+//! lerp (nlerp) instead: the incoming quaternion's sign is flipped to match
+//! the shadow's hemisphere (`dot(shadow, current) < 0`) *before* the same
+//! linear blend, and the blended result is renormalized back to unit length
+//! afterward so [`GaussianEma::apply_to`] always writes a valid rotation.
+//!
 //! # Usage
 //!
 //! ```rust,ignore
@@ -118,13 +132,56 @@ impl GaussianEma {
             }
         }
 
-        // Update rotations.
+        // Update rotations. Quaternions require special handling: `q` and
+        // `-q` represent the same rotation (double cover), so a naive
+        // component-wise blend can interpolate *through the origin* when the
+        // optimized quaternion crosses the sign boundary between updates,
+        // collapsing the shadow quaternion's norm toward zero. Align the
+        // incoming quaternion's sign with the shadow before blending, then
+        // renormalize the result so `apply_to` always writes a valid unit
+        // quaternion.
         for i in 0..n {
-            for j in 0..4 {
-                let idx = i * 4 + j;
-                self.rotations[idx] =
-                    d * self.rotations[idx] + one_minus_d * model.gaussians[i].rotation[j];
+            let base = i * 4;
+            let shadow = [
+                self.rotations[base],
+                self.rotations[base + 1],
+                self.rotations[base + 2],
+                self.rotations[base + 3],
+            ];
+            let mut current = model.gaussians[i].rotation;
+
+            let dot = shadow[0] * current[0]
+                + shadow[1] * current[1]
+                + shadow[2] * current[2]
+                + shadow[3] * current[3];
+            if dot < 0.0 {
+                for c in current.iter_mut() {
+                    *c = -*c;
+                }
             }
+
+            let mut blended = [0.0f32; 4];
+            for j in 0..4 {
+                blended[j] = d * shadow[j] + one_minus_d * current[j];
+            }
+
+            let norm_sq = blended[0] * blended[0]
+                + blended[1] * blended[1]
+                + blended[2] * blended[2]
+                + blended[3] * blended[3];
+            if norm_sq > 1e-16 {
+                let inv_norm = norm_sq.sqrt().recip();
+                for c in blended.iter_mut() {
+                    *c *= inv_norm;
+                }
+            } else {
+                // Degenerate blend (should not happen for sign-aligned unit
+                // quaternions, but guard defensively) -- fall back to the
+                // sign-aligned current rotation rather than a zero vector.
+                blended = current;
+            }
+
+            self.rotations[base..(4 + base)].copy_from_slice(&blended);
         }
 
         // Update scales.
@@ -434,5 +491,80 @@ mod tests {
         let model = make_model(1, 0.0);
         let ema = GaussianEma::new(&model, 0.9999);
         assert!((ema.decay() - 0.9999).abs() < 1e-7);
+    }
+
+    // ----- quaternion double-cover handling ---------------------------------
+
+    fn model_with_rotation(rotation: [f32; 4]) -> GaussianModel {
+        let attr = GaussianAttributes {
+            position: [0.0; 3],
+            _pad0: 0.0,
+            rotation,
+            scale: [0.0; 3],
+            opacity: 0.0,
+        };
+        GaussianModel {
+            gaussians: vec![attr],
+            sh_coeffs: vec![0.0; 3],
+            sh_degree: 0,
+            face_indices: vec![0],
+            barycentric: vec![[1.0, 0.0, 0.0]],
+            local_offsets: vec![[0.0; 3]],
+            is_rigid: vec![false],
+        }
+    }
+
+    #[test]
+    fn rotation_ema_sign_alignment_prevents_norm_collapse() {
+        // Shadow starts at q = (0, 0, 0, 1).
+        let model_pos = model_with_rotation([0.0, 0.0, 0.0, 1.0]);
+        let mut ema = GaussianEma::new(&model_pos, 0.5);
+
+        // Update with -q = (0, 0, 0, -1): the SAME rotation via the double
+        // cover. A naive component-wise blend would average q with -q and
+        // the shadow's norm would collapse toward 0; with sign alignment the
+        // blend should stay a valid, ~unit-norm quaternion pointing the same
+        // direction as before.
+        let model_neg = model_with_rotation([0.0, 0.0, 0.0, -1.0]);
+        ema.update(&model_neg);
+
+        let shadow = ema.shadow_rotations();
+        let norm = (shadow[0] * shadow[0]
+            + shadow[1] * shadow[1]
+            + shadow[2] * shadow[2]
+            + shadow[3] * shadow[3])
+            .sqrt();
+        assert!(
+            (norm - 1.0).abs() < 1e-4,
+            "shadow quaternion norm should stay ~1.0 across a sign flip, got {norm}"
+        );
+        assert!(
+            (shadow[3] - 1.0).abs() < 1e-4,
+            "sign-aligned blend of q with itself should stay at w=1.0, got w={}",
+            shadow[3]
+        );
+    }
+
+    #[test]
+    fn rotation_ema_apply_to_writes_unit_quaternion_across_sign_flips() {
+        let model_pos = model_with_rotation([0.0, 0.0, 0.0, 1.0]);
+        let mut ema = GaussianEma::new(&model_pos, 0.5);
+
+        // Alternate feeding +q and -q across several updates -- every
+        // resulting shadow quaternion written via `apply_to` must remain
+        // (numerically) a unit quaternion.
+        let signs = [-1.0f32, 1.0, -1.0, 1.0, -1.0];
+        for &s in &signs {
+            ema.update(&model_with_rotation([0.0, 0.0, 0.0, s]));
+        }
+
+        let mut eval = model_with_rotation([9.0, 9.0, 9.0, 9.0]);
+        ema.apply_to(&mut eval);
+        let r = eval.gaussians[0].rotation;
+        let norm = (r[0] * r[0] + r[1] * r[1] + r[2] * r[2] + r[3] * r[3]).sqrt();
+        assert!(
+            (norm - 1.0).abs() < 1e-4,
+            "apply_to must write a unit-norm quaternion, got norm={norm}"
+        );
     }
 }

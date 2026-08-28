@@ -203,16 +203,37 @@ impl VolumeGrid {
             && p[1] <= max[1]
             && p[2] <= max[2]
     }
+    /// Returns `true` if any dimension is zero (an empty grid). `VolumeGrid::new`
+    /// permits zero dimensions (some call sites construct a grid before its
+    /// final size is known), so every sampling method must check this rather
+    /// than assume `nx`/`ny`/`nz` are all positive.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.nx == 0 || self.ny == 0 || self.nz == 0
+    }
     /// Direct integer-indexed density lookup; clamps indices to valid range.
+    ///
+    /// Returns `0.0` for an empty grid (see [`Self::is_empty`]) rather than
+    /// indexing an empty `data` array.
     #[inline]
     pub fn density_at(&self, ix: usize, iy: usize, iz: usize) -> f32 {
+        if self.is_empty() {
+            return 0.0;
+        }
         let ix = ix.min(self.nx.saturating_sub(1));
         let iy = iy.min(self.ny.saturating_sub(1));
         let iz = iz.min(self.nz.saturating_sub(1));
         self.data[iz * self.ny * self.nx + iy * self.nx + ix]
     }
     /// Nearest-neighbour sample at world-space position.
+    ///
+    /// Returns `0.0` for an empty grid (see [`Self::is_empty`]) rather than
+    /// panicking in `f32::clamp` (whose `(0.0, (nx as f32) - 1.0)` range is
+    /// invalid, `min > max`, when `nx == 0`).
     pub fn sample_nearest(&self, x: f32, y: f32, z: f32) -> f32 {
+        if self.is_empty() {
+            return 0.0;
+        }
         let vx = ((x - self.origin[0]) / self.voxel_size[0] - 0.5).round();
         let vy = ((y - self.origin[1]) / self.voxel_size[1] - 0.5).round();
         let vz = ((z - self.origin[2]) / self.voxel_size[2] - 0.5).round();
@@ -222,7 +243,14 @@ impl VolumeGrid {
         self.density_at(ix, iy, iz)
     }
     /// Trilinear interpolation at world-space position, clamping at boundaries.
+    ///
+    /// Returns `0.0` for an empty grid (see [`Self::is_empty`]) rather than
+    /// panicking in the `i64::clamp(0, max - 1)` below (invalid, `min > max`,
+    /// when a dimension is 0).
     pub fn sample_trilinear(&self, x: f32, y: f32, z: f32) -> f32 {
+        if self.is_empty() {
+            return 0.0;
+        }
         let vx = (x - self.origin[0]) / self.voxel_size[0] - 0.5;
         let vy = (y - self.origin[1]) / self.voxel_size[1] - 0.5;
         let vz = (z - self.origin[2]) / self.voxel_size[2] - 0.5;
@@ -285,14 +313,35 @@ pub struct TransferFunction {
 impl TransferFunction {
     /// Construct from a list of control points.
     ///
-    /// Returns an error if the list is empty or not sorted by `density`.
+    /// # Errors
+    ///
+    /// - [`VolumetricRenderError::EmptyTransferFunction`] if `points` is empty.
+    /// - [`VolumetricRenderError::UnsortedTransferFunction`] if densities are
+    ///   not *strictly* increasing (two points at the same density would
+    ///   make [`Self::evaluate`]'s interpolation ill-defined there).
+    /// - [`VolumetricRenderError::InvalidTransferPoint`] if any point's
+    ///   opacity is outside `[0, 1]` or has a non-finite colour component.
     pub fn new(points: Vec<TransferPoint>) -> Result<Self, VolumetricRenderError> {
         if points.is_empty() {
             return Err(VolumetricRenderError::EmptyTransferFunction);
         }
         for w in points.windows(2) {
-            if w[0].density > w[1].density {
+            if w[0].density >= w[1].density {
                 return Err(VolumetricRenderError::UnsortedTransferFunction);
+            }
+        }
+        for (index, p) in points.iter().enumerate() {
+            if !(0.0..=1.0).contains(&p.opacity) {
+                return Err(VolumetricRenderError::InvalidTransferPoint {
+                    index,
+                    reason: "opacity must be in [0, 1]",
+                });
+            }
+            if !p.color.iter().all(|c| c.is_finite()) || !p.density.is_finite() {
+                return Err(VolumetricRenderError::InvalidTransferPoint {
+                    index,
+                    reason: "density and colour components must be finite",
+                });
             }
         }
         Ok(Self { points })
@@ -318,7 +367,16 @@ impl TransferFunction {
                 hi = mid;
             }
         }
-        let t = (density - pts[lo].density) / (pts[hi].density - pts[lo].density);
+        // `new` rejects equal-density control points, but `points` is a
+        // public field, so guard defensively against a caller constructing
+        // a `TransferFunction` directly with a near-zero-width interval
+        // here rather than let it produce +-inf / NaN.
+        let span = pts[hi].density - pts[lo].density;
+        let t = if span.abs() > f32::EPSILON {
+            (density - pts[lo].density) / span
+        } else {
+            0.0
+        };
         let lerp3 = |a: [f32; 3], b: [f32; 3]| {
             [
                 a[0] + t * (b[0] - a[0]),
@@ -390,9 +448,21 @@ pub enum VolumetricRenderError {
     /// Transfer function point list is empty.
     #[error("Transfer function has no points")]
     EmptyTransferFunction,
-    /// Transfer function control points are not sorted by density.
+    /// Transfer function control points are not strictly increasing in
+    /// density (this includes equal-density points: two control points at
+    /// the same density make `TransferFunction::evaluate`'s interpolation
+    /// ill-defined at that density).
     #[error("Transfer function points are not sorted by density ascending")]
     UnsortedTransferFunction,
+    /// A transfer function control point has an opacity outside `[0, 1]` or
+    /// a non-finite colour component.
+    #[error("Transfer function point {index} is invalid: {reason}")]
+    InvalidTransferPoint {
+        /// Index of the offending point in the input list.
+        index: usize,
+        /// What was wrong with it.
+        reason: &'static str,
+    },
     /// Input slice lengths are inconsistent with `n_gaussians`.
     #[error("Buffer length mismatch: expected {expected}, got {got} for '{field}'")]
     BufferLengthMismatch {
@@ -443,4 +513,174 @@ pub struct RayMarchResult {
     pub t_entry: f32,
     /// Ray parameter at volume exit.
     pub t_exit: f32,
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+//
+// This file's own regression tests. The sibling `tests.rs` (a separate
+// module, `super::tests`, not this one) holds the broader existing test
+// suite for the whole `volumetric_render` module.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Zero-size VolumeGrid: no panics ─────────────────────────────────────
+
+    #[test]
+    fn test_zero_size_grid_is_empty() {
+        let g = VolumeGrid::new(0, 4, 4, [0.0; 3], [1.0; 3]);
+        assert!(g.is_empty());
+        let g = VolumeGrid::new(4, 4, 4, [0.0; 3], [1.0; 3]);
+        assert!(!g.is_empty());
+    }
+
+    #[test]
+    fn test_zero_size_grid_density_at_no_panic() {
+        // Regression test: `density_at` used to index an empty `data` Vec
+        // and panic for any zero-size dimension.
+        for (nx, ny, nz) in [(0, 4, 4), (4, 0, 4), (4, 4, 0), (0, 0, 0)] {
+            let g = VolumeGrid::new(nx, ny, nz, [0.0; 3], [1.0; 3]);
+            assert_eq!(g.density_at(0, 0, 0), 0.0, "nx={nx} ny={ny} nz={nz}");
+            assert_eq!(g.density_at(5, 5, 5), 0.0, "nx={nx} ny={ny} nz={nz}");
+        }
+    }
+
+    #[test]
+    fn test_zero_size_grid_sample_nearest_no_panic() {
+        // Regression test: `sample_nearest` used to call
+        // `f32::clamp(0.0, (nx as f32) - 1.0)`, which panics (min > max)
+        // when nx == 0.
+        let g = VolumeGrid::new(0, 4, 4, [0.0; 3], [1.0; 3]);
+        assert_eq!(g.sample_nearest(0.5, 0.5, 0.5), 0.0);
+    }
+
+    #[test]
+    fn test_zero_size_grid_sample_trilinear_no_panic() {
+        // Regression test: `sample_trilinear` used to call
+        // `i64::clamp(0, (nx as i64) - 1)`, which panics (min > max) when
+        // nx == 0.
+        let g = VolumeGrid::new(4, 0, 4, [0.0; 3], [1.0; 3]);
+        assert_eq!(g.sample_trilinear(0.5, 0.5, 0.5), 0.0);
+    }
+
+    #[test]
+    fn test_zero_size_grid_gradient_no_panic() {
+        // `gradient` is built entirely on `sample_trilinear`, so it should
+        // inherit the fix automatically.
+        let g = VolumeGrid::new(4, 4, 0, [0.0; 3], [1.0; 3]);
+        let grad = g.gradient(0.5, 0.5, 0.5);
+        assert_eq!(grad, [0.0, 0.0, 0.0]);
+    }
+
+    // ── TransferFunction validation ──────────────────────────────────────────
+
+    #[test]
+    fn test_transfer_function_rejects_duplicate_density() {
+        // Regression test: `new` used to accept equal (not just decreasing)
+        // adjacent densities, which made `evaluate`'s interpolation
+        // ill-defined at that density.
+        let pts = vec![
+            TransferPoint {
+                density: 0.5,
+                color: [0.0; 3],
+                opacity: 0.0,
+            },
+            TransferPoint {
+                density: 0.5,
+                color: [1.0; 3],
+                opacity: 1.0,
+            },
+        ];
+        let err = TransferFunction::new(pts).expect_err("duplicate density must be rejected");
+        assert!(matches!(
+            err,
+            VolumetricRenderError::UnsortedTransferFunction
+        ));
+    }
+
+    #[test]
+    fn test_transfer_function_rejects_opacity_out_of_range() {
+        let pts = vec![
+            TransferPoint {
+                density: 0.0,
+                color: [0.0; 3],
+                opacity: 0.0,
+            },
+            TransferPoint {
+                density: 1.0,
+                color: [1.0; 3],
+                opacity: 1.5, // out of [0, 1]
+            },
+        ];
+        let err = TransferFunction::new(pts).expect_err("out-of-range opacity must be rejected");
+        assert!(matches!(
+            err,
+            VolumetricRenderError::InvalidTransferPoint { index: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn test_transfer_function_rejects_non_finite_color() {
+        let pts = vec![
+            TransferPoint {
+                density: 0.0,
+                color: [f32::NAN, 0.0, 0.0],
+                opacity: 0.0,
+            },
+            TransferPoint {
+                density: 1.0,
+                color: [1.0; 3],
+                opacity: 1.0,
+            },
+        ];
+        let err = TransferFunction::new(pts).expect_err("non-finite colour must be rejected");
+        assert!(matches!(
+            err,
+            VolumetricRenderError::InvalidTransferPoint { index: 0, .. }
+        ));
+    }
+
+    #[test]
+    fn test_transfer_function_evaluate_zero_span_no_nan() {
+        // Defensive check on `evaluate` itself: a `TransferFunction` with
+        // duplicate-density points constructed directly (bypassing `new`,
+        // since `points` is a public field) must not produce NaN or +-inf
+        // when evaluated near those densities. The `t` computation now
+        // guards its denominator with an epsilon check specifically for
+        // this, even though this interpolation's `lo`/`hi` search happens
+        // to land past any interior duplicate run in every configuration
+        // this test could construct (only 2-point all-duplicate inputs are
+        // fully absorbed by the domain-clamp checks above the binary
+        // search) -- the guard stays as defense in depth against future
+        // changes to that search.
+        let tf = TransferFunction {
+            points: vec![
+                TransferPoint {
+                    density: 0.0,
+                    color: [0.0; 3],
+                    opacity: 0.0,
+                },
+                TransferPoint {
+                    density: 0.5,
+                    color: [0.2, 0.4, 0.6],
+                    opacity: 0.5,
+                },
+                TransferPoint {
+                    density: 0.5,
+                    color: [1.0; 3],
+                    opacity: 1.0,
+                },
+                TransferPoint {
+                    density: 1.0,
+                    color: [1.0; 3],
+                    opacity: 1.0,
+                },
+            ],
+        };
+        let (color, opacity) = tf.evaluate(0.5);
+        assert!(color.iter().all(|c| c.is_finite()), "color = {color:?}");
+        assert!(opacity.is_finite(), "opacity = {opacity}");
+    }
 }

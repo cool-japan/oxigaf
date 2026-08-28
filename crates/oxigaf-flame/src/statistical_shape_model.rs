@@ -55,9 +55,32 @@ fn xorshift64(state: &mut u64) -> u64 {
 }
 
 /// Draw a uniform f32 in [0, 1) from the xorshift64 PRNG.
+///
+/// Built directly from the mantissa bits of a `[1.0, 2.0)`-range float
+/// (top 23 bits of the xorshift output become the mantissa, exponent fixed
+/// at 127), then shifted down by 1.0. A `u64 as f32` division (the
+/// previous implementation) rounds `u64::MAX` itself up to `2^64` in f32,
+/// so a draw whose top ~41 bits are all set divides to exactly `1.0` --
+/// this construction can never round up to `1.0`.
 #[inline]
 fn xorshift_f32(state: &mut u64) -> f32 {
-    xorshift64(state) as f32 / u64::MAX as f32
+    let bits = xorshift64(state);
+    let mantissa = (bits >> 41) as u32;
+    let float_bits: u32 = 0x3f80_0000u32 | mantissa;
+    f32::from_bits(float_bits) - 1.0_f32
+}
+
+/// Draw one sample from the standard normal distribution `N(0, 1)` via the
+/// Box-Muller transform, using two draws from [`xorshift_f32`].
+#[inline]
+fn standard_normal(state: &mut u64) -> f32 {
+    use std::f32::consts::PI;
+    // `xorshift_f32` can legitimately return exactly 0.0 (when its top 23
+    // bits happen to all be zero); floor it away from zero so `ln(u1)`
+    // never produces -inf (which would otherwise make this -inf/NaN).
+    let u1 = xorshift_f32(state).max(1e-30);
+    let u2 = xorshift_f32(state);
+    (-2.0 * u1.ln()).sqrt() * (2.0 * PI * u2).cos()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -81,8 +104,16 @@ pub struct StatisticalShapeModel {
     pub components: Vec<Vec<f32>>,
     /// Explained variance (eigenvalues): length `n_components`.
     pub variances: Vec<f32>,
-    /// Cumulative explained variance ratio: length `n_components`.
+    /// Cumulative explained variance ratio (relative to `total_variance`,
+    /// the TRUE total variance of the training data -- not merely the sum
+    /// of the retained `variances`): length `n_components`.
     pub explained_ratio: Vec<f32>,
+    /// Total variance of the (centered) training data, i.e. the sum of
+    /// ALL non-trivial eigenvalues of the data's covariance, not just the
+    /// `n_components` that were retained. `explained_ratio` is normalized
+    /// against this, so `explained_ratio.last()` reaches `1.0` only when
+    /// every true mode of variation was retained.
+    pub total_variance: f32,
 }
 
 /// Shape coefficients in the principal-component subspace.
@@ -150,7 +181,9 @@ pub struct SsmStats {
     pub n_vertices: usize,
     /// Number of principal components.
     pub n_components: usize,
-    /// Sum of all eigenvalues.
+    /// True total variance of the training data (sum of ALL non-trivial
+    /// eigenvalues of its covariance, not just the retained components --
+    /// see [`StatisticalShapeModel::total_variance`]).
     pub total_variance: f32,
     /// Per-component explained variance ratio.
     pub explained_variance_ratio: Vec<f32>,
@@ -340,6 +373,14 @@ pub fn ssm_build(
     // 3. Gram matrix G[i,j] = dot(c_i, c_j) / n_shapes.
     let mut gram = build_gram_matrix(&centered, n_shapes);
 
+    // True total variance of the training data = trace(Gram) = mean
+    // squared norm of the centered shapes. The dual (Gram-matrix) and
+    // primal (covariance-matrix) PCA formulations share the same nonzero
+    // eigenvalues, so trace(Gram) equals the sum of ALL of them -- not
+    // just the `n_components` retained below. Must be captured now, before
+    // deflation mutates `gram`.
+    let total_variance: f32 = (0..n_shapes).map(|i| gram[i * n_shapes + i]).sum();
+
     // 4. Power iteration + deflation to extract top-k eigenpairs.
     let max_components = (n_shapes - 1).min(n_components);
     let mut components: Vec<Vec<f32>> = Vec::with_capacity(max_components);
@@ -397,15 +438,16 @@ pub fn ssm_build(
         return Err(SsmError::Singular);
     }
 
-    // 5. Explained variance ratio (cumulative).
-    let total: f32 = variances.iter().sum();
-    let explained_ratio: Vec<f32> = if total > 0.0 {
+    // 5. Explained variance ratio (cumulative), relative to the TRUE total
+    // variance -- not the sum of retained `variances` -- so it correctly
+    // reads < 1.0 whenever fewer components than true modes are kept.
+    let explained_ratio: Vec<f32> = if total_variance > 1e-20 {
         let mut cum = 0.0f32;
         variances
             .iter()
             .map(|&v| {
-                cum += v / total;
-                cum
+                cum += v;
+                (cum / total_variance).min(1.0)
             })
             .collect()
     } else {
@@ -419,6 +461,7 @@ pub fn ssm_build(
         components,
         variances,
         explained_ratio,
+        total_variance,
     })
 }
 
@@ -539,10 +582,9 @@ pub fn ssm_reconstruction_error(
 // Shape generation and interpolation
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Generate a random shape within `±n_sigma` standard deviations per component.
-///
-/// Each coefficient `k` is drawn from `[-n_sigma*sqrt(var[k]),
-/// +n_sigma*sqrt(var[k])]`.
+/// Generate a random shape by sampling the model's learned Gaussian in
+/// coefficient space, `c_k ~ N(0, variance[k])`, clamped to `±n_sigma *
+/// sqrt(variance[k])`.
 ///
 /// # Errors
 ///
@@ -557,8 +599,12 @@ pub fn ssm_random_shape(
         .iter()
         .map(|&v| {
             let std = v.max(0.0).sqrt();
-            let u = xorshift_f32(rng_state) * 2.0 - 1.0; // uniform in [-1, 1]
-            u * n_sigma * std
+            // `.abs()` keeps the bound valid (min <= max) regardless of
+            // `n_sigma`'s sign, matching the previous implementation's
+            // tolerance of a negative `n_sigma`.
+            let bound = (n_sigma * std).abs();
+            let z = standard_normal(rng_state);
+            (z * std).clamp(-bound, bound)
         })
         .collect();
     ssm_reconstruct(model, &params)
@@ -665,7 +711,9 @@ pub fn ssm_compute_stats(
         return Err(SsmError::EmptyInput);
     }
 
-    let total_variance: f32 = model.variances.iter().sum();
+    // The model's TRUE total variance (not the sum of retained
+    // `variances` -- see `StatisticalShapeModel::total_variance`).
+    let total_variance = model.total_variance;
     let n_components = model.components.len();
 
     // Per-component ratio (not cumulative).
@@ -1074,6 +1122,30 @@ mod tests {
         assert!(last <= 1.0 + 1e-5, "cumulative ratio > 1: {last}");
     }
 
+    // Regression test: 11 full-rank random shapes span up to n_shapes-1=10
+    // non-trivial modes. Retaining only 3 components must NOT claim to
+    // explain ~100% of the variance (the old bug normalized against the
+    // sum of RETAINED eigenvalues only, so `explained_ratio.last()` was
+    // always exactly 1.0 regardless of how many true modes existed).
+    #[test]
+    fn test_build_explained_ratio_reflects_true_total_variance() {
+        let shapes = make_random_shapes(11, 20, 123);
+        let model = ssm_build(&shapes, 3).expect("build failed");
+        assert_eq!(model.components.len(), 3);
+        let last = *model.explained_ratio.last().expect("non-empty");
+        assert!(
+            last < 0.99,
+            "3 of ~10 true modes should not explain ~100% of variance: {last}"
+        );
+        let retained: f32 = model.variances.iter().sum();
+        assert!(
+            model.total_variance > retained + 1e-6,
+            "total_variance ({}) should exceed retained variance ({retained}) \
+             when fewer components than true modes are kept",
+            model.total_variance
+        );
+    }
+
     #[test]
     fn test_build_mean_shape_correct() {
         let n_shapes = 5;
@@ -1356,6 +1428,39 @@ mod tests {
                 let bound = n_sigma * v.max(0.0).sqrt() * 1.1 + 1e-3;
                 assert!(p.abs() <= bound, "random param {k} = {p} exceeds ±{bound}");
             }
+        }
+    }
+
+    // Regression test: the old implementation drew coefficients uniformly
+    // over [-n_sigma*std, +n_sigma*std], whose variance is (n_sigma*std)^2/3
+    // -- about 1/3 of the model's learned variance for large n_sigma (where
+    // clamping rarely triggers). Sampling the learned Gaussian instead
+    // should produce a sample variance close to the model's variance.
+    #[test]
+    fn test_random_shape_sample_variance_matches_model_not_uniform_third() {
+        let shapes = make_random_shapes(9, 12, 7);
+        let model = ssm_build(&shapes, 4).expect("build failed");
+        let n_sigma = 6.0f32; // wide enough that clamping is negligible
+        let mut rng = 4242u64;
+
+        let n_draws = 4000;
+        let mut sum_sq = vec![0.0f64; model.components.len()];
+        for _ in 0..n_draws {
+            let s = ssm_random_shape(&model, n_sigma, &mut rng).expect("random");
+            let sp = ssm_project(&model, &s).expect("project");
+            for (acc, &p) in sum_sq.iter_mut().zip(sp.params.iter()) {
+                *acc += f64::from(p) * f64::from(p);
+            }
+        }
+
+        for (k, (&acc, &v)) in sum_sq.iter().zip(model.variances.iter()).enumerate() {
+            let sample_var = (acc / f64::from(n_draws)) as f32;
+            let ratio = sample_var / v.max(1e-12);
+            assert!(
+                ratio > 0.5,
+                "component {k}: sample variance {sample_var} is only {ratio:.2}x the \
+                 model variance {v} -- looks uniform (~1/3), not Gaussian (~1x)"
+            );
         }
     }
 

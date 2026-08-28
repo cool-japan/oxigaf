@@ -132,7 +132,21 @@ impl<'a> UvAccessor<'a> {
         for (i, (&face_idx, &bary)) in face_indices.iter().zip(barycentrics.iter()).enumerate() {
             let uv = self
                 .interpolate_uv(face_idx as usize, bary)
-                .map_err(|e| FlameError::InvalidParams(format!("sample {i}: {e}")))?;
+                .map_err(|e| match e {
+                    // Preserve the structured variant (and its index/len
+                    // fields) so callers can match on it; just prefix the
+                    // batch index onto the context string.
+                    FlameError::IndexOutOfBounds {
+                        context,
+                        index,
+                        len,
+                    } => FlameError::IndexOutOfBounds {
+                        context: format!("sample {i}: {context}"),
+                        index,
+                        len,
+                    },
+                    other => other,
+                })?;
             result.push(uv);
         }
         Ok(result)
@@ -567,6 +581,25 @@ mod tests {
         let barycentrics: Vec<[f32; 3]> = vec![[1.0, 0.0, 0.0]]; // 1
         let result = accessor.sample_uvs(&face_indices, &barycentrics);
         assert!(result.is_err(), "mismatched lengths should fail");
+    }
+
+    #[test]
+    fn test_sample_uvs_bad_face_idx_preserves_index_out_of_bounds_variant() {
+        // A caller matching on `FlameError::IndexOutOfBounds { index, .. }`
+        // must be able to recover the offending index; `sample_uvs` must not
+        // flatten the structured error into `InvalidParams(String)`.
+        let mesh = triangle_mesh_with_uvs();
+        let accessor = mesh.uv().expect("mesh has UVs");
+        let face_indices = vec![0u32, 999];
+        let barycentrics: Vec<[f32; 3]> = vec![[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]];
+        let result = accessor.sample_uvs(&face_indices, &barycentrics);
+        match result {
+            Err(FlameError::IndexOutOfBounds { index, len, .. }) => {
+                assert_eq!(index, 999, "should report the offending face index");
+                assert_eq!(len, mesh.faces.len());
+            }
+            other => panic!("expected FlameError::IndexOutOfBounds, got {other:?}"),
+        }
     }
 
     // -----------------------------------------------------------------------

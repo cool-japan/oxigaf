@@ -9,6 +9,15 @@
 //! Functions operating on multi-channel SH use **per-channel** layout:
 //! `[r0..rN, g0..gN, b0..bN]` where `N = (degree+1)^2` coefficients per channel.
 //! Total length = `3 * N`.
+//!
+//! This is **not** the layout the GPU rasterizer's SH coefficient buffer
+//! uses: the shaders (`preprocess.wgsl`, `preprocess_bwd.wgsl`,
+//! `preprocess_sh{1,2,3}.wgsl`) read a per-coefficient **interleaved**
+//! layout, `sh_offset + 3*k + c` for basis index `k` and channel `c`
+//! (i.e. `[r0,g0,b0, r1,g1,b1, ...]`). The two layouts are only
+//! basis-value-compatible (see [`sh_eval_degree1`]'s sign convention
+//! note), not memory-layout-compatible: converting between them requires
+//! an explicit transpose, which this module does not currently provide.
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -21,23 +30,32 @@ pub const SH_C0: f32 = 0.282_094_8_f32;
 pub const SH_C1: f32 = 0.488_602_52_f32;
 
 /// L=2 normalisations (one per m-index: m = −2,−1,0,+1,+2).
+///
+/// Signs match the 3DGS shader convention (`preprocess.wgsl` /
+/// `sh_eval.wgsl`'s `SH_C2_0..SH_C2_4`), not the naive all-positive
+/// `√(...)` magnitudes: the `yz` (m=−1) and `xz` (m=+1) terms carry a
+/// negative sign here so `sh_eval_degree2`'s output matches what the GPU
+/// rasterizer evaluates from the same coefficients.
 pub const SH_C2: [f32; 5] = [
-    1.092_548_5_f32,  // m=−2: √(15/(4π))
-    1.092_548_5_f32,  // m=−1: √(15/(4π))
-    0.315_391_57_f32, // m= 0: √(5/(16π))
-    1.092_548_5_f32,  // m=+1: √(15/(4π))
-    0.546_274_24_f32, // m=+2: √(15/(16π))
+    1.092_548_5_f32,  // m=−2 (xy):  +√(15/(4π))
+    -1.092_548_5_f32, // m=−1 (yz):  −√(15/(4π))
+    0.315_391_57_f32, // m= 0:       +√(5/(16π))
+    -1.092_548_5_f32, // m=+1 (xz):  −√(15/(4π))
+    0.546_274_24_f32, // m=+2:       +√(15/(16π))
 ];
 
 /// L=3 normalisations (one per m-index: m = −3..=+3).
+///
+/// Signs match the 3DGS shader convention (`SH_C3_0..SH_C3_6`); see the
+/// note on [`SH_C2`].
 pub const SH_C3: [f32; 7] = [
-    0.590_043_6_f32,  // m=−3: √(35/(32π)) * √2
-    2.890_611_4_f32,  // m=−2: √(105/(4π))
-    0.457_045_8_f32,  // m=−1: √(21/(32π)) * √2
-    0.373_176_34_f32, // m= 0: √(7/(16π))
-    0.457_045_8_f32,  // m=+1: √(21/(32π)) * √2
-    1.445_305_7_f32,  // m=+2: √(105/(16π))
-    0.590_043_6_f32,  // m=+3: √(35/(32π)) * √2
+    -0.590_043_6_f32, // m=−3: −√(35/(32π)) * √2
+    2.890_611_4_f32,  // m=−2: +√(105/(4π))
+    -0.457_045_8_f32, // m=−1: −√(21/(32π)) * √2
+    0.373_176_34_f32, // m= 0: +√(7/(16π))
+    -0.457_045_8_f32, // m=+1: −√(21/(32π)) * √2
+    1.445_305_7_f32,  // m=+2: +√(105/(16π))
+    -0.590_043_6_f32, // m=+3: −√(35/(32π)) * √2
 ];
 
 // ---------------------------------------------------------------------------
@@ -124,9 +142,14 @@ pub fn sh_eval_degree0(_x: f32, _y: f32, _z: f32) -> [f32; 1] {
 /// Evaluate L=0 and L=1 SH basis values (4 total).
 ///
 /// Output order: `[Y_0^0, Y_1^{-1}, Y_1^0, Y_1^1]`
+///
+/// The m=−1 and m=+1 terms carry a negative sign (`-SH_C1 * y`,
+/// `-SH_C1 * x`) to match the 3DGS shader convention (`preprocess.wgsl` /
+/// `sh_eval.wgsl` evaluate `SH_C1 * vec3(-y, z, -x)`); only `SH_C1` itself
+/// (a normalisation magnitude) stays positive.
 #[inline]
 pub fn sh_eval_degree1(x: f32, y: f32, z: f32) -> [f32; 4] {
-    [SH_C0, SH_C1 * y, SH_C1 * z, SH_C1 * x]
+    [SH_C0, -SH_C1 * y, SH_C1 * z, -SH_C1 * x]
 }
 
 /// Evaluate L=0..=2 SH basis values (9 total).
@@ -200,7 +223,10 @@ pub fn sh_eval(direction: [f32; 3], degree: usize) -> Result<Vec<f32>, ShError> 
 /// Convert per-channel SH coefficients to a view-dependent RGB colour.
 ///
 /// `sh_coeffs` layout: `[r_0..r_N, g_0..g_N, b_0..b_N]` where `N = (degree+1)^2`.
-/// Total required length: `3 * N`.
+/// Total required length: `3 * N`. This is the **per-channel** layout (see
+/// the module docs); it is not memory-layout-compatible with the GPU
+/// rasterizer's interleaved SH buffer, though the basis values themselves
+/// (via [`sh_eval`]) now match the shader's sign convention.
 ///
 /// Returns clamped `[0, 1]` RGB: `color = 0.5 + Σ_k (c_k * Y_k)`.
 pub fn sh_to_color(
@@ -488,9 +514,9 @@ mod tests {
     fn test_sh_eval_degree1_x_axis() {
         let b = sh_eval_degree1(1.0, 0.0, 0.0);
         assert!(approx(b[0], SH_C0, EPS));
-        assert!(approx(b[1], 0.0, EPS)); // SH_C1 * y = 0
+        assert!(approx(b[1], 0.0, EPS)); // -SH_C1 * y = 0
         assert!(approx(b[2], 0.0, EPS)); // SH_C1 * z = 0
-        assert!(approx(b[3], SH_C1, EPS)); // SH_C1 * x = SH_C1
+        assert!(approx(b[3], -SH_C1, EPS)); // -SH_C1 * x = -SH_C1 (3DGS shader sign convention)
     }
 
     // 4. sh_eval normalizes non-unit vector
@@ -747,5 +773,160 @@ mod tests {
             })
             .sum();
         assert!(approx(y20_sum, 0.0, EPS), "Y_2^0 cardinal sum = {y20_sum}");
+    }
+
+    // 21. Regression test: CPU basis signs must match the 3DGS GPU shader
+    // convention (preprocess.wgsl / sh_eval.wgsl), at every degree.
+    #[test]
+    fn test_sh_basis_signs_match_shader_convention() {
+        // Cross-checked against the shaders' own literal constants,
+        // independently of this module's SH_C1/SH_C2/SH_C3 (so a future
+        // accidental sign flip in both places at once would still be
+        // caught by this test).
+        const SHADER_SH_C1: f32 = 0.488_602_51;
+        const SHADER_SH_C2_0: f32 = 1.092_548_4;
+        const SHADER_SH_C2_1: f32 = -1.092_548_4;
+        const SHADER_SH_C2_2: f32 = 0.315_391_56;
+        const SHADER_SH_C2_3: f32 = -1.092_548_4;
+        const SHADER_SH_C2_4: f32 = 0.546_274_2;
+        const SHADER_SH_C3_0: f32 = -0.590_043_6;
+        const SHADER_SH_C3_1: f32 = 2.890_611_4;
+        const SHADER_SH_C3_2: f32 = -0.457_045_8;
+        const SHADER_SH_C3_3: f32 = 0.373_176_33;
+        const SHADER_SH_C3_4: f32 = -0.457_045_8;
+        const SHADER_SH_C3_5: f32 = 1.445_305_7;
+        const SHADER_SH_C3_6: f32 = -0.590_043_6;
+
+        // A generic, non-axis-aligned direction (normalized (2,1,3)) so
+        // every term below is nonzero and every sign is exercised.
+        let (x, y, z) = (0.534_522_5_f32, 0.267_261_24_f32, 0.801_783_7_f32);
+        let tol = 1e-4;
+
+        // Degree 1: shader computes SH_C1 * vec3(-y, z, -x).
+        let b1 = sh_eval_degree1(x, y, z);
+        assert!(approx(b1[1], SHADER_SH_C1 * -y, tol), "Y_1^-1: {}", b1[1]);
+        assert!(approx(b1[2], SHADER_SH_C1 * z, tol), "Y_1^0: {}", b1[2]);
+        assert!(approx(b1[3], SHADER_SH_C1 * -x, tol), "Y_1^1: {}", b1[3]);
+
+        // Degree 2: shader computes SH_C2_k * (basis polynomial)_k.
+        let b2 = sh_eval_degree2(x, y, z);
+        assert!(approx(b2[4], SHADER_SH_C2_0 * x * y, tol), "Y_2^-2");
+        assert!(approx(b2[5], SHADER_SH_C2_1 * y * z, tol), "Y_2^-1");
+        assert!(
+            approx(b2[6], SHADER_SH_C2_2 * (2.0 * z * z - x * x - y * y), tol),
+            "Y_2^0"
+        );
+        assert!(approx(b2[7], SHADER_SH_C2_3 * x * z, tol), "Y_2^1");
+        assert!(
+            approx(b2[8], SHADER_SH_C2_4 * (x * x - y * y), tol),
+            "Y_2^2"
+        );
+
+        // Degree 3: shader computes SH_C3_k * (basis polynomial)_k.
+        let b3 = sh_eval_degree3(x, y, z);
+        assert!(
+            approx(b3[9], SHADER_SH_C3_0 * y * (3.0 * x * x - y * y), tol),
+            "Y_3^-3"
+        );
+        assert!(approx(b3[10], SHADER_SH_C3_1 * x * y * z, tol), "Y_3^-2");
+        assert!(
+            approx(
+                b3[11],
+                SHADER_SH_C3_2 * y * (4.0 * z * z - x * x - y * y),
+                tol
+            ),
+            "Y_3^-1"
+        );
+        assert!(
+            approx(
+                b3[12],
+                SHADER_SH_C3_3 * z * (2.0 * z * z - 3.0 * x * x - 3.0 * y * y),
+                tol
+            ),
+            "Y_3^0"
+        );
+        assert!(
+            approx(
+                b3[13],
+                SHADER_SH_C3_4 * x * (4.0 * z * z - x * x - y * y),
+                tol
+            ),
+            "Y_3^1"
+        );
+        assert!(
+            approx(b3[14], SHADER_SH_C3_5 * z * (x * x - y * y), tol),
+            "Y_3^2"
+        );
+        assert!(
+            approx(b3[15], SHADER_SH_C3_6 * x * (x * x - 3.0 * y * y), tol),
+            "Y_3^3"
+        );
+    }
+
+    // 22. Regression test: this module and `crate::environment` are both
+    // re-exported from the crate root, so they MUST agree basis-for-basis.
+    // Historically `spherical_harmonics` shipped the naive all-positive
+    // convention while `environment` (and the shaders, and `cpu_reference`)
+    // used the 3DGS one, so a crate-root caller got view-dependent colour
+    // mirrored relative to what the rasterizer produced.
+    #[test]
+    fn test_sh_eval_degree3_matches_environment_basis() {
+        // Absolute tolerance rather than bit equality: the two modules
+        // spell a few constants with a different final literal digit
+        // (e.g. -0.590_043_6 vs -0.590_043_59) and compute Y_2^0 as
+        // `2z²-x²-y²` here but `3z²-1` there — algebraically identical for
+        // unit vectors, different float rounding. 1e-6 is still ~7 orders
+        // of magnitude tighter than any sign flip.
+        let tol = 1e-6;
+
+        // Generic directions: every component nonzero, signs mixed, so a
+        // flip in any single m-index term is caught.
+        let dirs = [
+            [2.0_f32, 1.0, 3.0],
+            [-1.0_f32, 2.0, -0.5],
+            [0.3_f32, -0.7, 0.6],
+            [-0.8_f32, -0.4, -1.3],
+        ];
+
+        for dir in dirs {
+            // `sh_eval_degree3` does not normalise, `sh_basis_up_to_l3`
+            // documents a unit-vector precondition: feed both the exact
+            // same normalised triple.
+            let unit = normalize(dir).expect("direction is non-zero");
+            let [x, y, z] = unit;
+
+            let mine = sh_eval_degree3(x, y, z);
+            let theirs = crate::environment::sh_basis_up_to_l3(unit);
+
+            for (k, (a, b)) in mine.iter().zip(theirs.iter()).enumerate() {
+                assert!(
+                    approx(*a, *b, tol),
+                    "basis {k} disagrees for dir {dir:?}: \
+                     spherical_harmonics={a}, environment={b}"
+                );
+            }
+        }
+    }
+
+    // 23. The same equivalence must hold through the public `sh_eval`
+    // entry point (which normalises internally) at every supported degree.
+    #[test]
+    fn test_sh_eval_matches_environment_basis_all_degrees() {
+        let tol = 1e-6;
+        let dir = [2.0_f32, 1.0, 3.0];
+        let unit = normalize(dir).expect("direction is non-zero");
+        let reference = crate::environment::sh_basis_up_to_l3(unit);
+
+        for degree in 0..=3_usize {
+            let basis = sh_eval(dir, degree).expect("degree <= 3 and dir non-zero");
+            assert_eq!(basis.len(), sh_num_coeffs(degree));
+            for (k, value) in basis.iter().enumerate() {
+                assert!(
+                    approx(*value, reference[k], tol),
+                    "degree {degree} basis {k}: sh_eval={value}, environment={}",
+                    reference[k]
+                );
+            }
+        }
     }
 }

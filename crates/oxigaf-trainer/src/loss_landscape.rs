@@ -11,7 +11,9 @@
 //! let params = loss.minimum.clone();
 //! let grad = loss.gradient(&params).unwrap();
 //! let config = SharpnessConfig::default();
-//! let metrics = compute_sharpness(&params, &grad, &loss, &config).unwrap();
+//! // `&[]` = no parameter groups → plain global direction normalisation.
+//! // Pass `(start, len)` ranges to enable filter normalisation instead.
+//! let metrics = compute_sharpness(&params, &grad, &loss, &config, &[]).unwrap();
 //! assert!(metrics.gradient_norm < 1e-6);
 //! ```
 
@@ -54,6 +56,69 @@ fn random_unit_sphere(dim: usize, seed: u64) -> Vec<f32> {
         }
     }
     d
+}
+
+/// SplitMix64 finalizer.
+///
+/// Strongly mixes a seed so that adjacent inputs (e.g. `seed`, `seed+1`,
+/// `seed+2`, ...) produce decorrelated outputs. [`random_unit_sphere`]
+/// restarts a fresh [`xorshift64`] state from whatever seed it is given,
+/// and xorshift64 has weak avalanche on adjacent seeds — feeding it
+/// `config.seed + 0, config.seed + 1, ...` directly (as sample-loop
+/// callers here do) would produce correlated first outputs and therefore
+/// correlated sampled directions, biasing sharpness estimates that assume
+/// the samples cover the epsilon-sphere. Passing each seed through this
+/// finalizer first fixes that while keeping per-sample-index
+/// reproducibility (unlike threading one RNG state through the whole
+/// loop, which would make sample `k`'s direction depend on how many
+/// samples came before it).
+#[inline(always)]
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = x;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Rescale each parameter-group's slice of `dir` to match the L2 norm of
+/// the corresponding slice of `params` — "filter normalisation" (Li et al.
+/// 2018, "Visualizing the Loss Landscape of Neural Nets"):
+/// `d_g <- (d_g / ||d_g||) * ||theta_g||`.
+///
+/// Global (whole-vector) direction normalisation lets whichever parameter
+/// group has the largest raw magnitude dominate an epsilon-ball
+/// perturbation; filter normalisation instead scales each group's
+/// perturbation to that group's own natural scale, making landscape scans
+/// comparable across parameter groups with very different scales (e.g. a
+/// Gaussian model's world-space positions vs. log-scales vs. opacity
+/// logits) and across checkpoints/models.
+///
+/// `groups` is a list of `(start, len)` index ranges into `dir`/`params`.
+/// Ranges are clamped to `dir.len().min(params.len())`; a range with
+/// `len == 0` (after clamping) is a no-op. If a group's parameter-vector
+/// slice has ~zero norm, its direction slice is left as whatever
+/// unit-normalisation left it (typically ~0 too, since dividing by a
+/// ~zero `param_norm` would otherwise be undefined) — no perturbation in
+/// a degenerate all-zero group is the same math the formula gives:
+/// `d_g <- (d_g/||d_g||) * 0`.
+fn filter_normalize(dir: &mut [f32], params: &[f32], groups: &[(usize, usize)]) {
+    let n = dir.len().min(params.len());
+    for &(start, len) in groups {
+        let start = start.min(n);
+        let end = start.saturating_add(len).min(n);
+        if end <= start {
+            continue;
+        }
+        let dir_norm: f32 = dir[start..end].iter().map(|d| d * d).sum::<f32>().sqrt();
+        let param_norm: f32 = params[start..end].iter().map(|p| p * p).sum::<f32>().sqrt();
+        if dir_norm > 1e-12 {
+            let scale = param_norm / dir_norm;
+            for d in &mut dir[start..end] {
+                *d *= scale;
+            }
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -196,7 +261,12 @@ impl Default for SharpnessConfig {
 pub struct SharpnessMetrics {
     /// SAM sharpness: max_k L(θ + ε·d_k) − L(θ)
     pub sam_sharpness: f32,
-    /// Adaptive SAM: relative perturbation per parameter group.
+    /// Adaptive SAM: `L(θ + ε·g/‖g‖) − L(θ)`, the loss delta from a single
+    /// perturbation step along the (signed) normalised gradient — the
+    /// actual ascent direction. Can be NEGATIVE: a negative value means
+    /// the loss decreased along the gradient direction at this radius
+    /// (e.g. past a nearby local max, or on a very flat/noisy landscape),
+    /// which is itself informative and is not clamped away.
     pub adaptive_sam: f32,
     /// Gradient-based curvature estimate: ||g(θ + ε∇̂) − g(θ)|| / ε
     pub curvature_estimate: f32,
@@ -215,7 +285,8 @@ pub struct SharpnessMetrics {
 /// Compute sharpness metrics at the current parameter location.
 ///
 /// SAM approximation using random unit-ball samples:
-/// 1. Sample n unit-sphere directions d_k
+/// 1. Sample n unit-sphere directions d_k (filter-normalised per `groups`
+///    when non-empty, see `filter_normalize`)
 /// 2. Compute perturbed loss at θ + ε · d_k
 /// 3. SAM = max_k L(θ + ε·d_k) − L(θ)
 ///
@@ -223,11 +294,18 @@ pub struct SharpnessMetrics {
 /// g1 = gradient(θ + ε · ∇L/||∇L||)
 /// g0 = gradient(θ)
 /// curvature ≈ ||g1 − g0|| / ε
+///
+/// `groups`: `(start, len)` parameter-group ranges for filter
+/// normalisation (see `filter_normalize`) of the SAM-sampling
+/// directions. Pass `&[]` for plain global unit-vector normalisation
+/// (each sampled direction has norm exactly 1, as in the original
+/// implementation).
 pub fn compute_sharpness(
     params: &[f32],
     gradient: &[f32],
     evaluator: &dyn LossEvaluator,
     config: &SharpnessConfig,
+    groups: &[(usize, usize)],
 ) -> Result<SharpnessMetrics, LandscapeError> {
     let dim = params.len();
     if dim == 0 {
@@ -242,14 +320,52 @@ pub fn compute_sharpness(
     if !config.epsilon.is_finite() || config.epsilon <= 0.0 {
         return Err(LandscapeError::InvalidPerturbationScale(config.epsilon));
     }
-
-    let eps = config.epsilon;
-
-    // ── Base loss ────────────────────────────────────────────────────────────
     let base_loss = evaluator.evaluate(params)?;
     if !base_loss.is_finite() {
         return Err(LandscapeError::NonFiniteLoss);
     }
+    let (metrics, _g1, _g0) =
+        compute_sharpness_with_base(params, gradient, evaluator, config, groups, base_loss)?;
+    Ok(metrics)
+}
+
+/// Shared implementation behind [`compute_sharpness`] and
+/// [`compute_landscape_stats`], parameterised by an already-computed
+/// `base_loss` so callers that need it for other purposes too (like
+/// `compute_landscape_stats`) do not pay for a second, identical
+/// `evaluator.evaluate(params)` call.
+///
+/// Also returns the internal `(g1, g0)` gradients computed for
+/// `curvature_estimate` (empty when `gradient_norm < 1e-12`, since that
+/// branch is skipped) so `compute_landscape_stats` can reuse them for its
+/// `effective_dim` finite difference instead of recomputing two more
+/// identical `evaluator.gradient()` calls.
+fn compute_sharpness_with_base(
+    params: &[f32],
+    gradient: &[f32],
+    evaluator: &dyn LossEvaluator,
+    config: &SharpnessConfig,
+    groups: &[(usize, usize)],
+    base_loss: f32,
+) -> Result<(SharpnessMetrics, Vec<f32>, Vec<f32>), LandscapeError> {
+    let dim = params.len();
+    if dim == 0 {
+        return Err(LandscapeError::EmptyParameters);
+    }
+    if gradient.len() != dim {
+        return Err(LandscapeError::LengthMismatch {
+            len_p: dim,
+            len_g: gradient.len(),
+        });
+    }
+    if !config.epsilon.is_finite() || config.epsilon <= 0.0 {
+        return Err(LandscapeError::InvalidPerturbationScale(config.epsilon));
+    }
+    if !base_loss.is_finite() {
+        return Err(LandscapeError::NonFiniteLoss);
+    }
+
+    let eps = config.epsilon;
 
     // ── Gradient norm & parameter norm ───────────────────────────────────────
     let gradient_norm: f32 = gradient.iter().map(|g| g * g).sum::<f32>().sqrt();
@@ -258,8 +374,11 @@ pub fn compute_sharpness(
     // ── SAM sharpness — random unit-sphere perturbations ────────────────────
     let mut sam_sharpness: f32 = 0.0;
     for k in 0..config.num_samples {
-        let seed = config.seed.wrapping_add(k as u64);
-        let dir = random_unit_sphere(dim, seed);
+        let seed = splitmix64(config.seed.wrapping_add(k as u64));
+        let mut dir = random_unit_sphere(dim, seed);
+        if !groups.is_empty() {
+            filter_normalize(&mut dir, params, groups);
+        }
         let perturbed: Vec<f32> = params
             .iter()
             .zip(dir.iter())
@@ -275,27 +394,31 @@ pub fn compute_sharpness(
         }
     }
 
-    // ── Adaptive SAM — per-parameter scale by |g_i| / ||g|| ─────────────────
-    // δ_i = ε · |g_i| / ||g||  (when ||g|| == 0, adaptive perturbation is 0)
+    // ── Adaptive SAM — perturb along the SIGNED normalised gradient ─────────
+    // δ = ε · g / ||g|| (the true ascent direction). Using |g| instead
+    // (the previous implementation) discards the sign of every component,
+    // so components with g_i < 0 were perturbed downhill instead of
+    // uphill, contaminating the result — masked by a `.max(0.0)` clamp
+    // that hid the resulting negative deltas rather than reporting them.
     let adaptive_sam = if gradient_norm < 1e-12 {
         0.0
     } else {
         let perturbed: Vec<f32> = params
             .iter()
             .zip(gradient.iter())
-            .map(|(p, g)| p + eps * g.abs() / gradient_norm)
+            .map(|(p, g)| p + eps * g / gradient_norm)
             .collect();
         let p_loss = evaluator.evaluate(&perturbed)?;
         if !p_loss.is_finite() {
             return Err(LandscapeError::NonFiniteLoss);
         }
-        (p_loss - base_loss).max(0.0)
+        p_loss - base_loss
     };
 
     // ── Curvature estimate via finite-difference along gradient direction ─────
     // When ||g|| ≈ 0, skip (curvature undefined at flat point here).
-    let curvature_estimate = if gradient_norm < 1e-12 {
-        0.0
+    let (curvature_estimate, g1, g0) = if gradient_norm < 1e-12 {
+        (0.0, Vec::new(), Vec::new())
     } else {
         let grad_dir: Vec<f32> = gradient.iter().map(|g| g / gradient_norm).collect();
         let perturbed: Vec<f32> = params
@@ -311,17 +434,21 @@ pub fn compute_sharpness(
             .map(|(a, b)| (a - b) * (a - b))
             .sum::<f32>()
             .sqrt();
-        diff_norm / eps
+        (diff_norm / eps, g1, g0)
     };
 
-    Ok(SharpnessMetrics {
-        sam_sharpness,
-        adaptive_sam,
-        curvature_estimate,
-        gradient_norm,
-        parameter_norm,
-        epsilon: eps,
-    })
+    Ok((
+        SharpnessMetrics {
+            sam_sharpness,
+            adaptive_sam,
+            curvature_estimate,
+            gradient_norm,
+            parameter_norm,
+            epsilon: eps,
+        },
+        g1,
+        g0,
+    ))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -512,7 +639,19 @@ fn solve_3x3(m: [[f64; 3]; 3], r: [f64; 3]) -> Option<[f64; 3]> {
 /// Scan the loss landscape along a given direction.
 ///
 /// Evaluates the loss (and optionally gradients) at `num_steps` evenly-spaced
-/// offsets in `[−range, +range]` along the unit-normalised `direction`.
+/// offsets in `[−range, +range]` along `direction`.
+///
+/// `groups`: `(start, len)` parameter-group ranges for FILTER
+/// normalisation (Li et al. 2018, see `filter_normalize`) — each group's
+/// slice of `direction` is independently rescaled to that group's own
+/// parameter-vector norm, instead of the whole vector being normalised to
+/// a single global unit length. This matters because parameter groups
+/// with very different natural scales (e.g. a Gaussian model's
+/// world-space positions ~0.1, log-scales ~-5, opacity logits ~0, SH DC
+/// ~1.77) make a globally-normalised perturbation almost entirely
+/// absorbed by whichever group has the largest raw magnitude, producing
+/// scan results that are not comparable across checkpoints or models.
+/// Pass `&[]` for the previous global-unit-vector behaviour.
 pub fn scan_1d(
     center_params: &[f32],
     direction: &[f32],
@@ -520,6 +659,7 @@ pub fn scan_1d(
     range: f32,
     num_steps: usize,
     compute_gradients: bool,
+    groups: &[(usize, usize)],
 ) -> Result<LandscapeScan1D, LandscapeError> {
     let dim = center_params.len();
     if dim == 0 {
@@ -535,16 +675,28 @@ pub fn scan_1d(
         return Err(LandscapeError::InvalidInterpolationSteps(num_steps));
     }
 
-    // Normalise direction
-    let dir_norm: f32 = direction.iter().map(|d| d * d).sum::<f32>().sqrt();
-    let unit_dir: Vec<f32> = if dir_norm < 1e-12 {
-        // Degenerate direction — use canonical first axis
+    // Normalise direction: FILTER normalisation per `groups` when
+    // non-empty (each group's slice rescaled to that group's own
+    // parameter norm); otherwise plain global L2 normalisation to a unit
+    // vector, matching the previous behaviour.
+    let mut unit_dir: Vec<f32> = if direction.iter().map(|d| d * d).sum::<f32>().sqrt() < 1e-12 {
+        // Degenerate direction — use canonical first axis.
         let mut v = vec![0.0_f32; dim];
         v[0] = 1.0;
         v
     } else {
-        direction.iter().map(|d| d / dir_norm).collect()
+        direction.to_vec()
     };
+    if groups.is_empty() {
+        let dir_norm: f32 = unit_dir.iter().map(|d| d * d).sum::<f32>().sqrt();
+        if dir_norm > 1e-12 {
+            for d in &mut unit_dir {
+                *d /= dir_norm;
+            }
+        }
+    } else {
+        filter_normalize(&mut unit_dir, center_params, groups);
+    }
 
     // Linspace from -range to +range
     let offsets: Vec<f32> = (0..num_steps)
@@ -703,11 +855,18 @@ pub struct LandscapeStats {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Compute comprehensive landscape statistics at the given location.
+///
+/// `groups`: `(start, len)` parameter-group ranges for filter
+/// normalisation, threaded through to [`compute_sharpness`]'s SAM sampling
+/// and to this function's own random-perturbation sampling below (see
+/// `filter_normalize`). Pass `&[]` for plain global unit-vector
+/// normalisation.
 pub fn compute_landscape_stats(
     params: &[f32],
     gradient: &[f32],
     evaluator: &dyn LossEvaluator,
     config: &SharpnessConfig,
+    groups: &[(usize, usize)],
 ) -> Result<LandscapeStats, LandscapeError> {
     let dim = params.len();
     if dim == 0 {
@@ -725,7 +884,13 @@ pub fn compute_landscape_stats(
         return Err(LandscapeError::NonFiniteLoss);
     }
 
-    let sharpness = compute_sharpness(params, gradient, evaluator, config)?;
+    // Pass `base_loss` in (avoids a duplicate `evaluate(params)` call) and
+    // reuse the returned `(g1, g0)` below (avoids two duplicate
+    // `gradient()` calls at the identical grad-direction-perturbed point
+    // that `effective_dim` also needs) instead of calling `compute_sharpness`
+    // and separately recomputing both.
+    let (sharpness, g1, g0) =
+        compute_sharpness_with_base(params, gradient, evaluator, config, groups, base_loss)?;
     let gradient_norm = sharpness.gradient_norm;
 
     // ── Effective dimensionality: ||g||² / (gᵀ H g) ─────────────────────────
@@ -735,15 +900,8 @@ pub fn compute_landscape_stats(
         dim as f32
     } else {
         let eps = config.epsilon;
-        let grad_dir: Vec<f32> = gradient.iter().map(|g| g / gradient_norm).collect();
-        let p_shifted: Vec<f32> = params
-            .iter()
-            .zip(grad_dir.iter())
-            .map(|(p, d)| p + eps * d)
-            .collect();
-        let g1 = evaluator.gradient(&p_shifted)?;
-        let g0 = evaluator.gradient(params)?;
-        // Hg ≈ (g1 - g0) / eps
+        // g1/g0 reused from `compute_sharpness_with_base`'s curvature_estimate,
+        // which perturbs along the exact same grad_dir = gradient/gradient_norm.
         let hg: Vec<f32> = g1
             .iter()
             .zip(g0.iter())
@@ -764,8 +922,11 @@ pub fn compute_landscape_stats(
     let eps = config.epsilon;
     let mut loss_at_grid = Vec::with_capacity(num_samples);
     for k in 0..num_samples {
-        let seed = config.seed.wrapping_add(k as u64).wrapping_add(0xDEAD_BEEF);
-        let dir = random_unit_sphere(dim, seed);
+        let seed = splitmix64(config.seed.wrapping_add(k as u64).wrapping_add(0xDEAD_BEEF));
+        let mut dir = random_unit_sphere(dim, seed);
+        if !groups.is_empty() {
+            filter_normalize(&mut dir, params, groups);
+        }
         let perturbed: Vec<f32> = params
             .iter()
             .zip(dir.iter())
@@ -881,7 +1042,7 @@ mod tests {
             num_samples: 50,
             seed: 42,
         };
-        let metrics = compute_sharpness(&params, &grad, &loss, &config).unwrap();
+        let metrics = compute_sharpness(&params, &grad, &loss, &config, &[]).unwrap();
         let eps_sq = config.epsilon * config.epsilon;
         // For unit-sphere direction d on identity quadratic: L(ε·d) = ε²
         // With 50 samples we should be very close to eps_sq.
@@ -900,7 +1061,7 @@ mod tests {
         let params = vec![0.0; 4];
         let gradient = vec![0.0; 3]; // wrong length
         let config = SharpnessConfig::default();
-        let result = compute_sharpness(&params, &gradient, &loss, &config);
+        let result = compute_sharpness(&params, &gradient, &loss, &config, &[]);
         assert!(matches!(result, Err(LandscapeError::LengthMismatch { .. })));
     }
 
@@ -910,7 +1071,7 @@ mod tests {
         let loss = QuadraticLoss::identity(4);
         let center = vec![0.0_f32; 4];
         let direction = vec![1.0, 0.0, 0.0, 0.0];
-        let scan = scan_1d(&center, &direction, &loss, 1.0, 20, false).unwrap();
+        let scan = scan_1d(&center, &direction, &loss, 1.0, 20, false, &[]).unwrap();
         assert_eq!(scan.offsets.len(), 20);
         assert_eq!(scan.losses.len(), 20);
         assert!(scan.gradient_norms.is_none());
@@ -922,7 +1083,7 @@ mod tests {
         let loss = QuadraticLoss::identity(4);
         let center = loss.minimum.clone();
         let direction = vec![1.0, 0.0, 0.0, 0.0];
-        let scan = scan_1d(&center, &direction, &loss, 1.0, 21, false).unwrap();
+        let scan = scan_1d(&center, &direction, &loss, 1.0, 21, false, &[]).unwrap();
         // Middle element (offset 0) should have loss 0
         let mid = 10; // index 10 of 21 steps
         assert!(
@@ -938,7 +1099,7 @@ mod tests {
         let loss = QuadraticLoss::identity(4);
         let center = loss.minimum.clone();
         let direction = vec![1.0, 0.0, 0.0, 0.0];
-        let scan = scan_1d(&center, &direction, &loss, 1.0, 21, false).unwrap();
+        let scan = scan_1d(&center, &direction, &loss, 1.0, 21, false, &[]).unwrap();
         assert!(
             scan.is_locally_convex(),
             "Expected convex scan for quadratic"
@@ -951,7 +1112,7 @@ mod tests {
         let loss = QuadraticLoss::identity(4);
         let center = loss.minimum.clone();
         let direction = vec![1.0, 0.0, 0.0, 0.0];
-        let scan = scan_1d(&center, &direction, &loss, 1.0, 21, false).unwrap();
+        let scan = scan_1d(&center, &direction, &loss, 1.0, 21, false, &[]).unwrap();
         let (min_l, min_o) = scan.min_loss();
         assert!(min_l < 1e-6, "Min loss should be ~0, got {}", min_l);
         assert!(min_o.abs() < 1e-5, "Min offset should be ~0, got {}", min_o);
@@ -963,7 +1124,7 @@ mod tests {
         let loss = QuadraticLoss::identity(4);
         let center = loss.minimum.clone();
         let direction = vec![1.0, 0.0, 0.0, 0.0];
-        let scan = scan_1d(&center, &direction, &loss, 1.0, 21, false).unwrap();
+        let scan = scan_1d(&center, &direction, &loss, 1.0, 21, false, &[]).unwrap();
         assert!(scan.loss_variation() > 0.0, "Expected non-zero variation");
     }
 
@@ -1019,7 +1180,7 @@ mod tests {
     fn test_compute_landscape_stats_valid() {
         let (loss, params, grad) = make_identity_at_minimum();
         let config = SharpnessConfig::default();
-        let stats = compute_landscape_stats(&params, &grad, &loss, &config).unwrap();
+        let stats = compute_landscape_stats(&params, &grad, &loss, &config, &[]).unwrap();
         assert!(stats.base_loss >= 0.0);
         assert!(stats.mean_perturbed_loss.is_finite());
         assert!(stats.std_perturbed_loss >= 0.0);
@@ -1031,7 +1192,7 @@ mod tests {
     fn test_compute_landscape_stats_base_loss_matches() {
         let (loss, params, grad) = make_identity_at_minimum();
         let config = SharpnessConfig::default();
-        let stats = compute_landscape_stats(&params, &grad, &loss, &config).unwrap();
+        let stats = compute_landscape_stats(&params, &grad, &loss, &config, &[]).unwrap();
         let direct = loss.evaluate(&params).unwrap();
         assert!((stats.base_loss - direct).abs() < 1e-6);
     }
@@ -1042,7 +1203,7 @@ mod tests {
         let loss = QuadraticLoss::identity(4);
         let center = vec![0.0_f32; 4];
         let direction = vec![1.0, 0.0, 0.0, 0.0];
-        let scan = scan_1d(&center, &direction, &loss, 1.0, 40, false).unwrap();
+        let scan = scan_1d(&center, &direction, &loss, 1.0, 40, false, &[]).unwrap();
         let ascii = scan.format_ascii(40, 10);
         let lines: Vec<&str> = ascii.lines().collect();
         assert_eq!(lines.len(), 10, "Expected 10 lines, got {}", lines.len());
@@ -1061,11 +1222,121 @@ mod tests {
     fn test_compute_sharpness_gradient_norm_at_minimum() {
         let (loss, params, grad) = make_identity_at_minimum();
         let config = SharpnessConfig::default();
-        let metrics = compute_sharpness(&params, &grad, &loss, &config).unwrap();
+        let metrics = compute_sharpness(&params, &grad, &loss, &config, &[]).unwrap();
         assert!(
             metrics.gradient_norm < 1e-6,
             "Expected gradient_norm ≈ 0 at minimum, got {}",
             metrics.gradient_norm
         );
+    }
+
+    // ── adaptive_sam: signed ascent direction (regression) ───────────────────
+
+    #[test]
+    fn test_adaptive_sam_matches_closed_form_signed_ascent() {
+        // At params = [1,0,0,0] on L(θ)=||θ||², gradient = [2,0,0,0]
+        // (points away from the minimum, i.e. +x is uphill). This case
+        // alone can't distinguish |g| from g (both give the same
+        // direction here) — see the companion test below for that.
+        let loss = QuadraticLoss::identity(4);
+        let params = vec![1.0_f32, 0.0, 0.0, 0.0];
+        let grad = loss.gradient(&params).unwrap();
+        let config = SharpnessConfig {
+            epsilon: 0.05,
+            num_samples: 1,
+            seed: 1,
+        };
+        let metrics = compute_sharpness(&params, &grad, &loss, &config, &[]).unwrap();
+        let eps = config.epsilon;
+        let expected = (1.0 + eps) * (1.0 + eps) - 1.0; // (1+eps)^2 - 1^2
+        assert!(
+            (metrics.adaptive_sam - expected).abs() < 1e-4,
+            "expected adaptive_sam≈{expected}, got {}",
+            metrics.adaptive_sam
+        );
+    }
+
+    #[test]
+    fn test_adaptive_sam_uses_signed_gradient_not_abs() {
+        // Regression test: at params = [-1,0,0,0], gradient = [-2,0,0,0]
+        // (points toward -x — still the ascent direction, since we're
+        // already left of the minimum at 0). The old `g.abs()` code would
+        // instead perturb toward +x (DOWNHILL, back toward the minimum),
+        // producing a smaller loss delta than the true ascent step (and
+        // would have been clamped to 0.0 by the old `.max(0.0)` once that
+        // delta went negative).
+        let loss = QuadraticLoss::identity(4);
+        let params = vec![-1.0_f32, 0.0, 0.0, 0.0];
+        let grad = loss.gradient(&params).unwrap();
+        assert!(grad[0] < 0.0, "sanity: gradient should be negative here");
+        let config = SharpnessConfig {
+            epsilon: 0.05,
+            num_samples: 1,
+            seed: 1,
+        };
+        let metrics = compute_sharpness(&params, &grad, &loss, &config, &[]).unwrap();
+        let eps = config.epsilon;
+        // Correct signed-ascent step: p + eps*g/||g|| = -1 + eps*(-1) = -1-eps.
+        // Loss there: (-1-eps)^2 - (-1)^2 = 2*eps + eps^2.
+        let expected_signed = eps * eps + 2.0 * eps;
+        assert!(
+            (metrics.adaptive_sam - expected_signed).abs() < 1e-4,
+            "expected signed-ascent adaptive_sam≈{expected_signed}, got {}",
+            metrics.adaptive_sam
+        );
+    }
+
+    // ── filter_normalize / scan_1d groups ─────────────────────────────────────
+
+    #[test]
+    fn test_scan_1d_filter_normalization_respects_group_scale() {
+        // Two groups with very different natural scales: group A
+        // (indices 0..2) has large parameter magnitude, group B (indices
+        // 2..4) has small parameter magnitude. Filter normalisation
+        // should rescale each group's direction slice to match that
+        // group's own parameter norm, not let one raw direction magnitude
+        // dominate both.
+        let loss = QuadraticLoss::identity(4);
+        let center = vec![100.0_f32, 0.0, 0.001, 0.0]; // group A norm=100, group B norm=0.001
+        let direction = vec![1.0_f32, 0.0, 1.0, 0.0]; // equal raw magnitude in both groups
+        let groups = [(0usize, 2usize), (2usize, 2usize)];
+        let scan = scan_1d(&center, &direction, &loss, 1.0, 3, false, &groups).unwrap();
+
+        assert!(
+            (scan.direction[0] - 100.0).abs() < 1.0,
+            "group A direction component should scale to ~100, got {}",
+            scan.direction[0]
+        );
+        assert!(
+            scan.direction[2].abs() < 0.01,
+            "group B direction component should scale to ~0.001, got {}",
+            scan.direction[2]
+        );
+    }
+
+    #[test]
+    fn test_scan_1d_empty_groups_matches_global_normalization() {
+        // `groups = &[]` must reproduce the previous (global unit-vector)
+        // behaviour: the stored direction has norm 1.
+        let loss = QuadraticLoss::identity(4);
+        let center = vec![0.0_f32; 4];
+        let direction = vec![3.0_f32, 4.0, 0.0, 0.0];
+        let scan = scan_1d(&center, &direction, &loss, 1.0, 5, false, &[]).unwrap();
+        let norm: f32 = scan.direction.iter().map(|d| d * d).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-5, "expected unit norm, got {norm}");
+    }
+
+    // ── compute_landscape_stats + groups (dedup regression) ───────────────────
+
+    #[test]
+    fn test_compute_landscape_stats_with_groups_still_valid() {
+        let (loss, params, grad) = make_identity_at_minimum();
+        let config = SharpnessConfig::default();
+        let groups = [(0usize, 2usize), (2usize, 2usize)];
+        let stats = compute_landscape_stats(&params, &grad, &loss, &config, &groups).unwrap();
+        assert!(stats.base_loss >= 0.0);
+        assert!(stats.mean_perturbed_loss.is_finite());
+        assert!(stats.std_perturbed_loss >= 0.0);
+        assert!(stats.effective_dim >= 1.0);
     }
 }

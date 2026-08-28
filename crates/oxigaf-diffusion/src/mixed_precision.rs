@@ -4,6 +4,24 @@
 //! BF16 / FP16 conversions. It is unconditionally compiled; the
 //! `mixed_precision` feature flag only changes the *default* precision mode.
 //!
+//! ## Reachability
+//!
+//! As of this writing, **nothing else in this crate calls into this
+//! module**: `unet.rs`, `vae.rs` and `pipeline.rs` build and operate on
+//! `candle_core::Tensor`s at their own fixed dtype and never consult
+//! [`MixedPrecisionConfig::should_upcast`] or [`apply_precision`] when doing
+//! so, and [`MixedPrecisionConfig::validate`] is not invoked anywhere during
+//! pipeline construction. (A grep for `MixedPrecisionConfig` elsewhere in
+//! the `~/work` workspace turns up only `oxigaf-trainer`'s own, *separate*
+//! `mixed_precision` module — an independent implementation, not a consumer
+//! of this one.) This module is therefore, today, a standalone,
+//! independently-tested FP32↔BF16/FP16 conversion and precision-loss
+//! simulation toolkit rather than something the default inference path
+//! exercises. Wiring it in would mean: selecting `candle_core::DType` for
+//! weights/activations based on `MixedPrecisionConfig::mode` and
+//! `should_upcast(OpType::_)` in `unet.rs`/`vae.rs`, and calling
+//! `validate()` when a pipeline loads a `MixedPrecisionConfig`.
+//!
 //! ## BF16 (Brain Float 16)
 //!
 //! BF16 shares the same 8-bit exponent as FP32 (bias 127) but truncates the
@@ -379,15 +397,29 @@ pub fn f32_to_f16(x: f32) -> u16 {
     };
     let mant16 = mant16_raw + round_up;
 
-    // Rounding the mantissa may carry into the exponent.
-    let exp_biased = exp16 as u16;
-    let result_no_sign = (exp_biased << 10) | (mant16 & 0x03FF);
-    // If mant16 overflowed into bit 10, the exponent increments naturally.
+    // Rounding the mantissa may carry into the exponent: `mant16` can reach
+    // 0x400 (one bit past the 10-bit mantissa field) when `mant16_raw ==
+    // 0x3FF` and `round_up == 1`. Combine with `+` (not `|`) so that carry
+    // propagates into the exponent field instead of being masked away by
+    // `& 0x03FF` — e.g. `f32_to_f16(2047.5)` has `mant16_raw = 0x3FF` and
+    // rounds up, so it must become `exp16 = 26, mantissa = 0` (2048.0); the
+    // old `(exp_biased << 10) | (mant16 & 0x03FF)` computed `0x400 & 0x3FF
+    // == 0`, silently discarding the carry and returning half the correct
+    // magnitude (1024.0) instead. Using `+` on the full (uncapped) `mant16`
+    // is exactly the carry propagation that a ripple-carry add performs:
+    // `(exp_biased << 10)` has no bits below bit 10 set, so adding a value
+    // up to `0x400` either lands within the current exponent's mantissa
+    // field or carries a single 1 into bit 10 — i.e. increments the
+    // exponent by exactly 1, which is the correct IEEE 754 rounding
+    // behaviour for a mantissa overflow.
+    let exp_biased = exp16 as u32;
+    let result_no_sign = (exp_biased << 10) + mant16 as u32;
     if result_no_sign >= 0x7C00 {
-        // Overflow from rounding → Inf
+        // Overflow from rounding (possibly all the way from the maximum
+        // normal exponent) → Inf.
         return sign | 0x7C00;
     }
-    sign | result_no_sign
+    sign | result_no_sign as u16
 }
 
 /// Convert a IEEE 754 half-precision (`f16`) bit representation (`u16`) to
@@ -905,6 +937,67 @@ mod tests {
     }
 
     #[test]
+    fn test_f32_to_f16_mantissa_carry_increments_exponent() {
+        // Regression: a mantissa-rounding carry (mant16_raw == 0x3FF,
+        // round_bit == 1) must increment the exponent, not be masked away
+        // by `& 0x03FF`. 2047.5 has mant16_raw = 0x3FF and rounds up, so it
+        // must encode as exactly 2048.0 (exp16 = 26, mantissa = 0), not
+        // silently become 1024.0 (half the correct magnitude).
+        let bits = f32_to_f16(2047.5_f32);
+        assert_eq!(
+            bits, 0x6800_u16,
+            "2047.5 must round up to 2048.0's encoding (0x6800), got {bits:#06x}"
+        );
+        assert_eq!(f16_to_f32(bits), 2048.0_f32);
+    }
+
+    #[test]
+    fn test_f32_to_f16_carry_at_max_exponent_overflows_to_inf() {
+        // Regression: when the mantissa-rounding carry happens at the
+        // maximum normal f16 exponent (30), the result must become +Inf
+        // (0x7C00), not silently wrap to a finite value with half the
+        // correct magnitude (the old bug produced 0x7800 == 32768.0 here).
+        let bits = f32_to_f16(65520.0_f32);
+        assert_eq!(
+            bits, 0x7C00_u16,
+            "65520.0 must round up into +Inf's encoding (0x7C00), got {bits:#06x}"
+        );
+        assert!(f16_to_f32(bits).is_infinite());
+    }
+
+    #[test]
+    fn test_f32_to_f16_every_max_mantissa_normal_exponent_carries_correctly() {
+        // Sweep every normal f16 exponent's "about to overflow" boundary:
+        // a value whose mantissa rounds up from 0x3FF to 0x400 must land on
+        // the *next* exponent's zero-mantissa encoding (or +Inf, at the top
+        // exponent), and round-tripping back through f16_to_f32 must
+        // recover a power-of-two magnitude consistent with that exponent.
+        for exp16 in 1u32..=30 {
+            // Bit pattern with this exponent and maximal mantissa, one ULP
+            // below the next power of two — e.g. for exp16=15 (value 1.0's
+            // exponent) this is 1.9990234375.
+            let value = f16_to_f32(((exp16 as u16) << 10) | 0x03FF);
+            // Nudge just past the halfway rounding point so it rounds up.
+            let nudged = value * 1.0004;
+            let bits = f32_to_f16(nudged);
+            if exp16 == 30 {
+                assert_eq!(
+                    bits, 0x7C00,
+                    "carry at the top exponent must overflow to +Inf, got {bits:#06x}"
+                );
+            } else {
+                let expected = ((exp16 + 1) as u16) << 10;
+                assert_eq!(
+                    bits,
+                    expected,
+                    "carry at exp16={exp16} must land on exp16={}'s zero mantissa, got {bits:#06x}",
+                    exp16 + 1
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_f16_nan_roundtrip() {
         let result = f16_to_f32(f32_to_f16(f32::NAN));
         assert!(result.is_nan(), "NaN should roundtrip as NaN, got {result}");
@@ -954,8 +1047,10 @@ mod tests {
 
     #[test]
     fn test_apply_precision_fp32_is_exact_copy() {
-        let mut cfg = MixedPrecisionConfig::default();
-        cfg.mode = PrecisionMode::Float32;
+        let cfg = MixedPrecisionConfig {
+            mode: PrecisionMode::Float32,
+            ..MixedPrecisionConfig::default()
+        };
         let data = vec![1.0_f32, 2.0, 3.0, -1.5];
         let out = apply_precision(&data, &cfg);
         assert_eq!(out, data, "FP32 mode should produce exact copy");

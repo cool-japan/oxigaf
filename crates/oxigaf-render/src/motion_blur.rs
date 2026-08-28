@@ -22,6 +22,21 @@
 //! AccumulatedBlur       – result of accumulate_frames()
 //! MotionBlurStats       – diagnostic statistics
 //! ```
+//!
+//! # Choosing between the motion-blur modules
+//!
+//! Three CPU motion-blur modules coexist in this crate; they are *not*
+//! interchangeable, and the table below is the canonical guide:
+//!
+//! | Module | Input | Use it for |
+//! |---|---|---|
+//! | [`crate::motion_blur`] (this one) | `f32` RGB + [`VelocityField`] / sub-frame stacks | camera-path accumulation, simple gather blur |
+//! | [`crate::mb_pipeline`] | `f32` RGB + [`crate::mb_pipeline::VelocityBuffer`] | shutter-angle pipeline with depth-aware weights, jitter, velocity dilation/smoothing |
+//! | [`crate::motion_blur_image`] | `u8` RGBA | linear / radial / rotational image-space effects |
+//!
+//! [`MotionBlurError`] is shared with [`crate::mb_pipeline`], and the
+//! `f32`-RGB bilinear tap lives here (`bilinear_sample`), exposed publicly as
+//! [`crate::mb_pipeline::mb_bilinear_sample`].
 
 use thiserror::Error;
 
@@ -137,7 +152,18 @@ pub fn lerp_position(start: [f32; 3], end: [f32; 3], t: f32) -> [f32; 3] {
 /// **Note**: The result is *not* normalised.  Call [`normalize_quaternion`]
 /// afterwards if a unit quaternion is required.  This is sufficient for small
 /// angular differences between adjacent sub-frames.
+///
+/// `q` and `-q` represent the same rotation; if `q1` is stored in the
+/// opposite hemisphere from `q0` (`dot(q0, q1) < 0`), `q1` is negated
+/// first so the interpolation takes the short arc instead of swinging
+/// almost all the way around and back.
 pub fn lerp_quaternion(q0: [f32; 4], q1: [f32; 4], t: f32) -> [f32; 4] {
+    let dot = q0[0] * q1[0] + q0[1] * q1[1] + q0[2] * q1[2] + q0[3] * q1[3];
+    let q1 = if dot < 0.0 {
+        [-q1[0], -q1[1], -q1[2], -q1[3]]
+    } else {
+        q1
+    };
     [
         q0[0] + (q1[0] - q0[0]) * t,
         q0[1] + (q1[1] - q0[1]) * t,
@@ -314,6 +340,30 @@ impl AccumulationConfig {
             }
         }
         weights
+    }
+
+    /// Sub-frame interpolation parameters `t ∈ [0, 1]` at which each of the
+    /// `num_samples` sub-frames should be rendered, honouring `shutter_open`.
+    ///
+    /// With a fully-open shutter (`shutter_open == 1.0`, the default) this
+    /// spans the full exposure window and matches [`subframe_t`] exactly.
+    /// A partially-open shutter compresses the samples into a
+    /// `shutter_open`-fraction window centred at `t = 0.5` — e.g.
+    /// `shutter_open = 0.25` samples only `t ∈ [0.375, 0.625]`, matching a
+    /// camera whose shutter is open for only a quarter of the frame.
+    ///
+    /// Feed these `t` values (together with a [`CameraMotion`]) into
+    /// [`CameraMotion::position_at`] / [`CameraMotion::rotation_at`] when
+    /// rendering the sub-frames that [`accumulate_frames`] will blend.
+    pub fn subframe_times(&self) -> Vec<f32> {
+        let n = self.num_samples.max(1);
+        let shutter = self.shutter_open.clamp(0.0, 1.0);
+        (0..n)
+            .map(|i| {
+                let base = subframe_t(i, n); // full-frame parameter, [0, 1]
+                0.5 + (base - 0.5) * shutter
+            })
+            .collect()
     }
 }
 
@@ -535,12 +585,38 @@ impl Default for VelocityBlurConfig {
 /// Bilinear sample of a row-major RGB (`width × height × 3`) image.
 ///
 /// Coordinates outside `[0, width/height)` are clamped to the edge.
+/// An empty image (`width == 0` or `height == 0`) yields `[0, 0, 0]`.
+///
+/// This is the single f32-RGB bilinear tap shared by the CPU motion-blur
+/// modules: [`crate::mb_pipeline::mb_bilinear_sample`] is a thin public
+/// re-export of this function, so the velocity-blur path here and the
+/// velocity-buffer pipeline there cannot drift apart.
 ///
 /// Returns `[r, g, b]`.
-fn bilinear_sample(image: &[f32], width: usize, height: usize, sx: f32, sy: f32) -> [f32; 3] {
-    // Clamp continuous coordinates.
-    let sx = sx.clamp(0.0, width as f32 - 1.0 - f32::EPSILON);
-    let sy = sy.clamp(0.0, height as f32 - 1.0 - f32::EPSILON);
+pub(crate) fn bilinear_sample(
+    image: &[f32],
+    width: usize,
+    height: usize,
+    sx: f32,
+    sy: f32,
+) -> [f32; 3] {
+    // Degenerate image: `(x0 + 1).min(width - 1)` would underflow below.
+    if width == 0 || height == 0 {
+        return [0.0; 3];
+    }
+    // Clamp continuous coordinates. `width - 1.0 - EPSILON` goes negative
+    // for width == 1 (likewise height == 1), which panics in `f32::clamp`
+    // (requires min <= max) — guard those degenerate axes explicitly.
+    let sx = if width <= 1 {
+        0.0
+    } else {
+        sx.clamp(0.0, width as f32 - 1.0 - f32::EPSILON)
+    };
+    let sy = if height <= 1 {
+        0.0
+    } else {
+        sy.clamp(0.0, height as f32 - 1.0 - f32::EPSILON)
+    };
 
     let x0 = sx.floor() as usize;
     let y0 = sy.floor() as usize;
@@ -586,8 +662,11 @@ fn bilinear_sample(image: &[f32], width: usize, height: usize, sx: f32, sy: f32)
 /// 1. Retrieve the screen-space velocity `(vx, vy)` and scale by
 ///    `config.velocity_scale`.
 /// 2. Clamp the vector magnitude to `config.max_radius`.
-/// 3. Uniformly sample `config.num_samples` points along the vector from the
-///    pixel centre to `(px + vx, py + vy)`.
+/// 3. Uniformly sample `config.num_samples` points centred on the pixel,
+///    spanning from `(px - vx/2, py - vy/2)` to `(px + vx/2, py + vy/2)`
+///    (so the blur trail straddles the source pixel instead of trailing
+///    only forward, which would also shift the whole image by half the
+///    velocity vector).
 /// 4. Bilinear-sample the source image at each point (clamp-to-edge).
 /// 5. Average the samples into the output pixel.
 ///
@@ -653,11 +732,13 @@ pub fn apply_velocity_blur(
 
             let mut acc = [0.0_f32; 3];
             for s in 0..n {
-                // t ∈ [0, 1] across the n samples.
+                // t ∈ [-0.5, 0.5] across the n samples, straddling the
+                // pixel so the sampled kernel's centroid stays at the
+                // source pixel instead of trailing only forward.
                 let t = if n == 1 {
                     0.0
                 } else {
-                    s as f32 / (n - 1) as f32
+                    s as f32 / (n - 1) as f32 - 0.5
                 };
                 let sx = px_f + vx * t;
                 let sy = py_f + vy * t;
@@ -773,9 +854,14 @@ pub struct MotionBlurStats {
     pub max_blur_magnitude: f32,
     /// Fraction of pixels with velocity magnitude > 0.5 px.
     pub blurred_pixel_fraction: f32,
-    /// Effective weighted sample count:
-    /// `velocity_scale * num_samples` (saturated to `max_radius / mean_mag`
-    /// when mean is non-zero and would exceed the cap).
+    /// Estimated sample utilisation per pixel, in `[1, num_samples]`.
+    ///
+    /// This is a fast, **config-derived estimate** (`1 + (num_samples - 1) *
+    /// min(mean_blur_magnitude / max_radius, 1)`), not a measurement of the
+    /// actual per-pixel sample count evaluated by [`apply_velocity_blur`]
+    /// (which always evaluates exactly `config.num_samples` bilinear
+    /// samples for every pixel). Treat it as a utilisation heuristic for
+    /// tuning `num_samples` / `max_radius`, not as ground truth.
     pub effective_samples: f32,
 }
 
@@ -815,9 +901,11 @@ pub fn compute_motion_stats(
     let mean_mag = sum_mag / n_pixels as f32;
     let blurred_pixel_fraction = blurred_count as f32 / n_pixels as f32;
 
-    // Effective samples: nominal samples times the fraction of max_radius
-    // actually used.  When mean is zero all samples collapse to the same
-    // point, so effective count is 1.
+    // Estimated sample utilisation: nominal samples times the fraction of
+    // max_radius actually used.  When mean is zero all samples collapse to
+    // the same point, so the estimate is 1.  This is a config-derived
+    // heuristic, not a measurement — see the field doc on
+    // `MotionBlurStats::effective_samples`.
     let effective_samples = if mean_mag < 1e-6 {
         1.0
     } else {
@@ -1111,6 +1199,58 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_subframe_times_full_shutter_matches_subframe_t() {
+        let cfg = AccumulationConfig {
+            num_samples: 6,
+            shutter_open: 1.0,
+            ..AccumulationConfig::default()
+        };
+        let times = cfg.subframe_times();
+        assert_eq!(times.len(), 6);
+        for (i, &t) in times.iter().enumerate() {
+            assert!(approx(t, subframe_t(i, 6)), "index {i}: got {t}");
+        }
+    }
+
+    #[test]
+    fn test_subframe_times_partial_shutter_compresses_window() {
+        let cfg = AccumulationConfig {
+            num_samples: 5,
+            shutter_open: 0.5,
+            ..AccumulationConfig::default()
+        };
+        let times = cfg.subframe_times();
+        // First sample (base t=0.0) should map to 0.5 + (0.0-0.5)*0.5 = 0.25.
+        assert!(approx(times[0], 0.25), "got {}", times[0]);
+        // Last sample (base t=1.0) should map to 0.5 + (1.0-0.5)*0.5 = 0.75.
+        assert!(
+            approx(*times.last().unwrap(), 0.75),
+            "got {:?}",
+            times.last()
+        );
+        // All samples must stay within [0.25, 0.75].
+        for &t in &times {
+            assert!(
+                (0.25..=0.75).contains(&t),
+                "t={t} outside compressed window"
+            );
+        }
+    }
+
+    #[test]
+    fn test_subframe_times_zero_shutter_collapses_to_midpoint() {
+        let cfg = AccumulationConfig {
+            num_samples: 4,
+            shutter_open: 0.0,
+            ..AccumulationConfig::default()
+        };
+        let times = cfg.subframe_times();
+        for &t in &times {
+            assert!(approx(t, 0.5), "expected all samples at t=0.5, got {t}");
+        }
+    }
+
     // ── VelocityField ─────────────────────────────────────────────────────────
 
     #[test]
@@ -1217,6 +1357,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_apply_velocity_blur_centroid_stays_at_source_pixel() {
+        // A single bright pixel on a black background, blurred with a
+        // purely horizontal velocity, must keep its brightness centroid at
+        // the *source* column (symmetric blur trail) rather than shifting
+        // by half the velocity vector (the old one-sided [0,1] sampling).
+        let w = 16_usize;
+        let h = 1_usize;
+        let mut image = vec![0.0_f32; w * h * 3];
+        let src_x = 8_usize;
+        image[src_x * 3] = 1.0;
+        image[src_x * 3 + 1] = 1.0;
+        image[src_x * 3 + 2] = 1.0;
+
+        let mut velocity = VelocityField::new(w, h);
+        for x in 0..w {
+            velocity.set(x, 0, 6.0, 0.0).expect("set ok");
+        }
+        let config = VelocityBlurConfig {
+            num_samples: 32,
+            velocity_scale: 1.0,
+            max_radius: 32.0,
+        };
+        let output = apply_velocity_blur(&image, w, h, &velocity, &config)
+            .expect("apply_velocity_blur failed");
+
+        // Weighted-mean x position of the red channel in the output.
+        let (mut weighted_sum, mut weight_total) = (0.0_f32, 0.0_f32);
+        for x in 0..w {
+            let v = output[x * 3];
+            weighted_sum += x as f32 * v;
+            weight_total += v;
+        }
+        assert!(weight_total > 1e-3, "expected some non-zero output energy");
+        let centroid = weighted_sum / weight_total;
+        assert!(
+            (centroid - src_x as f32).abs() < 1.0,
+            "expected blur centroid near source pixel {src_x}, got {centroid}"
+        );
+    }
+
     // ── accumulate_frames ─────────────────────────────────────────────────────
 
     #[test]
@@ -1294,5 +1475,67 @@ mod tests {
         assert!(approx(stats.max_blur_magnitude, 0.0));
         assert!(approx(stats.blurred_pixel_fraction, 0.0));
         assert!(approx(stats.effective_samples, 1.0));
+    }
+
+    #[test]
+    fn test_compute_motion_stats_utilization_scales_with_magnitude() {
+        // Regression: `effective_samples` must follow the documented
+        // formula `1 + (num_samples - 1) * min(mean_mag / max_radius, 1)`
+        // and must not silently under/over-report versus `num_samples`.
+        let mut vf = VelocityField::new(2, 1);
+        vf.velocities = vec![4.0, 0.0, 4.0, 0.0]; // uniform |v| = 4.0 at both pixels
+        let config = VelocityBlurConfig {
+            num_samples: 9,
+            max_radius: 8.0,
+            velocity_scale: 1.0,
+        };
+        let stats = compute_motion_stats(&vf, &config);
+        // utilisation = min(4.0 / 8.0, 1.0) = 0.5 → 1 + (9-1)*0.5 = 5.0
+        assert!(
+            approx(stats.effective_samples, 5.0),
+            "expected 5.0, got {}",
+            stats.effective_samples
+        );
+    }
+
+    // ── bilinear_sample (shared with mb_pipeline) ─────────────────────────────
+
+    #[test]
+    fn test_bilinear_sample_zero_dimension_is_black() {
+        // Regression: `(x0 + 1).min(width - 1)` underflows for width == 0,
+        // which panics in debug builds. Both degenerate axes must short-circuit.
+        assert_eq!(bilinear_sample(&[], 0, 4, 0.0, 0.0), [0.0; 3]);
+        assert_eq!(bilinear_sample(&[], 4, 0, 0.0, 0.0), [0.0; 3]);
+        assert_eq!(bilinear_sample(&[], 0, 0, 2.5, -3.0), [0.0; 3]);
+    }
+
+    #[test]
+    fn test_bilinear_sample_matches_public_mb_reexport() {
+        // Regression: `mb_pipeline::mb_bilinear_sample` must stay a thin
+        // delegation to this implementation — a second copy would be free to
+        // drift.
+        let image: Vec<f32> = (0..(3 * 2 * 3)).map(|i| i as f32 * 0.03).collect();
+        for &(sx, sy) in &[
+            (0.0_f32, 0.0_f32),
+            (1.25, 0.5),
+            (2.75, 1.9),
+            (-4.0, 7.0),
+            (1.0, 1.0),
+        ] {
+            let here = bilinear_sample(&image, 3, 2, sx, sy);
+            let there = crate::mb_pipeline::mb_bilinear_sample(&image, 3, 2, sx, sy);
+            assert_eq!(here, there, "divergence at ({sx}, {sy})");
+        }
+    }
+
+    #[test]
+    fn test_bilinear_sample_single_pixel_axes() {
+        // width == 1 / height == 1 must not hit the negative-clamp panic.
+        let one_row = [0.1_f32, 0.2, 0.3, 0.4, 0.5, 0.6];
+        let got = bilinear_sample(&one_row, 2, 1, 0.5, 9.0);
+        assert!(approx(got[0], 0.25), "got {got:?}");
+        let one_col = [0.1_f32, 0.2, 0.3, 0.4, 0.5, 0.6];
+        let got = bilinear_sample(&one_col, 1, 2, 9.0, 0.5);
+        assert!(approx(got[0], 0.25), "got {got:?}");
     }
 }

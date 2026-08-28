@@ -1,75 +1,64 @@
 //! glTF 2.0 export for 3D Gaussian Splatting models.
 //!
-//! Outputs a `.gltf` (JSON) + `.bin` (binary buffer) file pair, with a custom
-//! `OXIGAF_gaussian_splat` extension storing per-Gaussian attributes.
+//! This module is a thin CLI-facing adapter over
+//! [`oxigaf::render::gltf::write_gltf`], the workspace's single glTF writer.
+//! See that module for the file layout, the binary buffer layout, and the
+//! specification requirements the writer satisfies.
 //!
-//! # Binary Buffer Layout
+//! # Why this is an adapter and not an implementation
 //!
-//! The `.bin` file contains tightly packed f32 arrays in this order:
+//! This file used to carry its own emitter, and it was the *third* one in the
+//! workspace to nominally produce "glTF":
 //!
-//! | Accessor    | Components | Bytes per Gaussian | Cumulative offset |
-//! |-------------|------------|---------------------|-------------------|
-//! | positions   | N×3        | 12                  | 0                 |
-//! | rotations   | N×4        | 16                  | N×12              |
-//! | scales      | N×3        | 12                  | N×28              |
-//! | opacities   | N×1        |  4                  | N×40              |
-//! | sh_coeffs   | N×C        |  4×C                | N×44              |
+//! | Caller | Output | Extension name |
+//! |--------|--------|----------------|
+//! | `oxigaf export --format gltf` | `.gltf` + `.bin` | `OXIGAF_gaussian_splat` |
+//! | `oxigaf::export(.., ExportFormat::Gltf)` | `.gltf` + `.bin` | `OXIGAF_gaussian_splat` |
+//! | `ExportStage` (`crate::export::export_gltf`) | self-contained `.glb` | `OXIGAF_gaussians` |
 //!
-//! Where `C = (sh_degree + 1)² × 3`.
+//! Three emitters behind one format name meant a consumer written against one
+//! silently mis-read the others. The version kept is the one that was actually
+//! spec-conformant: this file's old writer put all five accessors onto a
+//! single buffer view with no `byteStride`, which glTF 2.0 forbids for
+//! accessors of differing element size.
+//!
+//! [`export_gltf`] therefore keeps its signature and its
+//! [`CliError::GltfExport`] error type — no call site changes — but the bytes
+//! it writes now come from the shared writer.
 
-use std::io::{BufWriter, Write};
 use std::path::Path;
 
-use serde_json::{json, Value};
-
 use oxigaf::render::gaussian::GaussianModel;
+use oxigaf::render::gltf::{write_gltf, GltfError};
 
 use crate::error::CliError;
 
-// ---------------------------------------------------------------------------
-// glTF component type constants
-// ---------------------------------------------------------------------------
-
-/// glTF component type for 32-bit float.
-const COMPONENT_TYPE_FLOAT: u32 = 5126;
-
-// ---------------------------------------------------------------------------
-// Binary buffer construction
-// ---------------------------------------------------------------------------
-
-/// Append an `f32` slice into a byte buffer, returning the byte offset at
-/// which the slice was appended and its byte length.
-fn append_f32_slice(buf: &mut Vec<u8>, data: &[f32]) -> (usize, usize) {
-    let byte_offset = buf.len();
-    let byte_length = std::mem::size_of_val(data);
-    // SAFETY: f32 is Plain Old Data, converting via byte view is sound.
-    buf.extend_from_slice(bytemuck::cast_slice(data));
-    (byte_offset, byte_length)
-}
-
-// ---------------------------------------------------------------------------
-// Public export function
-// ---------------------------------------------------------------------------
-
 /// Export a [`GaussianModel`] to a glTF 2.0 `.gltf` + `.bin` file pair.
 ///
-/// Given `output_path` (with any extension or none), the function creates:
-/// - `<stem>.gltf` — JSON glTF document
-/// - `<stem>.bin`  — Binary buffer
+/// Given `output_path`, the function writes:
+/// - `<stem>.gltf` — the JSON glTF document,
+/// - `<stem>.bin`  — the binary attribute buffer it references.
 ///
-/// The binary layout follows fixed per-Gaussian strides; see the module-level
-/// documentation for the exact format.
+/// Unlike the shared writer, this wrapper normalises the document's extension
+/// to `.gltf` and creates the parent directory, because a CLI takes its output
+/// path from the user and `--output model.glb` must not silently produce a
+/// file that is not GLB.
+///
+/// # Errors
+///
+/// Returns [`CliError::GltfExport`] if the output directory cannot be created,
+/// or if either file cannot be created, written or flushed.
 pub fn export_gltf(model: &GaussianModel, output_path: &Path) -> Result<(), CliError> {
-    // Derive stem and output file paths.
+    // Derive stem and output file paths. `.gltf` is forced rather than taken
+    // from the user: the writer emits a JSON document, so any other extension
+    // would misdescribe the file — and a `.bin` extension would make the
+    // document collide with its own buffer sidecar.
     let stem = output_path
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("model");
     let parent = output_path.parent().unwrap_or_else(|| Path::new("."));
-
     let gltf_path = parent.join(format!("{stem}.gltf"));
-    let bin_path = parent.join(format!("{stem}.bin"));
-    let bin_filename = format!("{stem}.bin");
 
     // Create parent directory if needed.
     if !parent.as_os_str().is_empty() {
@@ -81,218 +70,15 @@ pub fn export_gltf(model: &GaussianModel, output_path: &Path) -> Result<(), CliE
         })?;
     }
 
-    let n = model.len();
-    let sh_channels = ((model.sh_degree + 1).pow(2) * 3) as usize;
-
-    // ----- Build binary buffer -----
-    let mut bin_data: Vec<u8> = Vec::new();
-
-    // Positions: N×3 f32
-    let positions: Vec<f32> = model
-        .gaussians
-        .iter()
-        .flat_map(|g| g.position.iter().copied())
-        .collect();
-    let (pos_byte_offset, _pos_byte_length) = append_f32_slice(&mut bin_data, &positions);
-
-    // Rotations: N×4 f32 (quaternion xyzw)
-    let rotations: Vec<f32> = model
-        .gaussians
-        .iter()
-        .flat_map(|g| g.rotation.iter().copied())
-        .collect();
-    let (rot_byte_offset, _rot_byte_length) = append_f32_slice(&mut bin_data, &rotations);
-
-    // Scales: N×3 f32
-    let scales: Vec<f32> = model
-        .gaussians
-        .iter()
-        .flat_map(|g| g.scale.iter().copied())
-        .collect();
-    let (scale_byte_offset, _scale_byte_length) = append_f32_slice(&mut bin_data, &scales);
-
-    // Opacities: N×1 f32
-    let opacities: Vec<f32> = model.gaussians.iter().map(|g| g.opacity).collect();
-    let (opacity_byte_offset, _opacity_byte_length) = append_f32_slice(&mut bin_data, &opacities);
-
-    // SH coefficients: N×C f32
-    let mut sh_data = model.sh_coeffs.clone();
-    sh_data.resize(n * sh_channels, 0.0_f32);
-    let (sh_byte_offset, _sh_byte_length) = append_f32_slice(&mut bin_data, &sh_data);
-
-    let total_bin_length = bin_data.len();
-
-    // ----- Write binary file -----
-    let bin_file = std::fs::File::create(&bin_path).map_err(|e| {
-        CliError::GltfExport(format!(
-            "Failed to create binary buffer '{}': {e}",
-            bin_path.display()
-        ))
-    })?;
-    let mut bin_writer = BufWriter::new(bin_file);
-    bin_writer.write_all(&bin_data).map_err(|e| {
-        CliError::GltfExport(format!(
-            "Failed to write binary buffer '{}': {e}",
-            bin_path.display()
-        ))
-    })?;
-    bin_writer.flush().map_err(|e| {
-        CliError::GltfExport(format!(
-            "Failed to flush binary buffer '{}': {e}",
-            bin_path.display()
-        ))
-    })?;
-
-    // ----- Build glTF JSON -----
-    // Single bufferView covering the entire binary buffer.
-    let buffer_view = json!({
-        "buffer": 0,
-        "byteOffset": 0,
-        "byteLength": total_bin_length
-    });
-
-    // Accessors — each references the single bufferView with its own byteOffset.
-    let accessor_positions = build_accessor(0, pos_byte_offset, n, "VEC3", COMPONENT_TYPE_FLOAT);
-    let accessor_rotations = build_accessor(0, rot_byte_offset, n, "VEC4", COMPONENT_TYPE_FLOAT);
-    let accessor_scales = build_accessor(0, scale_byte_offset, n, "VEC3", COMPONENT_TYPE_FLOAT);
-    let accessor_opacities =
-        build_accessor(0, opacity_byte_offset, n, "SCALAR", COMPONENT_TYPE_FLOAT);
-    let accessor_sh = if n == 0 || sh_channels == 0 {
-        build_accessor(0, sh_byte_offset, 0, "SCALAR", COMPONENT_TYPE_FLOAT)
-    } else {
-        build_accessor(
-            0,
-            sh_byte_offset,
-            n * sh_channels,
-            "SCALAR",
-            COMPONENT_TYPE_FLOAT,
-        )
-    };
-
-    // Accessor indices.
-    let acc_pos_idx = 0usize;
-    let acc_rot_idx = 1usize;
-    let acc_scale_idx = 2usize;
-    let acc_opacity_idx = 3usize;
-    let acc_sh_idx = 4usize;
-
-    // Custom Gaussian extension on the node.
-    let gaussian_extension = json!({
-        "gaussianCount": n,
-        "shDegree": model.sh_degree,
-        "positionsAccessor": acc_pos_idx,
-        "rotationsAccessor": acc_rot_idx,
-        "scalesAccessor": acc_scale_idx,
-        "opacitiesAccessor": acc_opacity_idx,
-        "shCoefficientsAccessor": acc_sh_idx
-    });
-
-    // Top-level extension metadata.
-    let top_ext = json!({
-        "gaussianCount": n,
-        "shDegree": model.sh_degree
-    });
-
-    // glTF mesh primitive uses POSITION so viewers can show a point cloud.
-    let primitive = json!({
-        "attributes": {
-            "POSITION": acc_pos_idx
-        },
-        "mode": 0  // POINTS
-    });
-
-    let document = json!({
-        "asset": {
-            "version": "2.0",
-            "generator": format!("OxiGAF v{}", env!("CARGO_PKG_VERSION"))
-        },
-        "extensionsUsed": ["OXIGAF_gaussian_splat"],
-        "scene": 0,
-        "scenes": [{ "name": "GaussianScene", "nodes": [0] }],
-        "nodes": [{
-            "name": "GaussianSplat",
-            "mesh": 0,
-            "extensions": {
-                "OXIGAF_gaussian_splat": gaussian_extension
-            }
-        }],
-        "meshes": [{
-            "name": "GaussianMesh",
-            "primitives": [primitive]
-        }],
-        "buffers": [{
-            "uri": bin_filename,
-            "byteLength": total_bin_length
-        }],
-        "bufferViews": [buffer_view],
-        "accessors": [
-            accessor_positions,
-            accessor_rotations,
-            accessor_scales,
-            accessor_opacities,
-            accessor_sh
-        ],
-        "extensions": {
-            "OXIGAF_gaussian_splat": top_ext
+    write_gltf(model, &gltf_path).map_err(|e| match e {
+        GltfError::InvalidOutputPath(message) => {
+            CliError::GltfExport(format!("Invalid output path: {message}"))
         }
-    });
-
-    // ----- Write .gltf JSON file -----
-    let gltf_json = serde_json::to_string_pretty(&document)
-        .map_err(|e| CliError::GltfExport(format!("Failed to serialize glTF JSON: {e}")))?;
-
-    let gltf_file = std::fs::File::create(&gltf_path).map_err(|e| {
-        CliError::GltfExport(format!(
-            "Failed to create glTF file '{}': {e}",
-            gltf_path.display()
-        ))
-    })?;
-    let mut gltf_writer = BufWriter::new(gltf_file);
-    gltf_writer.write_all(gltf_json.as_bytes()).map_err(|e| {
-        CliError::GltfExport(format!(
-            "Failed to write glTF file '{}': {e}",
-            gltf_path.display()
-        ))
-    })?;
-    gltf_writer.flush().map_err(|e| {
-        CliError::GltfExport(format!(
-            "Failed to flush glTF file '{}': {e}",
-            gltf_path.display()
-        ))
-    })?;
-
-    tracing::info!(
-        "Wrote glTF 2.0: {} Gaussians (SH degree {}) → {} + {}",
-        n,
-        model.sh_degree,
-        gltf_path.display(),
-        bin_path.display(),
-    );
-
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Accessor builder
-// ---------------------------------------------------------------------------
-
-/// Build a glTF accessor JSON object referencing a single bufferView.
-///
-/// `buffer_view_idx` is the index into the `bufferViews` array.
-/// `byte_offset` is the byte offset within that bufferView.
-fn build_accessor(
-    buffer_view_idx: usize,
-    byte_offset: usize,
-    count: usize,
-    accessor_type: &str,
-    component_type: u32,
-) -> Value {
-    json!({
-        "bufferView": buffer_view_idx,
-        "byteOffset": byte_offset,
-        "componentType": component_type,
-        "count": count,
-        "type": accessor_type
+        GltfError::Io {
+            action,
+            path,
+            source,
+        } => CliError::GltfExport(format!("Failed to {action} '{}': {source}", path.display())),
     })
 }
 
@@ -301,7 +87,6 @@ fn build_accessor(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
     use oxigaf::render::gaussian::{GaussianAttributes, GaussianModel};
@@ -333,204 +118,264 @@ mod tests {
         }
     }
 
-    /// Return a unique temp directory for each test.
-    fn temp_dir() -> std::path::PathBuf {
-        let base = std::env::temp_dir();
-        let id = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(0);
-        // Use a sub-directory unique per test invocation.
-        base.join(format!("oxigaf_gltf_test_{id}"))
+    /// Return a fresh, empty temp directory dedicated to one test.
+    fn temp_subdir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("oxigaf_cli_gltf_{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("test: temp dir creation should succeed");
+        dir
+    }
+
+    /// Read a whole file as text, failing the test on error.
+    fn read_text(path: &Path) -> String {
+        std::fs::read_to_string(path).expect("test: output file should be readable")
     }
 
     // -----------------------------------------------------------------------
-    // Test 1: export creates two files (.gltf + .bin)
+    // File pair
     // -----------------------------------------------------------------------
+
     #[test]
-    fn test_export_creates_two_files() {
-        let dir = temp_dir();
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        let out = dir.join("model.gltf");
-        let model = make_model(10, 1);
+    fn export_creates_the_document_and_its_buffer() {
+        let dir = temp_subdir("two_files");
+        export_gltf(&make_model(10, 1), &dir.join("model.gltf"))
+            .expect("test: export should succeed");
 
-        export_gltf(&model, &out).expect("export should succeed");
+        assert!(dir.join("model.gltf").is_file(), ".gltf must be created");
+        assert!(dir.join("model.bin").is_file(), ".bin must be created");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn export_creates_a_missing_parent_directory() {
+        // A CLI takes its output path from the user, so an absent parent is a
+        // routine case rather than an error — unlike the shared writer, which
+        // deliberately leaves directory creation to its caller.
+        let dir = temp_subdir("missing_parent");
+        let nested = dir.join("a").join("b");
+        export_gltf(&make_model(3, 0), &nested.join("model.gltf"))
+            .expect("test: export should create the parent directory");
+
+        assert!(nested.join("model.gltf").is_file());
+        assert!(nested.join("model.bin").is_file());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_non_gltf_output_extension_is_normalised() {
+        // `--output model.glb` must not yield a JSON document named `.glb`:
+        // the writer emits `.gltf` + `.bin`, so the extension is forced to
+        // match what is actually written.
+        let dir = temp_subdir("normalised_extension");
+        export_gltf(&make_model(4, 0), &dir.join("model.glb"))
+            .expect("test: export should succeed");
+
+        assert!(dir.join("model.gltf").is_file(), ".gltf must be written");
+        assert!(dir.join("model.bin").is_file(), ".bin must be written");
         assert!(
-            dir.join("model.gltf").exists(),
-            ".gltf file must be created"
+            !dir.join("model.glb").exists(),
+            "no file may be written under the misleading .glb name"
         );
-        assert!(dir.join("model.bin").exists(), ".bin file must be created");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_bin_output_path_does_not_clobber_the_buffer() {
+        // Regression for the collision the shared writer rejects: because the
+        // extension is normalised to `.gltf` first, `--output model.bin` is a
+        // *usable* request here rather than an error, and the document and
+        // buffer still end up in separate files.
+        let dir = temp_subdir("bin_output");
+        export_gltf(&make_model(4, 0), &dir.join("model.bin"))
+            .expect("test: a .bin output path must still produce a valid pair");
+
+        let doc = read_text(&dir.join("model.gltf"));
+        assert!(
+            doc.trim_start().starts_with('{'),
+            "the document must be JSON, not the binary buffer:\n{doc}"
+        );
+        assert!(dir.join("model.bin").is_file(), "the buffer must exist");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // -----------------------------------------------------------------------
-    // Test 2: .gltf is valid JSON
+    // Format unification
     // -----------------------------------------------------------------------
+
     #[test]
-    fn test_gltf_is_valid_json() {
-        let dir = temp_dir();
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        let out = dir.join("output.gltf");
-        let model = make_model(5, 0);
+    fn output_is_byte_identical_to_the_shared_writer() {
+        // The whole point of this module now: `oxigaf export --format gltf`
+        // and `oxigaf::export(.., ExportFormat::Gltf)` must produce the same
+        // bytes, because they run the same writer. Any future divergence here
+        // reintroduces the incompatible-emitters bug.
+        let dir = temp_subdir("byte_identical");
+        let model = make_model(6, 2);
 
-        export_gltf(&model, &out).expect("export should succeed");
+        export_gltf(&model, &dir.join("viacli.gltf")).expect("test: CLI export should succeed");
+        write_gltf(&model, &dir.join("direct.gltf")).expect("test: direct export should succeed");
 
-        let raw = std::fs::read_to_string(dir.join("output.gltf")).expect("read gltf file");
-        let parsed: Result<Value, _> = serde_json::from_str(&raw);
-        assert!(parsed.is_ok(), "glTF file must be valid JSON");
+        let via_cli = read_text(&dir.join("viacli.gltf")).replace("viacli.bin", "BUF");
+        let direct = read_text(&dir.join("direct.gltf")).replace("direct.bin", "BUF");
+        assert_eq!(
+            via_cli, direct,
+            "the CLI adapter must not alter the document beyond its file name"
+        );
+
+        let cli_bin = std::fs::read(dir.join("viacli.bin")).expect("test: CLI buffer should exist");
+        let direct_bin =
+            std::fs::read(dir.join("direct.bin")).expect("test: direct buffer should exist");
+        assert_eq!(cli_bin, direct_bin, "the binary buffers must be identical");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn every_accessor_owns_its_own_buffer_view() {
+        // Regression for this file's superseded writer, which put all five
+        // accessors on ONE strideless buffer view — forbidden by glTF 2.0.
+        let dir = temp_subdir("one_view_each");
+        export_gltf(&make_model(8, 1), &dir.join("model.gltf"))
+            .expect("test: export should succeed");
+
+        let text = read_text(&dir.join("model.gltf"));
+        assert_eq!(
+            text.matches(r#""buffer": 0"#).count(),
+            5,
+            "expected five distinct buffer views:\n{text}"
+        );
+        for view in 0..5 {
+            assert!(
+                text.contains(&format!(r#""bufferView": {view},"#)),
+                "accessor for buffer view {view} is missing:\n{text}"
+            );
+        }
+        assert!(
+            !text.contains("byteStride"),
+            "tightly-packed per-accessor views need no byteStride"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn empty_model_writes_no_zero_length_buffer() {
+        // The old writer emitted a 0-byte `.bin` plus `count: 0` accessors and
+        // a `byteLength: 0` buffer view — all forbidden by the glTF 2.0 schema
+        // (`minimum: 1`), so every conforming loader rejected the result.
+        let dir = temp_subdir("empty");
+        export_gltf(&make_model(0, 1), &dir.join("empty.gltf"))
+            .expect("test: empty model export should succeed");
+
+        assert!(dir.join("empty.gltf").is_file(), ".gltf must be created");
+        assert!(
+            !dir.join("empty.bin").exists(),
+            "no zero-length .bin may be written"
+        );
+
+        let text = read_text(&dir.join("empty.gltf"));
+        for forbidden in [
+            "\"accessors\"",
+            "\"bufferViews\"",
+            "\"buffers\"",
+            "\"nodes\"",
+        ] {
+            assert!(
+                !text.contains(forbidden),
+                "an empty model must omit {forbidden} entirely:\n{text}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // -----------------------------------------------------------------------
-    // Test 3: gaussian count in metadata matches
+    // Metadata and layout
     // -----------------------------------------------------------------------
+
     #[test]
-    fn test_gaussian_count_in_metadata() {
-        let dir = temp_dir();
-        std::fs::create_dir_all(&dir).expect("create temp dir");
+    fn metadata_reports_the_models_count_and_sh_degree() {
+        let dir = temp_subdir("metadata");
         let n = 42usize;
-        let out = dir.join("model.gltf");
-        let model = make_model(n, 1);
+        let sh_degree = 2u32;
+        export_gltf(&make_model(n, sh_degree), &dir.join("model.gltf"))
+            .expect("test: export should succeed");
 
-        export_gltf(&model, &out).expect("export should succeed");
+        let text = read_text(&dir.join("model.gltf"));
+        assert!(
+            text.contains(&format!(r#""gaussianCount": {n}"#)),
+            "gaussianCount must match the model size:\n{text}"
+        );
+        assert!(
+            text.contains(&format!(r#""shDegree": {sh_degree}"#)),
+            "shDegree must match the model:\n{text}"
+        );
 
-        let raw = std::fs::read_to_string(dir.join("model.gltf")).expect("read gltf file");
-        let doc: Value = serde_json::from_str(&raw).expect("parse JSON");
-
-        // Check top-level extension
-        let count = doc["extensions"]["OXIGAF_gaussian_splat"]["gaussianCount"]
-            .as_u64()
-            .expect("gaussianCount should be a number");
-        assert_eq!(count as usize, n, "gaussianCount must match model size");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // -----------------------------------------------------------------------
-    // Test 4: bin file size is correct (N*44 + N*C*4 bytes)
-    // -----------------------------------------------------------------------
     #[test]
-    fn test_bin_file_size_correct() {
-        let dir = temp_dir();
-        std::fs::create_dir_all(&dir).expect("create temp dir");
+    fn bin_file_size_is_n_times_44_plus_the_sh_block() {
+        let dir = temp_subdir("bin_size");
         let n = 20usize;
         let sh_degree = 3u32;
         let sh_channels = ((sh_degree + 1).pow(2) * 3) as usize;
-        let out = dir.join("model.gltf");
-        let model = make_model(n, sh_degree);
+        export_gltf(&make_model(n, sh_degree), &dir.join("model.gltf"))
+            .expect("test: export should succeed");
 
-        export_gltf(&model, &out).expect("export should succeed");
+        // positions(12) + rotations(16) + scales(12) + opacities(4) = 44 B
+        let expected = n * 44 + n * sh_channels * 4;
+        let actual = std::fs::metadata(dir.join("model.bin"))
+            .expect("test: bin file should exist")
+            .len();
+        assert_eq!(actual as usize, expected, "bin size must be N*44 + N*C*4");
 
-        let bin_meta = std::fs::metadata(dir.join("model.bin")).expect("bin file exists");
-        // positions(12) + rotations(16) + scales(12) + opacities(4) = 44 bytes/gaussian
-        // sh_coeffs: n * sh_channels * 4 bytes
-        let expected_bytes = n * 44 + n * sh_channels * 4;
-        assert_eq!(
-            bin_meta.len() as usize,
-            expected_bytes,
-            "bin file size must be N*44 + N*C*4"
-        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // -----------------------------------------------------------------------
-    // Test 5: positions accessor byteOffset is 0
-    // -----------------------------------------------------------------------
     #[test]
-    fn test_positions_accessor_byte_offset_is_zero() {
-        let dir = temp_dir();
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        let out = dir.join("model.gltf");
-        let model = make_model(8, 1);
+    fn position_accessor_carries_min_and_max() {
+        let dir = temp_subdir("min_max");
+        // make_model places Gaussian i at [i, i+0.1, i+0.2].
+        export_gltf(&make_model(5, 1), &dir.join("model.gltf"))
+            .expect("test: export should succeed");
 
-        export_gltf(&model, &out).expect("export should succeed");
-
-        let raw = std::fs::read_to_string(dir.join("model.gltf")).expect("read gltf file");
-        let doc: Value = serde_json::from_str(&raw).expect("parse JSON");
-        let pos_offset = doc["accessors"][0]["byteOffset"]
-            .as_u64()
-            .expect("positions accessor byteOffset must be a number");
-        assert_eq!(pos_offset, 0, "positions accessor byteOffset must be 0");
-    }
-
-    // -----------------------------------------------------------------------
-    // Test 6: rotations accessor byteOffset is N*12
-    // -----------------------------------------------------------------------
-    #[test]
-    fn test_rotations_accessor_byte_offset() {
-        let dir = temp_dir();
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        let n = 15usize;
-        let out = dir.join("model.gltf");
-        let model = make_model(n, 0);
-
-        export_gltf(&model, &out).expect("export should succeed");
-
-        let raw = std::fs::read_to_string(dir.join("model.gltf")).expect("read gltf file");
-        let doc: Value = serde_json::from_str(&raw).expect("parse JSON");
-        // accessor index 1 = rotations
-        let rot_offset = doc["accessors"][1]["byteOffset"]
-            .as_u64()
-            .expect("rotations accessor byteOffset must be a number");
-        assert_eq!(
-            rot_offset as usize,
-            n * 12,
-            "rotations byteOffset must be N*12"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // Test 7: empty model (0 Gaussians) exports without error
-    // -----------------------------------------------------------------------
-    #[test]
-    fn test_empty_model_exports_without_error() {
-        let dir = temp_dir();
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        let out = dir.join("empty.gltf");
-        let model = make_model(0, 1);
-
-        let result = export_gltf(&model, &out);
+        let text = read_text(&dir.join("model.gltf"));
         assert!(
-            result.is_ok(),
-            "empty model export should succeed: {result:?}"
+            text.contains(r#""min": [0, 0.1, 0.2]"#),
+            "POSITION accessor must carry the real min:\n{text}"
+        );
+        assert!(
+            text.contains(r#""max": [4, 4.1, 4.2]"#),
+            "POSITION accessor must carry the real max:\n{text}"
         );
 
-        assert!(dir.join("empty.gltf").exists(), ".gltf must be created");
-        assert!(dir.join("empty.bin").exists(), ".bin must be created");
-
-        // Verify .bin is empty (0 gaussians → 0 bytes)
-        let bin_meta = std::fs::metadata(dir.join("empty.bin")).expect("bin file exists");
-        assert_eq!(bin_meta.len(), 0, "empty model bin must have 0 bytes");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // -----------------------------------------------------------------------
-    // Test 8: sh_degree metadata is correct in JSON
-    // -----------------------------------------------------------------------
     #[test]
-    fn test_sh_degree_metadata_correct() {
-        let dir = temp_dir();
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        let sh_degree = 2u32;
-        let out = dir.join("model.gltf");
-        let model = make_model(5, sh_degree);
+    fn emitted_json_is_balanced() {
+        for (count, sh_degree) in [(0usize, 1u32), (1, 0), (12, 3)] {
+            let dir = temp_subdir(&format!("balanced_{count}_{sh_degree}"));
+            export_gltf(&make_model(count, sh_degree), &dir.join("model.gltf"))
+                .expect("test: export should succeed");
 
-        export_gltf(&model, &out).expect("export should succeed");
+            let text = read_text(&dir.join("model.gltf"));
+            assert_eq!(
+                text.matches('{').count(),
+                text.matches('}').count(),
+                "unbalanced braces for count={count}:\n{text}"
+            );
+            assert_eq!(
+                text.matches('[').count(),
+                text.matches(']').count(),
+                "unbalanced brackets for count={count}:\n{text}"
+            );
 
-        let raw = std::fs::read_to_string(dir.join("model.gltf")).expect("read gltf file");
-        let doc: Value = serde_json::from_str(&raw).expect("parse JSON");
-
-        // Check top-level extension
-        let degree = doc["extensions"]["OXIGAF_gaussian_splat"]["shDegree"]
-            .as_u64()
-            .expect("shDegree should be a number");
-        assert_eq!(
-            degree as u32, sh_degree,
-            "shDegree must match model sh_degree"
-        );
-
-        // Also verify via node-level extension
-        let node_degree = doc["nodes"][0]["extensions"]["OXIGAF_gaussian_splat"]["shDegree"]
-            .as_u64()
-            .expect("node extension shDegree should be a number");
-        assert_eq!(
-            node_degree as u32, sh_degree,
-            "node extension shDegree must match"
-        );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }

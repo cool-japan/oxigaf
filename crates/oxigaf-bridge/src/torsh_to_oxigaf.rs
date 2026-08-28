@@ -13,8 +13,13 @@ use torsh_nn::serialization::ModelState;
 /// # Arguments
 ///
 /// * `torsh_path` - Path to ToRSh safetensors file
-/// * `oxigaf_path` - Output path for OxiGAF format
-/// * `mapping` - Layer name mapping configuration
+/// * `oxigaf_path` - Output path for OxiGAF format. Its parent directory is
+///   created if it does not already exist.
+/// * `mapping` - Layer name mapping configuration. Custom mappings
+///   registered via [`LayerMapping::add_custom_mapping`] are consulted
+///   first (looked up by the exact ToRSh name); every other name is mapped
+///   by [`GafLayerMapper`], falling back to a mechanical `/` -> `.`
+///   substitution.
 /// * `precision` - Precision conversion configuration
 ///
 /// # Errors
@@ -53,7 +58,7 @@ use torsh_nn::serialization::ModelState;
 pub fn convert(
     torsh_path: &Path,
     oxigaf_path: &Path,
-    _mapping: &LayerMapping,
+    mapping: &LayerMapping,
     precision: &PrecisionConfig,
 ) -> Result<()> {
     use crate::precision::convert_precision;
@@ -66,8 +71,8 @@ pub fn convert(
         oxigaf_path
     );
 
-    // Use GafLayerMapper for comprehensive GAF model layer mapping.
-    // Falls back to simple slash→dot conversion for layers not in the mapper.
+    // Falls back to GafLayerMapper for names `mapping` has no custom
+    // override for, and finally to a mechanical slash→dot conversion.
     let gaf_mapper = GafLayerMapper::new();
 
     // 1. Load ToRSh ModelState
@@ -79,19 +84,24 @@ pub fn convert(
     // 2. Convert tensors and map names
     // First, collect all tensor data with owned bytes
     let mut tensor_data: Vec<(String, Vec<u8>, Vec<usize>, Dtype)> = Vec::new();
+    let mut total_saturated = 0usize;
 
     for (torsh_name, serializable_tensor) in &state.parameters {
-        // Map layer name: ToRSh → OxiGAF
-        // Try GafLayerMapper first (explicit mapping), fall back to slash→dot conversion
-        let oxigaf_name = match gaf_mapper.map_torsh_to_oxigaf(torsh_name) {
-            Ok(name) => name,
-            Err(_) => {
-                // Fallback: simple slash → dot conversion (VarBuilder-compatible)
-                tracing::debug!(
-                    "Layer '{}' not in GafLayerMapper, using slash→dot fallback",
-                    torsh_name
-                );
-                torsh_name.replace('/', ".")
+        // Map layer name: ToRSh → OxiGAF. A caller-registered custom
+        // mapping wins outright; otherwise try GafLayerMapper, falling back
+        // to a mechanical slash→dot conversion.
+        let oxigaf_name = if let Some(custom) = mapping.lookup_custom(torsh_name) {
+            custom.to_string()
+        } else {
+            match gaf_mapper.map_torsh_to_oxigaf(torsh_name) {
+                Ok(name) => name,
+                Err(_) => {
+                    tracing::debug!(
+                        "Layer '{}' not in GafLayerMapper, using slash→dot fallback",
+                        torsh_name
+                    );
+                    torsh_name.replace('/', ".")
+                }
             }
         };
 
@@ -101,7 +111,16 @@ pub fn convert(
 
         // Apply precision conversion
         let layer_precision = precision.get_layer_precision(&oxigaf_name);
-        let data_bytes = convert_precision(data_f32, layer_precision);
+        let (data_bytes, saturated) = convert_precision(data_f32, layer_precision);
+        if saturated > 0 {
+            tracing::warn!(
+                "{} value(s) in '{}' saturated to +/-infinity converting to {}",
+                saturated,
+                oxigaf_name,
+                layer_precision.name()
+            );
+            total_saturated += saturated;
+        }
 
         // Determine dtype based on precision
         let dtype = match layer_precision {
@@ -121,6 +140,13 @@ pub fn convert(
         );
     }
 
+    if total_saturated > 0 {
+        tracing::warn!(
+            "{} value(s) across all converted tensors saturated to +/-infinity during precision conversion",
+            total_saturated
+        );
+    }
+
     // 3. Create tensor views and serialize
     let mut tensors = BTreeMap::new();
     for (name, data_bytes, shape, dtype) in &tensor_data {
@@ -136,23 +162,18 @@ pub fn convert(
     let serialized = safetensors::serialize(&tensors, None)
         .map_err(|e| BridgeError::Conversion(format!("Failed to serialize safetensors: {}", e)))?;
 
-    // 4. Write to file
+    // 4. Write to file, creating the parent directory if needed so callers
+    // preserving nested input structure (e.g. examples/batch_convert.rs)
+    // don't have to remember to do it themselves.
+    if let Some(parent) = oxigaf_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
     std::fs::write(oxigaf_path, &serialized)?;
 
     tracing::info!("Successfully converted weights to OxiGAF format");
     Ok(())
-}
-
-#[cfg(not(feature = "torsh"))]
-pub fn convert(
-    _torsh_path: &Path,
-    _oxigaf_path: &Path,
-    _mapping: &LayerMapping,
-    _precision: &PrecisionConfig,
-) -> Result<()> {
-    Err(BridgeError::Conversion(
-        "ToRSh feature not enabled. Compile with --features torsh".to_string(),
-    ))
 }
 
 #[cfg(all(test, feature = "torsh"))]
@@ -161,14 +182,13 @@ mod tests {
     use crate::{Precision, PrecisionConfig};
     use approx::assert_relative_eq;
     use safetensors::SafeTensors;
-    use std::env;
     use torsh_nn::serialization::{ModelMetadata, SerializableTensor};
 
     #[test]
     fn test_torsh_to_oxigaf_basic_conversion() -> Result<()> {
-        let temp_dir = env::temp_dir();
-        let torsh_path = temp_dir.join("test_torsh_to_oxigaf.safetensors");
-        let oxigaf_path = temp_dir.join("test_oxigaf_output.safetensors");
+        let temp_dir = tempfile::tempdir().expect("test: failed to create temp dir");
+        let torsh_path = temp_dir.path().join("torsh_to_oxigaf.safetensors");
+        let oxigaf_path = temp_dir.path().join("oxigaf_output.safetensors");
 
         // Create test ToRSh safetensors
         create_test_torsh_safetensors(&torsh_path)?;
@@ -188,18 +208,76 @@ mod tests {
 
         assert!(!safetensors.names().is_empty());
 
-        // Cleanup
-        let _ = std::fs::remove_file(&torsh_path);
-        let _ = std::fs::remove_file(&oxigaf_path);
+        Ok(())
+    }
+
+    #[test]
+    fn test_torsh_to_oxigaf_creates_nested_output_directory() -> Result<()> {
+        // Regression test: `get_output_path` in examples/batch_convert.rs
+        // preserves the input's relative directory structure, but nothing
+        // created those nested output directories, so `std::fs::write`
+        // failed with `NotFound` for any input under a subdirectory.
+        // `convert` now creates its output's parent directory itself.
+        let temp_dir = tempfile::tempdir().expect("test: failed to create temp dir");
+        let torsh_path = temp_dir.path().join("torsh_nested.safetensors");
+        let oxigaf_path = temp_dir
+            .path()
+            .join("nested")
+            .join("subdir")
+            .join("oxigaf_nested.safetensors");
+
+        create_test_torsh_safetensors(&torsh_path)?;
+
+        let mapping = LayerMapping::new();
+        let precision = PrecisionConfig::default();
+        convert(&torsh_path, &oxigaf_path, &mapping, &precision)?;
+
+        assert!(oxigaf_path.exists());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_torsh_to_oxigaf_honors_custom_mapping() -> Result<()> {
+        // Regression test: `torsh_to_oxigaf::convert` used to ignore the
+        // `mapping` argument entirely, always building its own
+        // `GafLayerMapper` internally -- so `LayerMapping::add_custom_mapping`
+        // had no effect on this direction.
+        let temp_dir = tempfile::tempdir().expect("test: failed to create temp dir");
+        let torsh_path = temp_dir.path().join("torsh_custom.safetensors");
+        let oxigaf_path = temp_dir.path().join("oxigaf_custom.safetensors");
+
+        create_test_torsh_safetensors(&torsh_path)?;
+
+        let mut mapping = LayerMapping::new();
+        mapping.add_custom_mapping(
+            "linear/weight".to_string(),
+            "custom.renamed.path".to_string(),
+        );
+        let precision = PrecisionConfig::default();
+        convert(&torsh_path, &oxigaf_path, &mapping, &precision)?;
+
+        let data = std::fs::read(&oxigaf_path)?;
+        let safetensors = SafeTensors::deserialize(&data)
+            .map_err(|e| BridgeError::Conversion(format!("Failed to parse result: {}", e)))?;
+
+        assert!(
+            safetensors.tensor("custom.renamed.path").is_ok(),
+            "custom mapping should have been honored; got names: {:?}",
+            safetensors.names()
+        );
+        // The mechanical fallback (slash → dot) would have produced this
+        // name; it must not be present once the custom mapping applies.
+        assert!(safetensors.tensor("linear.weight").is_err());
 
         Ok(())
     }
 
     #[test]
     fn test_torsh_to_oxigaf_layer_mapping() -> Result<()> {
-        let temp_dir = env::temp_dir();
-        let torsh_path = temp_dir.join("test_torsh_mapping.safetensors");
-        let oxigaf_path = temp_dir.join("test_oxigaf_mapping.safetensors");
+        let temp_dir = tempfile::tempdir().expect("test: failed to create temp dir");
+        let torsh_path = temp_dir.path().join("torsh_mapping.safetensors");
+        let oxigaf_path = temp_dir.path().join("oxigaf_mapping.safetensors");
 
         // Create test data
         create_test_torsh_safetensors(&torsh_path)?;
@@ -223,18 +301,14 @@ mod tests {
             );
         }
 
-        // Cleanup
-        let _ = std::fs::remove_file(&torsh_path);
-        let _ = std::fs::remove_file(&oxigaf_path);
-
         Ok(())
     }
 
     #[test]
     fn test_torsh_to_oxigaf_precision_conversion() -> Result<()> {
-        let temp_dir = env::temp_dir();
-        let torsh_path = temp_dir.join("test_torsh_precision.safetensors");
-        let oxigaf_path = temp_dir.join("test_oxigaf_precision.safetensors");
+        let temp_dir = tempfile::tempdir().expect("test: failed to create temp dir");
+        let torsh_path = temp_dir.path().join("torsh_precision.safetensors");
+        let oxigaf_path = temp_dir.path().join("oxigaf_precision.safetensors");
 
         // Create test data
         create_test_torsh_safetensors(&torsh_path)?;
@@ -265,18 +339,14 @@ mod tests {
             }
         }
 
-        // Cleanup
-        let _ = std::fs::remove_file(&torsh_path);
-        let _ = std::fs::remove_file(&oxigaf_path);
-
         Ok(())
     }
 
     #[test]
     fn test_torsh_to_oxigaf_numerical_accuracy() -> Result<()> {
-        let temp_dir = env::temp_dir();
-        let torsh_path = temp_dir.join("test_torsh_accuracy.safetensors");
-        let oxigaf_path = temp_dir.join("test_oxigaf_accuracy.safetensors");
+        let temp_dir = tempfile::tempdir().expect("test: failed to create temp dir");
+        let torsh_path = temp_dir.path().join("torsh_accuracy.safetensors");
+        let oxigaf_path = temp_dir.path().join("oxigaf_accuracy.safetensors");
 
         // Create test data with known values
         create_test_torsh_safetensors(&torsh_path)?;
@@ -322,10 +392,6 @@ mod tests {
             }
         }
 
-        // Cleanup
-        let _ = std::fs::remove_file(&torsh_path);
-        let _ = std::fs::remove_file(&oxigaf_path);
-
         Ok(())
     }
 
@@ -366,27 +432,5 @@ mod tests {
         })?;
 
         Ok(())
-    }
-}
-
-#[cfg(all(test, not(feature = "torsh")))]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_convert_requires_feature() {
-        use std::env;
-        let temp_dir = env::temp_dir();
-        let torsh_path = temp_dir.join("dummy.safetensors");
-        let oxigaf_path = temp_dir.join("dummy_out.safetensors");
-        let mapping = LayerMapping::new();
-        let precision = PrecisionConfig::default();
-
-        let result = convert(&torsh_path, &oxigaf_path, &mapping, &precision);
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("ToRSh feature not enabled"));
     }
 }

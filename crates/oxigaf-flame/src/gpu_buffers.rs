@@ -195,18 +195,54 @@ impl GpuMeshBuffers {
     // Validation
     // -----------------------------------------------------------------------
 
-    /// Validate that all face indices are within vertex bounds.
+    /// Validate that the buffers are internally consistent: `vertices`,
+    /// `normals` and `faces` are exactly as long as `num_vertices` /
+    /// `num_faces` promise, and every face index is within vertex bounds.
+    ///
+    /// Every field of `GpuMeshBuffers` is public, so a struct built by hand
+    /// (or mutated after construction) can have a `num_faces`/`num_vertices`
+    /// that no longer matches the backing `Vec` lengths. Since this method's
+    /// entire purpose is to validate untrusted buffers, it must check those
+    /// lengths itself rather than trust them and index out of bounds.
     ///
     /// # Errors
     ///
-    /// Returns [`FlameError::IndexOutOfBounds`] if any face references a
-    /// vertex index `>= num_vertices`.
+    /// Returns [`FlameError::ShapeMismatch`] if `vertices`, `normals` or
+    /// `faces` does not have the length implied by `num_vertices` /
+    /// `num_faces`, or [`FlameError::IndexOutOfBounds`] if any face
+    /// references a vertex index `>= num_vertices`.
     pub fn validate(&self) -> Result<(), FlameError> {
         let nv = self.num_vertices as usize;
-        for face_idx in 0..self.num_faces as usize {
-            let base = face_idx * 4;
-            for slot in 0..3_usize {
-                let vi = self.faces[base + slot] as usize;
+        let nf = self.num_faces as usize;
+
+        let expected_vertex_len = checked_len(nv, "vertices", self.vertices.len())?;
+        if self.vertices.len() != expected_vertex_len {
+            return Err(FlameError::ShapeMismatch {
+                name: "vertices".into(),
+                expected: format!("{expected_vertex_len} (= num_vertices * 4)"),
+                got: format!("{}", self.vertices.len()),
+            });
+        }
+        if self.normals.len() != expected_vertex_len {
+            return Err(FlameError::ShapeMismatch {
+                name: "normals".into(),
+                expected: format!("{expected_vertex_len} (= num_vertices * 4)"),
+                got: format!("{}", self.normals.len()),
+            });
+        }
+
+        let expected_face_len = checked_len(nf, "faces", self.faces.len())?;
+        if self.faces.len() != expected_face_len {
+            return Err(FlameError::ShapeMismatch {
+                name: "faces".into(),
+                expected: format!("{expected_face_len} (= num_faces * 4)"),
+                got: format!("{}", self.faces.len()),
+            });
+        }
+
+        for (face_idx, chunk) in self.faces.chunks_exact(4).enumerate() {
+            for (slot, &vi_raw) in chunk[..3].iter().enumerate() {
+                let vi = vi_raw as usize;
                 if vi >= nv {
                     return Err(FlameError::index_out_of_bounds(
                         format!("face[{face_idx}][{slot}]"),
@@ -218,6 +254,19 @@ impl GpuMeshBuffers {
         }
         Ok(())
     }
+}
+
+/// Compute `count * 4`, reporting a [`FlameError::ShapeMismatch`] instead of
+/// panicking on overflow (relevant on 32-bit targets for a maliciously large
+/// `num_vertices`/`num_faces`).
+fn checked_len(count: usize, name: &str, got_len: usize) -> Result<usize, FlameError> {
+    count
+        .checked_mul(4)
+        .ok_or_else(|| FlameError::ShapeMismatch {
+            name: name.to_string(),
+            expected: format!("{count} * 4 (overflowed usize)"),
+            got: format!("{got_len}"),
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -568,6 +617,41 @@ mod tests {
             buf.validate().is_err(),
             "validation should fail for out-of-bounds face index"
         );
+    }
+
+    #[test]
+    fn test_validate_fails_instead_of_panicking_when_num_faces_exceeds_backing_array() {
+        // `num_faces` claims 2 faces but `faces` only holds data for 1 (4
+        // u32s). Before this was fixed, `validate()` indexed straight past
+        // the end of `faces` and panicked instead of returning an error.
+        let buf = GpuMeshBuffers {
+            vertices: vec![0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0],
+            normals: vec![0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+            faces: vec![0, 1, 0, 0],
+            num_vertices: 2,
+            num_faces: 2,
+        };
+        let err = buf
+            .validate()
+            .expect_err("mismatched num_faces must be reported, not panic");
+        assert!(matches!(err, FlameError::ShapeMismatch { .. }));
+    }
+
+    #[test]
+    fn test_validate_fails_instead_of_panicking_when_num_vertices_exceeds_backing_array() {
+        // `num_vertices` claims 2 vertices but `vertices`/`normals` only
+        // hold data for 1.
+        let buf = GpuMeshBuffers {
+            vertices: vec![0.0, 0.0, 0.0, 1.0],
+            normals: vec![0.0, 0.0, 1.0, 0.0],
+            faces: vec![0, 0, 0, 0],
+            num_vertices: 2,
+            num_faces: 1,
+        };
+        let err = buf
+            .validate()
+            .expect_err("mismatched num_vertices must be reported, not panic");
+        assert!(matches!(err, FlameError::ShapeMismatch { .. }));
     }
 
     // -----------------------------------------------------------------------

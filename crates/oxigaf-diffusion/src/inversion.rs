@@ -52,6 +52,12 @@ pub enum InversionError {
 // NoiseScheduleCoeffs
 // ---------------------------------------------------------------------------
 
+/// Smallest alpha cumprod a generated schedule may take.
+///
+/// `NoiseScheduleCoeffs::new` rejects `alpha_cumprod <= 0`, so generated
+/// schedules are clamped just above zero rather than to it.
+const MIN_ALPHA_CUMPROD: f32 = 1e-8;
+
 /// Pre-computed coefficients for a noise schedule at a given timestep.
 #[derive(Debug, Clone)]
 pub struct NoiseScheduleCoeffs {
@@ -91,13 +97,29 @@ impl NoiseScheduleCoeffs {
 pub struct DdimInversionConfig {
     /// Number of inversion steps.
     pub num_steps: usize,
-    /// Guidance scale for the noise predictor (typically 1.0 for exact inversion).
+    /// Guidance scale applied to every noise prediction.
+    ///
+    /// The predictor supplies a single ε, so classifier-free guidance against a
+    /// null (all-zero) unconditional branch reduces to
+    /// `ε_uncond + w·(ε_cond − ε_uncond) = w·ε_cond`; the scale therefore
+    /// multiplies the prediction and `1.0` is the identity used for exact
+    /// inversion.
     pub guidance_scale: f32,
     /// Whether to use iterative refinement (more accurate but slower).
+    ///
+    /// When enabled, each step is driven to the fixed point of the DDIM
+    /// relation instead of relying on the ε_θ(x_t) ≈ ε_θ(x_{t+1}) approximation.
     pub use_iterative_refinement: bool,
-    /// Maximum number of iterations for iterative refinement.
+    /// Maximum number of fixed-point iterations per refined step.
+    ///
+    /// Exceeding it yields [`InversionError::MaxIterationsReached`].
     pub max_refinement_iters: usize,
-    /// Convergence threshold for iterative refinement (L2 distance).
+    /// Convergence threshold for iterative refinement.
+    ///
+    /// Compared against the **RMS** distance `sqrt(mean((xₖ₊₁ − xₖ)²))` between
+    /// successive iterates, matching
+    /// [`InversionTrajectory::reconstruction_error`]'s normalization so the
+    /// threshold is independent of the latent dimension.
     pub refinement_threshold: f32,
 }
 
@@ -253,16 +275,20 @@ pub struct InversionTrajectory {
 }
 
 impl InversionTrajectory {
-    /// Return the initial clean latent x_0.
-    pub fn x_0(&self) -> &[f32] {
-        // Safety: the constructor always pushes x_0 first.
-        &self.latents[0]
+    /// Return the initial clean latent x_0, or `None` when the trajectory holds
+    /// no latents.
+    ///
+    /// Every field is public, so an empty trajectory is representable (see
+    /// [`is_empty`][Self::is_empty]); this accessor reports that case instead of
+    /// indexing out of bounds.
+    pub fn x_0(&self) -> Option<&[f32]> {
+        self.latents.first().map(|v| v.as_slice())
     }
 
-    /// Return the final noisy latent x_T (the one suitable for editing).
-    pub fn x_t(&self) -> &[f32] {
-        // Safety: latents always has at least one element (x_0).
-        &self.latents[self.latents.len() - 1]
+    /// Return the final noisy latent x_T (the one suitable for editing), or
+    /// `None` when the trajectory holds no latents.
+    pub fn x_t(&self) -> Option<&[f32]> {
+        self.latents.last().map(|v| v.as_slice())
     }
 
     /// Return the intermediate latent at the given step index, if in bounds.
@@ -284,25 +310,42 @@ impl InversionTrajectory {
     /// reconstructed latent, normalized by the latent dimension.
     ///
     /// Returns `sqrt(mean((x_0 - reconstructed)²))`.
+    ///
+    /// Fails with [`InversionError::InvalidTimesteps`] when the trajectory holds
+    /// no latents and therefore has no x_0 to compare against.
     pub fn reconstruction_error(&self, reconstructed: &[f32]) -> Result<f32, InversionError> {
-        let original = self.x_0();
+        let original = self.x_0().ok_or_else(|| {
+            InversionError::InvalidTimesteps("trajectory is empty: no x_0 recorded".to_string())
+        })?;
         if original.len() != reconstructed.len() {
             return Err(InversionError::LengthMismatch {
                 expected: original.len(),
                 actual: reconstructed.len(),
             });
         }
-        let mse = original
-            .iter()
-            .zip(reconstructed.iter())
-            .map(|(&a, &b)| {
-                let d = a - b;
-                d * d
-            })
-            .sum::<f32>()
-            / original.len() as f32;
-        Ok(mse.sqrt())
+        Ok(rms_distance(original, reconstructed))
     }
+}
+
+/// Root-mean-square distance between two equal-length latents.
+///
+/// Returns `0.0` for empty inputs. Callers are responsible for checking that
+/// the two slices agree in length; excess elements of the longer slice are
+/// ignored.
+#[inline]
+fn rms_distance(a: &[f32], b: &[f32]) -> f32 {
+    if a.is_empty() {
+        return 0.0;
+    }
+    let sum: f32 = a
+        .iter()
+        .zip(b.iter())
+        .map(|(&x, &y)| {
+            let d = x - y;
+            d * d
+        })
+        .sum();
+    (sum / a.len() as f32).sqrt()
 }
 
 // ---------------------------------------------------------------------------
@@ -323,11 +366,25 @@ impl InversionSchedule {
     /// Build a linear schedule interpolating alpha_cumprod from `start` to `end`.
     ///
     /// Typically `start ≈ 0.9999` (low noise) and `end ≈ 0.0047` (high noise).
+    ///
+    /// Both endpoints must be finite and inside `(0, 1]` — the range
+    /// [`NoiseScheduleCoeffs::new`] accepts. Rejecting them here keeps the
+    /// failure at the call site instead of surfacing it mid-inversion. Every
+    /// interpolated value is a convex combination of the two endpoints, so
+    /// validating the endpoints validates the whole schedule.
     pub fn linear(total_timesteps: usize, start: f32, end: f32) -> Result<Self, InversionError> {
         if total_timesteps == 0 {
             return Err(InversionError::InvalidTimesteps(
                 "total_timesteps must be > 0".to_string(),
             ));
+        }
+        for (name, value) in [("start", start), ("end", end)] {
+            if !value.is_finite() || value <= 0.0 || value > 1.0 {
+                return Err(InversionError::InvalidConfig(format!(
+                    "{} must be finite and in (0, 1], got {}",
+                    name, value
+                )));
+            }
         }
         let alpha_cumprods = (0..total_timesteps)
             .map(|i| {
@@ -355,8 +412,9 @@ impl InversionSchedule {
                 let t_frac = i as f32 / total as f32;
                 let arg = (t_frac + s) / (1.0 + s) * std::f32::consts::FRAC_PI_2;
                 let raw = arg.cos().powi(2) / denominator;
-                // Clamp to [0, 1] to guard against floating-point overshoot.
-                raw.clamp(0.0, 1.0)
+                // Clamp into (0, 1] — the range NoiseScheduleCoeffs accepts —
+                // to guard against floating-point overshoot at either end.
+                raw.clamp(MIN_ALPHA_CUMPROD, 1.0)
             })
             .collect();
         Self {
@@ -443,6 +501,101 @@ pub fn constant_noise_predictor(constant: f32) -> impl Fn(&[f32], usize) -> Vec<
 }
 
 // ---------------------------------------------------------------------------
+// Internal pipeline helpers
+// ---------------------------------------------------------------------------
+
+/// Scale a raw noise prediction by the configured guidance scale, in place.
+///
+/// With a single-branch predictor, classifier-free guidance against a null
+/// (all-zero) unconditional prediction reduces to `w · ε`, so `w = 1.0` is the
+/// identity required for exact inversion.
+#[inline]
+fn apply_guidance(noise_pred: &mut [f32], guidance_scale: f32) {
+    if (guidance_scale - 1.0).abs() <= f32::EPSILON {
+        return;
+    }
+    for eps in noise_pred.iter_mut() {
+        *eps *= guidance_scale;
+    }
+}
+
+/// Evaluate the predictor at `step`, check its length, and apply guidance.
+fn guided_noise_prediction<F>(
+    latent: &[f32],
+    step: usize,
+    guidance_scale: f32,
+    noise_predictor: &F,
+) -> Result<Vec<f32>, InversionError>
+where
+    F: Fn(&[f32], usize) -> Vec<f32>,
+{
+    let mut noise_pred = noise_predictor(latent, step);
+    if noise_pred.len() != latent.len() {
+        return Err(InversionError::LengthMismatch {
+            expected: latent.len(),
+            actual: noise_pred.len(),
+        });
+    }
+    apply_guidance(&mut noise_pred, guidance_scale);
+    Ok(noise_pred)
+}
+
+/// Reject schedules too degenerate to define an inversion trajectory.
+///
+/// A schedule with fewer than two alpha values makes every interpolated alpha
+/// identical (`alpha_at` collapses to a single sample), so inversion would be a
+/// silent no-op instead of a noising process.
+fn check_schedule(schedule: &InversionSchedule) -> Result<(), InversionError> {
+    if schedule.alpha_cumprods.len() < 2 {
+        return Err(InversionError::InvalidTimesteps(format!(
+            "schedule needs at least 2 alpha_cumprod values, got {}",
+            schedule.alpha_cumprods.len()
+        )));
+    }
+    Ok(())
+}
+
+/// Drive one inversion step to the fixed point of the DDIM relation.
+///
+/// The plain step leans on the approximation `ε_θ(x_t) ≈ ε_θ(x_{t+1})`. The
+/// exact relation instead demands that `x_{t+1}` satisfy
+/// `x_{t+1} = ddim_inversion_step(x_t, ε_θ(x_{t+1}))`, which this solves by
+/// fixed-point iteration seeded with the plain step's output. Each iterate
+/// re-evaluates the predictor at the *target* noise level — step index
+/// `next_step`, one above the level that produced the seed — because that is
+/// the argument the exact relation calls for.
+///
+/// Returns [`InversionError::MaxIterationsReached`] when the RMS change between
+/// successive iterates never drops below `config.refinement_threshold`.
+fn refine_inversion_step<F>(
+    x_t: &[f32],
+    initial_next: Vec<f32>,
+    next_step: usize,
+    coeffs_t: &NoiseScheduleCoeffs,
+    coeffs_next: &NoiseScheduleCoeffs,
+    config: &DdimInversionConfig,
+    noise_predictor: &F,
+) -> Result<Vec<f32>, InversionError>
+where
+    F: Fn(&[f32], usize) -> Vec<f32>,
+{
+    let mut current = initial_next;
+    for _ in 0..config.max_refinement_iters {
+        let noise_pred =
+            guided_noise_prediction(&current, next_step, config.guidance_scale, noise_predictor)?;
+        let candidate = ddim_inversion_step(x_t, &noise_pred, coeffs_t, coeffs_next)?;
+        let delta = rms_distance(&candidate, &current);
+        current = candidate;
+        if delta <= config.refinement_threshold {
+            return Ok(current);
+        }
+    }
+    Err(InversionError::MaxIterationsReached {
+        iterations: config.max_refinement_iters,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Full inversion pipeline
 // ---------------------------------------------------------------------------
 
@@ -451,6 +604,16 @@ pub fn constant_noise_predictor(constant: f32) -> impl Fn(&[f32], usize) -> Vec<
 /// The `noise_predictor` takes `(latent, step_idx)` and returns a noise
 /// prediction of the same length. This design allows testing without a real
 /// U-Net model.
+///
+/// Every prediction is scaled by `config.guidance_scale` before it is used.
+/// When `config.use_iterative_refinement` is set, each step is additionally
+/// driven to the fixed point of the DDIM relation (see
+/// [`DdimInversionConfig::refinement_threshold`]); the predictor is then called
+/// up to `1 + max_refinement_iters` times per step, and inversion fails with
+/// [`InversionError::MaxIterationsReached`] if a step does not converge. Note
+/// the step-index contract: refinement iterations evaluate the predictor at
+/// step index `i + 1` — the target noise level the fixed point is defined at —
+/// so a predictor keyed on the index sees values up to `num_steps`.
 ///
 /// # Returns
 /// An [`InversionTrajectory`] whose `latents[0]` is the initial x_0 and
@@ -465,6 +628,7 @@ where
     F: Fn(&[f32], usize) -> Vec<f32>,
 {
     config.validate()?;
+    check_schedule(schedule)?;
 
     // Get num_steps + 1 alpha values (low → high noise).
     let alphas = schedule.inversion_alphas(config.num_steps + 1);
@@ -485,8 +649,23 @@ where
     for i in 0..config.num_steps {
         let coeffs_t = NoiseScheduleCoeffs::new(alphas[i])?;
         let coeffs_next = NoiseScheduleCoeffs::new(alphas[i + 1])?;
-        let noise_pred = noise_predictor(&latent, i);
-        latent = ddim_inversion_step(&latent, &noise_pred, &coeffs_t, &coeffs_next)?;
+        let noise_pred =
+            guided_noise_prediction(&latent, i, config.guidance_scale, &noise_predictor)?;
+        let stepped = ddim_inversion_step(&latent, &noise_pred, &coeffs_t, &coeffs_next)?;
+        let next = if config.use_iterative_refinement {
+            refine_inversion_step(
+                &latent,
+                stepped,
+                i + 1,
+                &coeffs_t,
+                &coeffs_next,
+                config,
+                &noise_predictor,
+            )?
+        } else {
+            stepped
+        };
+        latent = next;
         trajectory_latents.push(latent.clone());
     }
 
@@ -503,6 +682,10 @@ where
 /// This is the reverse of [`run_ddim_inversion`]: starting from the noisy
 /// latent x_T, it steps through the denoising schedule and returns the
 /// final (cleaner) latent.
+///
+/// Every prediction is scaled by `config.guidance_scale`; the denoising
+/// direction is well-posed on its own, so `use_iterative_refinement` does not
+/// apply here.
 pub fn run_ddim_reconstruction<F>(
     x_t: &[f32],
     schedule: &InversionSchedule,
@@ -513,6 +696,7 @@ where
     F: Fn(&[f32], usize) -> Vec<f32>,
 {
     config.validate()?;
+    check_schedule(schedule)?;
 
     // Get num_steps + 1 alpha values (high → low noise).
     let alphas = schedule.denoising_alphas(config.num_steps + 1);
@@ -529,7 +713,8 @@ where
     for i in 0..config.num_steps {
         let coeffs_t = NoiseScheduleCoeffs::new(alphas[i])?;
         let coeffs_prev = NoiseScheduleCoeffs::new(alphas[i + 1])?;
-        let noise_pred = noise_predictor(&latent, i);
+        let noise_pred =
+            guided_noise_prediction(&latent, i, config.guidance_scale, &noise_predictor)?;
         latent = ddim_denoise_step(&latent, &noise_pred, &coeffs_t, &coeffs_prev)?;
     }
 
@@ -842,10 +1027,10 @@ mod tests {
         let x_0 = vec![1.0_f32, 2.0, 3.0, 4.0];
         let traj = run_ddim_inversion(&x_0, &sched, &config, null_noise_predictor).unwrap();
         // x_0 and x_T should differ when alpha values change.
-        let x_t = traj.x_t();
+        let x_t = traj.x_t().expect("trajectory has latents");
+        let x_0_slice = traj.x_0().expect("trajectory has latents");
         assert_ne!(
-            traj.x_0(),
-            x_t,
+            x_0_slice, x_t,
             "x_0 and x_T should differ after inversion steps"
         );
     }
@@ -876,7 +1061,7 @@ mod tests {
     #[test]
     fn test_trajectory_x_0() {
         let traj = make_test_trajectory(4, 3, 0.0);
-        assert_eq!(traj.x_0(), traj.latents[0].as_slice());
+        assert_eq!(traj.x_0(), Some(traj.latents[0].as_slice()));
     }
 
     // -----------------------------------------------------------------------
@@ -886,7 +1071,7 @@ mod tests {
     fn test_trajectory_x_t() {
         let traj = make_test_trajectory(4, 3, 0.0);
         let last_idx = traj.latents.len() - 1;
-        assert_eq!(traj.x_t(), traj.latents[last_idx].as_slice());
+        assert_eq!(traj.x_t(), Some(traj.latents[last_idx].as_slice()));
     }
 
     // -----------------------------------------------------------------------
@@ -895,7 +1080,7 @@ mod tests {
     #[test]
     fn test_reconstruction_error_same_latent() {
         let traj = make_test_trajectory(4, 3, 1.0);
-        let reconstructed = traj.x_0().to_vec();
+        let reconstructed = traj.x_0().expect("trajectory has latents").to_vec();
         let err = traj.reconstruction_error(&reconstructed).unwrap();
         assert!(
             err < 1e-6,
@@ -1034,5 +1219,207 @@ mod tests {
             blend_at_noise_level(&a, &b, 0.5),
             Err(InversionError::LengthMismatch { .. })
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression: an empty trajectory must not panic in x_0 / x_t.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_empty_trajectory_accessors_are_safe() {
+        let traj = InversionTrajectory {
+            latents: Vec::new(),
+            alpha_cumprods: Vec::new(),
+            num_steps: 0,
+            used_refinement: false,
+        };
+        assert!(traj.is_empty());
+        assert!(traj.x_0().is_none());
+        assert!(traj.x_t().is_none());
+        assert!(matches!(
+            traj.reconstruction_error(&[0.0_f32; 4]),
+            Err(InversionError::InvalidTimesteps(_))
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression: linear() rejects endpoints outside (0, 1] up front.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_linear_schedule_rejects_out_of_range_endpoints() {
+        assert!(matches!(
+            InversionSchedule::linear(50, 0.9999, 0.0),
+            Err(InversionError::InvalidConfig(_))
+        ));
+        assert!(matches!(
+            InversionSchedule::linear(50, 1.5, 0.5),
+            Err(InversionError::InvalidConfig(_))
+        ));
+        assert!(matches!(
+            InversionSchedule::linear(50, f32::NAN, 0.5),
+            Err(InversionError::InvalidConfig(_))
+        ));
+        assert!(matches!(
+            InversionSchedule::linear(50, 0.9999, -0.1),
+            Err(InversionError::InvalidConfig(_))
+        ));
+        assert!(InversionSchedule::linear(50, 1.0, 0.0047).is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression: a schedule with < 2 alphas cannot define an inversion.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_degenerate_schedule_rejected() {
+        let sched = InversionSchedule::cosine(1);
+        let config = DdimInversionConfig {
+            num_steps: 3,
+            ..Default::default()
+        };
+        let x_0 = vec![0.1_f32, 0.2];
+        assert!(matches!(
+            run_ddim_inversion(&x_0, &sched, &config, null_noise_predictor),
+            Err(InversionError::InvalidTimesteps(_))
+        ));
+        assert!(matches!(
+            run_ddim_reconstruction(&x_0, &sched, &config, null_noise_predictor),
+            Err(InversionError::InvalidTimesteps(_))
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression: guidance_scale actually scales the noise prediction.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_guidance_scale_is_applied() {
+        let sched = InversionSchedule::cosine(64);
+        let eps = 0.4_f32;
+        let scale = 2.5_f32;
+        let x_0 = vec![0.3_f32, -0.7, 1.1];
+
+        let alphas = sched.inversion_alphas(2);
+        let coeffs_t = NoiseScheduleCoeffs::new(alphas[0]).unwrap();
+        let coeffs_next = NoiseScheduleCoeffs::new(alphas[1]).unwrap();
+
+        let scaled_cfg = DdimInversionConfig {
+            num_steps: 1,
+            guidance_scale: scale,
+            ..Default::default()
+        };
+        let scaled_traj =
+            run_ddim_inversion(&x_0, &sched, &scaled_cfg, constant_noise_predictor(eps)).unwrap();
+        let scaled_noise = vec![eps * scale; x_0.len()];
+        let expected = ddim_inversion_step(&x_0, &scaled_noise, &coeffs_t, &coeffs_next).unwrap();
+        for (g, e) in scaled_traj
+            .x_t()
+            .expect("trajectory has latents")
+            .iter()
+            .zip(expected.iter())
+        {
+            assert!((g - e).abs() < 1e-5, "expected {e}, got {g}");
+        }
+
+        // guidance_scale = 1.0 must remain the identity (exact inversion).
+        let unit_cfg = DdimInversionConfig {
+            num_steps: 1,
+            ..Default::default()
+        };
+        let unit_traj =
+            run_ddim_inversion(&x_0, &sched, &unit_cfg, constant_noise_predictor(eps)).unwrap();
+        let unit_noise = vec![eps; x_0.len()];
+        let unscaled = ddim_inversion_step(&x_0, &unit_noise, &coeffs_t, &coeffs_next).unwrap();
+        for (g, e) in unit_traj
+            .x_t()
+            .expect("trajectory has latents")
+            .iter()
+            .zip(unscaled.iter())
+        {
+            assert!((g - e).abs() < 1e-5, "expected {e}, got {g}");
+        }
+        // The two must genuinely differ, otherwise the check above is vacuous.
+        assert_ne!(scaled_traj.x_t(), unit_traj.x_t());
+
+        // The reconstruction loop must scale its predictions the same way.
+        let recon =
+            run_ddim_reconstruction(&x_0, &sched, &scaled_cfg, constant_noise_predictor(eps))
+                .unwrap();
+        let d_alphas = sched.denoising_alphas(2);
+        let dc_t = NoiseScheduleCoeffs::new(d_alphas[0]).unwrap();
+        let dc_prev = NoiseScheduleCoeffs::new(d_alphas[1]).unwrap();
+        let expected_recon = ddim_denoise_step(&x_0, &scaled_noise, &dc_t, &dc_prev).unwrap();
+        for (g, e) in recon.iter().zip(expected_recon.iter()) {
+            assert!((g - e).abs() < 1e-5, "expected {e}, got {g}");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression: iterative refinement solves the DDIM fixed point.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_iterative_refinement_reaches_fixed_point() {
+        let sched = InversionSchedule::cosine(64);
+        // State-dependent predictor: a contraction, so the iteration converges
+        // and the refined result genuinely differs from the unrefined step.
+        let predictor = |x: &[f32], _step: usize| x.iter().map(|v| 0.05 * v).collect::<Vec<f32>>();
+        let config = DdimInversionConfig {
+            num_steps: 1,
+            use_iterative_refinement: true,
+            max_refinement_iters: 32,
+            refinement_threshold: 1e-6,
+            ..Default::default()
+        };
+        let x_0 = vec![0.5_f32, -0.25, 0.75, 1.0];
+        let traj = run_ddim_inversion(&x_0, &sched, &config, predictor).unwrap();
+        assert!(traj.used_refinement);
+
+        let alphas = sched.inversion_alphas(2);
+        let coeffs_t = NoiseScheduleCoeffs::new(alphas[0]).unwrap();
+        let coeffs_next = NoiseScheduleCoeffs::new(alphas[1]).unwrap();
+        let x_next = traj.x_t().expect("trajectory has latents").to_vec();
+
+        // Fixed point: x_next == step(x_0, eps(x_next)).
+        let eps_at_fixed_point = predictor(&x_next, 1);
+        let residual =
+            ddim_inversion_step(&x_0, &eps_at_fixed_point, &coeffs_t, &coeffs_next).unwrap();
+        for (r, x) in residual.iter().zip(x_next.iter()) {
+            assert!((r - x).abs() < 1e-4, "fixed point not reached: {r} vs {x}");
+        }
+
+        // And it is not merely the unrefined single step.
+        let plain_eps = predictor(&x_0, 0);
+        let plain = ddim_inversion_step(&x_0, &plain_eps, &coeffs_t, &coeffs_next).unwrap();
+        assert!(
+            plain
+                .iter()
+                .zip(x_next.iter())
+                .any(|(p, x)| (p - x).abs() > 1e-5),
+            "refinement left the unrefined step unchanged"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression: non-convergent refinement reports MaxIterationsReached.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_iterative_refinement_non_convergence_errors() {
+        let sched = InversionSchedule::cosine(64);
+        // Gain large enough to make the fixed-point map expansive.
+        let predictor = |x: &[f32], _step: usize| x.iter().map(|v| -8.0 * v).collect::<Vec<f32>>();
+        let config = DdimInversionConfig {
+            num_steps: 1,
+            use_iterative_refinement: true,
+            max_refinement_iters: 4,
+            refinement_threshold: 1e-6,
+            ..Default::default()
+        };
+        let x_0 = vec![0.5_f32, -0.25];
+        let result = run_ddim_inversion(&x_0, &sched, &config, predictor);
+        assert!(
+            matches!(
+                result,
+                Err(InversionError::MaxIterationsReached { iterations: 4 })
+            ),
+            "expected MaxIterationsReached, got {:?}",
+            result
+        );
     }
 }

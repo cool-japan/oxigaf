@@ -370,7 +370,32 @@ pub fn crop_image(
 /// Padding is distributed equally on both sides of the shorter dimension
 /// (half-pixel rounding goes to the bottom/right). Padded regions are filled
 /// with `pad_value`.
-pub fn pad_to_square(src: &[f32], src_dims: ImageDims, pad_value: f32) -> (Vec<f32>, ImageDims) {
+///
+/// # Errors
+/// - [`PreprocessError::EmptyImage`] when `src` is empty.
+/// - [`PreprocessError::InvalidDimensions`] when the source buffer length
+///   does not match `src_dims`.
+pub fn pad_to_square(
+    src: &[f32],
+    src_dims: ImageDims,
+    pad_value: f32,
+) -> Result<(Vec<f32>, ImageDims), PreprocessError> {
+    if src.is_empty() {
+        return Err(PreprocessError::EmptyImage);
+    }
+    if src.len() != src_dims.num_elements() {
+        return Err(PreprocessError::InvalidDimensions {
+            reason: format!(
+                "src length {} does not match dims {}×{}×{}={}",
+                src.len(),
+                src_dims.height,
+                src_dims.width,
+                src_dims.channels,
+                src_dims.num_elements()
+            ),
+        });
+    }
+
     let side = src_dims.height.max(src_dims.width);
     let c = src_dims.channels;
     let out_dims = ImageDims::new(side, side, c);
@@ -389,7 +414,7 @@ pub fn pad_to_square(src: &[f32], src_dims: ImageDims, pad_value: f32) -> (Vec<f
         }
     }
 
-    (out, out_dims)
+    Ok((out, out_dims))
 }
 
 // ---------------------------------------------------------------------------
@@ -436,6 +461,8 @@ const IMAGENET_STD: [f32; 3] = [0.229, 0.224, 0.225];
 ///
 /// # Errors
 /// - [`PreprocessError::EmptyImage`] when `src` is empty.
+/// - [`PreprocessError::InvalidDimensions`] when `src`'s length does not
+///   match `dims`.
 /// - [`PreprocessError::UnsupportedChannelCount`] when using [`NormalizationMode::ImageNet`]
 ///   or [`NormalizationMode::ZeroMean`] with a non-3-channel image.
 pub fn normalize_image(
@@ -445,6 +472,18 @@ pub fn normalize_image(
 ) -> Result<Vec<f32>, PreprocessError> {
     if src.is_empty() {
         return Err(PreprocessError::EmptyImage);
+    }
+    if src.len() != dims.num_elements() {
+        return Err(PreprocessError::InvalidDimensions {
+            reason: format!(
+                "src length {} does not match dims {}×{}×{}={}",
+                src.len(),
+                dims.height,
+                dims.width,
+                dims.channels,
+                dims.num_elements()
+            ),
+        });
     }
 
     let mut out = src.to_vec();
@@ -484,9 +523,12 @@ pub fn normalize_image(
                     got: c,
                 });
             }
-            for pixel_start in (0..out.len()).step_by(c) {
-                for ch in 0..c {
-                    out[pixel_start + ch] = (out[pixel_start + ch] - mean[ch]) / (std[ch] + 1e-8);
+            // `out.len() == dims.num_elements()` is a multiple of `c` (checked
+            // above), so `chunks_exact_mut` covers every element and keeps
+            // the per-pixel indexing statically in bounds.
+            for pixel in out.chunks_exact_mut(c) {
+                for (ch, v) in pixel.iter_mut().enumerate() {
+                    *v = (*v - mean[ch]) / (std[ch] + 1e-8);
                 }
             }
         }
@@ -498,10 +540,9 @@ pub fn normalize_image(
                     got: c,
                 });
             }
-            for pixel_start in (0..out.len()).step_by(c) {
-                for ch in 0..c {
-                    out[pixel_start + ch] =
-                        (out[pixel_start + ch] - IMAGENET_MEAN[ch]) / IMAGENET_STD[ch];
+            for pixel in out.chunks_exact_mut(c) {
+                for (ch, v) in pixel.iter_mut().enumerate() {
+                    *v = (*v - IMAGENET_MEAN[ch]) / IMAGENET_STD[ch];
                 }
             }
         }
@@ -515,7 +556,28 @@ pub fn normalize_image(
 // ---------------------------------------------------------------------------
 
 /// Flip `src` horizontally (left ↔ right).
-pub fn flip_horizontal(src: &[f32], dims: ImageDims) -> Vec<f32> {
+///
+/// # Errors
+/// - [`PreprocessError::EmptyImage`] when `src` is empty.
+/// - [`PreprocessError::InvalidDimensions`] when `src`'s length does not
+///   match `dims`.
+pub fn flip_horizontal(src: &[f32], dims: ImageDims) -> Result<Vec<f32>, PreprocessError> {
+    if src.is_empty() {
+        return Err(PreprocessError::EmptyImage);
+    }
+    if src.len() != dims.num_elements() {
+        return Err(PreprocessError::InvalidDimensions {
+            reason: format!(
+                "src length {} does not match dims {}×{}×{}={}",
+                src.len(),
+                dims.height,
+                dims.width,
+                dims.channels,
+                dims.num_elements()
+            ),
+        });
+    }
+
     let h = dims.height;
     let w = dims.width;
     let c = dims.channels;
@@ -527,11 +589,32 @@ pub fn flip_horizontal(src: &[f32], dims: ImageDims) -> Vec<f32> {
             out[dst_base..dst_base + c].copy_from_slice(&src[src_base..src_base + c]);
         }
     }
-    out
+    Ok(out)
 }
 
 /// Flip `src` vertically (top ↔ bottom).
-pub fn flip_vertical(src: &[f32], dims: ImageDims) -> Vec<f32> {
+///
+/// # Errors
+/// - [`PreprocessError::EmptyImage`] when `src` is empty.
+/// - [`PreprocessError::InvalidDimensions`] when `src`'s length does not
+///   match `dims`.
+pub fn flip_vertical(src: &[f32], dims: ImageDims) -> Result<Vec<f32>, PreprocessError> {
+    if src.is_empty() {
+        return Err(PreprocessError::EmptyImage);
+    }
+    if src.len() != dims.num_elements() {
+        return Err(PreprocessError::InvalidDimensions {
+            reason: format!(
+                "src length {} does not match dims {}×{}×{}={}",
+                src.len(),
+                dims.height,
+                dims.width,
+                dims.channels,
+                dims.num_elements()
+            ),
+        });
+    }
+
     let h = dims.height;
     let w = dims.width;
     let c = dims.channels;
@@ -541,7 +624,7 @@ pub fn flip_vertical(src: &[f32], dims: ImageDims) -> Vec<f32> {
         let dst_row = (h - 1 - y) * w * c;
         out[dst_row..dst_row + w * c].copy_from_slice(&src[src_row..src_row + w * c]);
     }
-    out
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -583,6 +666,18 @@ pub fn gaussian_blur(
     if src.is_empty() {
         return Err(PreprocessError::EmptyImage);
     }
+    if src.len() != dims.num_elements() {
+        return Err(PreprocessError::InvalidDimensions {
+            reason: format!(
+                "src length {} does not match dims {}×{}×{}={}",
+                src.len(),
+                dims.height,
+                dims.width,
+                dims.channels,
+                dims.num_elements()
+            ),
+        });
+    }
     if !sigma.is_finite() || sigma < 1e-8 {
         return Err(PreprocessError::InvalidSigma(sigma));
     }
@@ -591,8 +686,13 @@ pub fn gaussian_blur(
     let w = dims.width;
     let c = dims.channels;
 
-    // Derive kernel size: max(3, 2 * ceil(3 * sigma) + 1), clamped to odd
-    let half_size = (3.0 * sigma).ceil() as usize;
+    // Derive kernel size: max(3, 2 * ceil(3 * sigma) + 1), clamped to odd,
+    // and capped so the kernel can never exceed the image extent — beyond
+    // that every sample is already clamped to an edge pixel, so a larger
+    // kernel cannot change the result, and without the cap a pathologically
+    // large sigma would allocate and iterate an unbounded kernel.
+    let max_half = h.max(w).max(1);
+    let half_size = ((3.0 * sigma).ceil() as usize).min(max_half);
     let kernel_size = (2 * half_size + 1).max(3);
     // Ensure odd
     let kernel_size = if kernel_size.is_multiple_of(2) {
@@ -806,7 +906,7 @@ impl PreprocessingPipeline {
                     dims = next_dims;
                 }
                 PreprocessingStep::PadToSquare { pad_value } => {
-                    let (next, next_dims) = pad_to_square(&data, dims, *pad_value);
+                    let (next, next_dims) = pad_to_square(&data, dims, *pad_value)?;
                     data = next;
                     dims = next_dims;
                 }
@@ -814,10 +914,10 @@ impl PreprocessingPipeline {
                     data = normalize_image(&data, dims, *mode)?;
                 }
                 PreprocessingStep::FlipHorizontal => {
-                    data = flip_horizontal(&data, dims);
+                    data = flip_horizontal(&data, dims)?;
                 }
                 PreprocessingStep::FlipVertical => {
-                    data = flip_vertical(&data, dims);
+                    data = flip_vertical(&data, dims)?;
                 }
                 PreprocessingStep::GaussianBlur { sigma } => {
                     data = gaussian_blur(&data, dims, *sigma)?;
@@ -982,7 +1082,7 @@ mod tests {
         // 2×4 image (h=2, w=4): pad to 4×4
         let src = solid_image(2, 4, 1, 0.7);
         let dims = ImageDims::new(2, 4, 1);
-        let (out, out_dims) = pad_to_square(&src, dims, 0.0);
+        let (out, out_dims) = pad_to_square(&src, dims, 0.0).unwrap();
         assert_eq!(out_dims, ImageDims::new(4, 4, 1));
         // Padding rows (top and bottom) should be 0
         for x in 0..4_usize {
@@ -1001,7 +1101,7 @@ mod tests {
         // 4×2 image (h=4, w=2): pad to 4×4
         let src = solid_image(4, 2, 1, 0.3);
         let dims = ImageDims::new(4, 2, 1);
-        let (out, out_dims) = pad_to_square(&src, dims, 0.0);
+        let (out, out_dims) = pad_to_square(&src, dims, 0.0).unwrap();
         assert_eq!(out_dims, ImageDims::new(4, 4, 1));
         // Left and right padding columns should be 0; inner columns 1,2 → 0.3
         for y in 0..4_usize {
@@ -1010,6 +1110,26 @@ mod tests {
             assert!((out[y * 4 + 2] - 0.3).abs() < 1e-5); // col 2 data
             assert!((out[y * 4 + 3] - 0.0).abs() < 1e-6); // col 3 padded
         }
+    }
+
+    #[test]
+    fn test_pad_to_square_dimension_mismatch_errors() {
+        // Regression test: pad_to_square previously had no validation at
+        // all and indexed straight into `src`, panicking on a mismatch.
+        let dims = ImageDims::new(4, 4, 3);
+        let src = vec![0.0f32; 10]; // way too short for 4x4x3=48
+        let result = pad_to_square(&src, dims, 0.0);
+        assert!(matches!(
+            result,
+            Err(PreprocessError::InvalidDimensions { .. })
+        ));
+    }
+
+    #[test]
+    fn test_pad_to_square_empty_errors() {
+        let dims = ImageDims::new(0, 0, 3);
+        let result = pad_to_square(&[], dims, 0.0);
+        assert!(matches!(result, Err(PreprocessError::EmptyImage)));
     }
 
     // ---------- Normalize ----------
@@ -1053,6 +1173,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_normalize_dimension_mismatch_errors() {
+        // Regression test: normalize_image previously indexed `out` with
+        // `step_by(c)` and no length check, reading past the end whenever
+        // `src.len()` was not a multiple of `dims.channels`.
+        let src = vec![0.5f32; 7];
+        let dims = ImageDims::new(1, 1, 3); // expects 3 elements
+        let result = normalize_image(
+            &src,
+            dims,
+            NormalizationMode::ZeroMean {
+                mean: [0.0; 3],
+                std: [1.0; 3],
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(PreprocessError::InvalidDimensions { .. })
+        ));
+    }
+
     // ---------- Flip ----------
 
     #[test]
@@ -1060,7 +1201,7 @@ mod tests {
         // 1×3 single-channel image: [0.1, 0.2, 0.3]
         let src = vec![0.1f32, 0.2, 0.3];
         let dims = ImageDims::new(1, 3, 1);
-        let out = flip_horizontal(&src, dims);
+        let out = flip_horizontal(&src, dims).unwrap();
         assert!((out[0] - 0.3).abs() < 1e-6);
         assert!((out[1] - 0.2).abs() < 1e-6);
         assert!((out[2] - 0.1).abs() < 1e-6);
@@ -1071,10 +1212,30 @@ mod tests {
         // 3×1 single-channel image: [0.1, 0.2, 0.3] (3 rows, 1 column)
         let src = vec![0.1f32, 0.2, 0.3];
         let dims = ImageDims::new(3, 1, 1);
-        let out = flip_vertical(&src, dims);
+        let out = flip_vertical(&src, dims).unwrap();
         assert!((out[0] - 0.3).abs() < 1e-6);
         assert!((out[1] - 0.2).abs() < 1e-6);
         assert!((out[2] - 0.1).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_flip_horizontal_dimension_mismatch_errors() {
+        let dims = ImageDims::new(4, 4, 3);
+        let src = vec![0.0f32; 4]; // way too short
+        assert!(matches!(
+            flip_horizontal(&src, dims),
+            Err(PreprocessError::InvalidDimensions { .. })
+        ));
+    }
+
+    #[test]
+    fn test_flip_vertical_dimension_mismatch_errors() {
+        let dims = ImageDims::new(4, 4, 3);
+        let src = vec![0.0f32; 4];
+        assert!(matches!(
+            flip_vertical(&src, dims),
+            Err(PreprocessError::InvalidDimensions { .. })
+        ));
     }
 
     // ---------- Gaussian blur ----------
@@ -1110,6 +1271,35 @@ mod tests {
             gaussian_blur(&src, dims, -1.0),
             Err(PreprocessError::InvalidSigma(_))
         ));
+    }
+
+    #[test]
+    fn test_gaussian_blur_dimension_mismatch_errors() {
+        // Regression test: gaussian_blur previously indexed `src` using
+        // `dims` alone with no length check, and could read out of bounds.
+        let dims = ImageDims::new(4, 4, 3);
+        let src = vec![0.0f32; 4]; // way too short
+        assert!(matches!(
+            gaussian_blur(&src, dims, 1.0),
+            Err(PreprocessError::InvalidDimensions { .. })
+        ));
+    }
+
+    #[test]
+    fn test_gaussian_blur_huge_sigma_kernel_bounded() {
+        // Regression test: a pathologically large sigma must not allocate
+        // or iterate an unbounded kernel; `half_size` is capped to the
+        // image extent and the call must still succeed with a finite,
+        // in-range result.
+        let dims = ImageDims::new(4, 4, 1);
+        let src: Vec<f32> = (0..16).map(|i| i as f32 * 0.05).collect();
+        let out = gaussian_blur(&src, dims, 1.0e6).unwrap();
+        assert_eq!(out.len(), 16);
+        assert!(
+            out.iter().all(|v| v.is_finite() && *v >= 0.0 && *v <= 1.0),
+            "got NaN/Inf/out-of-range: {:?}",
+            out
+        );
     }
 
     // ---------- ImageStats ----------

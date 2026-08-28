@@ -345,7 +345,12 @@ impl CameraPath {
 ///
 /// Keyframes are evenly spaced around a horizontal circle of the given
 /// `radius`, at height `elevation` above `center`. All cameras look at
-/// `center`.
+/// `center`. The path is a **closed loop**: keyframe 0 (time 0.0, angle 0)
+/// and the last keyframe (time 1.0, angle 2π) sit at the same physical
+/// position, so `sample(0.0)` and `sample(1.0)` coincide and a looped
+/// playback has no jump at the wrap. This uses one of the `num_keyframes`
+/// control points to close the loop, so there are `num_keyframes - 1`
+/// distinct positions spaced `2π / (num_keyframes - 1)` apart.
 ///
 /// # Arguments
 /// * `center` – The point the camera orbits around.
@@ -364,18 +369,19 @@ pub fn turntable_path(
     let count = num_keyframes.max(2);
     let keyframes: Vec<CameraKeyframe> = (0..count)
         .map(|i| {
-            // Evenly spaced angles from 0 to 2π (not including 2π to avoid duplicate)
-            let angle = 2.0 * PI * (i as f32) / (count as f32);
+            // Angles span the full [0, 2*PI] closed interval, matching the
+            // time parameterisation below exactly: angle(i)/2*PI ==
+            // time(i), so angle == 0 and angle == 2*PI (the same physical
+            // position) land at time 0.0 and time 1.0 respectively and the
+            // orbit closes into a loop rather than leaving a gap.
+            let angle = 2.0 * PI * (i as f32) / (count - 1) as f32;
             let x = center[0] + radius * angle.cos();
             let y = center[1] + elevation;
             let z = center[2] + radius * angle.sin();
+            // Exact for integer-valued i / (count - 1), including 1.0 at
+            // i == count - 1.
             let time = i as f32 / (count - 1) as f32;
-            let mut kf = CameraKeyframe::new(time, [x, y, z], center, fov_y);
-            // Make sure the last keyframe time is exactly 1.0
-            if i == count - 1 {
-                kf.time = 1.0;
-            }
-            kf
+            CameraKeyframe::new(time, [x, y, z], center, fov_y)
         })
         .collect();
 
@@ -473,12 +479,13 @@ pub fn keyframe_to_render_camera(kf: &CameraKeyframe, width: usize, height: usiz
     };
 
     // Build view matrix (right-handed, camera looks toward -Z)
-    let view = glam::Mat4::look_at_rh(eye, center, up);
+    let view = glam::camera::rh::view::look_at_mat4(eye, center, up);
     let view_matrix = view.to_cols_array();
 
     // Build perspective projection (right-handed, depth [0, 1] for wgpu)
     let aspect = width as f32 / height.max(1) as f32;
-    let proj = glam::Mat4::perspective_rh(kf.fov_y, aspect, DEFAULT_NEAR, DEFAULT_FAR);
+    let proj =
+        glam::camera::rh::proj::directx::perspective(kf.fov_y, aspect, DEFAULT_NEAR, DEFAULT_FAR);
     let proj_matrix = proj.to_cols_array();
 
     // Focal lengths in pixels
@@ -718,6 +725,44 @@ mod tests {
             assert!(
                 (actual_elevation - elevation).abs() < 1e-4,
                 "Expected elevation {elevation}, got {actual_elevation}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_turntable_path_closes_loop() {
+        // Regression: the angle/time parameterisation must span a full
+        // revolution over t in [0, 1], not (count-1)/count of one (which
+        // left a gap and made a looped playback jump at the wrap).
+        let center = [0.5, 1.0, -2.0];
+        let radius = 3.0;
+        let elevation = 0.5;
+        let path = turntable_path(center, radius, elevation, 16, FRAC_PI_4);
+
+        let start = path.sample(0.0);
+        let end = path.sample(1.0);
+        for c in 0..3 {
+            assert!(
+                (start.position[c] - end.position[c]).abs() < 1e-3,
+                "sample(0.0) and sample(1.0) should coincide (closed loop): \
+                 start={:?}, end={:?}",
+                start.position,
+                end.position
+            );
+        }
+
+        // The keyframes themselves (not just the endpoints of the spline)
+        // must also span the full circle: the last keyframe's angle should
+        // be a full 2*PI from the first, i.e. the same position.
+        let first_kf = &path.keyframes[0];
+        let last_kf = path.keyframes.last().expect("at least 2 keyframes");
+        for c in 0..3 {
+            assert!(
+                (first_kf.position[c] - last_kf.position[c]).abs() < 1e-4,
+                "first and last keyframe should be at the same position \
+                 (angle 0 and angle 2*PI): first={:?}, last={:?}",
+                first_kf.position,
+                last_kf.position
             );
         }
     }

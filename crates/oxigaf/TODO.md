@@ -1,417 +1,161 @@
 # TODO for oxigaf (meta crate)
 
-## ✅ Completed (from plan)
+Status: 0.1.2. This file tracks the `oxigaf` meta-crate only (the facade over
+`oxigaf-flame` / `oxigaf-diffusion` / `oxigaf-render` / `oxigaf-trainer`) —
+see each sub-crate's own `TODO.md` for its scope.
 
-### Core Responsibilities (IMPLEMENTATION_PLAN.md 1.1)
-- ✅ **Re-export unified public API**
-  - `pub use oxigaf_flame as flame`
-  - `pub use oxigaf_diffusion as diffusion`
-  - `pub use oxigaf_render as render`
-  - `pub use oxigaf_trainer as trainer`
-- ✅ **Single entry point for entire ecosystem**
-  - All sub-crates accessible via oxigaf::*
-  - Clean module boundaries
+## Completed
 
-### Enhanced Features (EXCEEDS PLAN)
-- ✅ **Unified error handling** (NOT IN PLAN)
-  - `OxigafError` enum wrapping all sub-crate errors
-  - Automatic error conversion via `From<T>` impls
-  - `Result<T>` type alias for convenience
-  - Seamless error propagation across crate boundaries
-- ✅ **Comprehensive prelude module** (NOT IN PLAN)
-  - Re-exports most commonly used types from all sub-crates
-  - Single import for quick API access (`use oxigaf::prelude::*`)
-  - 40+ re-exported types organized by module:
-    - FLAME types (FlameModel, FlameParams, Mesh, Camera, etc.)
-    - Diffusion types (MultiViewDiffusionPipeline, DdimScheduler, etc.)
-    - Render types (Rasterizer, RasterConfig, GaussianModel, etc.)
-    - Trainer types (Trainer, TrainingConfig, OptimizerConfig, etc.)
-- ✅ **Feature flag orchestration** (EXCEEDS PLAN)
-  - Pass-through features to sub-crates
-  - GPU backends: `cuda`, `metal`
-  - Performance: `simd`, `parallel`, `flash_attention`, `mixed_precision`
-  - Debug: `gpu_debug`
-  - Convenience bundles: `full_performance`, `all_features`
-- ✅ **Extensive documentation** (EXCEEDS PLAN)
-  - 310 lines of rustdoc (70% of lib.rs is documentation!)
-  - Quick Start guide with minimal example
-  - Data Flow diagram (ASCII art pipeline)
-  - Feature Flags reference table
-  - Version Compatibility matrix
-  - GPU Requirements table
-  - Module Responsibilities overview
-  - Migration guide from Python GAF/PyTorch
-  - API comparison table
-- ✅ **Utility functions**
-  - `version()` function returning crate version
+### Core responsibilities (docs/design/IMPLEMENTATION_PLAN.md)
+- [x] Re-export the unified public API:
+  `pub use oxigaf_flame as flame`, `oxigaf_diffusion as diffusion`,
+  `oxigaf_render as render`, `oxigaf_trainer as trainer`
+- [x] Single entry point for the ecosystem — all four sub-crates reachable
+  via `oxigaf::*`, plus a `prelude` module for the common types
 
-### Examples (EXCEEDS PLAN)
-- ✅ **basic_flame.rs** — FLAME model loading and normal map rendering
-- ✅ **gaussian_render.rs** — GPU rasterization example
-- ✅ **training_loop.rs** — Full training pipeline example
-- ✅ **diffusion_inference.rs** — Multi-view diffusion inference
-- ✅ **end_to_end_pipeline.rs** — Full pipeline demo using PipelineBuilder API
-- ✅ **custom_loss.rs** — Custom Charbonnier loss alongside built-in trainer losses
-- ✅ **checkpoint_lifecycle.rs** — Checkpoint save/load with state restoration
+### Unified error handling
+- [x] `OxigafError` enum wrapping all four sub-crate errors via `#[from]`
+- [x] `Result<T>` alias, plus `FlameResult` / `DiffusionResult` /
+  `RenderResult` / `CliResult` (all currently identical aliases for
+  `Result<T, OxigafError>`, kept distinct for call-site readability)
+- [x] `ErrorContext` trait (`with_ctx` / `with_ctx_fn`) wrapping an error with
+  a context message via `OxigafError::Context`
+- [x] `wgpu::RequestAdapterError` converts into `OxigafError::GpuError`;
+  device-creation failures stay on the `OxigafError::Render` route instead
+  (see the doc comment on `OxigafError::GpuError`)
 
-### Testing
-- ✅ **33 unit tests** (all passing)
-  - `test_version()` — Version string validation
-  - `test_error_conversion_flame()` — FlameError → OxigafError
-  - `test_error_conversion_diffusion()` — DiffusionError → OxigafError
-  - `test_error_conversion_render()` — RenderError → OxigafError
-  - `test_error_conversion_trainer()` — TrainerError → OxigafError
-  - `test_prelude_exports()` — Verify all prelude types accessible
-  - `test_result_type_alias()` — Result<T> type alias works
-  - `test_with_ctx_ok_passthrough()` — with_ctx passes Ok unchanged
-  - `test_with_ctx_err_wraps()` — with_ctx wraps Err in Context
-  - `test_context_display_contains_context_string()` — Display includes context
-  - `test_with_ctx_fn_not_called_on_ok()` — closure not called on Ok
-  - `test_with_ctx_fn_called_on_err()` — closure called on Err
-  - `test_flame_result_alias()` — FlameResult<T> type alias works
-  - `test_diffusion_result_alias()` — DiffusionResult<T> type alias works
-  - `test_render_result_alias()` — RenderResult<T> type alias works
-  - `test_cli_result_alias()` — CliResult<T> type alias works
-  - `test_nested_context_display_contains_both_messages()` — nested context
-  - `test_pipeline_builder_creates_pipeline()` — PipelineBuilder::new() returns a valid pipeline
-  - `test_pipeline_stage_ordering()` — stages execute in the correct order
-  - `test_pipeline_error_propagation()` — errors from stages propagate correctly
-  - `test_pipeline_config_default()` — default config has expected values
-  - `test_pipeline_with_custom_config()` — custom config applied correctly
-  - `test_pipeline_checkpoint_save_load()` — checkpoint save/load roundtrip
-  - `test_pipeline_metrics_tracking()` — metrics are tracked per stage
-  - `test_pipeline_stage_skip()` — disabled stages are properly skipped
-  - `test_pipeline_callbacks()` — callbacks invoked at correct lifecycle points
-  - `test_pipeline_cancel_safe()` — cancellation leaves state consistent
-  - `test_pipeline_dry_run()` — dry-run mode doesn't mutate state
-  - `test_pipeline_multi_stage()` — multi-stage pipeline completes end-to-end
-  - `test_pipeline_empty_stages()` — pipeline with no stages succeeds
-  - `test_pipeline_stage_timeout()` — slow stages respect timeout config
-  - `test_pipeline_result_accumulation()` — results accumulate correctly
-  - `test_pipeline_parallel_stages()` — independent stages can run in parallel
-- ✅ **Error conversion testing**
-  - All 4 sub-crate errors properly convert
-  - Pattern matching works correctly
+### Pipeline module (`src/pipeline.rs`)
+- [x] `PipelineBuilder` / `PipelineConfig` — fluent builder with validation
+  (`flame_model_path`, `output_dir`, `num_views`, `iterations`)
+- [x] `export` and `render_from_file` are now real implementations (0.1.2).
+  Through 0.1.1 both were no-op stubs — `export`'s own doc comment called it
+  "a thin validation wrapper" that only checked `model_path.exists()`
+  (`let _ = (output_path.as_ref(), format); Ok(())`), and `render_from_file`
+  did the equivalent. Now:
+  - `export` loads a `.ply`/`.safetensors` Gaussian model and writes PLY
+    (`GaussianModel::save_ply`), Wavefront OBJ (new point-cloud writer), or
+    glTF 2.0 (`oxigaf_render::gltf::write_gltf`)
+  - `render_from_file` loads the model, auto-frames a camera from its
+    bounding box, rasterizes with `Rasterizer`, and saves the image
+- [x] `verify_assets` checks the exact `.npy` file set
+  `oxigaf_flame::io::load_flame_model` reads, via the shared
+  `oxigaf_flame::io::REQUIRED_NPY_FILES` constant. Previously it checked a
+  separately hand-maintained list with wrong names
+  (`shape_dirs.npy`/`J_regressor.npy` instead of the loader's
+  `shapedirs.npy`/`j_regressor.npy`) and omitted `lbs_weights.npy` entirely,
+  so a directory missing the skinning weights was reported as complete.
+- [x] `quick_train` — validates a `PipelineConfig` and resolves the output
+  directory. Does **not** itself invoke `oxigaf_trainer::Trainer`.
+- [x] `check_gpu` — synchronous wgpu adapter enumeration (`Vec<GpuInfo>`)
+- [x] `detect_best_backend` — compile-time target-OS backend guess
+  (`"Metal"` / `"Vulkan"` / `"Dx12"` / `"Gl"`)
+- [x] `export`, `render_from_file`, and `quick_train` each take two
+  independent generic path parameters (`P: AsRef<Path>`, `Q: AsRef<Path>`)
+  instead of forcing both path arguments to the same concrete type
 
-### Code Quality
-- ✅ **No unwrap policy** (`#![deny(clippy::unwrap_used)]`)
-- ✅ **Single file design** (lib.rs only, ~590 lines)
-- ✅ **Total: ~1,420 lines of code** (including examples)
-  - lib.rs: ~590 lines (ErrorContext trait + Context variant + type aliases + 10 new tests added)
-  - pipeline.rs: ~200 lines (PipelineBuilder + convenience functions + validation utilities)
-  - 4 examples: ~600 lines + 3 new pipeline examples
-- ✅ **Comprehensive rustdoc**
-  - Every public item documented
-  - Usage examples
-  - Links to sub-crate types
-- ✅ **Clean API surface**
-  - Only exports necessary types
-  - Prelude for common use cases
-  - Module-level organization
+### Feature flag orchestration
+- [x] Pass-through features to sub-crates: `simd`, `parallel`,
+  `flash_attention`, `mixed_precision`, `npz`, `gpu_debug`
+- [x] Convenience bundles: `full_performance`, `all_features`
+- [x] `tests/feature_forwarding_tests.rs` asserts that `parallel`,
+  `flash_attention`, `mixed_precision`, `npz`, and the `oxigaf-diffusion`
+  half of `gpu_debug` actually reach the sub-crate they name, in both the on
+  and off configuration (`simd` and the `oxigaf-render` half of `gpu_debug`
+  are unasserted — neither exposes a marker observable without nightly Rust
+  or a live GPU adapter)
 
-## 🚧 In Progress
+### Documentation
+- [x] Crate-level rustdoc: Quick Start, data-flow diagram, feature-flag
+  tables, version-compatibility matrix, GPU requirements, module
+  responsibilities, migration-from-Python table
+- [x] README.md documents the real `pipeline` module API (`export`,
+  `render_from_file`, `quick_train`, `verify_assets`, `check_gpu`), including
+  the 0.1.2 stub-to-real change
+- [ ] Mirror README's pipeline-API section into lib.rs's crate-level
+  rustdoc — its "Key Features" list still names only FLAME / diffusion /
+  rasterizer / training pipeline and never mentions the `pipeline` module,
+  `export`, or `render_from_file`
 
-Currently none - implementation is remarkably complete!
+### Examples — 7, all compiling against the current API
+(`cargo check -p oxigaf --examples --all-features`)
+- [x] `basic_flame.rs` — FLAME model loading and normal map rendering
+- [x] `gaussian_render.rs` — GPU rasterization
+- [x] `training_loop.rs` — full training pipeline
+- [x] `diffusion_inference.rs` — multi-view diffusion inference
+- [x] `end_to_end_pipeline.rs` — `PipelineBuilder` and the pipeline
+  convenience functions, end to end
+- [x] `custom_loss.rs` — custom Charbonnier loss alongside the built-in
+  trainer losses
+- [x] `checkpoint_lifecycle.rs` — checkpoint save/load with state restoration
 
-## 📋 Planned (potential enhancements)
+### Testing — 67 tests, all passing
+(`cargo nextest run -p oxigaf --all-features`)
+- [x] `src/lib.rs` unit tests (21) — error conversion, prelude re-exports,
+  `ErrorContext`, result aliases, the `RequestAdapterError -> GpuError`
+  conversion
+- [x] `src/pipeline.rs` unit tests (22) — `verify_assets`, `export`
+  (PLY/OBJ/glTF, including regression tests for the former stub behaviour),
+  `render_from_file` (including a malformed-model regression test), camera
+  framing, backend detection, and the mixed-path-type regression test
+- [x] `tests/api_tests.rs` (16) — black-box pipeline API tests
+- [x] `tests/feature_forwarding_tests.rs` (8) — feature-flag forwarding
 
-### Additional Examples
-- ✅ **end_to_end_pipeline.rs** — Full pipeline demo using PipelineBuilder API
-- ✅ **custom_loss.rs** — Custom Charbonnier loss alongside built-in trainer losses
-- ⬜ **multi_gpu.rs** — Multi-GPU training example (when supported)
-- ✅ **checkpoint_lifecycle.rs** — Full checkpoint save/restore lifecycle demo
+### Code quality
+- [x] `#![deny(clippy::unwrap_used)]`
+- [x] No `todo!()` / `unimplemented!()` remaining in `src/`
 
-### Documentation Enhancements
-- ⬜ **Architecture diagram**
-  - Add visual diagram of module dependencies
-  - Component interaction flowchart
-- ⬜ **Performance tuning guide**
-  - Feature flag combinations for different scenarios
-  - Hardware-specific recommendations
-  - Benchmarking results
-- ⬜ **Tutorial series**
-  - Step-by-step guides for common tasks
-  - Progressive complexity
-  - Best practices
-- ⬜ **FAQ section**
-  - Common issues and solutions
-  - Troubleshooting guide
-  - Migration tips
+## In Progress
 
-### Integration Helpers
-- ✅ **Builder patterns** — `PipelineBuilder` + convenience/validation in `pipeline.rs`
-- ✅ **Convenience functions** — `quick_train`, `render_from_file`, `export` in `pipeline.rs`
-- ✅ **Validation utilities** — `validate_config`, `check_gpu`, `verify_assets` in `pipeline.rs`
+None currently.
 
-### Feature Flag Improvements
-- ⬜ **Platform-specific defaults**
-  - Auto-detect GPU backend (Vulkan/Metal/DX12)
-  - Optimal feature selection per platform
-- ⬜ **Profiling features**
-  - `profile` feature for performance analysis
-  - Timing instrumentation
-  - Memory tracking
+## Planned (potential enhancements)
 
-## 💡 Future Enhancements
+### Additional examples
+- [ ] `multi_gpu.rs` — multi-GPU training example, once `oxigaf-trainer`
+  supports multi-GPU
 
-### Advanced API
-- ⬜ **Async API**
-  - Async versions of blocking operations
-  - Tokio integration
-  - Stream-based processing
-- ⬜ **Plugin system**
-  - Extensibility for custom components
-  - Third-party integrations
-  - Dynamic loading
-- ⬜ **Serialization format**
-  - Unified format for entire pipeline state
-  - Cross-language compatibility
-  - Versioned format
+### Documentation enhancements
+- [ ] Architecture / module-dependency diagram
+- [ ] Performance-tuning guide (feature-flag combinations, hardware-specific
+  recommendations, benchmark results)
+- [ ] FAQ / troubleshooting section
 
-### Developer Experience
-- ⬜ **Type aliases for common patterns**
-  - Reduce boilerplate
-  - Clearer code
-- ⬜ **Derive macros**
-  - Custom derive for common traits
-  - Reduce repetitive code
-- ✅ **Error context helpers** — `lib.rs`
-  - `ErrorContext<T>` trait with `with_ctx` / `with_ctx_fn`
-  - `OxigafError::Context { context, source }` variant for rich wrapping
-  - `OxigafError::NotInitialized` variant
-  - Type aliases: `FlameResult<T>`, `DiffusionResult<T>`, `RenderResult<T>`, `CliResult<T>`
-  - 10 new tests (total: 33 passing)
+### Feature flag improvements
+- [ ] Feed `detect_best_backend`'s guess into actual backend selection —
+  today it only reports a compile-time guess and nothing reads it back
+- [ ] `profile` feature for timing/memory instrumentation
 
-### Integration
-- ⬜ **FFI bindings**
-  - C API for foreign language integration
-  - Python bindings (PyO3)
-  - JavaScript/WASM bindings
-- ⬜ **REST API wrapper**
-  - HTTP server for remote inference
-  - WebSocket for streaming
-  - gRPC for high-performance
+## Future Enhancements
 
-## 📊 Current Status
+- [ ] Async versions of the pipeline convenience functions (Tokio
+  integration) — today `check_gpu` and `render_from_file` block
+  synchronously on wgpu's async APIs internally via `pollster::block_on`
+- [ ] FFI / Python (PyO3) / WASM bindings — none of the sub-crates expose
+  these today
+- [ ] REST/gRPC server wrapper for remote inference
 
-### Implementation: 100% complete (for v1.0 scope)
-- ✅ Re-exports: 100%
-- ✅ Unified error handling: 100%
-- ✅ Prelude: 100%
-- ✅ Feature flags: 100%
-- ✅ Documentation: 100%
-- ✅ Examples: 100%
-- ✅ Tests: 100%
+## Current Status
 
-### Tests: 33 tests (all passing)
-- ✅ Unit tests: 33
-- ✅ Error conversion coverage: 100%
-- ✅ Prelude export verification: ✅
-- ✅ ErrorContext trait: 10 new tests (with_ctx, with_ctx_fn, nested context, type aliases)
-- ⬜ Integration tests: 0 (examples serve this purpose)
+- Re-exports, unified error handling, prelude, and feature-flag
+  orchestration are complete for the crate's scope as a facade over
+  `oxigaf-flame` / `oxigaf-diffusion` / `oxigaf-render` / `oxigaf-trainer`.
+- `pipeline` module: `export` and `render_from_file` became real end-to-end
+  implementations in 0.1.2 (previously no-op stubs — see Completed above).
+  `quick_train` remains config validation only by design; it does not invoke
+  `oxigaf_trainer::Trainer` itself.
+- 67/67 tests passing (`cargo nextest run -p oxigaf --all-features`), 7/7
+  examples compiling against the current API
+  (`cargo check -p oxigaf --examples --all-features`), zero
+  `todo!()`/`unimplemented!()` in `src/`.
+- No known regressions in this crate as of 0.1.2.
 
-### Documentation: Excellent
-- ✅ Comprehensive rustdoc (310 lines!)
-- ✅ Quick Start guide
-- ✅ Data Flow diagram
-- ✅ Feature Flags table
-- ✅ Version Compatibility matrix
-- ✅ Migration guide from Python
-- ✅ 4 working examples
-- ✅ All public items documented
+## Notes
 
-### Examples: 4 examples
-- ✅ basic_flame.rs
-- ✅ gaussian_render.rs
-- ✅ training_loop.rs
-- ✅ diffusion_inference.rs
-
-## 📈 Comparison: Implementation vs Plan
-
-| Feature | Plan | Current | Notes |
-|---------|------|---------|-------|
-| Re-export sub-crates | ✅ | ✅ | Fully implemented |
-| Unified public API | ✅ | ✅ | Clean module structure |
-| Unified error handling | ⬜ Not in plan | ✅ | **EXCEEDS PLAN** - OxigafError enum |
-| Prelude module | ⬜ Not in plan | ✅ | **EXCEEDS PLAN** - 40+ re-exports |
-| Feature flags | ⬜ Not in plan | ✅ | **EXCEEDS PLAN** - Pass-through orchestration |
-| Documentation | ✅ Basic | ✅ | **EXCEEDS PLAN** - 310 lines of rustdoc |
-| Examples | ⬜ Not in plan | ✅ | **EXCEEDS PLAN** - 4 comprehensive examples |
-| Tests | ⬜ Not in plan | ✅ | **EXCEEDS PLAN** - 7 tests for error handling |
-
-## 🎯 Priority for v1.0
-
-The meta crate is **COMPLETE** for v1.0!
-
-All planned functionality is implemented, and the implementation significantly exceeds the original plan with:
-1. Unified error handling
-2. Comprehensive prelude
-3. Feature flag orchestration
-4. Extensive documentation
-5. Working examples
-
-**No critical tasks remaining.**
-
-**Optional enhancements for future versions:**
-1. ⬜ Additional examples (end-to-end, multi-GPU)
-2. ⬜ Builder patterns for complex workflows
-3. ⬜ Async API
-4. ⬜ FFI bindings
-
-## 🏆 Implementation Highlights
-
-**Where current implementation EXCEEDS the plan:**
-
-1. **Unified Error Handling** (NOT IN PLAN)
-   - OxigafError enum wraps all sub-crate errors
-   - Automatic error conversion
-   - Result<T> type alias
-   - Seamless error propagation
-   - Makes cross-crate error handling trivial
-
-2. **Comprehensive Prelude** (NOT IN PLAN)
-   - 40+ re-exported types
-   - Single import for quick access
-   - Organized by module
-   - Eliminates boilerplate
-   - Makes API discovery easy
-
-3. **Feature Flag Orchestration** (NOT IN PLAN)
-   - Pass-through to all sub-crates
-   - Convenience bundles (full_performance, all_features)
-   - Platform-specific options (cuda, metal)
-   - Performance toggles (simd, parallel, flash_attention)
-   - Debug options (gpu_debug)
-
-4. **Extensive Documentation** (EXCEEDS PLAN)
-   - 310 lines of rustdoc (70% of lib.rs!)
-   - Quick Start with working example
-   - Data Flow ASCII diagram
-   - Feature Flags reference table
-   - Version Compatibility matrix
-   - GPU Requirements
-   - Module Responsibilities
-   - Migration guide from Python GAF
-   - API comparison table
-
-5. **Working Examples** (NOT IN PLAN)
-   - 4 examples demonstrating all major features
-   - Progressive complexity
-   - Well-documented
-   - Runnable out of the box (with assets)
-
-6. **Testing** (NOT IN PLAN)
-   - 7 unit tests covering all error conversions
-   - Prelude export verification
-   - Result type alias testing
-   - 100% test pass rate
-
-7. **Code Quality** (EXCEEDS EXPECTATIONS)
-   - No unwrap policy enforced
-   - Single-file design (445 lines)
-   - 70% documentation density
-   - Clean API surface
-   - Excellent organization
-
-**Current implementation is PRODUCTION-READY:**
-- Serves as excellent entry point to OxiGAF ecosystem
-- Well-documented for new users
-- Clean API for library consumers
-- Comprehensive examples for learning
-- Robust error handling
-
-**Sets the standard for:**
-- Meta-crate design in Rust
-- Documentation quality
-- Error handling patterns
-- Prelude organization
-
-## 🚀 Immediate Next Steps
-
-For v1.0: **NONE** - The meta crate is complete!
-
-For future versions:
-1. **End-to-end example** (~1-2 days)
-   - Full pipeline demonstration
-   - Video → avatar → export
-   - Best practices showcase
-
-2. **PipelineBuilder** (~2-3 days)
-   - High-level builder API
-   - Sensible defaults
-   - Progressive customization
-   - Error-proof configuration
-
-3. **Async API** (~1 week)
-   - Async versions of blocking operations
-   - Tokio integration
-   - Stream-based processing
-   - Better integration with async ecosystem
-
-4. **Python bindings** (~2 weeks)
-   - PyO3 integration
-   - Python-friendly API
-   - Type hints
-   - Comprehensive Python docs
-
-**Estimated time to v2.0 enhancements: 3-4 weeks**
-
-But for v1.0, the meta crate is **COMPLETE AND EXCELLENT**!
-
-## 📝 Notes
-
-- **Design philosophy**: Minimal but complete
-- **Single file**: Intentional for simplicity
-- **Documentation density**: 70% (exceptional)
-- **Error handling**: Exemplary pattern for Rust
-- **Prelude design**: Well-organized, not overwhelming
-- **Examples**: Progressive complexity, well-documented
-- **MSRV**: Rust 1.75+ (nalgebra requirement)
-- **Pure Rust**: 100% (meta crate has no direct C/C++ dependencies)
-
-## 🎨 Architecture Quality
-
-The oxigaf meta crate is **exceptionally well-designed**:
-
-1. **Simplicity**: Single file, easy to understand
-2. **Completeness**: Everything needed, nothing extra
-3. **Documentation**: Sets the bar for Rust documentation
-4. **Error handling**: Exemplary unified error pattern
-5. **Prelude**: Makes API accessible without being overwhelming
-6. **Examples**: Progressive learning path
-7. **Testing**: Comprehensive for its scope
-8. **Organization**: Clean module boundaries
-9. **Extensibility**: Easy to add new sub-crates
-10. **User experience**: Excellent first impression
-
-The meta crate serves as an **excellent reference** for:
-- How to design a meta crate in Rust
-- Documentation best practices
-- Error handling patterns across crates
-- Prelude organization
-- Example quality and organization
-
-**Overall assessment: EXEMPLARY**
-
-The oxigaf meta crate demonstrates that a meta crate can be more than just re-exports—it can provide significant value through unified error handling, comprehensive documentation, and thoughtful API design.
-
-## 📊 Statistics
-
-- **Total lines**: 1,073 (including examples)
-- **lib.rs**: 445 lines
-  - Code: ~135 lines
-  - Rustdoc: ~310 lines (70%!)
-- **Examples**: ~600 lines across 4 files
-- **Tests**: 33 (100% passing)
-- **Re-exported types**: 40+ in prelude
-- **Sub-crates integrated**: 4
-- **Feature flags**: 9
-- **Documentation sections**: 10+
-- **Error types unified**: 4
-
-**Documentation quality: 10/10**
-**API design: 10/10**
-**Code quality: 10/10**
-**User experience: 10/10**
-
-This meta crate is a **model implementation** that other projects should study and emulate.
+- MSRV: Rust 1.87 (workspace floor — `usize::is_multiple_of`, stabilized in
+  1.87, is used in `oxigaf-bridge` and in `oxigaf-render`'s
+  gradient-verification tests; `clippy::incompatible_msrv` flags several
+  other 1.87 APIs used across `oxigaf-flame`).
+- `oxigaf` itself has no direct C/C++/Fortran dependency; see README.md's
+  "What 'pure Rust' means here" for the workspace-wide caveat about the
+  offline FLAME/PyTorch conversion scripts.
+- One-person project — contributions welcome via issues/PRs.

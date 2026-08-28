@@ -430,10 +430,16 @@ fn estimate_chunk_bytes(n_gaussians: usize, sh_channels: usize) -> usize {
 ///
 /// Each Gaussian is assigned to exactly one cell based on its position.
 /// `chunk_divisions` must have all components > 0 and `n` must be > 0.
+///
+/// `sh_channels` is the **total** number of SH floats per Gaussian (not a
+/// per-channel coefficient count — e.g. SH degree 2 is `9 * 3 = 27`, not
+/// `9`), used only for each chunk's `memory_bytes` estimate; see
+/// `estimate_chunk_bytes`.
 pub fn ss_chunk_scene(
     positions: &[f32],
     n: usize,
     chunk_divisions: [u32; 3],
+    sh_channels: usize,
 ) -> Result<Vec<StreamingChunk>, StreamingError> {
     if n == 0 {
         return Err(StreamingError::EmptyScene);
@@ -497,7 +503,7 @@ pub fn ss_chunk_scene(
                     ChunkGridDims { nx, ny, nz },
                 );
                 let id = ss_chunk_id(ix, iy, iz, nx, ny);
-                let mem = estimate_chunk_bytes(n_g, 9); // default sh_channels=9
+                let mem = estimate_chunk_bytes(n_g, sh_channels);
                 chunks.push(StreamingChunk {
                     id,
                     bounds_min: cmin,
@@ -596,16 +602,27 @@ pub fn ss_sort_chunks_by_priority(chunks: &mut [StreamingChunk], frustum: &ViewF
 // LOD selection
 // ---------------------------------------------------------------------------
 
-/// Select the LOD level for a Gaussian cluster at a given distance.
+/// Select the LOD level for a Gaussian cluster at a given distance, then
+/// escalate (coarsen) it further when the cluster holds a disproportionate
+/// share of the scene's Gaussians — a chunk that dominates the Gaussian
+/// count costs more to render/keep resident at a given LOD than a sparse
+/// one, so density (not just distance) should drive detail; otherwise a
+/// chunk with 10 Gaussians and one with 100k get identical LOD at the same
+/// distance and the Gaussian budget can never influence detail.
 ///
-/// Returns 0 (full), 1 (halved), or 2 (quartered) based on `lod_distances`.
+/// Returns 0 (full), 1 (halved), or 2 (quartered): the *coarser* of the
+/// `lod_distances`-based tier and a density-based tier computed from
+/// `n_gaussians / max_gaussians` (the cluster's share of `max_gaussians`,
+/// typically the scene total). `max_gaussians == 0` disables the density
+/// term (nothing to compute a share against), leaving distance in sole
+/// control.
 pub fn ss_select_lod(
     distance: f32,
-    _max_gaussians: usize,
-    _n_gaussians: usize,
+    max_gaussians: usize,
+    n_gaussians: usize,
     lod_distances: &[f32; 3],
 ) -> u8 {
-    if distance <= lod_distances[0] {
+    let distance_lod = if distance <= lod_distances[0] {
         0
     } else if distance <= lod_distances[2] {
         // Between threshold 0 and threshold 2
@@ -616,7 +633,22 @@ pub fn ss_select_lod(
         }
     } else {
         2
-    }
+    };
+
+    let density_lod = if max_gaussians == 0 {
+        0
+    } else {
+        let share = n_gaussians as f32 / max_gaussians as f32;
+        if share > 0.5 {
+            2
+        } else if share > 0.2 {
+            1
+        } else {
+            0
+        }
+    };
+
+    distance_lod.max(density_lod)
 }
 
 /// Deterministically subsample Gaussian indices according to LOD level.
@@ -648,7 +680,8 @@ pub struct ChunkCache {
     pub capacity_bytes: usize,
     /// Currently used memory in bytes.
     pub used_bytes: usize,
-    /// Entries: `(chunk_id, last_access_step, bytes)`.
+    /// Entries: `(chunk_id, last_access_step)`. Byte sizes are tracked
+    /// internally (see `entry_bytes`), parallel by index to this `Vec`.
     pub chunks: Vec<(u64, usize)>,
     /// Monotonically increasing logical clock.
     pub access_step: usize,
@@ -706,6 +739,13 @@ impl ChunkCache {
     }
 
     /// Insert a chunk into the cache, evicting LRU entries until it fits.
+    ///
+    /// If `chunk_id` is already resident, this refreshes its LRU position
+    /// (and corrects `used_bytes` if `bytes` differs) instead of appending a
+    /// duplicate entry — re-inserting an already-resident chunk (e.g.
+    /// `StreamingScene::mark_loaded` called twice for the same chunk) must
+    /// not inflate `used_bytes` or trigger spurious evictions of unrelated
+    /// chunks.
     pub fn insert(&mut self, chunk_id: u64, bytes: usize) -> Result<(), StreamingError> {
         if bytes > self.capacity_bytes {
             return Err(StreamingError::MemoryBudgetExceeded {
@@ -713,6 +753,16 @@ impl ChunkCache {
                 budget: self.capacity_bytes,
             });
         }
+
+        // Drop any existing entry for this chunk first, so the logic below
+        // always inserts fresh — this both refreshes the LRU position and
+        // keeps `used_bytes` correct if the size changed.
+        if let Some(pos) = self.chunks.iter().position(|(id, _)| *id == chunk_id) {
+            self.chunks.remove(pos);
+            let old_bytes = self.entry_bytes.remove(pos);
+            self.used_bytes = self.used_bytes.saturating_sub(old_bytes);
+        }
+
         // Evict until space is available
         while !self.can_fit(bytes) {
             if self.evict_lru().is_none() {
@@ -809,11 +859,7 @@ impl StreamingScene {
                 expected: n * 3,
             });
         }
-        let mut chunks = ss_chunk_scene(positions, n, config.chunk_divisions)?;
-        // Correct memory estimates using actual sh_channels
-        for chunk in &mut chunks {
-            chunk.memory_bytes = estimate_chunk_bytes(chunk.n_gaussians, sh_channels);
-        }
+        let chunks = ss_chunk_scene(positions, n, config.chunk_divisions, sh_channels)?;
         let cache = ChunkCache::new(config.memory_budget_bytes);
         Ok(Self {
             chunks,
@@ -1046,14 +1092,14 @@ mod tests {
             10.0,
             5.0, // near > far → error
         );
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            StreamingError::InvalidFrustum { near, far } => {
-                assert_eq!(near, 10.0);
-                assert_eq!(far, 5.0);
-            }
-            e => panic!("wrong error: {e}"),
-        }
+        let err = result.unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                StreamingError::InvalidFrustum { near, far } if *near == 10.0 && *far == 5.0
+            ),
+            "wrong error: {err}"
+        );
     }
 
     #[test]
@@ -1241,7 +1287,7 @@ mod tests {
     #[test]
     fn test_chunk_scene_2x2x2() {
         let positions = make_positions_8();
-        let chunks = ss_chunk_scene(&positions, 8, [2, 2, 2]).expect("chunk failed");
+        let chunks = ss_chunk_scene(&positions, 8, [2, 2, 2], 9).expect("chunk failed");
         // Should produce 8 chunks (2×2×2), each with 1 Gaussian
         assert_eq!(chunks.len(), 8);
         let total: usize = chunks.iter().map(|c| c.n_gaussians).sum();
@@ -1251,7 +1297,7 @@ mod tests {
     #[test]
     fn test_chunk_scene_all_assigned() {
         let positions = make_positions_8();
-        let chunks = ss_chunk_scene(&positions, 8, [2, 2, 2]).expect("chunk failed");
+        let chunks = ss_chunk_scene(&positions, 8, [2, 2, 2], 9).expect("chunk failed");
         let mut all_indices: Vec<usize> = chunks
             .iter()
             .flat_map(|c| c.gaussian_indices.iter().copied())
@@ -1262,15 +1308,31 @@ mod tests {
 
     #[test]
     fn test_chunk_scene_empty_error() {
-        let err = ss_chunk_scene(&[], 0, [2, 2, 2]);
+        let err = ss_chunk_scene(&[], 0, [2, 2, 2], 9);
         assert!(matches!(err, Err(StreamingError::EmptyScene)));
     }
 
     #[test]
     fn test_chunk_scene_zero_division_error() {
         let positions = make_positions_8();
-        let err = ss_chunk_scene(&positions, 8, [0, 2, 2]);
+        let err = ss_chunk_scene(&positions, 8, [0, 2, 2], 9);
         assert!(matches!(err, Err(StreamingError::InvalidChunkSize { .. })));
+    }
+
+    #[test]
+    fn test_chunk_scene_memory_bytes_uses_given_sh_channels() {
+        // Regression test: memory_bytes must reflect the caller-provided
+        // sh_channels (total per-Gaussian SH floats), not a hardcoded 9 —
+        // e.g. SH degree 2 needs 9 basis functions * 3 color channels = 27
+        // floats per Gaussian, not 9.
+        let positions = make_positions_8();
+        let sh_channels = 27;
+        let chunks = ss_chunk_scene(&positions, 8, [2, 2, 2], sh_channels).expect("chunk failed");
+        for chunk in chunks.iter().filter(|c| c.n_gaussians > 0) {
+            let floats_per_gaussian = 3 + 4 + 3 + 1 + sh_channels;
+            let expected = chunk.n_gaussians * floats_per_gaussian * std::mem::size_of::<f32>();
+            assert_eq!(chunk.memory_bytes, expected);
+        }
     }
 
     // ---- ss_chunk_id ----
@@ -1506,6 +1568,44 @@ mod tests {
         cache.insert(1, 256).expect("insert failed");
         assert_eq!(cache.used_bytes, 256);
         assert_eq!(cache.chunks.len(), 1);
+    }
+
+    #[test]
+    fn test_cache_insert_same_chunk_twice_does_not_duplicate() {
+        // Regression test: re-inserting an already-resident chunk (as
+        // `StreamingScene::mark_loaded` does whenever called twice for the
+        // same chunk) must not append a duplicate entry or inflate
+        // `used_bytes`.
+        let mut cache = ChunkCache::new(1024);
+        cache.insert(1, 256).expect("first insert");
+        cache.insert(1, 256).expect("second insert of same chunk");
+        assert_eq!(cache.chunks.len(), 1, "must not duplicate the entry");
+        assert_eq!(cache.used_bytes, 256, "used_bytes must not double-count");
+    }
+
+    #[test]
+    fn test_cache_insert_same_chunk_refreshes_lru_position() {
+        // Re-inserting an already-resident chunk should refresh its LRU
+        // position, protecting it from being the next eviction victim.
+        let mut cache = ChunkCache::new(512);
+        cache.insert(1, 200).expect("insert 1");
+        cache.insert(2, 200).expect("insert 2");
+        cache
+            .insert(1, 200)
+            .expect("re-insert 1, refreshing its LRU position");
+        // Chunk 2 is now the least-recently-touched; inserting a third
+        // chunk that forces an eviction should evict 2, not 1.
+        cache
+            .insert(3, 200)
+            .expect("insert 3, should evict chunk 2");
+        assert!(
+            cache.chunks.iter().any(|(id, _)| *id == 1),
+            "chunk 1 should survive (recently re-inserted)"
+        );
+        assert!(
+            cache.chunks.iter().all(|(id, _)| *id != 2),
+            "chunk 2 should be evicted (least recently touched)"
+        );
     }
 
     #[test]
@@ -1823,7 +1923,7 @@ mod tests {
             positions.push(((i / 8) % 8) as f32);
             positions.push((i / 64) as f32);
         }
-        let chunks = ss_chunk_scene(&positions, 64, [4, 4, 4]).expect("chunk failed");
+        let chunks = ss_chunk_scene(&positions, 64, [4, 4, 4], 9).expect("chunk failed");
         let total: usize = chunks.iter().map(|c| c.n_gaussians).sum();
         assert_eq!(total, 64);
     }
@@ -1837,10 +1937,47 @@ mod tests {
 
     #[test]
     fn test_select_lod_exact_threshold() {
-        // Exactly at threshold 0 → LOD 0
+        // Exactly at threshold 0 → LOD 0. Uses a low Gaussian share
+        // (50/10_000) so density-based escalation never kicks in here —
+        // this test is purely about the distance boundary.
         let thresholds = [10.0f32, 30.0, 60.0];
-        assert_eq!(ss_select_lod(10.0, 100, 50, &thresholds), 0);
+        assert_eq!(ss_select_lod(10.0, 10_000, 50, &thresholds), 0);
         // Exactly at threshold 2 → LOD 2
-        assert_eq!(ss_select_lod(60.0, 100, 50, &thresholds), 2);
+        assert_eq!(ss_select_lod(60.0, 10_000, 50, &thresholds), 2);
+    }
+
+    #[test]
+    fn test_select_lod_dominant_chunk_escalates_to_coarsest() {
+        // Regression test: before this fix, `max_gaussians`/`n_gaussians`
+        // were ignored entirely, so a chunk holding almost the whole scene
+        // and a nearly-empty chunk got identical LOD at identical distance.
+        let thresholds = [50.0f32, 100.0, 200.0]; // distance alone would give LOD 0 here
+        let distance = 10.0;
+        let total = 100_010;
+        assert_eq!(
+            ss_select_lod(distance, total, 10, &thresholds),
+            0,
+            "a sparse chunk stays at full detail"
+        );
+        assert_eq!(
+            ss_select_lod(distance, total, 100_000, &thresholds),
+            2,
+            "a chunk holding ~all the scene's Gaussians is forced to the coarsest LOD"
+        );
+    }
+
+    #[test]
+    fn test_select_lod_moderately_dense_chunk_escalates_one_level() {
+        // share = 30/100 = 0.3, between the 0.2 and 0.5 density tiers.
+        let thresholds = [50.0f32, 100.0, 200.0];
+        assert_eq!(ss_select_lod(10.0, 100, 30, &thresholds), 1);
+    }
+
+    #[test]
+    fn test_select_lod_zero_max_gaussians_uses_distance_only() {
+        // max_gaussians == 0 has no meaningful "share" to compute; distance
+        // alone must decide, and must not panic (divide by zero).
+        let thresholds = [50.0f32, 100.0, 200.0];
+        assert_eq!(ss_select_lod(10.0, 0, 5, &thresholds), 0);
     }
 }

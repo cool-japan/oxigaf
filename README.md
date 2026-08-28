@@ -4,7 +4,59 @@
 
 Implements the methods from [GAF: Gaussian Avatar Reconstruction from Monocular Videos via Multi-View Diffusion](https://arxiv.org/abs/2412.10209) entirely in the Rust ecosystem.
 
-## What's in v0.1.1
+## What's in v0.1.2
+
+### Gradient-Correctness Fixes (read before upgrading)
+- **Backward rasterizer shaders fixed**: `rasterize_bwd.wgsl` could accumulate
+  a tile's gradient onto the wrong Gaussian (a WGSL workgroup-uniformity bug
+  around `workgroupBarrier()`), and `preprocess_bwd.wgsl` omitted the position
+  gradient through view-dependent spherical-harmonics color for every
+  `sh_degree >= 1` model. Both affected *every* training run on 0.1.1 —
+  retraining is the only remedy. See `CHANGELOG.md`'s `[0.1.2]` migration
+  notes for the full detail.
+- **`Trainer::compute_gradients` no longer hardcodes an L2 photometric
+  loss** — `LossConfig`'s `w_l1`/`w_ssim`/`w_ms_ssim` weights previously only
+  affected the *logged* loss, never what the optimizer actually descended.
+  Position/scale/opacity regularization losses and SDS (score-distillation)
+  training likewise went from logged-only to actually producing gradients.
+
+### New Capabilities (v0.1.2)
+- **Pure-Rust PyTorch checkpoint ingest**: `oxigaf-bridge` now parses `.pt`/
+  `.pkl` checkpoints directly (`convert_pytorch_checkpoint`,
+  `convert_flame_model`) — no Python, no PyTorch, no `torch.load` needed, and
+  the old `scripts/convert_*.py` fallbacks are deprecated in its favor.
+- **Spec-conformant glTF 2.0 export**: a new `oxigaf_render::gltf` module
+  consolidates what were three independently-written, mutually-incompatible
+  glTF writers in the workspace into one that actually satisfies the spec
+  (per-accessor buffer views, mandatory `min`/`max`).
+- **Gaussian pruning, LR schedules, gradient clipping as config**:
+  `oxigaf-trainer` gained `pruning::GaussianPruner`, a 6-variant
+  `LrScheduleConfig`, and a `GradientClipConfig` — all genuinely wired into
+  `Trainer::train_step` via `TrainingConfig`, not just standalone APIs.
+- **A real meta-learning avatar model**: `meta_learning_avatar::
+  GaussianAvatarModel` is the first `MetaModel` implementation over an
+  actual Gaussian avatar (the prior `LinearModel` was a disconnected toy).
+- **GPU-side pass profiling**: `oxigaf_render::profiler::GpuTimestampProfiler`
+  (backed by `wgpu::Features::TIMESTAMP_QUERY`), alongside device-limit
+  validation so an under-provisioned GPU fails fast with a clear error
+  instead of an opaque pipeline-validation panic.
+
+### Also Fixed
+- PLY files with `sh_degree >= 1` written before this release load with
+  permuted higher-order SH coefficients (`f_rest_*` property order is now
+  channel-major, matching the reference 3DGS Python convention) — re-export
+  any you care about.
+- macOS: the default asset cache directory moved to `~/Library/Caches/oxigaf`
+  (`setup`/`doctor`/`cache` previously disagreed on where it lived).
+- `oxigaf::pipeline::export`/`render_from_file` were previously no-op stubs
+  despite their own doc comments describing real behavior — now genuinely
+  load, convert, render, and save.
+- Remaining C dependencies removed from `oxigaf-cli`'s HTTP stack (OpenSSL,
+  then `ring`) in favor of a pure-Rust `ureq`/`rustls`/RustCrypto stack.
+
+See `CHANGELOG.md` for the complete, verified list (breaking signature
+changes, deprecated APIs, and everything above with exact type/function
+names).
 
 ### 512×512 Multi-View Generation (v0.1.0)
 - **Latent Upsampler**: 32×32 → 64×64 latent upsampling for 512×512 output resolution
@@ -39,8 +91,8 @@ Implements the methods from [GAF: Gaussian Avatar Reconstruction from Monocular 
 
 ### Quality & Performance
 - **100% Pure Rust**: Zero C/Fortran dependencies (COOLJAPAN compliant)
-- **12537 Tests Passing**: Comprehensive validation across all crates
-- **Production Ready**: Zero unwrap(), all files <2000 lines, feature-gated dependencies
+- **Comprehensive test suite**: validation across all crates — see `CHANGELOG.md` / CI for current counts (a specific number here would only go stale)
+- **Production Ready**: Zero unwrap(), feature-gated dependencies, `splitrs`-based file-size policy (target: under 2000 lines per file)
 
 ## Workspace Structure
 
@@ -50,7 +102,7 @@ Implements the methods from [GAF: Gaussian Avatar Reconstruction from Monocular 
 | `oxigaf-diffusion` | lib | Multi-view diffusion with IP-Adapter, upsampling, and CFG (candle) |
 | `oxigaf-render` | lib | Differentiable 3D Gaussian Splatting rasterizer with CPU reference (wgpu) |
 | `oxigaf-trainer` | lib | Optimization pipeline with gradient verification and FLAME binding backward |
-| `oxigaf-bridge` | lib | PyTorch ↔ OxiGAF weight conversion and layer mapping utilities |
+| `oxigaf-bridge` | lib | PyTorch ↔ OxiGAF weight conversion and layer mapping utilities. Standalone library — add it as a dependency in your own project; it is not currently wired into the `oxigaf` CLI binary (the CLI's `convert` subcommand only handles FLAME `.pkl`/`.npz`). |
 | `oxigaf` | lib | Meta crate — unified re-export of all sub-crates |
 | `oxigaf-cli` | bin | CLI binary (`oxigaf` command) |
 
@@ -78,66 +130,77 @@ OxiGAF supports various feature flags for platform-specific optimizations:
 | `simd` | SIMD optimizations for FLAME model (requires nightly Rust) |
 | `parallel` | Parallel processing with rayon |
 | `flash_attention` | Memory-efficient attention mechanism |
-| `mixed_precision` | FP16/BF16 inference (placeholder) |
+| `mixed_precision` | FP16/BF16 inference |
 | `gpu_debug` | GPU validation layers and debug markers |
 
-### Platform-Specific Features
+### GPU / BLAS Backends
 
-| Feature | Platforms | Requirements |
-|---------|-----------|--------------|
-| `cuda` | Linux, Windows | NVIDIA GPU + CUDA Toolkit (nvcc, nvidia-smi) |
-| `metal` | macOS | Apple Silicon or Intel Mac with Metal |
-| `accelerate` | macOS | Apple Accelerate framework (enabled by default) |
+OxiGAF does not define its own `cuda` / `metal` / `accelerate` feature flags —
+no crate in this workspace declares them. GPU/BLAS acceleration for the
+`candle`-based crates (`oxigaf-diffusion`, `oxigaf-trainer`) is configured by
+depending on the `oxicandle-core` fork directly with its own features, e.g. in
+a downstream `Cargo.toml`:
+
+```toml
+candle-core = { package = "oxicandle-core", version = "0.11.0", features = ["metal"] }      # macOS GPU
+candle-core = { package = "oxicandle-core", version = "0.11.0", features = ["accelerate"] } # macOS BLAS
+candle-core = { package = "oxicandle-core", version = "0.11.0", features = ["cuda"] }        # NVIDIA GPU
+```
+
+The 3D Gaussian Splatting rasterizer (`oxigaf-render`) always uses `wgpu`,
+which auto-selects Metal / Vulkan / DirectX / GL at runtime — no feature flag
+needed there.
 
 ### Building Documentation
 
-**Important:** Do NOT use `--all-features` on macOS as it will attempt to enable CUDA support which requires Linux/Windows.
-
 ```bash
-# macOS (Metal supported, CUDA not available)
 cargo doc --no-deps --features "simd,parallel,flash_attention,mixed_precision,gpu_debug"
 
-# Linux with NVIDIA GPU
-cargo doc --no-deps --features "cuda,simd,parallel,flash_attention,mixed_precision,gpu_debug"
-
-# Linux without GPU (CPU only)
-cargo doc --no-deps --features "simd,parallel,flash_attention,mixed_precision"
-
-# Enforce warnings as errors (for CI)
-RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --features "simd,parallel,flash_attention"
+# Enforce warnings as errors
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --features "simd,parallel,flash_attention,mixed_precision,gpu_debug"
 ```
 
 ### Building with Features
 
 ```bash
-# macOS optimized build
-cargo build --release --features "metal,simd,parallel,flash_attention"
-
-# Linux with CUDA
-cargo build --release --features "cuda,simd,parallel,flash_attention"
-
 # CPU-only build (all platforms)
 cargo build --release --features "simd,parallel,flash_attention"
 ```
+
+See "GPU / BLAS Backends" above to additionally enable `oxicandle-core`'s
+`metal` / `accelerate` / `cuda` features for `oxigaf-diffusion`/`oxigaf-trainer`.
 
 ## FLAME Model Setup
 
 OxiGAF supports both legacy NPY and modern Safetensors formats for FLAME models.
 
-### Option 1: Safetensors (Recommended, v0.1.1)
+### Option 1: Safetensors (Recommended)
 
-Safetensors format is supported for runtime loading/saving. PyTorch conversion script coming soon.
+Safetensors format is supported for runtime loading/saving. The PyTorch
+conversion step is pure-Rust as of v0.1.2 (previously Python-only).
 
 1. Download the FLAME 2023 model from <https://flame.is.tue.mpg.de/>
-2. Convert using PyTorch and save as safetensors (script in development)
+2. Convert the PyTorch checkpoint to safetensors — pure Rust, no Python,
+   PyTorch, or `torch.load` needed (partitions into `unet`/`vae`/`clip`/
+   `other`; `--precision fp16` matches the old Python script's behaviour,
+   which always forced FP16 — omit it to keep each tensor's original dtype):
+   ```bash
+   cargo run -p oxigaf-bridge --example convert_pytorch -- \
+     --checkpoint path/to/checkpoint.pt --output-dir output_dir/ --precision fp16
+   ```
+   A Python fallback is still available if you prefer it:
+   `python scripts/convert_weights.py path/to/checkpoint.pt output_dir/`
 
 ### Option 2: NPY (Legacy)
 
 1. Download the FLAME 2023 model from <https://flame.is.tue.mpg.de/>
-2. Convert to `.npy` format:
+2. Convert to `.npy` format — pure Rust:
    ```bash
-   python scripts/convert_flame.py path/to/FLAME2023.pkl output_dir/
+   cargo run -p oxigaf-bridge --example convert_flame_pkl -- \
+     --model path/to/FLAME2023.pkl --output-dir output_dir/
    ```
+   A Python fallback is still available if you prefer it:
+   `python scripts/convert_flame.py path/to/FLAME2023.pkl output_dir/`
 
 ## Usage Examples
 
@@ -197,7 +260,11 @@ let model = load_flame_model_safetensors(Path::new("flame_model.safetensors"))?;
 save_flame_model_safetensors(&model, Path::new("output.safetensors"))?;
 ```
 
-### PyTorch Weight Conversion (v0.1.1)
+### PyTorch Weight Conversion
+
+`oxigaf-bridge` is a standalone library crate — add `oxigaf-bridge` to your
+own `Cargo.toml` to use it (`cargo add oxigaf-bridge`); it is not exposed
+through the `oxigaf` CLI binary.
 
 ```rust
 use oxigaf_bridge::LayerMapping;
@@ -213,7 +280,8 @@ mapping.add_custom_mapping(
 
 // Convert PyTorch layer names to OxiGAF format
 let oxigaf_name = mapping.pytorch_to_oxigaf("unet.down_blocks.0.conv.weight")?;
-// Result: "down_blocks_0_conv_weight"
+// Result: "down_blocks.0.conv.weight" (dot-separated — VarBuilder-loadable;
+// see crates/oxigaf-bridge/README.md for the 0.1.2 naming migration note)
 ```
 
 ## Documentation

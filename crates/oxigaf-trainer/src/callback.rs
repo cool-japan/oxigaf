@@ -358,9 +358,8 @@ pub struct LossLoggerCallback {
 impl LossLoggerCallback {
     /// Create a new logger that records every `log_every` steps.
     ///
-    /// Panics (via config error) if `log_every == 0`; callers should validate
-    /// before calling, but the constructor itself does not return a `Result` per
-    /// spec — it just uses a sensible fallback of 1 if zero is passed.
+    /// A `log_every` of 0 is clamped to 1. This never panics and never
+    /// returns an error.
     pub fn new(log_every: usize) -> Self {
         Self {
             log_every: log_every.max(1),
@@ -482,8 +481,10 @@ pub struct LrSchedulerCallback {
     /// Pre-computed LR table, one entry per training step.
     schedule: Vec<f64>,
     total_steps: usize,
-    #[allow(dead_code)]
+    /// Peak LR the schedule was built around; read back via [`Self::base_lr`].
     base_lr: f64,
+    /// Floor the cosine decays to; also the fallback of [`Self::lr_at`] when
+    /// the schedule is empty.
     min_lr: f64,
 }
 
@@ -544,6 +545,40 @@ impl LrSchedulerCallback {
         // SAFETY-equivalent: we know idx < schedule.len() because we filled
         // exactly total_steps entries and idx <= total_steps - 1.
         self.schedule.get(idx).copied().unwrap_or(self.min_lr)
+    }
+
+    /// The peak learning rate this schedule was built around.
+    ///
+    /// The schedule itself is pre-computed and private, so `base_lr` is the
+    /// only way for a caller to recover the *requested* peak — needed to log
+    /// or plot the current LR as a fraction of it (`lr_at(step) / base_lr`),
+    /// to rebuild an equivalent schedule for a longer run, or to assert in a
+    /// test that warmup actually reaches the rate that was asked for. Without
+    /// it, the value passed to [`Self::warmup_cosine`] is unrecoverable from
+    /// the callback.
+    ///
+    /// ```
+    /// use oxigaf_trainer::callback::LrSchedulerCallback;
+    ///
+    /// let cb = LrSchedulerCallback::warmup_cosine(100, 1e-3, 1e-6, 1000);
+    /// assert!((cb.base_lr() - 1e-3).abs() < 1e-12);
+    /// // Warmup ends exactly at the peak.
+    /// assert!((cb.lr_at(100) - cb.base_lr()).abs() < 1e-12);
+    /// ```
+    #[must_use]
+    pub fn base_lr(&self) -> f64 {
+        self.base_lr
+    }
+
+    /// The floor the cosine schedule decays toward.
+    ///
+    /// Reported alongside [`Self::base_lr`] so a caller can describe the full
+    /// `[min_lr, base_lr]` range the schedule spans; it is also what
+    /// [`Self::lr_at`] returns when no schedule was built
+    /// (`total_steps == 0`).
+    #[must_use]
+    pub fn min_lr(&self) -> f64 {
+        self.min_lr
     }
 }
 
@@ -670,13 +705,25 @@ impl MetricsHistoryCallback {
     /// Format all recorded metrics as a CSV string (header + one row per step).
     ///
     /// Columns: `step,loss,psnr,ssim,lr`
+    ///
+    /// `steps`, `losses`, `psnrs`, `ssims`, and `lrs` are all public `Vec`
+    /// fields, so nothing prevents external code from desynchronizing their
+    /// lengths (truncating one series, pushing to only one, etc). Rather
+    /// than indexing (which would panic on a mismatch), this zips all five
+    /// iterators together: a row is emitted only while every series still
+    /// has an entry, so a shorter series simply truncates the CSV instead of
+    /// causing an out-of-bounds panic.
     pub fn as_csv(&self) -> String {
         let mut out = String::from("step,loss,psnr,ssim,lr\n");
-        for i in 0..self.steps.len() {
-            out.push_str(&format!(
-                "{},{},{},{},{}\n",
-                self.steps[i], self.losses[i], self.psnrs[i], self.ssims[i], self.lrs[i],
-            ));
+        let rows = self
+            .steps
+            .iter()
+            .zip(self.losses.iter())
+            .zip(self.psnrs.iter())
+            .zip(self.ssims.iter())
+            .zip(self.lrs.iter());
+        for ((((step, loss), psnr), ssim), lr) in rows {
+            out.push_str(&format!("{step},{loss},{psnr},{ssim},{lr}\n"));
         }
         out
     }
@@ -1017,6 +1064,53 @@ mod tests {
         );
     }
 
+    // ── 17b. LrSchedulerCallback exposes its schedule bounds ─────────────────
+    //
+    // Regression: `base_lr` was stored by `warmup_cosine` and then read by
+    // nobody, suppressed with `#[allow(dead_code)]`. The pre-computed
+    // `schedule` is private, so without an accessor the peak LR a caller
+    // asked for was unrecoverable from the callback. Both bounds are now
+    // public read-back, and the peak must agree with the schedule itself.
+    #[test]
+    fn test_lr_scheduler_reports_schedule_bounds() {
+        let warmup_steps = 100;
+        let base_lr = 1e-3;
+        let min_lr = 1e-6;
+        let cb = LrSchedulerCallback::warmup_cosine(warmup_steps, base_lr, min_lr, 1000);
+
+        assert!(
+            (cb.base_lr() - base_lr).abs() < 1e-12,
+            "base_lr() should report the requested peak {base_lr}, got {}",
+            cb.base_lr()
+        );
+        assert!(
+            (cb.min_lr() - min_lr).abs() < 1e-12,
+            "min_lr() should report the requested floor {min_lr}, got {}",
+            cb.min_lr()
+        );
+        // The accessor must agree with the table it was built from: the first
+        // cosine step (t = 0) sits exactly at the peak.
+        assert!(
+            (cb.lr_at(warmup_steps) - cb.base_lr()).abs() < 1e-12,
+            "end of warmup should equal base_lr()"
+        );
+        assert!(
+            cb.min_lr() < cb.base_lr(),
+            "floor must sit below the peak for a decaying schedule"
+        );
+    }
+
+    // ── 17c. Empty schedule falls back to the reported floor ─────────────────
+    #[test]
+    fn test_lr_scheduler_empty_schedule_uses_min_lr() {
+        let cb = LrSchedulerCallback::warmup_cosine(0, 1e-3, 1e-6, 0);
+        // No table was built, so every step reports the documented fallback —
+        // and `min_lr()` names exactly that value.
+        assert!((cb.lr_at(0) - cb.min_lr()).abs() < 1e-12);
+        assert!((cb.lr_at(9_999) - cb.min_lr()).abs() < 1e-12);
+        assert!((cb.base_lr() - 1e-3).abs() < 1e-12);
+    }
+
     // ── 18. CheckpointCallback records paths ─────────────────────────────────
 
     #[test]
@@ -1073,6 +1167,24 @@ mod tests {
         let lines: Vec<&str> = csv.lines().collect();
         // Header + 2 data rows = 3 lines.
         assert_eq!(lines.len(), 3, "Expected 3 CSV lines, got {}", lines.len());
+    }
+
+    // ── 21b. MetricsHistoryCallback::as_csv tolerates desynchronized public
+    // Vec fields instead of panicking (regression: previously indexed
+    // `self.losses[i]` etc. driven off `self.steps.len()`) ───────────────────
+
+    #[test]
+    fn test_metrics_history_as_csv_desynced_vecs_truncates_instead_of_panicking() {
+        let mut cb = MetricsHistoryCallback::new();
+        cb.on_step_end(&make_ctx(0, 0.5)).unwrap_or_default();
+        cb.on_step_end(&make_ctx(1, 0.4)).unwrap_or_default();
+        cb.on_step_end(&make_ctx(2, 0.3)).unwrap_or_default();
+        // Externally desynchronize: steps has 3 entries but losses has only 1.
+        cb.losses.truncate(1);
+        let csv = cb.as_csv(); // must not panic
+        let lines: Vec<&str> = csv.lines().collect();
+        // Header + 1 data row (zip stops at the shortest series).
+        assert_eq!(lines.len(), 2, "Expected header + 1 row, got: {csv}");
     }
 
     // ── 22. CallbackChain::stats ─────────────────────────────────────────────

@@ -15,6 +15,8 @@
 //! println!("{}", format_eval_metrics(&metrics));
 //! ```
 
+use std::path::{Path, PathBuf};
+
 use thiserror::Error;
 
 // ---------------------------------------------------------------------------
@@ -91,14 +93,23 @@ pub struct EvalMetrics {
 pub struct EvalConfig {
     /// Evaluate every N training steps.
     pub eval_interval: usize,
-    /// Number of views to evaluate per evaluation call.
+    /// Number of views to evaluate per evaluation call. `evaluate` uses at
+    /// most this many of the views it's handed, in the order given, so a
+    /// caller can pass a large held-out set and let this field cap the
+    /// per-call cost (`0` evaluates zero views).
     pub n_eval_views: usize,
     /// Image width in pixels.
     pub image_width: usize,
     /// Image height in pixels.
     pub image_height: usize,
-    /// Whether rendered images should be saved (handled externally).
+    /// Whether rendered images should be saved as PNGs into
+    /// `render_output_dir` during `evaluate`.
     pub save_renders: bool,
+    /// Directory predicted/ground-truth PNGs are written into when
+    /// `save_renders` is `true`. If `save_renders` is `true` but this is
+    /// `None`, `evaluate` logs a `tracing::warn!` and skips saving (rather
+    /// than silently doing nothing with no signal either way).
+    pub render_output_dir: Option<PathBuf>,
     /// Patch size for the LPIPS approximation.
     pub lpips_patch_size: usize,
 }
@@ -111,6 +122,7 @@ impl Default for EvalConfig {
             image_width: 512,
             image_height: 512,
             save_renders: false,
+            render_output_dir: None,
             lpips_patch_size: 16,
         }
     }
@@ -181,9 +193,20 @@ impl ViewSynthesisEvaluator {
             )));
         }
 
+        // Honour `n_eval_views`: evaluate at most this many of the views
+        // given, in order (previously accepted but never read — `evaluate`
+        // always processed every view it was handed regardless).
+        let n_views = self.config.n_eval_views.min(predicted.len());
+        let predicted = &predicted[..n_views];
+        let ground_truth = &ground_truth[..n_views];
+
         let w = self.config.image_width;
         let h = self.config.image_height;
         let patch = self.config.lpips_patch_size;
+
+        if self.config.save_renders {
+            self.write_render_pngs(step, predicted, w, h)?;
+        }
 
         let mut per_view = Vec::with_capacity(predicted.len());
         for (view_id, (pred, gt)) in predicted.iter().zip(ground_truth.iter()).enumerate() {
@@ -207,6 +230,42 @@ impl ViewSynthesisEvaluator {
         self.eval_history.push(record);
 
         Ok(metrics)
+    }
+
+    /// Write each of `predicted`'s views as a PNG into
+    /// `config.render_output_dir`, named `step{step:08}_view{idx:04}.png`.
+    ///
+    /// Previously `save_renders` was accepted but never actually wrote
+    /// anything ("handled externally"). Logs a `tracing::warn!` and
+    /// returns `Ok(())` without writing anything if `render_output_dir` is
+    /// `None` — `save_renders: true` with no configured destination is a
+    /// config gap the caller should notice, not a silent no-op or a hard
+    /// evaluation failure.
+    fn write_render_pngs(
+        &self,
+        step: usize,
+        predicted: &[Vec<f32>],
+        width: usize,
+        height: usize,
+    ) -> Result<(), EvalError> {
+        let Some(dir) = self.config.render_output_dir.as_ref() else {
+            tracing::warn!(
+                "EvalConfig::save_renders is true but render_output_dir is None \
+                 — skipping render save"
+            );
+            return Ok(());
+        };
+        std::fs::create_dir_all(dir).map_err(|e| {
+            EvalError::InvalidParam(format!(
+                "failed to create render_output_dir '{}': {e}",
+                dir.display()
+            ))
+        })?;
+        for (view_id, pred) in predicted.iter().enumerate() {
+            let path = dir.join(format!("step{step:08}_view{view_id:04}.png"));
+            save_render_png(pred, width, height, &path)?;
+        }
+        Ok(())
     }
 
     /// Return the record with the highest mean PSNR so far.
@@ -259,6 +318,36 @@ impl ViewSynthesisEvaluator {
 #[inline(always)]
 fn pixel_idx(row: usize, col: usize, width: usize, channel: usize) -> usize {
     (row * width + col) * 3 + channel
+}
+
+/// Encode a flat `H×W×3`, `[0,1]`-range RGB buffer as a PNG and write it to
+/// `path`, creating/overwriting the file.
+fn save_render_png(
+    data: &[f32],
+    width: usize,
+    height: usize,
+    path: &Path,
+) -> Result<(), EvalError> {
+    let expected = width * height * 3;
+    if data.len() != expected {
+        return Err(EvalError::SizeMismatch {
+            pred_w: width,
+            pred_h: height,
+            gt_w: data.len() / 3,
+            gt_h: 1,
+        });
+    }
+    let pixels: Vec<u8> = data
+        .iter()
+        .map(|&v| (v.clamp(0.0, 1.0) * 255.0).round() as u8)
+        .collect();
+    let img = image::RgbImage::from_raw(width as u32, height as u32, pixels).ok_or_else(|| {
+        EvalError::InvalidParam("failed to build image buffer from pixel data".into())
+    })?;
+    img.save(path).map_err(|e| {
+        EvalError::InvalidParam(format!("failed to save render '{}': {e}", path.display()))
+    })?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -329,10 +418,21 @@ pub fn eval_psnr(predicted: &[f32], ground_truth: &[f32]) -> Result<f32, EvalErr
     Ok(10.0 * (1.0_f32 / mse).log10())
 }
 
-/// Simplified SSIM (Structural Similarity Index) using an 11×11 sliding window.
+/// SSIM (Structural Similarity Index), delegating to the exact SSIM the
+/// trainer optimises against ([`crate::loss::ssim_loss`]: an 11×11 Gaussian
+/// window, σ=1.5, replicate-padded so every pixel gets full coverage).
 ///
-/// Uses Wang et al. (2004) constants adapted for `[0, 1]` pixel range:
-/// `C1 = 0.0001`, `C2 = 0.0009`. Strides by 4 pixels for efficiency.
+/// This fixes two prior defects in a standalone box-window implementation
+/// that lived here:
+/// - It hardcoded a constant `0.0` (the worst possible SSIM) for any image
+///   smaller than the window, regardless of how similar the images
+///   actually were, because no 11×11 box window could fit at all.
+///   Replicate padding means every pixel always has a well-defined window
+///   here, with no small-image special case needed.
+/// - It used a *different* window (an unweighted box, strided by 4 pixels)
+///   than [`crate::loss::ssim_loss`]'s Gaussian window, so this evaluation
+///   metric could silently disagree with the training objective it's
+///   supposed to be measuring.
 pub fn eval_ssim(
     predicted: &[f32],
     ground_truth: &[f32],
@@ -362,69 +462,9 @@ pub fn eval_ssim(
         ));
     }
 
-    // Constants for images in [0, 1].
-    const C1: f32 = 0.0001; // (0.01)^2
-    const C2: f32 = 0.0009; // (0.03)^2
-    const WIN: usize = 11;
-    const HALF: usize = WIN / 2;
-    const STRIDE: usize = 4;
-
-    let mut total_ssim = 0.0_f32;
-    let mut n_windows = 0_usize;
-
-    for ch in 0..3_usize {
-        let mut row = HALF;
-        while row + HALF < height {
-            let mut col = HALF;
-            while col + HALF < width {
-                // Collect window pixels.
-                let mut sum_x = 0.0_f32;
-                let mut sum_y = 0.0_f32;
-                let mut sum_xx = 0.0_f32;
-                let mut sum_yy = 0.0_f32;
-                let mut sum_xy = 0.0_f32;
-                let n = (WIN * WIN) as f32;
-
-                for wr in 0..WIN {
-                    let r = row + wr - HALF;
-                    for wc in 0..WIN {
-                        let c = col + wc - HALF;
-                        let x = predicted[pixel_idx(r, c, width, ch)];
-                        let y = ground_truth[pixel_idx(r, c, width, ch)];
-                        sum_x += x;
-                        sum_y += y;
-                        sum_xx += x * x;
-                        sum_yy += y * y;
-                        sum_xy += x * y;
-                    }
-                }
-
-                let mu_x = sum_x / n;
-                let mu_y = sum_y / n;
-                let sigma_x2 = (sum_xx / n) - mu_x * mu_x;
-                let sigma_y2 = (sum_yy / n) - mu_y * mu_y;
-                let sigma_xy = (sum_xy / n) - mu_x * mu_y;
-
-                // Wang et al. SSIM formula.
-                let numerator = (2.0 * mu_x * mu_y + C1) * (2.0 * sigma_xy + C2);
-                let denominator = (mu_x * mu_x + mu_y * mu_y + C1) * (sigma_x2 + sigma_y2 + C2);
-
-                total_ssim += numerator / denominator;
-                n_windows += 1;
-
-                col += STRIDE;
-            }
-            row += STRIDE;
-        }
-    }
-
-    if n_windows == 0 {
-        // Image too small for the 11×11 window — return 1.0 for identical, else compare directly.
-        let mse = eval_mse(predicted, ground_truth)?;
-        return Ok(if mse < 1e-10 { 1.0 } else { 0.0 });
-    }
-
-    Ok(total_ssim / n_windows as f32)
+    let kernel = crate::loss::gaussian_kernel_1d(11, 1.5);
+    let dissimilarity = crate::loss::ssim_loss(predicted, ground_truth, width, height, &kernel);
+    Ok(1.0 - dissimilarity)
 }
 
 /// Compute Sobel gradient magnitude for a single-channel H×W image.
@@ -464,18 +504,68 @@ fn extract_channel(image: &[f32], width: usize, height: usize, ch: usize) -> Vec
     out
 }
 
+/// Mean of per-patch mean absolute differences between two same-length
+/// gradient-magnitude maps, tiling `width × height` into non-overlapping
+/// `patch_size × patch_size` blocks (boundary blocks are smaller, not
+/// dropped). Every patch counts equally regardless of its pixel count. When
+/// every patch happens to be the same size (`patch_size` evenly divides
+/// both `width` and `height`) this is arithmetically identical to a flat
+/// per-pixel mean; it differs only when boundary patches are smaller,
+/// weighting their (typically sparser) pixels more heavily per-pixel than
+/// a full interior patch. `patch_size == 0` is treated as `1` (per-pixel
+/// patches, always equivalent to a flat mean).
+fn patch_mean_abs_diff(
+    a: &[f32],
+    b: &[f32],
+    width: usize,
+    height: usize,
+    patch_size: usize,
+) -> f32 {
+    let patch_size = patch_size.max(1);
+    let mut patch_means = Vec::new();
+    let mut py = 0;
+    while py < height {
+        let y_end = (py + patch_size).min(height);
+        let mut px = 0;
+        while px < width {
+            let x_end = (px + patch_size).min(width);
+            let mut sum = 0.0_f32;
+            let mut count = 0usize;
+            for y in py..y_end {
+                for x in px..x_end {
+                    let idx = y * width + x;
+                    sum += (a[idx] - b[idx]).abs();
+                    count += 1;
+                }
+            }
+            if count > 0 {
+                patch_means.push(sum / count as f32);
+            }
+            px += patch_size;
+        }
+        py += patch_size;
+    }
+    if patch_means.is_empty() {
+        0.0
+    } else {
+        patch_means.iter().sum::<f32>() / patch_means.len() as f32
+    }
+}
+
 /// Simplified LPIPS approximation using per-channel Sobel gradient magnitudes.
 ///
-/// `lpips_approx = mean(|grad_mag_pred - grad_mag_gt|)` averaged over all channels.
-/// The `patch_size` parameter is accepted for API compatibility but not used in the
-/// current gradient-based implementation (gradient computation naturally captures
-/// multi-scale spatial structure).
+/// For each channel, computes `|grad_mag_pred - grad_mag_gt|` per pixel and
+/// aggregates it via `patch_mean_abs_diff` with `patch_size × patch_size`
+/// tiles (previously `patch_size` was accepted but silently ignored,
+/// always using a flat per-pixel mean instead — every patch now counts
+/// equally, which matters when error is spatially uneven or the image
+/// doesn't tile evenly), then averages across channels.
 pub fn eval_lpips_approx(
     predicted: &[f32],
     ground_truth: &[f32],
     width: usize,
     height: usize,
-    _patch_size: usize,
+    patch_size: usize,
 ) -> Result<f32, EvalError> {
     let expected = width * height * 3;
     if predicted.len() != expected || ground_truth.len() != expected {
@@ -492,7 +582,6 @@ pub fn eval_lpips_approx(
         ));
     }
 
-    let n_pixels = width * height;
     let mut total = 0.0_f32;
 
     for ch in 0..3_usize {
@@ -502,13 +591,7 @@ pub fn eval_lpips_approx(
         let pred_mag = sobel_magnitude(&pred_ch, width, height);
         let gt_mag = sobel_magnitude(&gt_ch, width, height);
 
-        let channel_sum: f32 = pred_mag
-            .iter()
-            .zip(gt_mag.iter())
-            .map(|(pm, gm)| (pm - gm).abs())
-            .sum();
-
-        total += channel_sum / n_pixels as f32;
+        total += patch_mean_abs_diff(&pred_mag, &gt_mag, width, height, patch_size);
     }
 
     Ok(total / 3.0)
@@ -927,12 +1010,15 @@ mod tests {
 
     #[test]
     fn eval_ssim_small_image_still_works() {
-        // 4×4 image — smaller than the 11×11 window, falls back to MSE-based result.
+        // 4×4 image — smaller than an 11×11 window, but replicate-padded
+        // convolution (see eval_ssim's doc) gives every pixel full coverage
+        // regardless of image size, so no small-image special case is
+        // needed — this used to hit a hardcoded-0.0 fallback instead.
         let w = 4;
         let h = 4;
         let a = make_image(w, h, 0.5);
         let ssim = eval_ssim(&a, &a, w, h).unwrap();
-        // Identical images → MSE=0 → returns 1.0
+        // Identical images → SSIM=1 exactly, at any size.
         assert!(
             (ssim - 1.0).abs() < 1e-5,
             "small identical → SSIM=1, got {}",
@@ -948,6 +1034,41 @@ mod tests {
         let b = make_gradient_image(w, h);
         let ssim = eval_ssim(&a, &b, w, h).unwrap();
         assert!((ssim - 1.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn eval_ssim_small_nearly_identical_images_not_hardcoded_zero() {
+        // Regression: two nearly-identical small thumbnails used to report
+        // SSIM = 0.0 (the worst possible score) purely because no 11×11 box
+        // window fit — regardless of how similar the images actually were.
+        let w = 8;
+        let h = 8;
+        let a = make_image(w, h, 0.5);
+        let b: Vec<f32> = a.iter().map(|&v| v + 0.001).collect();
+        let ssim = eval_ssim(&a, &b, w, h).unwrap();
+        assert!(
+            ssim > 0.9,
+            "nearly-identical 8x8 images should score near 1.0, got {ssim}"
+        );
+    }
+
+    #[test]
+    fn eval_ssim_matches_training_time_ssim_loss() {
+        // Regression: this module's SSIM used to diverge from
+        // `loss::ssim_loss` (the one actually optimised during training) —
+        // different window shape and stride entirely. They must now agree
+        // exactly, since `eval_ssim` delegates to it directly.
+        let w = 32;
+        let h = 32;
+        let a = make_gradient_image(w, h);
+        let b: Vec<f32> = a.iter().map(|&v| (v * 1.3).min(1.0)).collect();
+        let ssim = eval_ssim(&a, &b, w, h).unwrap();
+        let kernel = crate::loss::gaussian_kernel_1d(11, 1.5);
+        let dissimilarity = crate::loss::ssim_loss(&a, &b, w, h, &kernel);
+        assert!(
+            (ssim - (1.0 - dissimilarity)).abs() < 1e-6,
+            "eval_ssim ({ssim}) must equal 1.0 - loss::ssim_loss ({dissimilarity})"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -1001,6 +1122,83 @@ mod tests {
             eval_lpips_approx(&a, &b, 32, 32, 16),
             Err(EvalError::SizeMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn patch_mean_abs_diff_weights_boundary_patches_equally() {
+        // Regression: `lpips_patch_size` used to be accepted but silently
+        // ignored (always a flat per-pixel mean). With patch_size=2 over a
+        // 3x1 row, tiling gives an unequal-sized final patch: [0,0] (mean
+        // 0) and [6] (mean 6) -> mean of patch means = 3.0, which differs
+        // from the flat per-pixel mean (0+0+6)/3 = 2.0.
+        let a = [0.0_f32, 0.0, 6.0];
+        let b = [0.0_f32, 0.0, 0.0];
+        let flat = patch_mean_abs_diff(&a, &b, 3, 1, 1);
+        let patched = patch_mean_abs_diff(&a, &b, 3, 1, 2);
+        assert!(
+            (flat - 2.0).abs() < 1e-6,
+            "flat mean should be 2.0, got {flat}"
+        );
+        assert!(
+            (patched - 3.0).abs() < 1e-6,
+            "patch mean should be 3.0, got {patched}"
+        );
+    }
+
+    #[test]
+    fn eval_lpips_approx_matches_manual_patch_aggregation() {
+        // End-to-end: `lpips_patch_size` must actually reach the
+        // aggregation, not just be accepted and discarded. Reproduces
+        // eval_lpips_approx's own pipeline manually (extract channel,
+        // Sobel, patch-aggregate) with a patch_size that does *not* evenly
+        // divide the image (so patch weighting is actually exercised, per
+        // patch_mean_abs_diff's doc) and checks they agree — this would
+        // fail if `patch_size` were silently ignored in favour of a flat
+        // per-pixel mean.
+        let w = 8;
+        let h = 8;
+        let patch_size = 3; // 8 does not divide evenly by 3
+        let pred = make_gradient_image(w, h);
+        let gt = make_image(w, h, 0.5);
+
+        let mut expected = 0.0_f32;
+        for ch in 0..3 {
+            let pred_ch = extract_channel(&pred, w, h, ch);
+            let gt_ch = extract_channel(&gt, w, h, ch);
+            let pred_mag = sobel_magnitude(&pred_ch, w, h);
+            let gt_mag = sobel_magnitude(&gt_ch, w, h);
+            expected += patch_mean_abs_diff(&pred_mag, &gt_mag, w, h, patch_size);
+        }
+        expected /= 3.0;
+
+        let actual = eval_lpips_approx(&pred, &gt, w, h, patch_size).unwrap();
+        assert!(
+            (actual - expected).abs() < 1e-6,
+            "expected {expected}, got {actual}"
+        );
+
+        // And patch_size=1 (equal-sized 1x1 patches) must match the old
+        // flat per-pixel-mean behaviour exactly.
+        let mut flat_expected = 0.0_f32;
+        for ch in 0..3 {
+            let pred_ch = extract_channel(&pred, w, h, ch);
+            let gt_ch = extract_channel(&gt, w, h, ch);
+            let pred_mag = sobel_magnitude(&pred_ch, w, h);
+            let gt_mag = sobel_magnitude(&gt_ch, w, h);
+            let n_pixels = w * h;
+            let channel_sum: f32 = pred_mag
+                .iter()
+                .zip(gt_mag.iter())
+                .map(|(pm, gm)| (pm - gm).abs())
+                .sum();
+            flat_expected += channel_sum / n_pixels as f32;
+        }
+        flat_expected /= 3.0;
+        let actual_flat = eval_lpips_approx(&pred, &gt, w, h, 1).unwrap();
+        assert!(
+            (actual_flat - flat_expected).abs() < 1e-6,
+            "patch_size=1 should equal the flat per-pixel mean"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -1307,6 +1505,69 @@ mod tests {
             ev.evaluate(100, &pred, &gt),
             Err(EvalError::InvalidParam(_))
         ));
+    }
+
+    #[test]
+    fn evaluate_honors_n_eval_views_cap() {
+        // Regression: n_eval_views was accepted but never read — evaluate
+        // always processed every view it was handed, regardless of this
+        // field.
+        let config = EvalConfig {
+            image_width: 16,
+            image_height: 16,
+            n_eval_views: 2,
+            ..EvalConfig::default()
+        };
+        let mut ev = ViewSynthesisEvaluator::new(config);
+        let (pred, gt) = make_eval_views(5, 16, 16); // hand it 5, cap is 2
+        let metrics = ev.evaluate(1000, &pred, &gt).unwrap();
+        assert_eq!(
+            metrics.total_views, 2,
+            "must cap at n_eval_views, not use all 5 given"
+        );
+        assert_eq!(ev.latest_metrics().unwrap().per_view.len(), 2);
+    }
+
+    #[test]
+    fn evaluate_save_renders_writes_png_files() {
+        // Regression: save_renders was accepted but evaluate() never wrote
+        // anything ("handled externally").
+        let dir = std::env::temp_dir().join(format!(
+            "oxigaf_view_synth_eval_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let config = EvalConfig {
+            image_width: 4,
+            image_height: 4,
+            n_eval_views: 2,
+            save_renders: true,
+            render_output_dir: Some(dir.clone()),
+            ..EvalConfig::default()
+        };
+        let mut ev = ViewSynthesisEvaluator::new(config);
+        let (pred, gt) = make_eval_views(2, 4, 4);
+        ev.evaluate(7, &pred, &gt).unwrap();
+
+        assert!(dir.join("step00000007_view0000.png").exists());
+        assert!(dir.join("step00000007_view0001.png").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn evaluate_save_renders_without_dir_warns_and_does_not_error() {
+        let config = EvalConfig {
+            image_width: 16,
+            image_height: 16,
+            save_renders: true,
+            render_output_dir: None,
+            ..EvalConfig::default()
+        };
+        let mut ev = ViewSynthesisEvaluator::new(config);
+        let (pred, gt) = make_eval_views(1, 16, 16);
+        // A missing destination is logged, not fatal.
+        assert!(ev.evaluate(1, &pred, &gt).is_ok());
     }
 
     // ------------------------------------------------------------------

@@ -190,6 +190,31 @@ pub fn clip_by_per_group_norm(
     Ok(original_norms)
 }
 
+/// Scale `gradients` in place by `max_norm / known_norm` if `known_norm > max_norm`.
+///
+/// This is the same scaling `clip_by_global_norm` performs, but takes the
+/// pre-clip global norm as a parameter instead of recomputing it internally.
+/// `GradientClipper::step` already computes `original_norm` once per call
+/// (needed for `ClipStats` and the EMA update regardless of mode), so its
+/// `GlobalNorm`/`Adaptive` arms use this instead of the public
+/// `clip_by_global_norm` to avoid a second full O(n) pass over the gradient
+/// set just to recompute the identical norm.
+///
+/// No validation: callers are expected to have already checked
+/// `max_norm > 0` and non-empty `gradients` (as `GradientClipper::step` does
+/// via `ClipMode::validate` at construction time and its own empty check).
+#[inline]
+fn scale_to_norm(gradients: &mut [Vec<f32>], known_norm: f32, max_norm: f32) {
+    if known_norm > max_norm && known_norm > 0.0 {
+        let scale = max_norm / known_norm;
+        for group in gradients.iter_mut() {
+            for v in group.iter_mut() {
+                *v *= scale;
+            }
+        }
+    }
+}
+
 /// Clamp every gradient element to `[-max_val, max_val]`.
 ///
 /// Returns the number of elements that were clamped (changed value).
@@ -264,6 +289,14 @@ impl ClipStats {
 /// Default EMA factor used for modes other than `Adaptive`.
 const DEFAULT_EMA_FACTOR: f32 = 0.9;
 
+/// Default number of recent global norms [`GradientClipper`] retains.
+///
+/// The history is a *sliding window*, not a full log: a training run is
+/// hundreds of thousands of steps long, so an unbounded `Vec` would grow for
+/// the entire run while only its tail is ever read (see
+/// [`GradientClipper::recent_history`]).
+pub const DEFAULT_NORM_HISTORY_CAPACITY: usize = 1024;
+
 /// Stateful gradient clipper that tracks history and supports adaptive clipping.
 #[derive(Debug)]
 pub struct GradientClipper {
@@ -271,8 +304,11 @@ pub struct GradientClipper {
     pub mode: ClipMode,
     /// Exponential moving average of the global gradient norm.
     ema_norm: f32,
-    /// Full history of observed global norms (one per `step` call).
-    norm_history: Vec<f32>,
+    /// Sliding window of the most recently observed global norms (one entry
+    /// per `step` call), bounded by `history_capacity`.
+    norm_history: VecDeque<f32>,
+    /// Maximum number of entries retained in `norm_history`.
+    history_capacity: usize,
     /// Number of times clipping was actually applied (norm exceeded threshold).
     pub clip_count: usize,
     /// Total number of `step` calls.
@@ -280,15 +316,38 @@ pub struct GradientClipper {
 }
 
 impl GradientClipper {
-    /// Create a new clipper for the given mode.
+    /// Create a new clipper for the given mode, retaining
+    /// [`DEFAULT_NORM_HISTORY_CAPACITY`] recent norms.
     ///
     /// Returns `Err` if the mode parameters are invalid.
     pub fn new(mode: ClipMode) -> Result<Self, ClipError> {
+        Self::with_history_capacity(mode, DEFAULT_NORM_HISTORY_CAPACITY)
+    }
+
+    /// Create a new clipper that retains at most `history_capacity` recent
+    /// global norms.
+    ///
+    /// The window is bounded so a long training run cannot grow the history
+    /// without limit; once it is full, pushing a new norm evicts the oldest.
+    ///
+    /// # Errors
+    /// - `Err` if the mode parameters are invalid.
+    /// - [`ClipError::InvalidThreshold`] if `history_capacity` is zero.
+    pub fn with_history_capacity(
+        mode: ClipMode,
+        history_capacity: usize,
+    ) -> Result<Self, ClipError> {
         mode.validate()?;
+        if history_capacity == 0 {
+            return Err(ClipError::InvalidThreshold(
+                "history_capacity must be >= 1".to_string(),
+            ));
+        }
         Ok(Self {
             mode,
             ema_norm: 0.0,
-            norm_history: Vec::new(),
+            norm_history: VecDeque::with_capacity(history_capacity),
+            history_capacity,
             clip_count: 0,
             step_count: 0,
         })
@@ -309,22 +368,46 @@ impl GradientClipper {
             self.ema_norm = original_norm;
         }
 
-        let (was_clipped, num_elements_clipped) = match self.mode {
+        let (was_clipped, num_elements_clipped, clipped_norm) = match self.mode {
             ClipMode::GlobalNorm { max_norm } => {
-                let before = global_gradient_norm(gradients);
-                clip_by_global_norm(gradients, max_norm)?;
-                let clipped = before > max_norm;
-                (clipped, 0usize)
+                // Use the already-computed `original_norm` directly instead
+                // of calling the public `clip_by_global_norm` (which would
+                // recompute the identical norm internally before deciding
+                // whether to scale).
+                scale_to_norm(gradients, original_norm, max_norm);
+                let clipped = original_norm > max_norm;
+                // Exact by construction: clipping scales the norm down to
+                // exactly `max_norm` when exceeded, otherwise it is
+                // unchanged -- no need to re-scan the (possibly huge)
+                // gradient set to measure it again.
+                let clipped_norm = original_norm.min(max_norm);
+                (clipped, 0usize, clipped_norm)
             }
             ClipMode::PerGroupNorm { max_norm } => {
                 let norms = clip_by_per_group_norm(gradients, max_norm)?;
                 let clipped = norms.iter().any(|&n| n > max_norm);
-                (clipped, 0usize)
+                // Exact by construction: each group's norm is scaled down to
+                // exactly `max_norm` when exceeded; the global norm is the
+                // L2 combination of the (now-capped) per-group norms, which
+                // `clip_by_per_group_norm` already computed and returned --
+                // no need for another full pass over every element.
+                let clipped_norm = norms
+                    .iter()
+                    .map(|&n| {
+                        let capped = n.min(max_norm);
+                        capped * capped
+                    })
+                    .sum::<f32>()
+                    .sqrt();
+                (clipped, 0usize, clipped_norm)
             }
             ClipMode::ValueClip { max_val } => {
                 let n = clip_by_value(gradients, max_val)?;
                 let clipped = n > 0;
-                (clipped, n)
+                // Per-element clamping has no closed-form norm update, so
+                // this is the one mode that must re-measure directly.
+                let clipped_norm = global_gradient_norm(gradients);
+                (clipped, n, clipped_norm)
             }
             ClipMode::Adaptive {
                 ema_factor,
@@ -333,9 +416,14 @@ impl GradientClipper {
                 // Update EMA with this step's norm (before clipping).
                 self.ema_norm = ema_factor * self.ema_norm + (1.0 - ema_factor) * original_norm;
                 let threshold = (self.ema_norm * clip_factor).max(1e-6);
-                clip_by_global_norm(gradients, threshold)?;
+                // Same reasoning as `GlobalNorm` above: `original_norm` was
+                // already measured before this threshold was derived from
+                // it, so reuse it instead of letting `clip_by_global_norm`
+                // recompute the same pre-clip norm a second time.
+                scale_to_norm(gradients, original_norm, threshold);
                 let clipped = original_norm > threshold;
-                (clipped, 0usize)
+                let clipped_norm = original_norm.min(threshold);
+                (clipped, 0usize, clipped_norm)
             }
         };
 
@@ -345,9 +433,10 @@ impl GradientClipper {
                 DEFAULT_EMA_FACTOR * self.ema_norm + (1.0 - DEFAULT_EMA_FACTOR) * original_norm;
         }
 
-        let clipped_norm = global_gradient_norm(gradients);
-
-        self.norm_history.push(original_norm);
+        if self.norm_history.len() == self.history_capacity {
+            self.norm_history.pop_front();
+        }
+        self.norm_history.push_back(original_norm);
         self.step_count += 1;
         if was_clipped {
             self.clip_count += 1;
@@ -377,19 +466,31 @@ impl GradientClipper {
         self.clip_count as f32 / self.step_count as f32
     }
 
-    /// The last `n` entries from the norm history.
+    /// The last `n` entries of the retained norm window, oldest first.
     ///
-    /// If `n >= history.len()`, returns the full history.
-    pub fn recent_history(&self, n: usize) -> &[f32] {
+    /// If `n` is at least the retained length, the whole window is returned.
+    /// Note the window itself is bounded by
+    /// [`history_capacity`](Self::history_capacity), so this can never return
+    /// more than that many entries however large `n` is, and entries older
+    /// than the window have already been evicted.
+    pub fn recent_history(&self, n: usize) -> Vec<f32> {
         let len = self.norm_history.len();
-        if n >= len {
-            &self.norm_history
-        } else {
-            &self.norm_history[len - n..]
-        }
+        let skip = len.saturating_sub(n);
+        self.norm_history.iter().skip(skip).copied().collect()
     }
 
-    /// Reset all counters and EMA, but keep the mode.
+    /// Maximum number of recent norms retained by this clipper.
+    pub fn history_capacity(&self) -> usize {
+        self.history_capacity
+    }
+
+    /// Number of norms currently retained (at most
+    /// [`history_capacity`](Self::history_capacity)).
+    pub fn history_len(&self) -> usize {
+        self.norm_history.len()
+    }
+
+    /// Reset all counters and EMA, but keep the mode and history capacity.
     pub fn reset_stats(&mut self) {
         self.ema_norm = 0.0;
         self.norm_history.clear();
@@ -903,6 +1004,75 @@ mod tests {
         );
     }
 
+    // ── PerGroupNorm: analytical clipped_norm matches direct measurement ─────
+    #[test]
+    fn test_step_per_group_norm_clipped_norm_matches_direct_computation() {
+        let mut clipper = GradientClipper::new(ClipMode::PerGroupNorm { max_norm: 1.0 }).unwrap();
+        // Group 0: norm = 5 (3,4) -> clipped to 1.0
+        // Group 1: norm = 0.5 (0.3,0.4) -> unclipped
+        let mut grads = vec![vec![3.0_f32, 4.0], vec![0.3_f32, 0.4]];
+        let stats = clipper.step(&mut grads).unwrap();
+        assert!(stats.was_clipped);
+        // Expected global norm after clipping: sqrt(1.0^2 + 0.5^2)
+        let expected = (1.0f32 * 1.0 + 0.5 * 0.5).sqrt();
+        assert!(
+            (stats.clipped_norm - expected).abs() < 1e-4,
+            "expected {expected}, got {}",
+            stats.clipped_norm
+        );
+        // Cross-check against directly re-measuring the (now-mutated)
+        // gradients, to confirm the analytical shortcut is exact.
+        let direct = global_gradient_norm(&grads);
+        assert!(
+            (stats.clipped_norm - direct).abs() < 1e-4,
+            "analytical clipped_norm {} should match direct measurement {direct}",
+            stats.clipped_norm
+        );
+    }
+
+    // ── GlobalNorm/Adaptive: analytical clipped_norm matches direct measurement ──
+    // Regression for the `scale_to_norm` refactor (replaces the internal
+    // `clip_by_global_norm` call in `step`, which used to recompute the same
+    // pre-clip norm `step` had already measured as `original_norm`): confirms
+    // the now-single-pass norm computation still produces gradients whose
+    // post-clip norm exactly matches the analytically-derived `clipped_norm`.
+    #[test]
+    fn test_step_global_norm_clipped_norm_matches_direct_computation() {
+        let mut clipper = GradientClipper::new(ClipMode::GlobalNorm { max_norm: 1.0 }).unwrap();
+        let mut grads = vec![vec![3.0_f32, 4.0], vec![0.3_f32, 0.4]]; // norm = sqrt(25+0.25)
+        let stats = clipper.step(&mut grads).unwrap();
+        assert!(stats.was_clipped);
+        let direct = global_gradient_norm(&grads);
+        assert!(
+            (stats.clipped_norm - direct).abs() < 1e-4,
+            "analytical clipped_norm {} should match direct measurement {direct}",
+            stats.clipped_norm
+        );
+        assert!(
+            (stats.clipped_norm - 1.0).abs() < 1e-4,
+            "clipped_norm should be exactly max_norm=1.0, got {}",
+            stats.clipped_norm
+        );
+    }
+
+    #[test]
+    fn test_step_adaptive_clipped_norm_matches_direct_computation() {
+        let mut clipper = GradientClipper::new(ClipMode::Adaptive {
+            ema_factor: 0.9,
+            clip_factor: 0.5,
+        })
+        .unwrap();
+        let mut grads = vec![vec![3.0_f32, 4.0]]; // norm = 5 -> threshold = 5*0.5 = 2.5
+        let stats = clipper.step(&mut grads).unwrap();
+        assert!(stats.was_clipped);
+        let direct = global_gradient_norm(&grads);
+        assert!(
+            (stats.clipped_norm - direct).abs() < 1e-4,
+            "analytical clipped_norm {} should match direct measurement {direct}",
+            stats.clipped_norm
+        );
+    }
+
     // ── Bonus: clip_fraction is 0 before any steps ────────────────────────────
     #[test]
     fn test_clip_fraction_zero_steps() {
@@ -924,6 +1094,54 @@ mod tests {
         for (j, &v) in last_3.iter().enumerate() {
             assert!((v - (j + 3) as f32).abs() < 1e-5, "entry {j} was {v}");
         }
+    }
+
+    // ── Regression (F283): the norm history is a bounded sliding window ──────
+    // It used to be an unbounded `Vec<f32>` pushed once per `step`, so a
+    // multi-hundred-thousand-step training run grew it for the entire run
+    // while only its tail was ever read.
+    #[test]
+    fn test_norm_history_is_bounded_and_evicts_oldest() {
+        let mut clipper =
+            GradientClipper::with_history_capacity(ClipMode::GlobalNorm { max_norm: 1000.0 }, 4)
+                .expect("capacity 4 is valid");
+        assert_eq!(clipper.history_capacity(), 4);
+
+        for i in 1..=100 {
+            let mut g = vec![vec![i as f32]];
+            clipper.step(&mut g).expect("step must succeed");
+        }
+
+        // 100 steps recorded, but only the last 4 norms are retained.
+        assert_eq!(clipper.step_count, 100);
+        assert_eq!(clipper.history_len(), 4, "history must stay bounded");
+
+        // Asking for more than the capacity still yields only the window.
+        let all = clipper.recent_history(usize::MAX);
+        assert_eq!(all.len(), 4);
+        // Oldest-first ordering, and the *newest* norms survived.
+        for (j, &v) in all.iter().enumerate() {
+            let expected = (97 + j) as f32;
+            assert!(
+                (v - expected).abs() < 1e-5,
+                "entry {j} was {v}, expected {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_with_history_capacity_zero_is_rejected() {
+        let err = GradientClipper::with_history_capacity(ClipMode::GlobalNorm { max_norm: 1.0 }, 0)
+            .expect_err("zero capacity must be rejected");
+        assert!(matches!(err, ClipError::InvalidThreshold(_)));
+    }
+
+    #[test]
+    fn test_default_history_capacity_is_bounded() {
+        let clipper =
+            GradientClipper::new(ClipMode::GlobalNorm { max_norm: 1.0 }).expect("valid mode");
+        assert_eq!(clipper.history_capacity(), DEFAULT_NORM_HISTORY_CAPACITY);
+        assert_eq!(clipper.history_len(), 0);
     }
 
     // ── Bonus: reset_stats clears state ───────────────────────────────────────

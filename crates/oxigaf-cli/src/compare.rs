@@ -1,21 +1,23 @@
 //! `oxigaf compare` command — compare two model files and report differences.
 //!
 //! Supports:
-//! - `.ply` — PLY binary_little_endian format (Gaussian count, SH degree, bounding box,
-//!   opacity stats, scale stats, position stats)
-//! - `.safetensors` — tensor count and names comparison
+//! - `.ply` — both `ascii` and `binary_little_endian` PLY (Gaussian count,
+//!   SH degree, bounding box, opacity stats, scale stats, position stats)
+//! - `.safetensors` — Gaussian count and SH degree always; full
+//!   distributional statistics too when `positions`/`scales`/`opacities`
+//!   are stored as `F32` (see [`ModelStats::stats_available`])
 //!
 //! # Output Formats
 //! - `text` — human-readable columnar output
 //! - `json` — machine-readable JSON
 
-use std::io::{BufReader, Read};
+use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 
 use anyhow::{Context, Result};
 
 use crate::cli::CompareArgs;
-use crate::info::{parse_ply_header_info, sh_degree_from_rest};
+use crate::info::{parse_ply_header_info, sh_degree_from_rest, MAX_INITIAL_VERTEX_CAPACITY};
 
 // ---------------------------------------------------------------------------
 // ModelStats
@@ -46,14 +48,27 @@ pub struct ModelStats {
     pub position_mean: [f32; 3],
     /// Standard deviation of position [x, y, z].
     pub position_std: [f32; 3],
+    /// Whether `bbox_min`/`bbox_max`/`scale_*`/`opacity_*`/`position_*`
+    /// above were computed from real per-Gaussian data.
+    ///
+    /// `false` means those fields are all-zero placeholders — e.g. a
+    /// safetensors file whose scale/opacity tensors use an unsupported
+    /// dtype — and must be excluded from any similarity computation rather
+    /// than compared as though they were genuine zero values (which would
+    /// otherwise make two completely different degenerate-stats files
+    /// score as a perfect match). `gaussian_count` and `sh_degree` are
+    /// always reliable (they come from shape/header metadata alone) and are
+    /// unaffected by this flag.
+    pub stats_available: bool,
 }
 
 impl ModelStats {
     /// Compute statistics from a `.ply` or `.safetensors` file.
     ///
-    /// Only `binary_little_endian` PLY files support full statistics. ASCII PLY
-    /// files and safetensors files return bounding boxes of all-zeros and zero
-    /// stats where data is not available.
+    /// Both `ascii` and `binary_little_endian` PLY files support full
+    /// statistics. Safetensors files support full statistics when their
+    /// `positions`/`scales`/`opacities` tensors are `F32`; see
+    /// [`ModelStats::stats_available`] for what happens otherwise.
     pub fn from_file(path: &Path) -> Result<Self> {
         if !path.exists() {
             anyhow::bail!("File not found: {}", path.display());
@@ -75,7 +90,7 @@ impl ModelStats {
         }
     }
 
-    /// Parse a PLY file and compute statistics.
+    /// Parse a PLY file (ascii or binary_little_endian) and compute statistics.
     fn from_ply(path: &Path) -> Result<Self> {
         use std::fs::File;
 
@@ -87,23 +102,6 @@ impl ModelStats {
 
         let sh_degree = sh_degree_from_rest(header.num_rest);
         let file_path = path.to_str().unwrap_or("<non-utf8>").to_string();
-
-        if !header.format.contains("binary_little_endian") {
-            // Return stub stats for ASCII PLY — full stats require binary format.
-            return Ok(Self {
-                file_path,
-                gaussian_count: header.vertex_count,
-                sh_degree,
-                bbox_min: [0.0; 3],
-                bbox_max: [0.0; 3],
-                scale_mean: 0.0,
-                scale_std: 0.0,
-                opacity_mean: 0.0,
-                opacity_std: 0.0,
-                position_mean: [0.0; 3],
-                position_std: [0.0; 3],
-            });
-        }
 
         if header.vertex_count == 0 {
             return Ok(Self {
@@ -118,20 +116,42 @@ impl ModelStats {
                 opacity_std: 0.0,
                 position_mean: [0.0; 3],
                 position_std: [0.0; 3],
+                stats_available: true,
             });
         }
 
-        let vertex_data =
-            read_ply_vertex_data(&mut reader, header.vertex_count, header.num_rest)
-                .with_context(|| format!("Failed to read vertex data: {}", path.display()))?;
+        let vertex_data = if header.format.contains("binary_little_endian") {
+            read_ply_vertex_data_binary(&mut reader, header.vertex_count, &header.properties)
+                .with_context(|| format!("Failed to read vertex data: {}", path.display()))?
+        } else if header.format.contains("ascii") {
+            read_ply_vertex_data_ascii(&mut reader, header.vertex_count, &header.properties)
+                .with_context(|| format!("Failed to read vertex data: {}", path.display()))?
+        } else {
+            anyhow::bail!(
+                "Unsupported PLY format '{}' in {}: only 'ascii' and 'binary_little_endian' are supported",
+                header.format,
+                path.display()
+            );
+        };
 
-        let stats = compute_model_stats(&vertex_data, &file_path, header.vertex_count, sh_degree);
-        Ok(stats)
+        Ok(compute_model_stats(
+            &vertex_data,
+            &file_path,
+            header.vertex_count,
+            sh_degree,
+        ))
     }
 
     /// Parse a safetensors file and compute available statistics.
     ///
-    /// Extracts Gaussian count, SH degree, and bounding box from tensor shapes.
+    /// Gaussian count and SH degree are read from tensor shapes alone (this
+    /// is always reliable, regardless of dtype). Distributional statistics
+    /// (bbox, scale, opacity, position) additionally require the
+    /// `positions`/`scales`/`opacities` tensors to be present and stored as
+    /// `F32` — reinterpreting F16/BF16/integer bytes as f32 would silently
+    /// produce garbage, so an unsupported dtype is treated the same as a
+    /// missing tensor: `stats_available` is set to `false` rather than
+    /// fabricating zeros that would otherwise be compared as genuine data.
     fn from_safetensors(path: &Path) -> Result<Self> {
         let file_path = path.to_str().unwrap_or("<non-utf8>").to_string();
 
@@ -141,26 +161,84 @@ impl ModelStats {
         let st = safetensors::SafeTensors::deserialize(&bytes)
             .with_context(|| format!("Failed to deserialize SafeTensors: {}", path.display()))?;
 
-        // Infer Gaussian count from positions tensor (shape [N, 3]) or xyz tensor
-        let mut gaussian_count = 0usize;
-        let mut sh_degree = 0u32;
+        let shape_of = |name: &str| -> Option<Vec<usize>> {
+            st.tensor(name).ok().map(|tv| tv.shape().to_vec())
+        };
+        let f32_values = |name: &str| -> Option<Vec<f32>> {
+            let tv = st.tensor(name).ok()?;
+            if tv.dtype() != safetensors::tensor::Dtype::F32 {
+                return None;
+            }
+            Some(bytemuck::cast_slice::<u8, f32>(tv.data()).to_vec())
+        };
 
-        let names = st.names();
-        for name in &names {
-            if let Ok(tv) = st.tensor(name) {
-                let shape = tv.shape();
-                // positions / xyz expected shape: [N, 3]
-                if (*name == "positions" || *name == "xyz" || *name == "pos")
-                    && shape.len() == 2
-                    && shape[1] == 3
-                {
+        // Gaussian count from the positions tensor's shape — reliable even
+        // when the dtype isn't f32, since we only need N here.
+        let mut gaussian_count = 0usize;
+        let mut position_tensor_name: Option<&str> = None;
+        for name in ["positions", "xyz", "pos"] {
+            if let Some(shape) = shape_of(name) {
+                if shape.len() == 2 && shape[1] == 3 {
                     gaussian_count = shape[0];
+                    position_tensor_name = Some(name);
+                    break;
                 }
-                // f_rest shape [N, K] where K = num_rest
-                if name.starts_with("f_rest") && shape.len() == 2 {
-                    let num_rest = shape[1];
-                    sh_degree = sh_degree_from_rest(num_rest);
-                }
+            }
+        }
+
+        // SH degree from the sh_coeffs tensor's total element count; shape
+        // may be `[N, C]` or a flat `[N*C]` depending on the writer.
+        let mut sh_degree = 0u32;
+        if let Some(shape) = shape_of("sh_coeffs") {
+            let total: usize = shape.iter().product();
+            if gaussian_count > 0 && total.is_multiple_of(gaussian_count) {
+                let channels = total / gaussian_count;
+                sh_degree = sh_degree_from_rest(channels.saturating_sub(3));
+            }
+        }
+
+        let positions = position_tensor_name.and_then(f32_values);
+        let scale_values = f32_values("scales").or_else(|| f32_values("scale"));
+        let opacity_values = f32_values("opacities").or_else(|| f32_values("opacity"));
+
+        if let (Some(pos), Some(scale_values), Some(opacity_values)) =
+            (positions, scale_values, opacity_values)
+        {
+            if gaussian_count > 0 && pos.len() == gaussian_count * 3 {
+                let xs: Vec<f32> = pos.iter().step_by(3).copied().collect();
+                let ys: Vec<f32> = pos.iter().skip(1).step_by(3).copied().collect();
+                let zs: Vec<f32> = pos.iter().skip(2).step_by(3).copied().collect();
+
+                let (pos_mean_x, pos_std_x) = mean_std(&xs);
+                let (pos_mean_y, pos_std_y) = mean_std(&ys);
+                let (pos_mean_z, pos_std_z) = mean_std(&zs);
+                let bbox_min = [
+                    xs.iter().cloned().fold(f32::INFINITY, f32::min),
+                    ys.iter().cloned().fold(f32::INFINITY, f32::min),
+                    zs.iter().cloned().fold(f32::INFINITY, f32::min),
+                ];
+                let bbox_max = [
+                    xs.iter().cloned().fold(f32::NEG_INFINITY, f32::max),
+                    ys.iter().cloned().fold(f32::NEG_INFINITY, f32::max),
+                    zs.iter().cloned().fold(f32::NEG_INFINITY, f32::max),
+                ];
+                let (opacity_mean, opacity_std) = mean_std(&opacity_values);
+                let (scale_mean, scale_std) = mean_std(&scale_values);
+
+                return Ok(Self {
+                    file_path,
+                    gaussian_count,
+                    sh_degree,
+                    bbox_min,
+                    bbox_max,
+                    scale_mean,
+                    scale_std,
+                    opacity_mean,
+                    opacity_std,
+                    position_mean: [pos_mean_x, pos_mean_y, pos_mean_z],
+                    position_std: [pos_std_x, pos_std_y, pos_std_z],
+                    stats_available: true,
+                });
             }
         }
 
@@ -176,15 +254,16 @@ impl ModelStats {
             opacity_std: 0.0,
             position_mean: [0.0; 3],
             position_std: [0.0; 3],
+            stats_available: false,
         })
     }
 }
 
 // ---------------------------------------------------------------------------
-// Vertex reading (PLY binary_little_endian)
+// Vertex reading (PLY: ascii and binary_little_endian)
 // ---------------------------------------------------------------------------
 
-/// Raw per-vertex data extracted from a binary PLY file.
+/// Raw per-vertex data extracted from a PLY file.
 struct VertexData {
     xs: Vec<f32>,
     ys: Vec<f32>,
@@ -193,73 +272,161 @@ struct VertexData {
     scales: Vec<f32>, // interleaved: scale_x, scale_y, scale_z per vertex
 }
 
-/// Read all vertex data from the body of a binary_little_endian PLY file.
+/// Byte/column indices of the vertex properties this module extracts.
+struct VertexFieldIndices {
+    x: usize,
+    y: usize,
+    z: usize,
+    opacity: usize,
+    scale0: usize,
+    scale1: usize,
+    scale2: usize,
+}
+
+/// Locate the required vertex fields within the header's declared property
+/// order (`x`, `y`, `z`, `opacity`, `scale_0..2`), so vertex data can be
+/// read correctly regardless of property order, omitted normals, or extra
+/// per-vertex properties — rather than assuming a fixed layout the header
+/// is never actually checked against.
+fn resolve_vertex_field_indices(properties: &[String]) -> Result<VertexFieldIndices> {
+    let find = |name: &str| -> Result<usize> {
+        properties.iter().position(|p| p == name).ok_or_else(|| {
+            anyhow::anyhow!("PLY vertex element is missing required property '{name}'")
+        })
+    };
+    Ok(VertexFieldIndices {
+        x: find("x")?,
+        y: find("y")?,
+        z: find("z")?,
+        opacity: find("opacity")?,
+        scale0: find("scale_0")?,
+        scale1: find("scale_1")?,
+        scale2: find("scale_2")?,
+    })
+}
+
+/// Initial reservation for one per-vertex `Vec`, derived from — but never
+/// dictated by — an untrusted PLY header's `element vertex` count.
 ///
-/// Property layout (all f32, 4 bytes each):
-/// ```text
-/// x, y, z, nx, ny, nz, f_dc_0, f_dc_1, f_dc_2,
-/// f_rest_0..f_rest_{num_rest-1},
-/// opacity, scale_0, scale_1, scale_2, rot_0, rot_1, rot_2, rot_3
-/// ```
-fn read_ply_vertex_data(
+/// Nothing ties that number to the file's actual size, so a malformed or
+/// hostile header (`element vertex 999999999999`) used to become five
+/// enormous `Vec::with_capacity` requests before a single byte of body was
+/// read. Rust aborts the process on allocation failure — it is not a
+/// catchable `Result` — so that could crash a command whose whole job is to
+/// safely inspect untrusted files, and `vertex_count * 3` for the
+/// interleaved scale buffer could additionally overflow `usize` (a panic in
+/// debug, a nonsense capacity in release) before any cap applied. Capping
+/// first and multiplying afterwards fixes both: a genuinely larger file
+/// still reads correctly, since `Vec::push` grows the buffer as needed.
+///
+/// The cap itself is shared with [`crate::info`], which reserves from the
+/// same header field for the same reason.
+fn initial_vertex_capacity(vertex_count: usize) -> usize {
+    vertex_count.min(MAX_INITIAL_VERTEX_CAPACITY)
+}
+
+/// Read all vertex data from the body of a `binary_little_endian` PLY file.
+///
+/// Every vertex property is assumed to be a 4-byte `float` (the universal
+/// convention for 3D Gaussian Splatting PLY exports, including this crate's
+/// own writer). `properties` gives the exact per-vertex property order as
+/// declared in the header, so this reads exactly as many floats per vertex
+/// as the file actually contains.
+fn read_ply_vertex_data_binary(
     reader: &mut impl Read,
     vertex_count: usize,
-    num_rest: usize,
+    properties: &[String],
 ) -> Result<VertexData> {
-    let mut xs = Vec::with_capacity(vertex_count);
-    let mut ys = Vec::with_capacity(vertex_count);
-    let mut zs = Vec::with_capacity(vertex_count);
-    let mut opacities = Vec::with_capacity(vertex_count);
-    let mut scales = Vec::with_capacity(vertex_count * 3);
+    let idx = resolve_vertex_field_indices(properties)?;
+    let stride = properties.len();
 
-    // Skip: nx, ny, nz (3) + f_dc_0..2 (3) + f_rest_0..{num_rest-1} (num_rest)
-    let skip_after_xyz = 3 + 3 + num_rest;
-    let mut skip_buf = vec![0u8; skip_after_xyz * 4];
-    let mut rot_buf = [0u8; 16]; // rot_0..rot_3 = 4 floats
+    // Capped, not driven directly by the untrusted header count — see
+    // `initial_vertex_capacity`.
+    let capacity = initial_vertex_capacity(vertex_count);
+    let mut xs = Vec::with_capacity(capacity);
+    let mut ys = Vec::with_capacity(capacity);
+    let mut zs = Vec::with_capacity(capacity);
+    let mut opacities = Vec::with_capacity(capacity);
+    let mut scales = Vec::with_capacity(capacity * 3);
+
+    let mut record = vec![0f32; stride];
     let mut buf4 = [0u8; 4];
 
     for _ in 0..vertex_count {
-        // x
-        reader.read_exact(&mut buf4).context("EOF reading x")?;
-        xs.push(f32::from_le_bytes(buf4));
-        // y
-        reader.read_exact(&mut buf4).context("EOF reading y")?;
-        ys.push(f32::from_le_bytes(buf4));
-        // z
-        reader.read_exact(&mut buf4).context("EOF reading z")?;
-        zs.push(f32::from_le_bytes(buf4));
+        for slot in record.iter_mut() {
+            reader
+                .read_exact(&mut buf4)
+                .context("EOF reading PLY vertex record")?;
+            *slot = f32::from_le_bytes(buf4);
+        }
+        xs.push(record[idx.x]);
+        ys.push(record[idx.y]);
+        zs.push(record[idx.z]);
+        opacities.push(record[idx.opacity]);
+        scales.push(record[idx.scale0]);
+        scales.push(record[idx.scale1]);
+        scales.push(record[idx.scale2]);
+    }
 
-        // skip normals + dc + rest
-        reader
-            .read_exact(&mut skip_buf)
-            .context("EOF skipping normals/sh")?;
+    Ok(VertexData {
+        xs,
+        ys,
+        zs,
+        opacities,
+        scales,
+    })
+}
 
-        // opacity
-        reader
-            .read_exact(&mut buf4)
-            .context("EOF reading opacity")?;
-        opacities.push(f32::from_le_bytes(buf4));
+/// Read all vertex data from the body of an `ascii` PLY file.
+///
+/// Each vertex is one whitespace-separated line of decimal values, in the
+/// same property order as `binary_little_endian`; fields are located by
+/// name via [`resolve_vertex_field_indices`] exactly as in the binary path.
+fn read_ply_vertex_data_ascii(
+    reader: &mut impl BufRead,
+    vertex_count: usize,
+    properties: &[String],
+) -> Result<VertexData> {
+    let idx = resolve_vertex_field_indices(properties)?;
+    let expected_fields = properties.len();
 
-        // scale_0
-        reader
-            .read_exact(&mut buf4)
-            .context("EOF reading scale_0")?;
-        scales.push(f32::from_le_bytes(buf4));
-        // scale_1
-        reader
-            .read_exact(&mut buf4)
-            .context("EOF reading scale_1")?;
-        scales.push(f32::from_le_bytes(buf4));
-        // scale_2
-        reader
-            .read_exact(&mut buf4)
-            .context("EOF reading scale_2")?;
-        scales.push(f32::from_le_bytes(buf4));
+    // Capped, not driven directly by the untrusted header count — see
+    // `initial_vertex_capacity`.
+    let capacity = initial_vertex_capacity(vertex_count);
+    let mut xs = Vec::with_capacity(capacity);
+    let mut ys = Vec::with_capacity(capacity);
+    let mut zs = Vec::with_capacity(capacity);
+    let mut opacities = Vec::with_capacity(capacity);
+    let mut scales = Vec::with_capacity(capacity * 3);
 
-        // skip rot_0..rot_3
-        reader
-            .read_exact(&mut rot_buf)
-            .context("EOF reading rotations")?;
+    let mut line = String::new();
+    for row in 0..vertex_count {
+        line.clear();
+        let bytes_read = reader
+            .read_line(&mut line)
+            .with_context(|| format!("I/O error reading ASCII PLY vertex {row}"))?;
+        if bytes_read == 0 {
+            anyhow::bail!("Unexpected EOF reading ASCII PLY vertex {row}/{vertex_count}");
+        }
+        let fields: Vec<&str> = line.split_ascii_whitespace().collect();
+        if fields.len() < expected_fields {
+            anyhow::bail!(
+                "ASCII PLY vertex {row} has {} fields, expected {expected_fields}",
+                fields.len()
+            );
+        }
+        let parse_field = |i: usize| -> Result<f32> {
+            fields[i]
+                .parse::<f32>()
+                .with_context(|| format!("Invalid float '{}' in ASCII PLY vertex {row}", fields[i]))
+        };
+        xs.push(parse_field(idx.x)?);
+        ys.push(parse_field(idx.y)?);
+        zs.push(parse_field(idx.z)?);
+        opacities.push(parse_field(idx.opacity)?);
+        scales.push(parse_field(idx.scale0)?);
+        scales.push(parse_field(idx.scale1)?);
+        scales.push(parse_field(idx.scale2)?);
     }
 
     Ok(VertexData {
@@ -330,6 +497,7 @@ fn compute_model_stats(
         opacity_std,
         position_mean: [pos_mean_x, pos_mean_y, pos_mean_z],
         position_std: [pos_std_x, pos_std_y, pos_std_z],
+        stats_available: true,
     }
 }
 
@@ -377,8 +545,29 @@ pub fn bbox_iou(min_a: [f32; 3], max_a: [f32; 3], min_b: [f32; 3], max_b: [f32; 
 
     let union_vol = vol_a + vol_b - inter_vol;
     if union_vol <= 0.0 {
-        // Both boxes are degenerate (zero volume); treat as identical
-        1.0
+        // At least one box is degenerate (zero volume on some axis) — IoU
+        // itself is undefined here (0/0), so fall back to a distance-based
+        // similarity between the box centers instead of blindly reporting a
+        // perfect match. Two coincident degenerate boxes (e.g. two
+        // single-point clouds at the same location) still score 1.0; two
+        // degenerate boxes far apart (e.g. single points at (0,0,0) and
+        // (100,100,100), which previously both scored a perfect 1.0) decay
+        // smoothly toward 0 instead.
+        let center_a = [
+            (min_a[0] + max_a[0]) * 0.5,
+            (min_a[1] + max_a[1]) * 0.5,
+            (min_a[2] + max_a[2]) * 0.5,
+        ];
+        let center_b = [
+            (min_b[0] + max_b[0]) * 0.5,
+            (min_b[1] + max_b[1]) * 0.5,
+            (min_b[2] + max_b[2]) * 0.5,
+        ];
+        let dx = center_a[0] - center_b[0];
+        let dy = center_a[1] - center_b[1];
+        let dz = center_a[2] - center_b[2];
+        let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+        (-dist).exp()
     } else {
         (inter_vol / union_vol).clamp(0.0, 1.0)
     }
@@ -412,16 +601,32 @@ pub struct ComparisonReport {
 
     /// Overall heuristic similarity in `[0.0, 1.0]`.
     ///
-    /// Weighted combination of:
+    /// When [`ComparisonReport::stats_available`] is `true`, a weighted
+    /// combination of:
     /// - bbox IoU (40 %)
     /// - Gaussian count similarity (30 %)
     /// - SH degree match (10 %)
     /// - Scale similarity (10 %)
     /// - Opacity similarity (10 %)
+    ///
+    /// When `false`, only Gaussian count (30 %) and SH degree (10 %) are
+    /// available, renormalized to sum to 1.0 — see
+    /// [`ComparisonReport::stats_available`].
     pub overall_similarity: f32,
 
     /// Similarity threshold used for the recommendation.
     pub threshold: f64,
+
+    /// `true` only when both models' distributional statistics (bounding
+    /// box, scale, opacity — see [`ModelStats::stats_available`]) were
+    /// available. When `false`, `overall_similarity` reflects only
+    /// Gaussian count and SH degree, and `bbox_iou` /
+    /// `scale_mean_diff_pct` / `opacity_mean_diff_pct` compare all-zero
+    /// placeholders for at least one model — they are still computed (so
+    /// callers inspecting individual fields see the same shape of report
+    /// either way) but are not meaningful and must not be read as real
+    /// measurements.
+    pub stats_available: bool,
 }
 
 impl ComparisonReport {
@@ -435,6 +640,7 @@ impl ComparisonReport {
         };
 
         let sh_degree_same = a.sh_degree == b.sh_degree;
+        let stats_available = a.stats_available && b.stats_available;
 
         let iou = bbox_iou(a.bbox_min, a.bbox_max, b.bbox_min, b.bbox_max);
 
@@ -462,10 +668,18 @@ impl ComparisonReport {
         // Opacity similarity: 1 - |pct| / 100, clamped to [0, 1]
         let opacity_sim = (1.0 - opacity_mean_diff_pct.abs() / 100.0).clamp(0.0, 1.0) as f32;
 
-        // Weighted similarity
-        let overall_similarity =
+        // Weighted similarity. When distributional stats aren't available
+        // for at least one model (e.g. an unsupported safetensors dtype),
+        // bbox/scale/opacity are all-zero placeholders on both sides —
+        // comparing them would score a spurious perfect match on 60% of
+        // the weight, so renormalize over just the metadata-only
+        // components (count + SH degree) instead.
+        let overall_similarity = if stats_available {
             (0.40 * iou + 0.30 * count_sim + 0.10 * sh_sim + 0.10 * scale_sim + 0.10 * opacity_sim)
-                .clamp(0.0, 1.0);
+                .clamp(0.0, 1.0)
+        } else {
+            ((0.30 * count_sim + 0.10 * sh_sim) / 0.40).clamp(0.0, 1.0)
+        };
 
         Self {
             model_a: a,
@@ -478,6 +692,7 @@ impl ComparisonReport {
             opacity_mean_diff_pct,
             overall_similarity,
             threshold,
+            stats_available,
         }
     }
 
@@ -515,6 +730,13 @@ impl ComparisonReport {
 
         let mut out = String::new();
         out.push_str(&format!("Comparing: {} vs {}\n\n", a_name, b_name));
+        if !self.stats_available {
+            out.push_str(
+                "⚠ Partial comparison: bounding box / scale / opacity statistics are \
+                 unavailable for one or both models (unsupported format or dtype). \
+                 Overall similarity below reflects only Gaussian count and SH degree.\n\n",
+            );
+        }
         out.push_str("=== Structural Differences ===\n");
         out.push_str(&format!(
             "  Gaussian count:  {:>10}  →  {:>10}  ({}{}, {}{:.2}%)\n",
@@ -663,6 +885,7 @@ impl ComparisonReport {
                 "opacity_std": a.opacity_std,
                 "position_mean": a.position_mean,
                 "position_std": a.position_std,
+                "stats_available": a.stats_available,
             },
             "model_b": {
                 "file_path": b.file_path,
@@ -676,6 +899,7 @@ impl ComparisonReport {
                 "opacity_std": b.opacity_std,
                 "position_mean": b.position_mean,
                 "position_std": b.position_std,
+                "stats_available": b.stats_available,
             },
             "gaussian_count_diff": self.gaussian_count_diff,
             "gaussian_count_pct": self.gaussian_count_pct,
@@ -685,6 +909,7 @@ impl ComparisonReport {
             "opacity_mean_diff_pct": self.opacity_mean_diff_pct,
             "overall_similarity": self.overall_similarity,
             "threshold": self.threshold,
+            "stats_available": self.stats_available,
             "recommendation": self.recommendation(),
         });
 
@@ -716,6 +941,15 @@ fn format_count(n: usize) -> String {
 /// Run the `compare` command.
 pub fn run_compare(args: CompareArgs) -> Result<()> {
     let threshold = args.threshold;
+    if !(0.0..=1.0).contains(&threshold) {
+        anyhow::bail!("--threshold must be between 0.0 and 1.0 (inclusive), got {threshold}");
+    }
+
+    // `CompareArgs::format` is a bare `String` (not a `ValueEnum`), so an
+    // unrecognized value must be rejected here rather than silently falling
+    // through to the text-output default — a typo like `--format jsom`
+    // should not exit 0 with unparseable-as-JSON output.
+    let format = args.format.to_lowercase();
 
     let stats_a = ModelStats::from_file(&args.model1)
         .with_context(|| format!("Failed to load model A: {}", args.model1.display()))?;
@@ -724,14 +958,16 @@ pub fn run_compare(args: CompareArgs) -> Result<()> {
 
     let report = ComparisonReport::compute(stats_a, stats_b, threshold);
 
-    match args.format.to_lowercase().as_str() {
+    match format.as_str() {
         "json" => {
             let json = report.format_json()?;
             println!("{}", json);
         }
-        _ => {
-            // default: text
+        "text" => {
             print!("{}", report.format_text());
+        }
+        other => {
+            anyhow::bail!("Unknown --format value '{other}': expected 'text' or 'json'");
         }
     }
 
@@ -832,6 +1068,75 @@ mod tests {
         Ok(())
     }
 
+    /// Write an `ascii`-format PLY with the same property layout and the
+    /// same per-vertex values as [`write_test_ply`], so the two can be
+    /// compared for equivalent stats.
+    fn write_test_ply_ascii(
+        path: &Path,
+        n_vertices: usize,
+        num_rest: usize,
+        position_offset: f32,
+        opacity_override: Option<f32>,
+        scale_override: Option<f32>,
+    ) -> Result<()> {
+        let mut f = fs::File::create(path)?;
+
+        writeln!(f, "ply")?;
+        writeln!(f, "format ascii 1.0")?;
+        writeln!(f, "element vertex {}", n_vertices)?;
+        writeln!(f, "property float x")?;
+        writeln!(f, "property float y")?;
+        writeln!(f, "property float z")?;
+        writeln!(f, "property float nx")?;
+        writeln!(f, "property float ny")?;
+        writeln!(f, "property float nz")?;
+        writeln!(f, "property float f_dc_0")?;
+        writeln!(f, "property float f_dc_1")?;
+        writeln!(f, "property float f_dc_2")?;
+        for i in 0..num_rest {
+            writeln!(f, "property float f_rest_{}", i)?;
+        }
+        writeln!(f, "property float opacity")?;
+        writeln!(f, "property float scale_0")?;
+        writeln!(f, "property float scale_1")?;
+        writeln!(f, "property float scale_2")?;
+        writeln!(f, "property float rot_0")?;
+        writeln!(f, "property float rot_1")?;
+        writeln!(f, "property float rot_2")?;
+        writeln!(f, "property float rot_3")?;
+        writeln!(f, "end_header")?;
+
+        let opacity = opacity_override.unwrap_or(0.5);
+        let scale = scale_override.unwrap_or(0.01);
+        for i in 0..n_vertices {
+            let t = i as f32 / n_vertices.max(1) as f32;
+            let mut fields: Vec<f32> = vec![
+                position_offset + t,
+                position_offset + t * 0.5,
+                position_offset + t * 0.25,
+                0.0,
+                0.0,
+                1.0, // normal
+                0.5,
+                0.5,
+                0.5, // f_dc
+            ];
+            fields.extend(std::iter::repeat_n(0.0f32, num_rest));
+            fields.push(opacity);
+            fields.extend([scale, scale, scale]);
+            fields.extend([1.0f32, 0.0, 0.0, 0.0]); // rotation
+
+            let line = fields
+                .iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join(" ");
+            writeln!(f, "{line}")?;
+        }
+
+        Ok(())
+    }
+
     // -----------------------------------------------------------------------
     // bbox_iou tests
     // -----------------------------------------------------------------------
@@ -898,6 +1203,46 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_bbox_iou_coincident_degenerate_boxes_are_identical() {
+        let p = [0.0f32, 0.0, 0.0];
+        let iou = bbox_iou(p, p, p, p);
+        assert!(
+            (iou - 1.0).abs() < 1e-5,
+            "two coincident zero-volume boxes should score 1.0, got {}",
+            iou
+        );
+    }
+
+    #[test]
+    fn test_bbox_iou_distant_degenerate_boxes_are_not_identical() {
+        // Regression test: two single-point clouds at (0,0,0) and
+        // (100,100,100) both have zero-volume bounding boxes, and the old
+        // "both degenerate => 1.0" rule reported them as a perfect overlap
+        // — the dominant (40%) term behind the "essentially identical"
+        // false positive for two totally different point clouds.
+        let a_pos = [0.0f32, 0.0, 0.0];
+        let b_pos = [100.0f32, 100.0, 100.0];
+        let iou = bbox_iou(a_pos, a_pos, b_pos, b_pos);
+        assert!(
+            iou < 0.01,
+            "two degenerate boxes 100 units apart must not score as identical, got {}",
+            iou
+        );
+    }
+
+    #[test]
+    fn test_bbox_iou_degenerate_output_always_in_range() {
+        let a_pos = [1.0f32, -2.0, 3.0];
+        let b_pos = [1.5f32, -2.0, 3.0];
+        let iou = bbox_iou(a_pos, a_pos, b_pos, b_pos);
+        assert!(
+            (0.0..=1.0).contains(&iou),
+            "degenerate-box IoU must stay in [0, 1], got {}",
+            iou
+        );
+    }
+
     // -----------------------------------------------------------------------
     // ModelStats tests
     // -----------------------------------------------------------------------
@@ -939,6 +1284,245 @@ mod tests {
 
         fs::remove_file(&path).ok();
         Ok(())
+    }
+
+    #[test]
+    fn test_model_stats_from_ascii_ply_has_real_stats() -> Result<()> {
+        // Regression test: ASCII PLY used to return `stats_available`-less
+        // all-zero "stub stats". It must now report real, non-trivial
+        // bounding box / scale / opacity statistics, same as binary.
+        let path = env::temp_dir().join("test_compare_ascii_real_stats.ply");
+        write_test_ply_ascii(&path, 10, 45, 5.0, Some(0.7), Some(0.02))?;
+
+        let stats = ModelStats::from_file(&path)?;
+        assert!(stats.stats_available);
+        assert_eq!(stats.gaussian_count, 10);
+        assert_eq!(stats.sh_degree, 3);
+        assert!(
+            (stats.opacity_mean - 0.7).abs() < 1e-4,
+            "opacity_mean should reflect real data, got {}",
+            stats.opacity_mean
+        );
+        assert!(
+            (stats.scale_mean - 0.02).abs() < 1e-4,
+            "scale_mean should reflect real data, got {}",
+            stats.scale_mean
+        );
+        assert!(
+            stats.bbox_min != [0.0; 3] || stats.bbox_max != [0.0; 3],
+            "bounding box must not be the all-zero placeholder"
+        );
+
+        fs::remove_file(&path).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn test_model_stats_ascii_and_binary_ply_agree() -> Result<()> {
+        let ascii_path = env::temp_dir().join("test_compare_parity_ascii.ply");
+        let binary_path = env::temp_dir().join("test_compare_parity_binary.ply");
+        write_test_ply_ascii(&ascii_path, 8, 9, 2.0, Some(0.6), Some(0.03))?;
+        write_test_ply(&binary_path, 8, 9, 2.0, Some(0.6), Some(0.03))?;
+
+        let ascii_stats = ModelStats::from_file(&ascii_path)?;
+        let binary_stats = ModelStats::from_file(&binary_path)?;
+
+        assert_eq!(ascii_stats.gaussian_count, binary_stats.gaussian_count);
+        assert_eq!(ascii_stats.sh_degree, binary_stats.sh_degree);
+        assert!((ascii_stats.opacity_mean - binary_stats.opacity_mean).abs() < 1e-4);
+        assert!((ascii_stats.scale_mean - binary_stats.scale_mean).abs() < 1e-4);
+        for i in 0..3 {
+            assert!((ascii_stats.bbox_min[i] - binary_stats.bbox_min[i]).abs() < 1e-4);
+            assert!((ascii_stats.bbox_max[i] - binary_stats.bbox_max[i]).abs() < 1e-4);
+        }
+
+        fs::remove_file(&ascii_path).ok();
+        fs::remove_file(&binary_path).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn test_model_stats_from_ply_missing_required_property_errors() -> Result<()> {
+        // A PLY that omits `scale_1` (unusual, but the header property list
+        // is what must be trusted, not an assumed fixed layout) must fail
+        // with a descriptive error rather than misreading unrelated bytes
+        // as scale_1.
+        let path = env::temp_dir().join("test_compare_missing_property.ply");
+        let mut f = fs::File::create(&path)?;
+        writeln!(f, "ply")?;
+        writeln!(f, "format ascii 1.0")?;
+        writeln!(f, "element vertex 1")?;
+        writeln!(f, "property float x")?;
+        writeln!(f, "property float y")?;
+        writeln!(f, "property float z")?;
+        writeln!(f, "property float opacity")?;
+        writeln!(f, "property float scale_0")?;
+        // scale_1 and scale_2 intentionally omitted
+        writeln!(f, "end_header")?;
+        writeln!(f, "1.0 2.0 3.0 0.5 0.1")?;
+        drop(f);
+
+        let result = ModelStats::from_file(&path);
+        assert!(
+            result.is_err(),
+            "missing required property must be a hard error"
+        );
+
+        fs::remove_file(&path).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn test_model_stats_from_safetensors_f32_has_real_stats() -> Result<()> {
+        use safetensors::tensor::{Dtype, TensorView};
+
+        let path = env::temp_dir().join("test_compare_safetensors_f32.safetensors");
+        let n = 4usize;
+        let positions: Vec<f32> = vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+        let scales: Vec<f32> = vec![0.02; n * 3];
+        let opacities: Vec<f32> = vec![0.8; n];
+
+        let pos_view = TensorView::new(Dtype::F32, vec![n, 3], bytemuck::cast_slice(&positions))
+            .map_err(|e| anyhow::anyhow!("tensor view error: {e}"))?;
+        let scl_view = TensorView::new(Dtype::F32, vec![n, 3], bytemuck::cast_slice(&scales))
+            .map_err(|e| anyhow::anyhow!("tensor view error: {e}"))?;
+        let opa_view = TensorView::new(Dtype::F32, vec![n], bytemuck::cast_slice(&opacities))
+            .map_err(|e| anyhow::anyhow!("tensor view error: {e}"))?;
+        let tensors: Vec<(&str, TensorView<'_>)> = vec![
+            ("positions", pos_view),
+            ("scales", scl_view),
+            ("opacities", opa_view),
+        ];
+        let data = safetensors::serialize(tensors, None)
+            .map_err(|e| anyhow::anyhow!("serialize error: {e}"))?;
+        fs::write(&path, &data)?;
+
+        let stats = ModelStats::from_file(&path)?;
+        assert!(stats.stats_available);
+        assert_eq!(stats.gaussian_count, 4);
+        assert!((stats.opacity_mean - 0.8).abs() < 1e-4);
+        assert!((stats.scale_mean - 0.02).abs() < 1e-4);
+        assert!(
+            stats.bbox_max[0] > stats.bbox_min[0],
+            "bounding box should span the real position data"
+        );
+
+        fs::remove_file(&path).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn test_model_stats_from_safetensors_unsupported_dtype_marks_unavailable() -> Result<()> {
+        use safetensors::tensor::{Dtype, TensorView};
+
+        let path = env::temp_dir().join("test_compare_safetensors_f16.safetensors");
+        let n = 4usize;
+        let positions: Vec<f32> = vec![0.0; n * 3];
+        // 2 bytes/element f16 payload — content is irrelevant, only the
+        // dtype tag matters: it must never be reinterpreted as f32.
+        let scales_f16_bytes = vec![0u8; n * 3 * 2];
+        let opacities: Vec<f32> = vec![0.5; n];
+
+        let pos_view = TensorView::new(Dtype::F32, vec![n, 3], bytemuck::cast_slice(&positions))
+            .map_err(|e| anyhow::anyhow!("tensor view error: {e}"))?;
+        let scl_view = TensorView::new(Dtype::F16, vec![n, 3], &scales_f16_bytes)
+            .map_err(|e| anyhow::anyhow!("tensor view error: {e}"))?;
+        let opa_view = TensorView::new(Dtype::F32, vec![n], bytemuck::cast_slice(&opacities))
+            .map_err(|e| anyhow::anyhow!("tensor view error: {e}"))?;
+        let tensors: Vec<(&str, TensorView<'_>)> = vec![
+            ("positions", pos_view),
+            ("scales", scl_view),
+            ("opacities", opa_view),
+        ];
+        let data = safetensors::serialize(tensors, None)
+            .map_err(|e| anyhow::anyhow!("serialize error: {e}"))?;
+        fs::write(&path, &data)?;
+
+        let stats = ModelStats::from_file(&path)?;
+        assert!(
+            !stats.stats_available,
+            "an F16 scales tensor must not be silently reinterpreted as F32"
+        );
+        // Gaussian count is still reliable — it only needed the shape.
+        assert_eq!(stats.gaussian_count, 4);
+        assert_eq!(stats.bbox_min, [0.0; 3]);
+        assert_eq!(stats.bbox_max, [0.0; 3]);
+
+        fs::remove_file(&path).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn test_compare_two_different_ascii_ply_files_are_not_falsely_identical() -> Result<()> {
+        // Direct regression test for the critical finding: two clearly
+        // different ASCII PLY models (different positions, opacity, scale
+        // — only the Gaussian count matches) must not be reported as
+        // "essentially identical". Before the fix, ASCII PLY always
+        // produced all-zero stub stats, `bbox_iou` treated two degenerate
+        // zero-volume boxes as identical, and the zero-mean guards made
+        // scale/opacity diffs also read as identical — overall_similarity
+        // was exactly 1.0 for any two same-count ASCII PLY files.
+        let path_a = env::temp_dir().join("test_compare_diff_ascii_a.ply");
+        let path_b = env::temp_dir().join("test_compare_diff_ascii_b.ply");
+        write_test_ply_ascii(&path_a, 20, 9, 0.0, Some(0.9), Some(0.005))?;
+        write_test_ply_ascii(&path_b, 20, 9, 50.0, Some(0.1), Some(0.5))?;
+
+        let stats_a = ModelStats::from_file(&path_a)?;
+        let stats_b = ModelStats::from_file(&path_b)?;
+        assert!(stats_a.stats_available && stats_b.stats_available);
+
+        let report = ComparisonReport::compute(stats_a, stats_b, 0.8);
+        assert!(report.stats_available);
+        assert!(
+            report.overall_similarity < 0.9,
+            "clearly different models must not score as essentially identical, got {}",
+            report.overall_similarity
+        );
+        assert!(
+            !report.recommendation().contains("essentially identical"),
+            "recommendation should not claim identity: {}",
+            report.recommendation()
+        );
+
+        fs::remove_file(&path_a).ok();
+        fs::remove_file(&path_b).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn test_comparison_report_stats_unavailable_renormalizes_weights() {
+        // Two models whose distributional stats are unavailable (as
+        // `from_safetensors` reports for an unsupported dtype) but with
+        // identical Gaussian count and SH degree: overall_similarity must
+        // come out to 1.0 via the renormalized (count + SH degree only)
+        // formula, not via a spurious bbox/scale/opacity "match" on
+        // all-zero placeholders.
+        let unavailable = |file_path: &str| ModelStats {
+            file_path: file_path.to_string(),
+            gaussian_count: 1000,
+            sh_degree: 2,
+            bbox_min: [0.0; 3],
+            bbox_max: [0.0; 3],
+            scale_mean: 0.0,
+            scale_std: 0.0,
+            opacity_mean: 0.0,
+            opacity_std: 0.0,
+            position_mean: [0.0; 3],
+            position_std: [0.0; 3],
+            stats_available: false,
+        };
+        let report = ComparisonReport::compute(unavailable("a"), unavailable("b"), 0.8);
+        assert!(!report.stats_available);
+        assert!(
+            approx_eq_f32(report.overall_similarity, 1.0, 1e-4),
+            "renormalized similarity for matching count+SH should be 1.0, got {}",
+            report.overall_similarity
+        );
+        assert!(report.format_text().contains("Partial comparison"));
+    }
+
+    fn approx_eq_f32(a: f32, b: f32, tol: f32) -> bool {
+        (a - b).abs() < tol
     }
 
     // -----------------------------------------------------------------------
@@ -999,11 +1583,21 @@ mod tests {
         Ok(())
     }
 
+    /// Regression: this used to write `test_compare_range_{a,b}.ply` at
+    /// fixed names directly under `env::temp_dir()`, which every concurrent
+    /// invocation of this test (a parallel `cargo test`/`nextest` run, or
+    /// simply this test racing another one that happens to touch the same
+    /// name) shares — one run's `write_test_ply` could truncate a file
+    /// another run had just opened for reading. A per-test `tempfile`
+    /// directory gives each invocation its own directory, so no name
+    /// collides across processes; its `Drop` impl also removes it, which is
+    /// why the explicit `fs::remove_file` cleanup this file's other tests
+    /// still do is unnecessary here.
     #[test]
     fn test_comparison_report_similarity_in_range() -> Result<()> {
-        let tmp_dir = env::temp_dir();
-        let path_a = tmp_dir.join("test_compare_range_a.ply");
-        let path_b = tmp_dir.join("test_compare_range_b.ply");
+        let tmp_dir = tempfile::tempdir().context("create temp dir")?;
+        let path_a = tmp_dir.path().join("test_compare_range_a.ply");
+        let path_b = tmp_dir.path().join("test_compare_range_b.ply");
 
         write_test_ply(&path_a, 100, 45, 0.0, Some(0.3), Some(0.005))?;
         write_test_ply(&path_b, 200, 9, 5.0, Some(0.8), Some(0.05))?;
@@ -1019,8 +1613,6 @@ mod tests {
             report.overall_similarity
         );
 
-        fs::remove_file(&path_a).ok();
-        fs::remove_file(&path_b).ok();
         Ok(())
     }
 
@@ -1101,6 +1693,7 @@ mod tests {
             opacity_std: 0.0,
             position_mean: [0.0; 3],
             position_std: [0.0; 3],
+            stats_available: true,
         };
         let b = ModelStats {
             file_path: "b.ply".to_string(),
@@ -1114,6 +1707,7 @@ mod tests {
             opacity_std: 0.0,
             position_mean: [0.0; 3],
             position_std: [10.0; 3],
+            stats_available: true,
         };
         let report = ComparisonReport::compute(a, b, 0.8);
         assert!(
@@ -1155,5 +1749,160 @@ mod tests {
         assert!((mean - 5.0).abs() < 1e-4, "Expected mean=5.0, got {}", mean);
         // Population std dev = 2.0
         assert!((std - 2.0).abs() < 1e-3, "Expected std≈2.0, got {}", std);
+    }
+
+    // -----------------------------------------------------------------------
+    // run_compare validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_run_compare_rejects_out_of_range_threshold() {
+        // Threshold is validated before any file I/O, so nonexistent paths
+        // are fine here — the point is that a bad --threshold value is a
+        // real error, not silently clamped or ignored.
+        let args = CompareArgs {
+            model1: env::temp_dir().join("does_not_exist_a.ply"),
+            model2: env::temp_dir().join("does_not_exist_b.ply"),
+            format: "text".to_string(),
+            threshold: 5.0,
+        };
+        let result = run_compare(args);
+        assert!(result.is_err());
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            msg.contains("threshold"),
+            "error should mention threshold: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_run_compare_rejects_unknown_format() -> Result<()> {
+        let path_a = env::temp_dir().join("test_compare_run_format_a.ply");
+        let path_b = env::temp_dir().join("test_compare_run_format_b.ply");
+        write_test_ply(&path_a, 3, 0, 0.0, None, None)?;
+        write_test_ply(&path_b, 3, 0, 0.0, None, None)?;
+
+        let args = CompareArgs {
+            model1: path_a.clone(),
+            model2: path_b.clone(),
+            format: "jsom".to_string(), // typo for "json"
+            threshold: 0.8,
+        };
+        let result = run_compare(args);
+        assert!(
+            result.is_err(),
+            "an unrecognized --format value must be a hard error, not a silent text fallback"
+        );
+
+        fs::remove_file(&path_a).ok();
+        fs::remove_file(&path_b).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn test_run_compare_accepts_text_and_json() -> Result<()> {
+        let path_a = env::temp_dir().join("test_compare_run_valid_a.ply");
+        let path_b = env::temp_dir().join("test_compare_run_valid_b.ply");
+        write_test_ply(&path_a, 3, 0, 0.0, None, None)?;
+        write_test_ply(&path_b, 3, 0, 0.0, None, None)?;
+
+        for fmt in ["text", "TEXT", "json", "JSON"] {
+            let args = CompareArgs {
+                model1: path_a.clone(),
+                model2: path_b.clone(),
+                format: fmt.to_string(),
+                threshold: 0.8,
+            };
+            run_compare(args).with_context(|| format!("format '{fmt}' should be accepted"))?;
+        }
+
+        fs::remove_file(&path_a).ok();
+        fs::remove_file(&path_b).ok();
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Untrusted `element vertex` counts must not drive the reservation.
+    // -----------------------------------------------------------------------
+
+    /// The seven properties both PLY readers require, in canonical order.
+    fn required_properties() -> Vec<String> {
+        ["x", "y", "z", "opacity", "scale_0", "scale_1", "scale_2"]
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect()
+    }
+
+    #[test]
+    fn initial_vertex_capacity_is_capped_but_exact_below_the_cap() {
+        // Ordinary files keep their exact one-shot reservation …
+        assert_eq!(initial_vertex_capacity(0), 0);
+        assert_eq!(initial_vertex_capacity(52_341), 52_341);
+        // … and anything above the cap is clamped, so `capacity * 3` for the
+        // interleaved scale buffer cannot overflow `usize` either.
+        assert_eq!(
+            initial_vertex_capacity(MAX_INITIAL_VERTEX_CAPACITY + 1),
+            MAX_INITIAL_VERTEX_CAPACITY
+        );
+        assert_eq!(
+            initial_vertex_capacity(usize::MAX),
+            MAX_INITIAL_VERTEX_CAPACITY
+        );
+        assert!(
+            MAX_INITIAL_VERTEX_CAPACITY.checked_mul(3).is_some(),
+            "the cap itself must leave room for the *3 scale reservation"
+        );
+    }
+
+    #[test]
+    fn read_ply_vertex_data_binary_huge_untrusted_count_does_not_abort() {
+        // Regression: `element vertex 999999999999` used to reach
+        // `Vec::with_capacity(vertex_count)` (and `* 3`) directly, asking
+        // for terabytes before a single body byte was read. Rust aborts the
+        // process on allocation failure rather than returning a catchable
+        // `Result`, so a malformed file could crash the command. With the
+        // reservation capped this must instead fail fast and cleanly on EOF,
+        // since the "body" here is empty.
+        let properties = required_properties();
+        let result =
+            read_ply_vertex_data_binary(&mut std::io::empty(), 999_999_999_999, &properties);
+        assert!(result.is_err(), "expected a clean EOF error, not a crash");
+    }
+
+    #[test]
+    fn read_ply_vertex_data_ascii_huge_untrusted_count_does_not_abort() {
+        // Same regression on the ASCII path, which reserved from the very
+        // same untrusted header field.
+        let properties = required_properties();
+        let mut empty_body = BufReader::new(std::io::empty());
+        let result = read_ply_vertex_data_ascii(&mut empty_body, 999_999_999_999, &properties);
+        let msg = result.err().map(|e| format!("{e:#}")).unwrap_or_default();
+        assert!(
+            msg.contains("EOF"),
+            "expected a clean EOF error, not a crash: {msg}"
+        );
+    }
+
+    #[test]
+    fn read_ply_vertex_data_still_reads_real_files_after_the_cap() -> Result<()> {
+        // The cap is an allocation hint only: a real file is still read in
+        // full, value for value.
+        let path = env::temp_dir().join("test_compare_capped_reservation.ply");
+        write_test_ply(&path, 4, 0, 0.0, Some(0.5), Some(0.25))?;
+        let stats = ModelStats::from_file(&path)?;
+        fs::remove_file(&path).ok();
+        assert_eq!(stats.gaussian_count, 4);
+        assert!(stats.stats_available);
+        assert!(
+            (stats.opacity_mean - 0.5).abs() < 1e-4,
+            "opacity_mean: {}",
+            stats.opacity_mean
+        );
+        assert!(
+            (stats.scale_mean - 0.25).abs() < 1e-4,
+            "scale_mean: {}",
+            stats.scale_mean
+        );
+        Ok(())
     }
 }

@@ -134,11 +134,17 @@ impl CurriculumStage {
     }
 
     /// Number of steps in this stage, or `usize::MAX` for the final open stage.
+    ///
+    /// Uses `saturating_sub` as defense in depth against an inverted range
+    /// (`step_start > step_end`): [`CurriculumSchedule::validate`] rejects
+    /// this for any stage added through [`CurriculumSchedule::add_stage`],
+    /// but `step_start`/`step_end` are public fields a caller can still
+    /// mutate directly after construction without re-validating.
     pub fn duration(&self) -> usize {
         if self.step_end == usize::MAX {
             usize::MAX
         } else {
-            self.step_end - self.step_start
+            self.step_end.saturating_sub(self.step_start)
         }
     }
 }
@@ -184,14 +190,22 @@ impl CurriculumSchedule {
         self.stages.len()
     }
 
-    /// Validate the schedule: stages must be non-overlapping and sorted by
-    /// `step_start`.  Returns an error describing the first violation found.
+    /// Validate the schedule: every stage must have `step_start <=
+    /// step_end`, stages must be contiguous (no gaps) and non-overlapping,
+    /// and sorted by `step_start`.  Returns an error describing the first
+    /// violation found.
     pub fn validate(&self) -> Result<(), CurriculumError> {
         if self.stages.is_empty() {
             return Err(CurriculumError::EmptySchedule);
         }
         let mut prev_end: usize = 0;
         for (i, stage) in self.stages.iter().enumerate() {
+            if stage.step_start > stage.step_end {
+                return Err(CurriculumError::InvalidSchedule(format!(
+                    "stage '{}' has step_start ({}) > step_end ({})",
+                    stage.name, stage.step_start, stage.step_end
+                )));
+            }
             if stage.step_start < prev_end && i > 0 {
                 let prev = &self.stages[i - 1];
                 // Decide whether it is an overlap or unsorted order.
@@ -206,6 +220,24 @@ impl CurriculumSchedule {
                     stage_a: prev.name.clone(),
                     stage_b: stage.name.clone(),
                 });
+            }
+            // Gap check: every stage after the first must pick up exactly
+            // where the previous one left off. Without this, a step that
+            // falls in the gap resolves to no active stage at all
+            // (`active_stage_index_at` returns `None`), and
+            // `CurriculumController::state_at` silently substitutes its
+            // hardcoded fallback values for every difficulty dimension
+            // instead of surfacing the misconfiguration. A gap *before* the
+            // first stage is still allowed (see `active_stage_at`'s doc):
+            // this only constrains stages relative to each other.
+            if i > 0 && stage.step_start != prev_end {
+                return Err(CurriculumError::InvalidSchedule(format!(
+                    "gap between stage '{}' (ends at {prev_end}) and stage '{}' (starts at {}): \
+                     stages must be contiguous",
+                    self.stages[i - 1].name,
+                    stage.name,
+                    stage.step_start
+                )));
             }
             prev_end = stage.step_end;
         }
@@ -249,9 +281,39 @@ impl CurriculumSchedule {
     ///   the current stage is the last one.
     ///
     /// Returns `None` if the dimension is not configured in any reachable stage.
+    ///
+    /// The stage itself is resolved from `step` via
+    /// `Self::active_stage_index_at`. A caller that has already decided
+    /// which stage should be in effect — e.g.
+    /// [`CurriculumController`], whose effective stage can run ahead of
+    /// `step` due to loss-driven or manual advancement — should call
+    /// [`Self::value_at_stage`] directly instead, since re-deriving the
+    /// stage from `step` here would silently discard that decision.
     pub fn value_at(&self, step: usize, dim: &DifficultyDimension) -> Option<f64> {
         let idx = self.active_stage_index_at(step)?;
-        let current = &self.stages[idx];
+        self.value_at_stage(idx, step, dim)
+    }
+
+    /// Like [`Self::value_at`], but resolves the difficulty value against an
+    /// explicitly given `stage_idx` instead of re-deriving the stage from
+    /// `step`.
+    ///
+    /// `step` is still used for the intra-stage interpolation fraction (and
+    /// is expected to be `>= stages[stage_idx].step_start` in the normal
+    /// case, though `saturating_sub` keeps this well-defined — clamped to
+    /// progress `0.0` — even when it is not, e.g. right after
+    /// [`CurriculumController`] has advanced `stage_idx` ahead of what
+    /// `step` alone would select).
+    ///
+    /// Returns `None` if `stage_idx` is out of range or the dimension is not
+    /// configured on that stage.
+    pub fn value_at_stage(
+        &self,
+        stage_idx: usize,
+        step: usize,
+        dim: &DifficultyDimension,
+    ) -> Option<f64> {
+        let current = self.stages.get(stage_idx)?;
         let current_val = current.get_value(dim)?;
 
         if !self.interpolate {
@@ -262,7 +324,7 @@ impl CurriculumSchedule {
         //   1. There is a next stage.
         //   2. The next stage also has this dimension.
         //   3. The current stage has a finite duration (step_end != usize::MAX).
-        let next = self.stages.get(idx + 1);
+        let next = self.stages.get(stage_idx + 1);
         let (Some(next_stage), Some(next_val)) = (next, next.and_then(|s| s.get_value(dim))) else {
             return Some(current_val);
         };
@@ -272,7 +334,7 @@ impl CurriculumSchedule {
         }
 
         // Intra-stage fractional progress.
-        let duration = (current.step_end - current.step_start) as f64;
+        let duration = current.step_end.saturating_sub(current.step_start) as f64;
         let elapsed = (step.saturating_sub(current.step_start)) as f64;
         let t = if duration > 0.0 {
             (elapsed / duration).clamp(0.0, 1.0)
@@ -287,14 +349,27 @@ impl CurriculumSchedule {
 
     /// Fractional progress within the active stage: 0.0 = stage start,
     /// 1.0 = stage end (clamped, infinite stages return 0.0).
+    ///
+    /// The stage is resolved from `step`; see [`Self::value_at`]'s note on
+    /// preferring [`Self::stage_progress_at_stage`] when a specific stage
+    /// (rather than the step-derived one) is already known.
     pub fn stage_progress(&self, step: usize) -> f32 {
-        let Some(stage) = self.active_stage_at(step) else {
+        let Some(idx) = self.active_stage_index_at(step) else {
+            return 0.0;
+        };
+        self.stage_progress_at_stage(idx, step)
+    }
+
+    /// Like [`Self::stage_progress`], but against an explicit `stage_idx`
+    /// instead of the step-derived one. See [`Self::value_at_stage`].
+    pub fn stage_progress_at_stage(&self, stage_idx: usize, step: usize) -> f32 {
+        let Some(stage) = self.stages.get(stage_idx) else {
             return 0.0;
         };
         if stage.step_end == usize::MAX {
             return 0.0;
         }
-        let duration = stage.step_end - stage.step_start;
+        let duration = stage.step_end.saturating_sub(stage.step_start);
         if duration == 0 {
             return 1.0;
         }
@@ -468,8 +543,19 @@ impl CurriculumController {
             .map(|s| s.name.clone())
             .unwrap_or_else(|| "unknown".to_owned());
 
+        // Resolve every difficulty value against `eff_idx` — the
+        // controller's EFFECTIVE stage (which honours `no_regression` and
+        // any loss-driven/manual advancement via `record_loss`/
+        // `advance_stage`) — rather than re-deriving the stage from `step`
+        // alone. Using `self.schedule.value_at(step, dim)` here would
+        // silently discard advancement: the reported `stage_name`/
+        // `stage_index` would show the advanced stage while every actual
+        // difficulty value stayed pinned to whatever `step`'s own natural
+        // stage would give, making early advancement a display-only no-op.
         let get_val = |dim: &DifficultyDimension, default: f64| -> f64 {
-            self.schedule.value_at(step, dim).unwrap_or(default)
+            self.schedule
+                .value_at_stage(eff_idx, step, dim)
+                .unwrap_or(default)
         };
 
         let render_resolution =
@@ -480,7 +566,7 @@ impl CurriculumController {
         let sh_degree = (get_val(&DifficultyDimension::ShDegree, 3.0).round() as u32).min(3);
         let ddim_steps = get_val(&DifficultyDimension::DdimSteps, 20.0).round() as usize;
 
-        let stage_progress = self.schedule.stage_progress(step);
+        let stage_progress = self.schedule.stage_progress_at_stage(eff_idx, step);
 
         CurriculumState {
             step,
@@ -699,6 +785,21 @@ mod tests {
         assert_eq!(stage.get_value(&DifficultyDimension::GuidanceScale), None);
     }
 
+    #[test]
+    fn test_curriculum_stage_inverted_range_does_not_underflow() {
+        // `step_start`/`step_end` are public fields, so a caller can build
+        // an inverted range directly (bypassing `CurriculumSchedule::validate`,
+        // which rejects this when the stage is added to a schedule).
+        // `duration()` must degrade gracefully (saturating to 0) rather than
+        // underflow-panic (debug) or wrap to a huge value (release).
+        let stage = CurriculumStage::new("inverted", 200, 100);
+        assert_eq!(
+            stage.duration(),
+            0,
+            "inverted range must saturate to 0, not underflow"
+        );
+    }
+
     // ── CurriculumSchedule – add / validate ──────────────────────────────
 
     #[test]
@@ -738,6 +839,52 @@ mod tests {
             "expected overlapping error, got {:?}",
             result
         );
+    }
+
+    #[test]
+    fn test_schedule_inverted_stage_range_error() {
+        // A stage with step_start > step_end must be rejected outright,
+        // rather than silently accepted and later underflowing in
+        // `duration()` / `value_at()` / `stage_progress()`.
+        let schedule = CurriculumSchedule::new().add_stage(CurriculumStage::new("bad", 200, 100));
+        let result = schedule.validate();
+        assert!(
+            matches!(result, Err(CurriculumError::InvalidSchedule(_))),
+            "expected InvalidSchedule for step_start > step_end, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_schedule_gap_error() {
+        // A gap between consecutive stages (stage_0 ends at 100, stage_1
+        // doesn't start until 200) must be rejected: an uncovered step in
+        // [100, 200) would otherwise resolve to no active stage at all, and
+        // `CurriculumController::state_at` would silently substitute
+        // hardcoded defaults for every difficulty dimension.
+        let schedule = CurriculumSchedule::new()
+            .add_stage(CurriculumStage::new("stage_0", 0, 100))
+            .add_stage(CurriculumStage::new("stage_1", 200, 300));
+        let result = schedule.validate();
+        assert!(
+            matches!(result, Err(CurriculumError::InvalidSchedule(_))),
+            "expected InvalidSchedule for a gap between stages, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_schedule_gap_before_first_stage_is_allowed() -> Result<(), CurriculumError> {
+        // A gap BEFORE the very first stage is a deliberate, documented
+        // case (see `active_stage_at`'s doc: returns `None` "if step
+        // precedes the first stage") and must remain accepted — the
+        // contiguity requirement only applies BETWEEN stages.
+        let schedule = CurriculumSchedule::new()
+            .add_stage(CurriculumStage::new("warmup_done", 100, 200))
+            .add_stage(CurriculumStage::new("main", 200, usize::MAX));
+        schedule.validate()?;
+        assert!(schedule.active_stage_at(50).is_none());
+        Ok(())
     }
 
     // ── CurriculumSchedule – active stage ────────────────────────────────
@@ -951,6 +1098,23 @@ mod tests {
             "stage should have advanced; idx={}",
             ctrl.current_stage_idx()
         );
+        assert_eq!(ctrl.current_stage_idx(), 1);
+
+        // Regression: every `record_loss` call above used `step` values in
+        // [0, 200), still deep inside "low_res"'s own [0, 1000) range. Once
+        // the controller has advanced, `state_at` at one of those SAME step
+        // values must reflect the advanced stage's actual difficulty
+        // VALUES, not just its name/index — otherwise loss-driven
+        // advancement changes what is reported without changing what the
+        // training loop actually receives.
+        let state = ctrl.state_at(50);
+        assert_eq!(state.stage_name, "high_res");
+        assert_eq!(state.stage_index, 1);
+        assert_eq!(
+            state.render_resolution, 256,
+            "state_at must use the ADVANCED stage's render_resolution (256), not the \
+             step-derived stage's (64), once the controller has advanced past it"
+        );
 
         Ok(())
     }
@@ -976,6 +1140,43 @@ mod tests {
         let ok = ctrl.advance_stage();
         assert!(!ok);
         assert_eq!(ctrl.current_stage_idx(), 3);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_state_at_uses_effective_stage_after_force_advance() -> Result<(), CurriculumError> {
+        // Focused regression for `CurriculumController::state_at` ignoring
+        // the effective stage: force-advance with `advance_stage()` (fully
+        // deterministic, unlike loss-threshold advancement) and query
+        // `state_at` at step 0 -- squarely inside stage_0's own [0, 2000)
+        // range from a pure step-based view. Every difficulty dimension
+        // `default_gaf()` configures must come from the ADVANCED stage
+        // (stage_1), matching the already-correct `stage_name`/`stage_index`.
+        let schedule = CurriculumSchedule::default_gaf();
+        let config = CurriculumConfig::default(); // no_regression: true
+        let mut ctrl = CurriculumController::new(schedule, config)?;
+
+        ctrl.advance_stage(); // stage_0 -> stage_1
+        assert_eq!(ctrl.current_stage_idx(), 1);
+
+        let state = ctrl.state_at(0);
+        assert_eq!(state.stage_name, "stage_1");
+        assert_eq!(state.stage_index, 1);
+        // stage_1's configured values (see `default_gaf`'s table), NOT
+        // stage_0's (res=64, views=1, guidance=1.0, sh=0).
+        assert_eq!(state.render_resolution, 128);
+        assert_eq!(state.num_views, 2);
+        assert!((state.guidance_scale - 3.0).abs() < 1e-9);
+        assert_eq!(state.sh_degree, 1);
+
+        // `format_state` (which delegates to `state_at`) must reflect the
+        // same advanced values, not just the advanced name.
+        let formatted = ctrl.format_state(0);
+        assert!(
+            formatted.contains("res=128"),
+            "formatted state: {formatted}"
+        );
 
         Ok(())
     }

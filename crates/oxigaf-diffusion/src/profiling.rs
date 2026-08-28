@@ -14,7 +14,7 @@ pub struct LayerProfile {
 #[derive(Debug, Default)]
 pub struct DiffusionProfiler {
     profiles: Vec<LayerProfile>,
-    active: HashMap<String, Instant>,
+    active: HashMap<String, (Instant, usize)>,
 }
 
 impl DiffusionProfiler {
@@ -24,36 +24,89 @@ impl DiffusionProfiler {
     }
 
     /// Begin timing the named layer.
+    ///
+    /// The resulting [`LayerProfile::estimated_memory_bytes`] will be `0`;
+    /// use [`Self::start_with_memory`] instead when a memory estimate (e.g.
+    /// from [`estimate_attention_memory_bytes`] or
+    /// [`estimate_unet_memory_bytes`]) is available for the layer being
+    /// timed.
     pub fn start(&mut self, name: impl Into<String>) {
-        self.active.insert(name.into(), Instant::now());
+        self.start_with_memory(name, 0);
     }
 
-    /// Stop timing the named layer and record its duration.
+    /// Begin timing the named layer, attaching a caller-supplied estimated
+    /// memory footprint (in bytes) that will be recorded on the resulting
+    /// [`LayerProfile`] once [`Self::stop`] is called.
+    ///
+    /// The estimate is typically computed with
+    /// [`estimate_attention_memory_bytes`] or [`estimate_unet_memory_bytes`]
+    /// for the specific layer shape being profiled — this method has no way
+    /// to derive it itself, since it does not know what kind of layer `name`
+    /// refers to.
+    pub fn start_with_memory(&mut self, name: impl Into<String>, estimated_memory_bytes: usize) {
+        self.active
+            .insert(name.into(), (Instant::now(), estimated_memory_bytes));
+    }
+
+    /// Stop timing the named layer and record its duration (and any memory
+    /// estimate attached via [`Self::start_with_memory`]).
     ///
     /// Returns the elapsed [`Duration`], or `None` if `name` was not started.
     pub fn stop(&mut self, name: &str) -> Option<Duration> {
-        self.active.remove(name).map(|start| {
-            let elapsed = start.elapsed();
-            self.profiles.push(LayerProfile {
-                name: name.to_string(),
-                duration: elapsed,
-                estimated_memory_bytes: 0,
-            });
-            elapsed
-        })
+        self.active
+            .remove(name)
+            .map(|(start, estimated_memory_bytes)| {
+                let elapsed = start.elapsed();
+                self.profiles.push(LayerProfile {
+                    name: name.to_string(),
+                    duration: elapsed,
+                    estimated_memory_bytes,
+                });
+                elapsed
+            })
     }
 
     /// Time a closure and record it under `name`.
+    ///
+    /// The resulting [`LayerProfile::estimated_memory_bytes`] will be `0`;
+    /// use [`Self::time_with_memory`] instead when a memory estimate is
+    /// available for the layer being timed.
     pub fn time<F: FnOnce() -> R, R>(&mut self, name: &str, f: F) -> R {
+        self.time_with_memory(name, 0, f)
+    }
+
+    /// Time a closure and record it under `name`, along with a
+    /// caller-supplied estimated memory footprint (in bytes) — typically
+    /// computed via [`estimate_attention_memory_bytes`] or
+    /// [`estimate_unet_memory_bytes`] before calling this.
+    pub fn time_with_memory<F: FnOnce() -> R, R>(
+        &mut self,
+        name: &str,
+        estimated_memory_bytes: usize,
+        f: F,
+    ) -> R {
         let start = Instant::now();
         let result = f();
         let elapsed = start.elapsed();
         self.profiles.push(LayerProfile {
             name: name.to_string(),
             duration: elapsed,
-            estimated_memory_bytes: 0,
+            estimated_memory_bytes,
         });
         result
+    }
+
+    /// Sum of [`LayerProfile::estimated_memory_bytes`] across all recorded
+    /// layers.
+    ///
+    /// This is a naive sum, not a true peak-memory estimate (real layers
+    /// overlap and get freed during a forward pass), but it gives a useful
+    /// upper bound and lets [`estimate_attention_memory_bytes`] /
+    /// [`estimate_unet_memory_bytes`] estimates recorded via
+    /// [`Self::start_with_memory`] / [`Self::time_with_memory`] actually
+    /// feed into a queryable total.
+    pub fn total_estimated_memory_bytes(&self) -> usize {
+        self.profiles.iter().map(|p| p.estimated_memory_bytes).sum()
     }
 
     /// Return all recorded layer profiles in insertion order.
@@ -74,7 +127,10 @@ impl DiffusionProfiler {
         sorted
     }
 
-    /// Fraction of total time spent in the first profile entry whose name equals `name`.
+    /// Fraction of total time spent across all profile entries whose name
+    /// equals `name` (summed, not just the first match — a layer timed once
+    /// per denoising step, for example, will have its `name` repeated once
+    /// per step, and this returns the aggregate share across every step).
     ///
     /// Returns `0.0` when total duration is zero.
     pub fn fraction_of_total(&self, name: &str) -> f64 {
@@ -97,12 +153,16 @@ impl DiffusionProfiler {
         let total_ms = total.as_secs_f64() * 1000.0;
         let mut lines = vec![
             format!(
-                "Diffusion profiler: {:.3} ms total, {} layers",
+                "Diffusion profiler: {:.3} ms total, {} layers, {} est. memory (sum)",
                 total_ms,
-                self.profiles.len()
+                self.profiles.len(),
+                format_bytes(self.total_estimated_memory_bytes()),
             ),
-            format!("{:<40} {:>12} {:>8}", "Layer", "Time (ms)", "%"),
-            "-".repeat(62),
+            format!(
+                "{:<40} {:>12} {:>8} {:>12}",
+                "Layer", "Time (ms)", "%", "Est. Mem"
+            ),
+            "-".repeat(76),
         ];
         for p in &self.profiles {
             let ms = p.duration.as_secs_f64() * 1000.0;
@@ -111,7 +171,13 @@ impl DiffusionProfiler {
             } else {
                 0.0
             };
-            lines.push(format!("{:<40} {:>12.3} {:>8.2}", p.name, ms, pct));
+            lines.push(format!(
+                "{:<40} {:>12.3} {:>8.2} {:>12}",
+                p.name,
+                ms,
+                pct,
+                format_bytes(p.estimated_memory_bytes)
+            ));
         }
         lines.join("\n")
     }
@@ -120,6 +186,24 @@ impl DiffusionProfiler {
     pub fn clear(&mut self) {
         self.profiles.clear();
         self.active.clear();
+    }
+}
+
+/// Format a byte count as a human-readable string (`B`/`KB`/`MB`/`GB`,
+/// 1024-based).
+fn format_bytes(bytes: usize) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    let b = bytes as f64;
+    if b >= GB {
+        format!("{:.2} GB", b / GB)
+    } else if b >= MB {
+        format!("{:.2} MB", b / MB)
+    } else if b >= KB {
+        format!("{:.2} KB", b / KB)
+    } else {
+        format!("{bytes} B")
     }
 }
 
@@ -289,6 +373,68 @@ mod tests {
         assert!(profiler.profiles().is_empty());
     }
 
+    // Regression tests for the previously-hardcoded-to-0 estimated_memory_bytes.
+
+    // 9a. plain start()/stop() still records 0 (no fabricated estimate).
+    #[test]
+    fn start_stop_without_memory_records_zero() {
+        let mut profiler = DiffusionProfiler::new();
+        profiler.start("plain");
+        profiler.stop("plain");
+        assert_eq!(profiler.profiles()[0].estimated_memory_bytes, 0);
+    }
+
+    // 9b. plain time() still records 0 (no fabricated estimate).
+    #[test]
+    fn time_without_memory_records_zero() {
+        let mut profiler = DiffusionProfiler::new();
+        profiler.time("plain", || {});
+        assert_eq!(profiler.profiles()[0].estimated_memory_bytes, 0);
+    }
+
+    // 9c. start_with_memory()/stop() carries the estimate through.
+    #[test]
+    fn start_stop_with_memory_records_estimate() {
+        let mut profiler = DiffusionProfiler::new();
+        let est = estimate_attention_memory_bytes(1, 64, 8, 64);
+        profiler.start_with_memory("attn", est);
+        profiler.stop("attn");
+        assert_eq!(profiler.profiles()[0].estimated_memory_bytes, est);
+        assert!(est > 0);
+    }
+
+    // 9d. time_with_memory() carries the estimate through.
+    #[test]
+    fn time_with_memory_records_estimate() {
+        let mut profiler = DiffusionProfiler::new();
+        let est = estimate_unet_memory_bytes(1, 256, 64, 4);
+        let result = profiler.time_with_memory("unet", est, || 7u32);
+        assert_eq!(result, 7);
+        assert_eq!(profiler.profiles()[0].estimated_memory_bytes, est);
+    }
+
+    // 9e. total_estimated_memory_bytes sums across mixed recording styles.
+    #[test]
+    fn total_estimated_memory_bytes_sums_all_layers() {
+        let mut profiler = DiffusionProfiler::new();
+        profiler.time("no_estimate", || {});
+        profiler.time_with_memory("with_estimate_1", 1000, || {});
+        profiler.time_with_memory("with_estimate_2", 2000, || {});
+        assert_eq!(profiler.total_estimated_memory_bytes(), 3000);
+    }
+
+    // 9f. format_report surfaces the recorded memory estimate, not just 0.
+    #[test]
+    fn format_report_shows_nonzero_memory_estimate() {
+        let mut profiler = DiffusionProfiler::new();
+        profiler.time_with_memory("unet", 1_048_576, || {});
+        let report = profiler.format_report();
+        assert!(
+            report.contains("1.00 MB"),
+            "report should surface the recorded memory estimate:\n{report}"
+        );
+    }
+
     // 10. estimate_attention_memory_bytes returns a positive value
     #[test]
     fn estimate_attention_memory_positive() {
@@ -339,9 +485,9 @@ mod tests {
     #[test]
     fn attention_memory_score_component_quadratic() {
         // Isolate the score component by choosing head_dim=0 (zero QKV bytes).
-        // score = batch × heads × seq × seq × 4
-        let scores_128: usize = 1 * 8 * 128 * 128 * 4;
-        let scores_256: usize = 1 * 8 * 256 * 256 * 4;
+        // score = batch × heads × seq × seq × 4, at batch = 1.
+        let scores_128: usize = 8 * 128 * 128 * 4;
+        let scores_256: usize = 8 * 256 * 256 * 4;
         assert_eq!(
             scores_256,
             4 * scores_128,

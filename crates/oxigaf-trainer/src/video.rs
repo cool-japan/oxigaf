@@ -108,6 +108,16 @@ pub struct VideoFrameIterator {
     frame_indices: Vec<usize>,
     current_pos: usize,
     config: VideoConfig,
+    /// The most recent error `next_frame` encountered while loading a frame,
+    /// if any — see [`Self::last_error`].
+    last_error: Option<TrainerError>,
+    /// Number of times [`Self::shuffle_indices`] has run so far. Combined
+    /// with `config.shuffle_seed` (via `wrapping_add`) to give each
+    /// reshuffle a distinct-but-reproducible seed, so successive epochs get
+    /// independent-looking permutations instead of deterministically
+    /// reapplying the exact same one every time (see
+    /// [`Self::shuffle_indices`]).
+    shuffle_epoch: u64,
 }
 
 impl VideoFrameIterator {
@@ -133,6 +143,8 @@ impl VideoFrameIterator {
             frame_indices,
             current_pos: 0,
             config,
+            last_error: None,
+            shuffle_epoch: 0,
         };
 
         // Shuffle the initial iteration order if requested.
@@ -148,7 +160,7 @@ impl VideoFrameIterator {
     /// Supports:
     /// - A `.json` file path (loaded with [`FlameSequence::from_json`]).
     /// - A directory path (loaded with [`FlameSequence::from_directory`] using
-    ///   the pattern `"frame_{}.json"` and auto-detected frame count).
+    ///   the pattern `"frame_{:04}.json"` and auto-detected frame count).
     ///
     /// # Errors
     ///
@@ -203,22 +215,51 @@ impl VideoFrameIterator {
         let seq_idx = self.frame_indices[self.current_pos];
         self.current_pos += 1;
 
-        Some(
-            self.sequence
-                .get_frame(seq_idx)
-                .cloned()
-                .map_err(|e| TrainerError::SequenceError(e.to_string())),
-        )
+        let load_result = match self.sequence.get_frame(seq_idx).cloned() {
+            Ok(params) => {
+                self.last_error = None;
+                Ok(params)
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                // Build two independent `TrainerError`s from clones of the
+                // same message (`TrainerError` itself isn't `Clone`): one to
+                // return now, one to keep for `last_error()` — see that
+                // method's doc for why a caller can't just call
+                // `next_frame` again to "see the error again".
+                self.last_error = Some(TrainerError::SequenceError(msg.clone()));
+                Err(TrainerError::SequenceError(msg))
+            }
+        };
+
+        Some(load_result)
+    }
+
+    /// The error `next_frame` most recently encountered while loading a
+    /// frame, if any.
+    ///
+    /// `next_frame` always advances `current_pos` past a frame before
+    /// reporting whether loading it succeeded (so a corrupt frame can't
+    /// wedge the iterator in a permanent retry loop), which means a caller
+    /// cannot simply call `next_frame` again to "see the error again" —
+    /// that call loads the *next* frame instead. This is the only way to
+    /// inspect which error occurred after the fact, in particular after
+    /// [`Self::next_batch`] stops early on a load failure.
+    #[must_use]
+    pub fn last_error(&self) -> Option<&TrainerError> {
+        self.last_error.as_ref()
     }
 
     /// Collect the next `batch_size` frames into a [`FrameBatch`].
     ///
-    /// Returns `None` when the sequence is exhausted and looping is disabled.
-    /// A partial batch is returned if fewer than `batch_size` frames remain
-    /// (non-looping) — the batch will contain all remaining frames.
-    ///
-    /// Returns `None` only when the very first call to `next_frame` returns
-    /// `None` (i.e., the sequence was already exhausted before this call).
+    /// Returns `None` when the sequence is exhausted and looping is disabled,
+    /// or when the very next frame fails to load (see [`Self::last_error`]
+    /// to distinguish the two: exhaustion leaves it `None`, a load failure
+    /// sets it). A partial (possibly empty) batch is also possible: if
+    /// frames `0..k` of this call loaded fine but frame `k+1` failed to
+    /// load, the batch stops at `k` frames rather than including the
+    /// failure or skipping past it — [`Self::last_error`] reports what went
+    /// wrong so the caller can decide whether to retry, skip, or abort.
     pub fn next_batch(&mut self, batch_size: usize) -> Option<FrameBatch> {
         let mut frames = Vec::with_capacity(batch_size);
         let mut indices = Vec::with_capacity(batch_size);
@@ -226,9 +267,13 @@ impl VideoFrameIterator {
         for _ in 0..batch_size {
             match self.next_frame() {
                 None => break,
-                Some(Err(_e)) => {
-                    // Propagate the error by stopping; caller can call next_frame
-                    // to observe the error directly.
+                Some(Err(_)) => {
+                    // `next_frame` already advanced past the failing frame
+                    // and recorded the error in `self.last_error` — stop the
+                    // batch here rather than silently skipping the bad frame
+                    // and continuing, which would hide a corrupt file behind
+                    // a merely-short batch. `next_frame` again here would
+                    // load the *next* frame, not re-surface this error.
                     break;
                 }
                 Some(Ok(params)) => {
@@ -293,10 +338,21 @@ impl VideoFrameIterator {
 
     // ---- Private helpers ----------------------------------------------------
 
-    /// Shuffle `frame_indices` in-place using the configured seed.
+    /// Shuffle `frame_indices` in-place.
+    ///
+    /// Regression: this used to reseed `StdRng` from `config.shuffle_seed`
+    /// on every call, so it always applied the exact same permutation `P`
+    /// to whatever order `frame_indices` currently held — successive
+    /// `reset()` calls produced `P`, `P²`, `P³`, ... (a short deterministic
+    /// cycle), not an independent shuffle per epoch as documented. Mixing
+    /// in `shuffle_epoch` (incremented after every call) gives each call a
+    /// distinct seed while staying fully reproducible for a fixed
+    /// `(shuffle_seed, epoch)` pair.
     fn shuffle_indices(&mut self) {
-        let mut rng = rand::rngs::StdRng::seed_from_u64(self.config.shuffle_seed);
+        let seed = self.config.shuffle_seed.wrapping_add(self.shuffle_epoch);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
         self.frame_indices.shuffle(&mut rng);
+        self.shuffle_epoch = self.shuffle_epoch.wrapping_add(1);
     }
 }
 
@@ -379,12 +435,6 @@ fn discover_directory_sequence(dir: &std::path::Path) -> Result<(usize, String),
 
     Ok((count, "frame_{:04}.json".to_string()))
 }
-
-// ---------------------------------------------------------------------------
-// TrainerError addition — SequenceError
-//
-// NOTE: This variant is declared here but must be added to the enum in lib.rs.
-// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -680,5 +730,120 @@ mod tests {
             0,
             "frame_at must not advance current_pos"
         );
+    }
+
+    // ---- Regression: last_error / next_batch error visibility ---------------
+
+    #[test]
+    fn last_error_starts_none() {
+        let seq = make_sequence(3);
+        let iter = VideoFrameIterator::from_sequence(seq, default_config()).expect("ok");
+        assert!(iter.last_error().is_none());
+    }
+
+    #[test]
+    fn last_error_set_after_failing_next_frame() {
+        // Regression: `next_batch` used to just `break` on a load error
+        // with no way to inspect it afterward — `next_frame` had already
+        // advanced past the failing frame, so calling it again (per the old
+        // doc comment) returned the *next* frame's result, not the error.
+        let seq = make_sequence(3);
+        let mut iter = VideoFrameIterator::from_sequence(seq, default_config()).expect("ok");
+
+        // Inject an out-of-range sequence index to force `get_frame` to fail
+        // (private-field access is legal here: `mod tests` is a child of
+        // this module).
+        iter.frame_indices = vec![999];
+
+        let result = iter.next_frame();
+        assert!(matches!(result, Some(Err(_))), "expected a load error");
+        assert!(
+            iter.last_error().is_some(),
+            "last_error must be set after a failing next_frame"
+        );
+    }
+
+    #[test]
+    fn last_error_cleared_by_a_subsequent_successful_load() {
+        let seq = make_sequence(3);
+        let mut iter = VideoFrameIterator::from_sequence(seq, default_config()).expect("ok");
+        iter.frame_indices = vec![999, 0];
+
+        assert!(iter.next_frame().unwrap().is_err());
+        assert!(iter.last_error().is_some());
+
+        assert!(iter.next_frame().unwrap().is_ok());
+        assert!(
+            iter.last_error().is_none(),
+            "a later successful load should clear the stale error"
+        );
+    }
+
+    #[test]
+    fn next_batch_stops_at_a_failing_frame_and_records_last_error() {
+        let seq = make_sequence(3);
+        let mut iter = VideoFrameIterator::from_sequence(seq, default_config()).expect("ok");
+        // Frame 0 loads fine, frame 1 (index 999) fails, frame 2 would load
+        // fine but must never be reached because the batch stops early.
+        iter.frame_indices = vec![0, 999, 1];
+
+        let batch = iter
+            .next_batch(3)
+            .expect("partial batch before the failure");
+        assert_eq!(batch.frames.len(), 1, "must stop before the failing frame");
+        assert!(iter.last_error().is_some());
+    }
+
+    // ---- Regression: shuffle must vary per epoch, not repeat the same P -----
+
+    #[test]
+    fn shuffle_differs_across_successive_resets() {
+        let seq = make_sequence(50);
+        let cfg = VideoConfig {
+            shuffle_frames: true,
+            shuffle_seed: 7,
+            ..Default::default()
+        };
+        let mut iter = VideoFrameIterator::from_sequence(seq, cfg).expect("ok");
+        let epoch0 = iter.frame_indices.clone();
+        iter.reset();
+        let epoch1 = iter.frame_indices.clone();
+        iter.reset();
+        let epoch2 = iter.frame_indices.clone();
+
+        assert_ne!(epoch0, epoch1, "epoch 1 must differ from epoch 0");
+        assert_ne!(epoch1, epoch2, "epoch 2 must differ from epoch 1");
+        assert_ne!(epoch0, epoch2, "epoch 2 must differ from epoch 0 too");
+
+        for perm in [&epoch0, &epoch1, &epoch2] {
+            let mut sorted = (*perm).clone();
+            sorted.sort_unstable();
+            assert_eq!(
+                sorted,
+                (0..50).collect::<Vec<_>>(),
+                "must stay a permutation of 0..50"
+            );
+        }
+    }
+
+    #[test]
+    fn shuffle_epoch_sequence_is_reproducible_from_same_seed() {
+        let make_iter = || {
+            let seq = make_sequence(20);
+            let cfg = VideoConfig {
+                shuffle_frames: true,
+                shuffle_seed: 99,
+                ..Default::default()
+            };
+            VideoFrameIterator::from_sequence(seq, cfg).expect("ok")
+        };
+
+        let mut a = make_iter();
+        let mut b = make_iter();
+        for _ in 0..3 {
+            assert_eq!(a.frame_indices, b.frame_indices);
+            a.reset();
+            b.reset();
+        }
     }
 }

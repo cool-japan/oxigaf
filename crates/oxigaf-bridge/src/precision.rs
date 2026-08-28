@@ -5,7 +5,7 @@
 
 use crate::error::{BridgeError, Result};
 use half::{bf16, f16};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 /// Floating-point precision types
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -41,7 +41,11 @@ impl Precision {
 /// Configuration for precision conversion
 pub struct PrecisionConfig {
     default_precision: Precision,
-    layer_precisions: HashMap<String, Precision>,
+    /// Patterns are stored in a `BTreeMap` purely so iteration order is
+    /// deterministic (lexicographic by pattern) regardless of insertion
+    /// order or the process's hash-seed -- see [`PrecisionConfig::get_layer_precision`]
+    /// for the actual match-selection rule.
+    layer_precisions: BTreeMap<String, Precision>,
     keep_normalization_fp32: bool,
 }
 
@@ -50,7 +54,7 @@ impl PrecisionConfig {
     pub fn new() -> Self {
         Self {
             default_precision: Precision::FP32,
-            layer_precisions: HashMap::new(),
+            layer_precisions: BTreeMap::new(),
             keep_normalization_fp32: true,
         }
     }
@@ -76,21 +80,38 @@ impl PrecisionConfig {
     }
 
     /// Get the precision for a specific layer
+    ///
+    /// If more than one registered pattern matches `layer_name`, the
+    /// *longest* pattern wins (the most specific match); ties are broken by
+    /// picking the lexicographically smallest pattern string. This is fully
+    /// deterministic regardless of the order patterns were registered in,
+    /// unlike a plain first-match-wins scan over a `HashMap`.
     pub fn get_layer_precision(&self, layer_name: &str) -> Precision {
-        // Check if layer matches any pattern
+        let mut best: Option<(&str, Precision)> = None;
         for (pattern, precision) in &self.layer_precisions {
-            if layer_name.contains(pattern) {
-                return *precision;
+            if !layer_name.contains(pattern.as_str()) {
+                continue;
+            }
+            let is_better = match best {
+                None => true,
+                Some((best_pattern, _)) => {
+                    pattern.len() > best_pattern.len()
+                        || (pattern.len() == best_pattern.len() && pattern.as_str() < best_pattern)
+                }
+            };
+            if is_better {
+                best = Some((pattern.as_str(), *precision));
             }
         }
 
-        // Keep normalization layers in FP32 if configured
-        if self.keep_normalization_fp32
-            && (layer_name.contains("norm")
-                || layer_name.contains("layernorm")
-                || layer_name.contains("batchnorm")
-                || layer_name.contains("groupnorm"))
-        {
+        if let Some((_, precision)) = best {
+            return precision;
+        }
+
+        // Keep normalization layers in FP32 if configured. "norm" alone
+        // covers "layernorm"/"batchnorm"/"groupnorm" (each contains "norm"
+        // as a substring), so checking those separately would be redundant.
+        if self.keep_normalization_fp32 && layer_name.contains("norm") {
             return Precision::FP32;
         }
 
@@ -159,12 +180,62 @@ pub fn bf16_bytes_to_f32(bytes: &[u8]) -> Result<Vec<f32>> {
     Ok(bf16_data.iter().map(|x| x.to_f32()).collect())
 }
 
-/// Convert f32 data to specified precision
-pub fn convert_precision(data: &[f32], precision: Precision) -> Vec<u8> {
+/// Maps a `safetensors::Dtype` to the corresponding [`Precision`], if it is
+/// one of the three floating-point precisions this crate converts between.
+/// Returns `None` for every other dtype (integers, bool, and other float
+/// widths `safetensors` supports but this crate does not convert -- those
+/// are passed through by their callers unchanged instead).
+pub fn float_precision_of(dtype: safetensors::Dtype) -> Option<Precision> {
+    match dtype {
+        safetensors::Dtype::F32 => Some(Precision::FP32),
+        safetensors::Dtype::F16 => Some(Precision::FP16),
+        safetensors::Dtype::BF16 => Some(Precision::BF16),
+        _ => None,
+    }
+}
+
+/// Maps a [`Precision`] to its corresponding `safetensors::Dtype`.
+pub fn dtype_of(precision: Precision) -> safetensors::Dtype {
     match precision {
-        Precision::FP32 => data.iter().flat_map(|x| x.to_le_bytes()).collect(),
+        Precision::FP32 => safetensors::Dtype::F32,
+        Precision::FP16 => safetensors::Dtype::F16,
+        Precision::BF16 => safetensors::Dtype::BF16,
+    }
+}
+
+/// Convert f32 data to specified precision.
+///
+/// Returns the encoded bytes together with a count of elements that were
+/// finite in `data` but became non-finite (`+/-inf`) after the conversion --
+/// e.g. values whose magnitude exceeds FP16's ~65504 cap. `half::f16`/`bf16`
+/// saturate silently on overflow, and the encoded bytes alone carry no trace
+/// of that: a downstream NaN/Inf checker (see
+/// `validation::validate_converted_checkpoint`) cannot otherwise tell such a
+/// saturated value apart from one that was already `inf` in the source.
+/// Callers should treat a non-zero count as a conversion warning.
+pub fn convert_precision(data: &[f32], precision: Precision) -> (Vec<u8>, usize) {
+    let bytes = match precision {
+        Precision::FP32 => return (data.iter().flat_map(|x| x.to_le_bytes()).collect(), 0),
         Precision::FP16 => f32_to_f16_bytes(data),
         Precision::BF16 => f32_to_bf16_bytes(data),
+    };
+    let saturated = count_saturated(data, &bytes, precision);
+    (bytes, saturated)
+}
+
+/// Counts elements that were finite in `original` but decode back to a
+/// non-finite value from `encoded` at `precision`. Used by
+/// [`convert_precision`] to report silent overflow saturation.
+fn count_saturated(original: &[f32], encoded: &[u8], precision: Precision) -> usize {
+    match bytes_to_f32(encoded, precision) {
+        Ok(decoded) => original
+            .iter()
+            .zip(decoded.iter())
+            .filter(|(&orig, &conv)| orig.is_finite() && !conv.is_finite())
+            .count(),
+        // Should not happen: `encoded` was just produced by this module's
+        // own encoder, so it always has a length valid for `precision`.
+        Err(_) => 0,
     }
 }
 
@@ -190,7 +261,13 @@ pub fn bytes_to_f32(bytes: &[u8], precision: Precision) -> Result<Vec<f32>> {
     }
 }
 
-/// Validate round-trip conversion error
+/// Validate round-trip conversion error.
+///
+/// Uses a *relative* threshold (`diff <= max_error * orig.abs().max(1.0)`)
+/// rather than a fixed absolute one, since an absolute threshold is the
+/// wrong metric across weights of different magnitude: a `max_error` tight
+/// enough for values near zero is spuriously strict for large ones, and one
+/// loose enough for large values lets small ones drift arbitrarily.
 pub fn validate_conversion(original: &[f32], converted: &[f32], max_error: f32) -> Result<()> {
     if original.len() != converted.len() {
         return Err(BridgeError::Validation(format!(
@@ -201,15 +278,16 @@ pub fn validate_conversion(original: &[f32], converted: &[f32], max_error: f32) 
     }
 
     let mut max_diff = 0.0f32;
-    for (_i, (&orig, &conv)) in original.iter().zip(converted.iter()).enumerate() {
+    for (i, (&orig, &conv)) in original.iter().zip(converted.iter()).enumerate() {
         let diff = (orig - conv).abs();
         if diff > max_diff {
             max_diff = diff;
         }
-        if diff > max_error {
+        let allowed = max_error * orig.abs().max(1.0);
+        if diff > allowed {
             return Err(BridgeError::Validation(format!(
-                "Conversion error too large at index {}: original {}, converted {}, diff {}",
-                _i, orig, conv, diff
+                "Conversion error too large at index {}: original {}, converted {}, diff {} (allowed {})",
+                i, orig, conv, diff, allowed
             )));
         }
     }
@@ -297,9 +375,43 @@ mod tests {
     }
 
     #[test]
+    fn test_layer_precision_longest_match_wins_deterministically() {
+        // Regression test: overlapping patterns used to resolve via HashMap
+        // iteration order, which is randomized per-process. The longest
+        // (most specific) match must win, and the result must be the same
+        // every time regardless of registration order.
+        let mut config = PrecisionConfig::new();
+        config.set_default_precision(Precision::FP32);
+        config.set_layer_precision("attn", Precision::FP16);
+        config.set_layer_precision("attn.to_q", Precision::BF16);
+
+        assert_eq!(
+            config.get_layer_precision("down_blocks.0.attn.to_q.weight"),
+            Precision::BF16,
+            "the more specific pattern 'attn.to_q' should win over 'attn'"
+        );
+        assert_eq!(
+            config.get_layer_precision("down_blocks.0.attn.to_k.weight"),
+            Precision::FP16,
+            "only 'attn' matches 'to_k', so it should apply"
+        );
+
+        // Same patterns, registered in the opposite order: result must be identical.
+        let mut config2 = PrecisionConfig::new();
+        config2.set_default_precision(Precision::FP32);
+        config2.set_layer_precision("attn.to_q", Precision::BF16);
+        config2.set_layer_precision("attn", Precision::FP16);
+        assert_eq!(
+            config2.get_layer_precision("down_blocks.0.attn.to_q.weight"),
+            Precision::BF16
+        );
+    }
+
+    #[test]
     fn test_convert_precision_fp32() {
         let data = vec![1.0f32, 2.0, 3.0];
-        let bytes = convert_precision(&data, Precision::FP32);
+        let (bytes, saturated) = convert_precision(&data, Precision::FP32);
+        assert_eq!(saturated, 0);
         let converted = bytes_to_f32(&bytes, Precision::FP32)
             .expect("test: precision conversion should succeed");
 
@@ -309,13 +421,32 @@ mod tests {
     #[test]
     fn test_convert_precision_fp16() {
         let data = vec![1.0f32, 2.0, 3.0];
-        let bytes = convert_precision(&data, Precision::FP16);
+        let (bytes, saturated) = convert_precision(&data, Precision::FP16);
+        assert_eq!(saturated, 0);
         let converted = bytes_to_f32(&bytes, Precision::FP16)
             .expect("test: precision conversion should succeed");
 
         for (&orig, &conv) in data.iter().zip(converted.iter()) {
             assert_relative_eq!(orig, conv, epsilon = 0.01);
         }
+    }
+
+    #[test]
+    fn test_convert_precision_fp16_reports_overflow_saturation() {
+        // Regression test: values outside FP16's ~65504 range used to
+        // silently become +/-inf with no way for a caller to detect it.
+        let data = vec![1.0f32, 100_000.0, -200_000.0, 2.0];
+        let (bytes, saturated) = convert_precision(&data, Precision::FP16);
+        assert_eq!(
+            saturated, 2,
+            "the two out-of-range values should be flagged"
+        );
+
+        let decoded = bytes_to_f32(&bytes, Precision::FP16).expect("test: decode should succeed");
+        assert!(decoded[1].is_infinite() && decoded[1].is_sign_positive());
+        assert!(decoded[2].is_infinite() && decoded[2].is_sign_negative());
+        assert!(decoded[0].is_finite());
+        assert!(decoded[3].is_finite());
     }
 
     #[test]
@@ -327,6 +458,31 @@ mod tests {
         assert!(validate_conversion(&original, &good, 1e-6).is_ok());
         assert!(validate_conversion(&original, &bad, 1e-6).is_err());
         assert!(validate_conversion(&original, &bad, 1.0).is_ok());
+    }
+
+    #[test]
+    fn test_validate_conversion_uses_relative_threshold() {
+        // A fixed absolute threshold is the wrong metric across weights of
+        // different magnitude: the same `max_error` must scale with the
+        // value being compared, not apply uniformly.
+        let original = vec![1000.0f32];
+        let converted = vec![1000.5f32]; // 0.05% relative error
+                                         // Absolute diff (0.5) would fail a naive 0.01 absolute threshold,
+                                         // but 0.05% relative error should pass a 0.001 (0.1%) relative one.
+        assert!(validate_conversion(&original, &converted, 0.001).is_ok());
+
+        let tiny_original = vec![0.001f32];
+        let tiny_converted = vec![0.006f32]; // large relative error, small absolute one
+        assert!(validate_conversion(&tiny_original, &tiny_converted, 0.001).is_err());
+    }
+
+    #[test]
+    fn test_float_precision_of_and_dtype_of_round_trip() {
+        for precision in [Precision::FP32, Precision::FP16, Precision::BF16] {
+            assert_eq!(float_precision_of(dtype_of(precision)), Some(precision));
+        }
+        assert_eq!(float_precision_of(safetensors::Dtype::I64), None);
+        assert_eq!(float_precision_of(safetensors::Dtype::BOOL), None);
     }
 
     #[test]

@@ -194,6 +194,7 @@ fn zero_weights_valid() {
         w_normal: 0.0,
         w_gradient_penalty: 0.0,
         gradient_penalty_threshold: 100.0,
+        w_scale_reg_max_scale: oxigaf_trainer::loss::MAX_REASONABLE_WORLD_SCALE,
     };
     assert!(config.validate().is_ok());
 }

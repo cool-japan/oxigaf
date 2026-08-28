@@ -674,14 +674,19 @@ pub fn sample_negatives(
     n: usize,
     seed: u64,
 ) -> Result<Vec<usize>, FeatureBankError> {
-    // Collect all indices whose label differs from query label.
-    let candidates: Vec<usize> = bank
-        .entries
-        .iter()
-        .enumerate()
-        .filter(|(_, e)| e.label != label)
-        .map(|(i, _)| i)
-        .collect();
+    // Collect all indices whose label differs from query label. Label 0 is
+    // a wildcard ("unknown"): every entry is eligible in that case, matching
+    // `FeatureBank::features_by_label`'s label-0 handling.
+    let candidates: Vec<usize> = if label == 0 {
+        (0..bank.entries.len()).collect()
+    } else {
+        bank.entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.label != label)
+            .map(|(i, _)| i)
+            .collect()
+    };
 
     if candidates.is_empty() {
         return Err(FeatureBankError::EmptyBank);
@@ -1286,6 +1291,45 @@ mod tests {
         }
         // Should return exactly 2 (all available negatives).
         assert_eq!(negs.len(), 2);
+    }
+
+    #[test]
+    fn sample_negatives_label_zero_is_wildcard_includes_all() {
+        let mut bank = make_bank(16, 2);
+        // All entries have label 0 ("unknown"). Per the documented contract,
+        // querying with label=0 must treat every entry as an eligible
+        // negative (matching `features_by_label`'s wildcard behaviour), not
+        // filter them all out.
+        bank.push(vec![1.0, 0.0], 0, 0)
+            .unwrap_or_else(|e| panic!("{e}"));
+        bank.push(vec![0.0, 1.0], 0, 1)
+            .unwrap_or_else(|e| panic!("{e}"));
+        bank.push(vec![0.5, 0.5], 0, 2)
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        let negs = sample_negatives(&bank, 0, 10, 7).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            negs.len(),
+            3,
+            "label 0 should treat all entries as eligible negatives"
+        );
+    }
+
+    #[test]
+    fn sample_negatives_label_nonzero_still_excludes_matching_label() {
+        // Regression guard: the label-0 wildcard must not accidentally
+        // affect the non-zero-label filtering path.
+        let mut bank = make_bank(16, 2);
+        bank.push(vec![1.0, 0.0], 5, 0)
+            .unwrap_or_else(|e| panic!("{e}"));
+        bank.push(vec![0.0, 1.0], 5, 1)
+            .unwrap_or_else(|e| panic!("{e}"));
+        bank.push(vec![0.5, 0.5], 6, 2)
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        let negs = sample_negatives(&bank, 5, 10, 7).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(negs.len(), 1, "only the label-6 entry should be eligible");
+        assert_eq!(bank.entries[negs[0]].label, 6);
     }
 
     // ── sample_positive ──────────────────────────────────────────────────────

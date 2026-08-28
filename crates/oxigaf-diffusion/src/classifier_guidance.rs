@@ -290,10 +290,30 @@ pub struct GuidanceConfig {
     pub use_central_diff: bool,
 
     /// Number of random directions for stochastic gradient estimation.
-    /// `0` means full (per-dimension) finite differences.
+    /// `0` means full (per-dimension) finite differences, *unless* the latent
+    /// is longer than `auto_spsa_threshold` (see below).
     ///
     /// Default: `0`.
     pub num_random_directions: usize,
+
+    /// Latent length above which [`apply_guidance_step`] automatically uses
+    /// SPSA (`auto_spsa_directions` random directions) instead of full
+    /// per-dimension finite differences, even when `num_random_directions ==
+    /// 0`. Full finite differences cost O(N) score evaluations per guidance
+    /// step (each itself typically O(N) for a per-element scorer), i.e.
+    /// O(N^2) total — for a realistic Stable-Diffusion latent of
+    /// 4×64×64 = 16384 elements that is on the order of 5×10^8 float ops per
+    /// step. Set to `usize::MAX` to disable auto-switching and always use the
+    /// exact gradient regardless of latent size.
+    ///
+    /// Default: `4096`.
+    pub auto_spsa_threshold: usize,
+
+    /// Number of random directions used when `auto_spsa_threshold` triggers
+    /// the automatic switch to SPSA.
+    ///
+    /// Default: `32`.
+    pub auto_spsa_directions: usize,
 }
 
 impl Default for GuidanceConfig {
@@ -304,6 +324,8 @@ impl Default for GuidanceConfig {
             grad_clip: 0.0,
             use_central_diff: true,
             num_random_directions: 0,
+            auto_spsa_threshold: 4096,
+            auto_spsa_directions: 32,
         }
     }
 }
@@ -334,6 +356,11 @@ impl GuidanceConfig {
                 self.grad_clip
             )));
         }
+        if self.auto_spsa_directions == 0 {
+            return Err(ClassifierGuidanceError::InvalidConfig(
+                "auto_spsa_directions must be > 0".to_string(),
+            ));
+        }
         Ok(())
     }
 }
@@ -344,13 +371,14 @@ impl GuidanceConfig {
 
 /// Apply one step of classifier guidance to a latent.
 ///
-/// Updates the latent by adding `guidance_scale * gradient`. Returns the
-/// updated latent and the score evaluated at the *input* latent (before update).
-///
-/// The gradient is estimated using the method configured in `config`:
-/// - If `num_random_directions > 0`: SPSA stochastic gradient (seeded by 0).
-/// - If `use_central_diff`: central finite differences.
-/// - Otherwise: forward finite differences.
+/// Equivalent to [`apply_guidance_step_seeded`] with `seed = 0`. Calling this
+/// directly is fine for a single, standalone guidance step; for a *multi-step*
+/// run built by hand (rather than via [`run_guidance_steps`], which already
+/// varies the seed per step), prefer [`apply_guidance_step_seeded`] with a
+/// distinct seed per step — reusing seed `0` for every step of a loop
+/// produces identical SPSA perturbation directions every time (see
+/// [`stochastic_fd_gradient`]'s seed-to-state mapping), collapsing the
+/// estimator onto a fixed, biased subspace no matter how many steps run.
 ///
 /// # Errors
 ///
@@ -361,18 +389,47 @@ pub fn apply_guidance_step<F: ScoreFunction>(
     score_fn: &F,
     config: &GuidanceConfig,
 ) -> Result<(Vec<f32>, f32), ClassifierGuidanceError> {
+    apply_guidance_step_seeded(latent, score_fn, config, 0)
+}
+
+/// Apply one step of classifier guidance to a latent, using `seed` for any
+/// stochastic (SPSA) gradient estimation.
+///
+/// Updates the latent by adding `guidance_scale * gradient`. Returns the
+/// updated latent and the score evaluated at the *input* latent (before update).
+///
+/// The gradient is estimated using the method configured in `config`:
+/// - If `num_random_directions > 0`: SPSA stochastic gradient with `seed`.
+/// - Else if `latent.len() > config.auto_spsa_threshold`: SPSA with
+///   `config.auto_spsa_directions` directions and `seed`, to avoid the O(N^2)
+///   cost of full finite differences on a large latent.
+/// - Else if `use_central_diff`: central finite differences.
+/// - Otherwise: forward finite differences.
+///
+/// # Errors
+///
+/// - [`ClassifierGuidanceError::InvalidConfig`] if config is invalid.
+/// - Propagates errors from score evaluation.
+pub fn apply_guidance_step_seeded<F: ScoreFunction>(
+    latent: &[f32],
+    score_fn: &F,
+    config: &GuidanceConfig,
+    seed: u64,
+) -> Result<(Vec<f32>, f32), ClassifierGuidanceError> {
     config.validate()?;
 
     let score_before = score_fn.score(latent)?;
 
-    let mut gradient = if config.num_random_directions > 0 {
-        stochastic_fd_gradient(
-            latent,
-            score_fn,
-            config.fd_eps,
-            config.num_random_directions,
-            0,
-        )
+    let effective_directions = if config.num_random_directions > 0 {
+        config.num_random_directions
+    } else if latent.len() > config.auto_spsa_threshold {
+        config.auto_spsa_directions
+    } else {
+        0
+    };
+
+    let mut gradient = if effective_directions > 0 {
+        stochastic_fd_gradient(latent, score_fn, config.fd_eps, effective_directions, seed)
     } else if config.use_central_diff {
         fd_gradient(latent, score_fn, config.fd_eps)
     } else {
@@ -540,9 +597,14 @@ impl Default for CompositeScoreFunction {
 
 impl ScoreFunction for CompositeScoreFunction {
     fn score(&self, latent: &[f32]) -> Result<f32, ClassifierGuidanceError> {
-        // Empty composite returns 0.0 (no guidance)
+        // An empty composite has no meaningful score. `ClassifierGuidanceError`
+        // already declares `EmptyGuidance` for exactly this case; returning
+        // `Ok(0.0)` here made it unreachable and produced a *silent* no-op
+        // guidance run (constant-zero score -> zero gradient -> latent
+        // returned unchanged) that looks identical to a successful run to a
+        // caller who forgot to call `.add()`.
         if self.components.is_empty() {
-            return Ok(0.0);
+            return Err(ClassifierGuidanceError::EmptyGuidance);
         }
         let mut total = 0.0f32;
         for (scorer, weight) in &self.components {
@@ -582,9 +644,14 @@ pub struct GuidanceStats {
 ///
 /// Returns `(final_latent, stats_per_step)`.
 ///
+/// Each step uses a distinct SPSA seed (`step as u64 + 1`) via
+/// [`apply_guidance_step_seeded`], so — unlike calling [`apply_guidance_step`]
+/// (seed `0`) in a hand-written loop — successive steps sample independent
+/// random perturbation directions instead of repeating the same one.
+///
 /// # Errors
 ///
-/// - Propagates errors from [`apply_guidance_step`] or score evaluation.
+/// - Propagates errors from [`apply_guidance_step_seeded`] or score evaluation.
 pub fn run_guidance_steps<F: ScoreFunction>(
     initial_latent: Vec<f32>,
     score_fn: &F,
@@ -597,7 +664,8 @@ pub fn run_guidance_steps<F: ScoreFunction>(
     let mut stats_vec = Vec::with_capacity(num_steps);
 
     for step in 0..num_steps {
-        let (updated, score_before) = apply_guidance_step(&latent, score_fn, config)?;
+        let seed = step as u64 + 1;
+        let (updated, score_before) = apply_guidance_step_seeded(&latent, score_fn, config, seed)?;
         let score_after = score_fn.score(&updated)?;
         let score_delta = score_after - score_before;
 
@@ -994,16 +1062,111 @@ mod tests {
         assert!(result.is_err());
     }
 
+    // ---- apply_guidance_step_seeded / seed threading ----
+
+    #[test]
+    fn test_apply_guidance_step_seeded_different_seeds_differ() {
+        // Regression test: apply_guidance_step used to hardcode seed=0 for
+        // SPSA, so repeated calls (as in a hand-written multi-step loop)
+        // always sampled the identical Rademacher perturbation directions.
+        let latent = vec![0.0f32; 16];
+        let config = GuidanceConfig {
+            num_random_directions: 4,
+            ..Default::default()
+        };
+        let (updated_a, _) =
+            apply_guidance_step_seeded(&latent, &MeanMaximizer, &config, 1).unwrap();
+        let (updated_b, _) =
+            apply_guidance_step_seeded(&latent, &MeanMaximizer, &config, 2).unwrap();
+        assert_ne!(
+            updated_a, updated_b,
+            "different seeds should produce different SPSA perturbation directions"
+        );
+    }
+
+    #[test]
+    fn test_apply_guidance_step_default_seed_matches_seeded_zero() {
+        // apply_guidance_step must remain exactly equivalent to seed=0,
+        // preserving its documented default behavior for standalone callers.
+        let latent = vec![0.0f32; 16];
+        let config = GuidanceConfig {
+            num_random_directions: 4,
+            ..Default::default()
+        };
+        let (updated_a, score_a) = apply_guidance_step(&latent, &MeanMaximizer, &config).unwrap();
+        let (updated_b, score_b) =
+            apply_guidance_step_seeded(&latent, &MeanMaximizer, &config, 0).unwrap();
+        assert_eq!(updated_a, updated_b);
+        assert_eq!(score_a, score_b);
+    }
+
+    #[test]
+    fn test_run_guidance_steps_uses_distinct_seeds_per_step() {
+        // Regression test: run_guidance_steps calling apply_guidance_step in
+        // a loop used to reuse seed=0 (frozen SPSA directions) on every step.
+        // MeanMaximizer's score is linear in the latent, so its central-
+        // difference SPSA estimate (s_plus - s_minus) depends only on the
+        // sampled delta directions, not on the latent's current value --
+        // under the bug every step's update would therefore be *exactly*
+        // identical no matter how many steps run.
+        let latent = vec![0.0f32; 16];
+        let config = GuidanceConfig {
+            num_random_directions: 4,
+            guidance_scale: 1.0,
+            ..Default::default()
+        };
+        let (_, stats) = run_guidance_steps(latent, &MeanMaximizer, &config, 3).unwrap();
+        let norms: Vec<f32> = stats.iter().map(|s| s.latent_update_norm).collect();
+        let all_same = norms.windows(2).all(|w| (w[0] - w[1]).abs() < 1e-9);
+        assert!(
+            !all_same,
+            "per-step SPSA directions should differ, got identical update norms {norms:?}"
+        );
+    }
+
+    // ---- auto_spsa_threshold ----
+
+    #[test]
+    fn test_apply_guidance_step_auto_spsa_for_large_latent() {
+        // A latent longer than auto_spsa_threshold must not fall through to
+        // full O(N) central-difference finite differences; this is a smoke
+        // test that the auto-SPSA path still succeeds and returns a
+        // full-length update.
+        let latent = vec![0.0f32; 5000];
+        let config = GuidanceConfig {
+            auto_spsa_threshold: 4096,
+            ..Default::default()
+        };
+        let (updated, score_before) =
+            apply_guidance_step(&latent, &MeanMaximizer, &config).unwrap();
+        assert_eq!(updated.len(), 5000);
+        assert_eq!(score_before, 0.0);
+    }
+
+    #[test]
+    fn test_apply_guidance_step_small_latent_unaffected_by_auto_spsa_default() {
+        // Latents at/under the default threshold must retain the exact
+        // (deterministic, non-stochastic) full finite-difference behavior.
+        let latent = vec![1.0f32, 2.0, 3.0, 4.0];
+        let config = GuidanceConfig::default();
+        let (updated_a, _) = apply_guidance_step(&latent, &MeanMaximizer, &config).unwrap();
+        let (updated_b, _) = apply_guidance_step(&latent, &MeanMaximizer, &config).unwrap();
+        assert_eq!(
+            updated_a, updated_b,
+            "small latents should use the deterministic central-difference path"
+        );
+    }
+
     // ---- CompositeScoreFunction ----
 
     #[test]
-    fn test_composite_empty_returns_zero() {
+    fn test_composite_empty_returns_empty_guidance_error() {
         let composite = CompositeScoreFunction::new();
-        let score = composite.score(&[1.0f32, 2.0, 3.0]).unwrap();
-        assert!(
-            score.abs() < 1e-6,
-            "empty composite should return 0.0, got {score}"
-        );
+        let result = composite.score(&[1.0f32, 2.0, 3.0]);
+        assert!(matches!(
+            result,
+            Err(ClassifierGuidanceError::EmptyGuidance)
+        ));
     }
 
     #[test]

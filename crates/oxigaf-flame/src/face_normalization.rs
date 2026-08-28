@@ -434,8 +434,30 @@ pub fn rotation_align(from: [f32; 3], to: [f32; 3]) -> [[f32; 3]; 3] {
 
 /// Compute 3 principal axes (eigenvectors) of a vertex cloud via power-iteration deflation.
 ///
-/// Uses deterministic initial vectors `[1,0,0]`, `[0,1,0]`, `[0,0,1]` — no randomness.
-/// Returns `[axis0, axis1, axis2]` in descending order of explained variance.
+/// The first axis is seeded deterministically at `[1,0,0]`. The second is
+/// seeded with whichever world axis is *least* aligned with the first,
+/// Gram-Schmidt-orthogonalised against it — never with a fixed `[0,1,0]`
+/// regardless of where the first axis converged. That fixed-seed approach
+/// is what let the second axis collapse onto the first: if axis 0
+/// converges to (say) `[0,1,0]` — the common case for a head-shaped cloud
+/// whose dominant variance is vertical — the once-deflated data has no
+/// remaining energy along `[0,1,0]`, so seeding axis 1 there made power
+/// iteration break on its very first step and return the untouched,
+/// non-orthogonal seed as if it were a converged axis. Seeding orthogonally
+/// to axis 0 up front makes that failure mode structurally impossible. The
+/// third axis is never estimated by power iteration at all: it is always
+/// the exact `cross(axis0, axis1)`, which is both cheaper and guarantees an
+/// exactly orthonormal, right-handed triple.
+///
+/// Returns `[axis0, axis1, axis2]`. When the (deflated) data has genuine
+/// variance along a given axis, that axis is a real eigenvector and the
+/// triple is in descending order of explained variance; when the deflated
+/// data is degenerate in some direction (e.g. a perfectly planar or linear
+/// point cloud), the corresponding axis instead falls back to an
+/// orthogonal completion of the frame with no variance information. Either
+/// way the three returned vectors are always mutually orthonormal, which is
+/// what callers like [`align_frontal`] rely on to build a valid rotation
+/// matrix.
 ///
 /// # Errors
 ///
@@ -450,39 +472,109 @@ pub fn pca_axes(vertices: &[[f32; 3]]) -> Result<[[f32; 3]; 3], FaceNormError> {
     let centroid = vertex_centroid(vertices)?;
     let mut centered: Vec<[f32; 3]> = vertices.iter().map(|v| vec3_sub(*v, centroid)).collect();
 
-    let init_vecs: [[f32; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
-    let mut axes = [[0.0_f32; 3]; 3];
+    let axis0 = power_iterate_axis(&centered, [1.0, 0.0, 0.0]);
+    deflate_along(&mut centered, axis0);
 
-    for (k, axis_slot) in axes.iter_mut().enumerate() {
-        let mut v = init_vecs[k];
-        // Power iteration: v ← Cov*v / ||Cov*v||
-        // Cov*v = Σ_i x_i * dot(x_i, v)  (scatter form, avoids explicit 3×3 matrix)
-        for _ in 0..100 {
-            let mut cv = [0.0_f32; 3];
-            for xi in &centered {
-                let d = vec3_dot(*xi, v);
-                cv[0] += xi[0] * d;
-                cv[1] += xi[1] * d;
-                cv[2] += xi[2] * d;
-            }
-            let cv_n = vec3_normalize(cv);
-            // Guard: if Cov*v is zero (degenerate), break early
-            if vec3_len(cv) < 1e-30 {
-                break;
-            }
-            v = cv_n;
+    let seed1 = orthogonal_seed(axis0);
+    let axis1_raw = power_iterate_axis(&centered, seed1);
+    // Re-orthogonalise defensively: every point used to derive `axis1_raw`
+    // already had its axis0 component removed by `deflate_along`, so it
+    // should already be orthogonal to axis0 up to floating-point error —
+    // this just cleans up drift accumulated over up to 100 iterations.
+    let axis1 = gram_schmidt_unit(axis1_raw, axis0).unwrap_or(seed1);
+    deflate_along(&mut centered, axis1);
+
+    // Axis 2 is derived exactly, never estimated: the one direction power
+    // iteration would otherwise have to recover from data that (after two
+    // deflations) may carry almost no signal at all.
+    let axis2_raw = vec3_cross(axis0, axis1);
+    let axis2 = if vec3_len(axis2_raw) < 1e-6 {
+        // Should not happen given the orthogonal seeding above, but fall
+        // back to *some* vector orthogonal to axis0 rather than returning
+        // a non-unit (or zero) vector.
+        orthogonal_seed(axis0)
+    } else {
+        vec3_normalize(axis2_raw)
+    };
+
+    Ok([axis0, axis1, axis2])
+}
+
+/// Scatter-form power iteration for the dominant eigenvector of the
+/// covariance of `centered` (already-centered points), starting from
+/// `seed` (assumed unit length).
+///
+/// `Cov * v = Σ_i x_i * dot(x_i, v)` avoids forming an explicit 3×3 matrix.
+/// If the data carries no energy reachable from `seed` — including on the
+/// very first step, e.g. because deflation already removed all variance in
+/// every direction `seed` can reach — `seed` itself is returned unchanged,
+/// which is why callers must pass a `seed` that is already a reasonable
+/// axis candidate (orthogonal to any previously-found axes) rather than an
+/// arbitrary vector.
+fn power_iterate_axis(centered: &[[f32; 3]], seed: [f32; 3]) -> [f32; 3] {
+    let mut v = seed;
+    for _ in 0..100 {
+        let mut cv = [0.0_f32; 3];
+        for xi in centered {
+            let d = vec3_dot(*xi, v);
+            cv[0] += xi[0] * d;
+            cv[1] += xi[1] * d;
+            cv[2] += xi[2] * d;
         }
-        *axis_slot = v;
-        // Deflation: remove component along v from all centered vertices
-        for xi in &mut centered {
-            let proj = vec3_dot(*xi, v);
-            xi[0] -= proj * v[0];
-            xi[1] -= proj * v[1];
-            xi[2] -= proj * v[2];
+        if vec3_len(cv) < 1e-30 {
+            break;
         }
+        v = vec3_normalize(cv);
     }
+    v
+}
 
-    Ok(axes)
+/// Remove the component along unit vector `axis` from every point in
+/// `centered`, in place (one step of PCA deflation).
+fn deflate_along(centered: &mut [[f32; 3]], axis: [f32; 3]) {
+    for xi in centered.iter_mut() {
+        let proj = vec3_dot(*xi, axis);
+        xi[0] -= proj * axis[0];
+        xi[1] -= proj * axis[1];
+        xi[2] -= proj * axis[2];
+    }
+}
+
+/// Pick the world coordinate axis (`[1,0,0]`, `[0,1,0]`, or `[0,0,1]`)
+/// least aligned with unit vector `axis`, then Gram-Schmidt it against
+/// `axis` so the result is exactly orthogonal to `axis`.
+///
+/// Because `axis` is a unit vector, its 3 squared components sum to 1, so
+/// the smallest is at most `1/3` — the chosen coordinate axis's component
+/// along `axis` therefore has magnitude at most `sqrt(1/3) ≈ 0.577`, and
+/// the orthogonalised result always has length at least
+/// `sqrt(1 - 1/3) ≈ 0.816`, safely clear of the degenerate zero-length case
+/// regardless of what `axis` turns out to be.
+fn orthogonal_seed(axis: [f32; 3]) -> [f32; 3] {
+    let candidates = [[1.0_f32, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+    let best = candidates
+        .into_iter()
+        .min_by(|a, b| {
+            let da = vec3_dot(*a, axis).abs();
+            let db = vec3_dot(*b, axis).abs();
+            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .unwrap_or([1.0, 0.0, 0.0]);
+    gram_schmidt_unit(best, axis).unwrap_or(best)
+}
+
+/// Remove the component of `v` along unit vector `axis` and re-normalise.
+///
+/// Returns `None` if the residual is too small to normalise reliably,
+/// leaving the caller to pick a fallback.
+fn gram_schmidt_unit(v: [f32; 3], axis: [f32; 3]) -> Option<[f32; 3]> {
+    let proj = vec3_dot(v, axis);
+    let residual = vec3_sub(v, vec3_scale(axis, proj));
+    if vec3_len(residual) < 1e-6 {
+        None
+    } else {
+        Some(vec3_normalize(residual))
+    }
 }
 
 /// Align a mesh so the eye line (vector from left to right eye) is horizontal (no Z component).
@@ -522,12 +614,19 @@ pub fn align_eye_line(
     let re = vertices[right_eye_idx];
     let eye_vec = vec3_sub(re, le);
 
-    // Target: horizontal (right in XZ plane, no Y lean, so project to XZ)
-    // We want the eye line to have no Y component, i.e. target = [ex, 0, ez] normalised
-    let target_eye = vec3_normalize([eye_vec[0], 0.0, eye_vec[2]]);
-    let current_eye = vec3_normalize(eye_vec);
-
-    let rot = rotation_align(current_eye, target_eye);
+    // Roll correction only: rotate about the face-forward (Z) axis by the
+    // angle needed to zero the eye line's Y component. `rotation_align`
+    // (the minimal-arc rotation between `current_eye` and its XZ-plane
+    // projection) is NOT equivalent to this: its rotation axis is
+    // `cross(current_eye, target_eye)`, which — since the two vectors
+    // differ only in their Y component — lies in the XZ plane, i.e. a
+    // HORIZONTAL axis, not the Z (face-forward) axis. Rotating about a
+    // horizontal axis zeroes the eye line's Y component too, but it also
+    // injects unwanted pitch/yaw into the rest of the head. An explicit Z
+    // roll is the only rotation that corrects roll alone, matching this
+    // function's documented contract.
+    let roll_angle = -eye_vec[1].atan2(eye_vec[0]);
+    let rot = axis_angle_rotation([0.0, 0.0, 1.0], roll_angle);
     let transform = NormTransform {
         rotation: rot,
         translation: [0.0, 0.0, 0.0],
@@ -537,28 +636,96 @@ pub fn align_eye_line(
     Ok((aligned, transform))
 }
 
+/// Assign each PCA axis a semantic role (left-right / up / front-back) by
+/// which *original* coordinate axis it is most aligned with, rather than by
+/// variance rank.
+///
+/// For a real FLAME head the largest-variance axis is vertical (head height
+/// including the neck: extents are roughly X≈0.15m width, Y≈0.25m height,
+/// Z≈0.20m depth), not left-right — a rank-based assignment silently swaps
+/// roles. `align_frontal` refines a mesh that is already roughly frontal
+/// (that is what "frontal alignment" means for a PCA-based refinement
+/// rather than a from-scratch frame construction), so each PCA axis should
+/// already be close to one of the original X/Y/Z directions; whichever
+/// original axis a PCA axis best matches (by absolute dot product)
+/// determines its role. Conflicts are resolved by greedily assigning the
+/// single best-matching (axis, role) pair first, then the next-best among
+/// what remains, since the 3 PCA axes returned by [`pca_axes`] are always
+/// mutually orthonormal.
+///
+/// Returns `(right, forward)` — the PCA axes assigned to the left-right and
+/// front-back roles (signs not yet fixed; `up` is not returned because
+/// callers re-derive it from `cross(right, forward)` for orthogonality).
+fn pick_right_and_forward(axes: [[f32; 3]; 3]) -> ([f32; 3], [f32; 3]) {
+    // Role indices: 0 = right (world +X), 1 = up (world +Y), 2 = forward
+    // (world +Z).
+    let world = [[1.0_f32, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+
+    let mut axis_for_role: [usize; 3] = [0, 1, 2];
+    let mut role_taken = [false; 3];
+    let mut axis_taken = [false; 3];
+
+    for _ in 0..3 {
+        let mut best = (0usize, 0usize, -1.0_f32);
+        for (a, axis) in axes.iter().enumerate() {
+            if axis_taken[a] {
+                continue;
+            }
+            for (r, role_axis) in world.iter().enumerate() {
+                if role_taken[r] {
+                    continue;
+                }
+                let score = vec3_dot(*axis, *role_axis).abs();
+                if score > best.2 {
+                    best = (a, r, score);
+                }
+            }
+        }
+        axis_for_role[best.1] = best.0;
+        role_taken[best.1] = true;
+        axis_taken[best.0] = true;
+    }
+
+    (axes[axis_for_role[0]], axes[axis_for_role[2]])
+}
+
 /// Align a mesh to a frontal face pose using PCA.
 ///
-/// The first principal axis (most variance) is treated as left-right,
-/// the third (least variance) as front-back.
-/// Result: third axis → +Z, first axis → +X, up = cross(right, forward).
+/// Each PCA axis is assigned to the left-right or front-back role by which
+/// original coordinate axis it is closest to (see
+/// `pick_right_and_forward`) — NOT by variance rank, which is wrong for
+/// head-shaped meshes (their largest-variance axis is vertical).
+/// Result: front-back → +Z, left-right → +X, up = cross(right, forward).
+///
+/// `nose_tip_idx`, if given, pins the forward direction's sign using actual
+/// geometry (the nose tip must end up on the `+forward` side of the
+/// centroid) instead of the coarser `forward.z >= 0` convention used when
+/// it is `None`.
 ///
 /// Returns `(aligned_vertices, transform)`.
 ///
 /// # Errors
 ///
-/// Returns [`FaceNormError::EmptyMesh`] if `vertices` is empty.
+/// Returns [`FaceNormError::EmptyMesh`] if `vertices` is empty, or
+/// [`FaceNormError::InvalidLandmark`] if `nose_tip_idx` is out of range.
 pub fn align_frontal(
     vertices: &[[f32; 3]],
+    nose_tip_idx: Option<usize>,
 ) -> Result<(Vec<[f32; 3]>, NormTransform), FaceNormError> {
     if vertices.is_empty() {
         return Err(FaceNormError::EmptyMesh("vertex slice is empty".into()));
     }
+    if let Some(idx) = nose_tip_idx {
+        if idx >= vertices.len() {
+            return Err(FaceNormError::InvalidLandmark {
+                idx,
+                n_verts: vertices.len(),
+            });
+        }
+    }
 
     let axes = pca_axes(vertices)?;
-    // axes[0] = most variance (left-right), axes[2] = least variance (front-back)
-    let right_raw = axes[0]; // left-right axis
-    let forward_raw = axes[2]; // front-back axis
+    let (right_raw, forward_raw) = pick_right_and_forward(axes);
 
     // Fix signs by convention:
     // - forward should have positive Z (face looks toward +Z)
@@ -572,6 +739,24 @@ pub fn align_frontal(
         vec3_scale(right_raw, -1.0)
     } else {
         right_raw
+    };
+
+    // A nose-tip landmark, when available, is a far more reliable way to
+    // fix which way is "forward" than the coarse `forward.z >= 0`
+    // convention above (which only canonicalises an otherwise-arbitrary
+    // PCA sign, and has no notion of which side the face actually looks
+    // toward): the nose tip should end up on the `+forward` side of the
+    // centroid.
+    let forward = if let Some(idx) = nose_tip_idx {
+        let centroid = vertex_centroid(vertices)?;
+        let nose_dir = vec3_sub(vertices[idx], centroid);
+        if vec3_dot(nose_dir, forward) < 0.0 {
+            vec3_scale(forward, -1.0)
+        } else {
+            forward
+        }
+    } else {
+        forward
     };
 
     // up = cross(right, forward), normalized
@@ -622,9 +807,15 @@ pub fn align_frontal(
 /// Pipeline (in order):
 /// 1. Compute centering point per `config.center_on`.
 /// 2. Apply rotational alignment per `config.align_to`
-///    (for `EyeLine`, both eye indices must be `Some`).
+///    (for `EyeLine`, both eye indices must be `Some`; for `FrontalFace`,
+///    `nose_tip_idx` is used to pin the forward sign when `Some`).
 /// 3. Scale so inter-pupil distance = `config.target_scale`
 ///    (if eye indices are `None`, skip scaling by IPD — use bbox diagonal instead).
+///
+/// If `left_eye_idx`/`right_eye_idx` are both given (regardless of
+/// `config.align_to`), they must be valid indices into `vertices` — an
+/// invalid index is always reported as [`FaceNormError::InvalidLandmark`],
+/// never silently downgraded to bounding-box scaling.
 ///
 /// # Errors
 ///
@@ -635,6 +826,7 @@ pub fn normalize_mesh(
     config: &NormConfig,
     left_eye_idx: Option<usize>,
     right_eye_idx: Option<usize>,
+    nose_tip_idx: Option<usize>,
 ) -> Result<NormResult, FaceNormError> {
     if vertices.is_empty() {
         return Err(FaceNormError::EmptyMesh(
@@ -683,7 +875,7 @@ pub fn normalize_mesh(
     let align_t = match &config.align_to {
         AlignMode::None => NormTransform::identity(),
         AlignMode::FrontalFace => {
-            let (_, t) = align_frontal(&centered_verts)?;
+            let (_, t) = align_frontal(&centered_verts, nose_tip_idx)?;
             t
         }
         AlignMode::EyeLine => {
@@ -701,8 +893,15 @@ pub fn normalize_mesh(
     // Step 3: compute scale
     let face_scale_val = face_diagonal(vertices).unwrap_or(1.0);
 
+    // Propagate `InvalidLandmark` rather than swallowing it: a bad index
+    // used to silently zero the IPD, which made `scale_factor` fall back to
+    // bounding-box-diagonal scaling — a completely different normalisation
+    // — with no error, even though `AlignMode::EyeLine` validates these
+    // same indices and does error on a bad one. Falling back to bbox
+    // scaling is still supported, but only when eye indices are genuinely
+    // absent (`None`), never when they were supplied but wrong.
     let ipd = if let (Some(li), Some(ri)) = (left_eye_idx, right_eye_idx) {
-        inter_pupil_distance(vertices, li, ri).unwrap_or(0.0)
+        inter_pupil_distance(vertices, li, ri)?
     } else {
         0.0
     };
@@ -792,6 +991,29 @@ mod tests {
                 [t * 10.0 - 5.0, t * 0.1, t * 0.1]
             })
             .collect()
+    }
+
+    /// A dense point cloud on the surface of an axis-aligned ellipsoid with
+    /// semi-axes matching a real FLAME head's rough proportions: narrowest
+    /// in X (left-right), tallest in Y (up, including the neck), and
+    /// mid-sized in Z (front-back depth). Variance order is therefore
+    /// Y > Z > X — the LARGEST-variance axis is vertical, not left-right,
+    /// which is exactly the case that trips up a variance-rank-based axis
+    /// assignment.
+    fn head_like_mesh(n_theta: usize, n_phi: usize) -> Vec<[f32; 3]> {
+        let (semi_x, semi_y, semi_z) = (0.15_f32, 0.25_f32, 0.20_f32); // X, Y, Z semi-axes
+        let mut pts = Vec::with_capacity(n_theta * n_phi);
+        for i in 0..n_theta {
+            let theta = std::f32::consts::PI * (i as f32 + 0.5) / n_theta as f32; // (0, PI)
+            for j in 0..n_phi {
+                let phi = 2.0 * std::f32::consts::PI * j as f32 / n_phi as f32; // [0, 2*PI)
+                let px = semi_x * theta.sin() * phi.cos();
+                let py = semi_y * theta.cos();
+                let pz = semi_z * theta.sin() * phi.sin();
+                pts.push([px, py, pz]);
+            }
+        }
+        pts
     }
 
     // ─── vec3_dot ───────────────────────────────────────────────────────────
@@ -1251,6 +1473,55 @@ mod tests {
         assert_eq!(axes.len(), 3);
     }
 
+    // Regression test for the duplicate-axis bug: seeding axis 1 with a
+    // fixed `[0,1,0]` collapsed it onto axis 0 whenever axis 0 itself
+    // converged near vertical — the common case for a head-shaped (or, as
+    // here, Y-elongated) point cloud.
+    #[test]
+    fn test_pca_axes_second_axis_not_duplicate_when_dominant_variance_is_vertical() {
+        let verts: Vec<[f32; 3]> = (0..20)
+            .map(|i| {
+                let t = i as f32 / 19.0;
+                // Elongated along Y by factor 100 vs. the small X/Z wobble,
+                // matching `elongated_mesh`'s shape but rotated so the
+                // dominant direction is vertical instead of horizontal.
+                [t * 0.1, t * 10.0 - 5.0, t * 0.1]
+            })
+            .collect();
+        let axes = pca_axes(&verts).expect("pca failed");
+
+        let axis0_vertical = vec3_dot(vec3_normalize(axes[0]), [0.0, 1.0, 0.0]).abs();
+        assert!(
+            axis0_vertical > 0.98,
+            "axis0 should align with Y (the dominant direction), got dot={axis0_vertical}"
+        );
+
+        let d01 = vec3_dot(axes[0], axes[1]).abs();
+        assert!(
+            d01 < 0.1,
+            "axis1 must not collapse onto axis0 (old bug), got |dot|={d01}"
+        );
+        let d02 = vec3_dot(axes[0], axes[2]).abs();
+        let d12 = vec3_dot(axes[1], axes[2]).abs();
+        assert!(d02 < 0.1, "axis0,2 should be orthogonal, got |dot|={d02}");
+        assert!(d12 < 0.1, "axis1,2 should be orthogonal, got |dot|={d12}");
+    }
+
+    #[test]
+    fn test_pca_axes_all_unit_length() {
+        // Every returned axis must be a unit vector, including in the
+        // degenerate (rank-deficient) fallback paths.
+        let verts = elongated_mesh(20); // exactly rank-1 data
+        let axes = pca_axes(&verts).expect("pca failed");
+        for (i, axis) in axes.iter().enumerate() {
+            let len = vec3_len(*axis);
+            assert!(
+                (len - 1.0).abs() < 1e-3,
+                "axis {i} should be unit length, got {len}"
+            );
+        }
+    }
+
     // ─── align_eye_line ─────────────────────────────────────────────────────
 
     #[test]
@@ -1297,7 +1568,7 @@ mod tests {
     #[test]
     fn test_align_frontal_rotation_is_orthogonal() {
         let verts = elongated_mesh(30);
-        let (_, t) = align_frontal(&verts).expect("frontal failed");
+        let (_, t) = align_frontal(&verts, None).expect("frontal failed");
         let rrt = mat3_mul(t.rotation, mat3_transpose(t.rotation));
         assert!(approx_mat(rrt, mat3_identity(), 1e-4));
     }
@@ -1305,7 +1576,7 @@ mod tests {
     #[test]
     fn test_align_frontal_det_is_positive() {
         let verts = unit_cube_vertices();
-        let (_, t) = align_frontal(&verts).expect("frontal failed");
+        let (_, t) = align_frontal(&verts, None).expect("frontal failed");
         assert!(
             mat3_det(t.rotation) > 0.0,
             "rotation must have positive det"
@@ -1314,14 +1585,71 @@ mod tests {
 
     #[test]
     fn test_align_frontal_empty_error() {
-        assert!(align_frontal(&[]).is_err());
+        assert!(align_frontal(&[], None).is_err());
     }
 
     #[test]
     fn test_align_frontal_preserves_vertex_count() {
         let verts = unit_cube_vertices();
-        let (aligned, _) = align_frontal(&verts).expect("frontal failed");
+        let (aligned, _) = align_frontal(&verts, None).expect("frontal failed");
         assert_eq!(aligned.len(), verts.len());
+    }
+
+    // Regression test for the variance-rank bug: for a head-shaped mesh
+    // (dominant variance is vertical, least variance is left-right — the
+    // OPPOSITE of what the old `axes[0] = right` assumption required),
+    // `right` must still end up matching the mesh's true narrow (X) axis.
+    #[test]
+    fn test_align_frontal_identifies_right_axis_by_alignment_not_variance_rank() {
+        let verts = head_like_mesh(24, 48);
+        let (aligned, transform) = align_frontal(&verts, None).expect("frontal failed");
+
+        // `transform.rotation[0]` ("right") is the direction whose dot
+        // product with an original-frame point gives the point's aligned
+        // X-coordinate; it must match the mesh's true narrow direction
+        // (original world X), not its tall direction (original world Y).
+        let right_row = transform.rotation[0];
+        let alignment_with_true_right = vec3_dot(vec3_normalize(right_row), [1.0, 0.0, 0.0]).abs();
+        assert!(
+            alignment_with_true_right > 0.9,
+            "right axis should align with the mesh's true left-right (X) \
+             direction, got rotation row0={right_row:?} (|dot| with X = \
+             {alignment_with_true_right})"
+        );
+
+        // Equivalently: the aligned X extent should match the mesh's true
+        // (narrow) width, not its (tall) height.
+        let xs: Vec<f32> = aligned.iter().map(|v| v[0]).collect();
+        let x_extent = xs.iter().copied().fold(f32::MIN, f32::max)
+            - xs.iter().copied().fold(f32::MAX, f32::min);
+        assert!(
+            x_extent < 0.35,
+            "aligned X extent should match the mesh's narrow width (~0.3), got {x_extent}"
+        );
+    }
+
+    #[test]
+    fn test_align_frontal_nose_tip_landmark_fixes_forward_sign() {
+        // A head-like mesh whose "nose" landmark protrudes along -Z in the
+        // input frame. Regardless of whichever sign the raw PCA/heuristic
+        // path would otherwise pick, passing `nose_tip_idx` must place the
+        // nose on the +forward side after alignment.
+        let mut verts = head_like_mesh(24, 48);
+        let nose_idx = verts.len();
+        verts.push([0.0, 0.0, -0.35]); // nose tip protrudes along -Z
+
+        let (aligned, _) = align_frontal(&verts, Some(nose_idx)).expect("frontal failed");
+        assert!(
+            aligned[nose_idx][2] > 0.0,
+            "nose landmark should end up on the +forward side after alignment, got z={}",
+            aligned[nose_idx][2]
+        );
+    }
+
+    #[test]
+    fn test_align_frontal_invalid_nose_tip_idx_error() {
+        let verts = unit_cube_vertices();
+        assert!(align_frontal(&verts, Some(9999)).is_err());
     }
 
     // ─── normalize_mesh ──────────────────────────────────────────────────────
@@ -1334,7 +1662,7 @@ mod tests {
             center_on: CenterMode::Centroid,
             align_to: AlignMode::None,
         };
-        let result = normalize_mesh(&verts, &config, None, None).expect("normalize failed");
+        let result = normalize_mesh(&verts, &config, None, None, None).expect("normalize failed");
         // Centroid of normalized vertices should be near origin
         let c = vertex_centroid(&result.normalized_vertices).expect("centroid failed");
         assert!(approx3(c, [0.0, 0.0, 0.0], 1e-4));
@@ -1353,7 +1681,7 @@ mod tests {
             center_on: CenterMode::LandmarkMean(vec![0, 3]),
             align_to: AlignMode::None,
         };
-        let result = normalize_mesh(&verts, &config, None, None).expect("normalize failed");
+        let result = normalize_mesh(&verts, &config, None, None, None).expect("normalize failed");
         // Mean of verts[0] and verts[3] should map to origin
         let m = vertex_centroid(&[result.normalized_vertices[0], result.normalized_vertices[3]])
             .expect("centroid");
@@ -1372,7 +1700,8 @@ mod tests {
             center_on: CenterMode::Origin,
             align_to: AlignMode::EyeLine,
         };
-        let result = normalize_mesh(&verts, &config, Some(0), Some(1)).expect("normalize failed");
+        let result =
+            normalize_mesh(&verts, &config, Some(0), Some(1), None).expect("normalize failed");
         let le = result.normalized_vertices[0];
         let re = result.normalized_vertices[1];
         assert!(
@@ -1389,7 +1718,7 @@ mod tests {
             center_on: CenterMode::Centroid,
             align_to: AlignMode::FrontalFace,
         };
-        let result = normalize_mesh(&verts, &config, None, None).expect("normalize failed");
+        let result = normalize_mesh(&verts, &config, None, None, None).expect("normalize failed");
         assert!(!result.normalized_vertices.is_empty());
     }
 
@@ -1406,7 +1735,8 @@ mod tests {
             center_on: CenterMode::Centroid,
             align_to: AlignMode::None,
         };
-        let result = normalize_mesh(&verts, &config, Some(0), Some(1)).expect("normalize failed");
+        let result =
+            normalize_mesh(&verts, &config, Some(0), Some(1), None).expect("normalize failed");
         let nv = &result.normalized_vertices;
         let d = vec3_len(vec3_sub(nv[1], nv[0]));
         assert!(
@@ -1418,7 +1748,7 @@ mod tests {
     #[test]
     fn test_normalize_mesh_empty_error() {
         let config = NormConfig::default();
-        assert!(normalize_mesh(&[], &config, None, None).is_err());
+        assert!(normalize_mesh(&[], &config, None, None, None).is_err());
     }
 
     #[test]
@@ -1429,7 +1759,7 @@ mod tests {
             center_on: CenterMode::Centroid,
             align_to: AlignMode::None,
         };
-        assert!(normalize_mesh(&verts, &config, None, None).is_err());
+        assert!(normalize_mesh(&verts, &config, None, None, None).is_err());
     }
 
     #[test]
@@ -1441,7 +1771,28 @@ mod tests {
             align_to: AlignMode::EyeLine,
         };
         // No eye indices provided → error
-        assert!(normalize_mesh(&verts, &config, None, None).is_err());
+        assert!(normalize_mesh(&verts, &config, None, None, None).is_err());
+    }
+
+    // Regression test: an out-of-range eye index used to be silently
+    // swallowed by `.unwrap_or(0.0)`, which zeroed the IPD and made
+    // `normalize_mesh` fall back to bounding-box scaling instead of
+    // reporting `InvalidLandmark` — even though the same indices DO error
+    // under `AlignMode::EyeLine`. The error must now surface consistently
+    // regardless of `align_to`.
+    #[test]
+    fn test_normalize_mesh_invalid_eye_idx_errors_even_without_eyeline_align() {
+        let verts = unit_cube_vertices();
+        let config = NormConfig {
+            target_scale: 1.0,
+            center_on: CenterMode::Centroid,
+            align_to: AlignMode::None,
+        };
+        let result = normalize_mesh(&verts, &config, Some(0), Some(9999), None);
+        assert!(
+            result.is_err(),
+            "an out-of-range eye index must error, not silently fall back to bbox scaling"
+        );
     }
 
     #[test]
@@ -1452,7 +1803,7 @@ mod tests {
             center_on: CenterMode::Origin,
             align_to: AlignMode::None,
         };
-        let result = normalize_mesh(&verts, &config, None, None).expect("normalize failed");
+        let result = normalize_mesh(&verts, &config, None, None, None).expect("normalize failed");
         // Origin mode: no translation — just scaling
         // All vertices should be scaled but not shifted
         assert!(!result.normalized_vertices.is_empty());
@@ -1464,7 +1815,7 @@ mod tests {
     fn test_format_norm_result_nonempty() {
         let verts = unit_cube_vertices();
         let config = NormConfig::default();
-        let result = normalize_mesh(&verts, &config, None, None).expect("normalize failed");
+        let result = normalize_mesh(&verts, &config, None, None, None).expect("normalize failed");
         let s = format_norm_result(&result);
         assert!(!s.is_empty(), "format result must not be empty");
         assert!(s.contains("NormResult"), "should contain 'NormResult'");

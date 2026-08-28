@@ -62,8 +62,11 @@ pub struct ImageQualityMetrics {
     pub mse: f32,
     /// Mean absolute error in [0, 1] range.
     pub mae: f32,
-    /// Simplified structural similarity index in [0, 1].
-    pub ssim: f32,
+    /// Simplified structural similarity index in [0, 1], or `None` when the
+    /// image is too small to produce at least 4 non-overlapping 8×8 patches
+    /// (see [`compute_ssim`]) -- SSIM was not meaningfully evaluated, not a
+    /// genuine perfect score.
+    pub ssim: Option<f32>,
     /// Maximum per-pixel absolute error in [0, 1].
     pub max_error: f32,
     /// Image width in pixels.
@@ -73,15 +76,19 @@ pub struct ImageQualityMetrics {
 }
 
 impl ImageQualityMetrics {
-    /// Returns `true` when both PSNR and SSIM satisfy the given thresholds.
+    /// Returns `true` when PSNR satisfies `min_psnr` and, if SSIM was
+    /// evaluated, it also satisfies `min_ssim`. An unevaluated SSIM
+    /// (`self.ssim.is_none()`) does not by itself fail this check -- pair
+    /// with [`Self::ssim`]'s `None` case to surface that distinctly to a
+    /// caller who cares, e.g. as [`check_quality`] does.
     pub fn passes_threshold(&self, min_psnr: f32, min_ssim: f32) -> bool {
-        self.psnr >= min_psnr && self.ssim >= min_ssim
+        self.psnr >= min_psnr && self.ssim.is_none_or(|s| s >= min_ssim)
     }
 
     /// Returns a single-line human-readable summary of the key metrics.
     pub fn format_summary(&self) -> String {
         format!(
-            "{}×{} | PSNR: {:.2} dB | SSIM: {:.4} | MSE: {:.6} | MAE: {:.6} | MaxErr: {:.4}",
+            "{}×{} | PSNR: {:.2} dB | SSIM: {} | MSE: {:.6} | MAE: {:.6} | MaxErr: {:.4}",
             self.width,
             self.height,
             if self.psnr.is_infinite() {
@@ -89,7 +96,8 @@ impl ImageQualityMetrics {
             } else {
                 self.psnr
             },
-            self.ssim,
+            self.ssim
+                .map_or_else(|| "N/A".to_string(), |s| format!("{s:.4}")),
             self.mse,
             self.mae,
             self.max_error,
@@ -110,9 +118,10 @@ impl fmt::Display for ImageQualityMetrics {
 /// Detection results for common rendering artifacts.
 #[derive(Debug, Clone)]
 pub struct ArtifactReport {
-    /// Whether any pixel is fully saturated (component == 0 or component == 255).
+    /// Whether any non-background pixel has all of R/G/B saturated at the
+    /// same extreme (all 0, or all 255). See [`detect_artifacts`].
     pub has_clipping: bool,
-    /// Fraction of pixels that contain at least one clipped component.
+    /// Fraction of pixels counted as clipped under that same rule.
     pub clipping_fraction: f32,
     /// Whether mean channel values deviate significantly from neutral gray.
     pub has_color_drift: bool,
@@ -145,6 +154,14 @@ pub struct QualityThresholds {
     pub max_clipping_pct: f32,
     /// Maximum acceptable estimated noise level (default: 0.05).
     pub max_noise_level: f32,
+    /// Known flat background fill colour (RGB), e.g. `Some([0, 0, 0])` for
+    /// the solid black background typical of a composited 3DGS avatar
+    /// render. Pixels exactly matching it are excluded from clipping
+    /// detection in [`detect_artifacts`] -- without this, a render that is
+    /// 40-80% background pixels (a plain black or white fill saturates
+    /// every channel) is reported as clipped regardless of subject content.
+    /// `None` (the default) disables background exclusion.
+    pub background_color: Option<[u8; 3]>,
 }
 
 impl Default for QualityThresholds {
@@ -154,6 +171,7 @@ impl Default for QualityThresholds {
             min_ssim: 0.85,
             max_clipping_pct: 0.05,
             max_noise_level: 0.05,
+            background_color: None,
         }
     }
 }
@@ -392,7 +410,10 @@ pub fn compute_psnr(a: &[f32], b: &[f32]) -> Result<f32, QualityError> {
 /// Images are converted to luminance first.  Patches of 8×8 pixels are
 /// evaluated with a stride of 4 in both x and y.
 ///
-/// Returns `Ok(1.0)` when the image is too small to produce ≥ 4 patches.
+/// Returns `Ok(None)` when the image is too small to produce ≥ 4 patches
+/// (up to roughly 15×15 pixels) -- SSIM cannot be meaningfully evaluated,
+/// so this reports "not evaluated" rather than fabricating a perfect 1.0
+/// regardless of actual content.
 /// Returns an error when the inputs disagree in length or are empty.
 pub fn compute_ssim(
     a: &[f32],
@@ -400,7 +421,7 @@ pub fn compute_ssim(
     width: u32,
     height: u32,
     channels: u32,
-) -> Result<f32, QualityError> {
+) -> Result<Option<f32>, QualityError> {
     let n_pixels = (width * height) as usize;
     let expected_len = n_pixels * channels as usize;
     if expected_len == 0 {
@@ -461,7 +482,7 @@ pub fn compute_ssim(
 
     if w < PATCH || h < PATCH {
         // Too small to generate even one complete patch.
-        return Ok(1.0);
+        return Ok(None);
     }
 
     let mut py = 0_u32;
@@ -511,10 +532,10 @@ pub fn compute_ssim(
     }
 
     if patch_count < 4 {
-        return Ok(1.0);
+        return Ok(None);
     }
 
-    Ok(ssim_sum / patch_count as f32)
+    Ok(Some(ssim_sum / patch_count as f32))
 }
 
 // ---------------------------------------------------------------------------
@@ -580,6 +601,13 @@ pub fn compute_quality_metrics(
 // ---------------------------------------------------------------------------
 
 /// Detects common rendering artefacts in a single RGBA image.
+///
+/// Clipping detection excludes pixels exactly matching
+/// [`QualityThresholds::background_color`] (see its doc), and counts a
+/// pixel as clipped only when all three of R/G/B saturate at the *same*
+/// extreme (all 0, or all 255) rather than when any single channel does --
+/// a vividly saturated single-channel colour (e.g. pure red `(255, 0, 0)`)
+/// is not exposure clipping.
 pub fn detect_artifacts(
     pixels: &[u8],
     width: u32,
@@ -611,7 +639,10 @@ pub fn detect_artifacts(
         let r = chunk[0];
         let g = chunk[1];
         let b = chunk[2];
-        if r == 0 || r == 255 || g == 0 || g == 255 || b == 0 || b == 255 {
+        let is_background = thresholds.background_color == Some([r, g, b]);
+        let saturated_black = r == 0 && g == 0 && b == 0;
+        let saturated_white = r == 255 && g == 255 && b == 255;
+        if !is_background && (saturated_black || saturated_white) {
             clipped_count += 1;
         }
         sum_r += r as f64;
@@ -771,12 +802,25 @@ pub fn check_quality(
         ));
         passed = false;
     }
-    if metrics.ssim < thresholds.min_ssim {
-        issues.push(format!(
-            "SSIM {:.4} below threshold {:.4}",
-            metrics.ssim, thresholds.min_ssim
-        ));
-        passed = false;
+    match metrics.ssim {
+        Some(ssim) if ssim < thresholds.min_ssim => {
+            issues.push(format!(
+                "SSIM {:.4} below threshold {:.4}",
+                ssim, thresholds.min_ssim
+            ));
+            passed = false;
+        }
+        None => {
+            // Too small to produce enough patches (see `compute_ssim`):
+            // surfaced as an issue for visibility, but does not by itself
+            // fail the check -- neither claiming a fabricated perfect score
+            // nor penalizing a small-but-otherwise-fine render for a metric
+            // that could not be computed.
+            issues.push(
+                "SSIM not evaluated: image too small to produce enough 8×8 patches".to_string(),
+            );
+        }
+        Some(_) => {}
     }
     if artifacts.clipping_fraction > thresholds.max_clipping_pct {
         issues.push(format!(
@@ -842,7 +886,15 @@ pub fn check_quality_batch(
         .cloned()
         .fold(f32::NEG_INFINITY, f32::max);
 
-    let mean_ssim = reports.iter().map(|r| r.metrics.ssim).sum::<f32>() / total_images as f32;
+    // Average only over images where SSIM was actually evaluated (`Some`);
+    // an unevaluated (`None`) image no longer silently contributes a
+    // fabricated 1.0 to the batch mean.
+    let evaluated_ssim: Vec<f32> = reports.iter().filter_map(|r| r.metrics.ssim).collect();
+    let mean_ssim = if evaluated_ssim.is_empty() {
+        0.0
+    } else {
+        evaluated_ssim.iter().sum::<f32>() / evaluated_ssim.len() as f32
+    };
 
     // Restore infinity for min_psnr when all images are identical.
     let min_psnr_out = if min_psnr >= 999.0 {
@@ -1233,7 +1285,9 @@ mod tests {
     fn test_ssim_identical() {
         let img = gradient_rgba(32, 32);
         let f32_img = rgba_u8_to_rgb_f32(&img);
-        let ssim = compute_ssim(&f32_img, &f32_img, 32, 32, 3).expect("ssim");
+        let ssim = compute_ssim(&f32_img, &f32_img, 32, 32, 3)
+            .expect("ssim")
+            .expect("32x32 should produce enough patches to evaluate");
         assert!(
             (ssim - 1.0).abs() < 1e-4,
             "identical images → SSIM≈1, got {}",
@@ -1247,7 +1301,9 @@ mod tests {
         let b = solid_rgba(32, 32, 255, 255, 255, 255);
         let fa = rgba_u8_to_rgb_f32(&a);
         let fb = rgba_u8_to_rgb_f32(&b);
-        let ssim = compute_ssim(&fa, &fb, 32, 32, 3).expect("ssim");
+        let ssim = compute_ssim(&fa, &fb, 32, 32, 3)
+            .expect("ssim")
+            .expect("32x32 should produce enough patches to evaluate");
         // Solid black vs solid white should give near-0 or very low SSIM.
         // (C1 and C2 stabilise the formula for uniform patches; result may not be exactly 0)
         assert!(
@@ -1258,15 +1314,18 @@ mod tests {
     }
 
     #[test]
-    fn test_ssim_small_image_returns_one() {
-        // Image smaller than one 8×8 patch.
+    fn test_ssim_small_image_returns_none_not_evaluated() {
+        // Regression: images too small to produce >= 4 patches (up to
+        // roughly 15x15) used to return `Ok(1.0)`, silently reporting a
+        // perfect score for content that was never actually compared. Any
+        // image up to one 8x8 patch (here 3x3) must instead report `None`
+        // ("not evaluated"), not a fabricated perfect score.
         let a = vec![0.5_f32; 9]; // 3×3×1
-        let b = vec![0.8_f32; 9];
+        let b = vec![0.8_f32; 9]; // deliberately different from `a`
         let ssim = compute_ssim(&a, &b, 3, 3, 1).expect("ssim");
-        assert!(
-            (ssim - 1.0).abs() < 1e-6,
-            "tiny image → fallback 1.0, got {}",
-            ssim
+        assert_eq!(
+            ssim, None,
+            "image too small for even one 8x8 patch must be `None`, not a fabricated 1.0"
         );
     }
 
@@ -1281,7 +1340,9 @@ mod tests {
             .collect();
         let fa = rgba_u8_to_rgb_f32(&a);
         let fb = rgba_u8_to_rgb_f32(&b);
-        let ssim = compute_ssim(&fa, &fb, 32, 32, 3).expect("ssim");
+        let ssim = compute_ssim(&fa, &fb, 32, 32, 3)
+            .expect("ssim")
+            .expect("32x32 should produce enough patches to evaluate");
         assert!(ssim < 0.5, "inverted gradient → low SSIM, got {}", ssim);
     }
 
@@ -1328,10 +1389,13 @@ mod tests {
         let a = checkerboard(32, 32);
         let b = checkerboard(32, 32);
         let m = compute_quality_metrics(&a, &b, 32, 32).expect("metrics");
+        let ssim = m
+            .ssim
+            .expect("32x32 should produce enough patches to evaluate");
         assert!(
-            m.ssim >= 0.0 && m.ssim <= 1.0001,
+            (0.0..=1.0001).contains(&ssim),
             "SSIM out of range: {}",
-            m.ssim
+            ssim
         );
     }
 
@@ -1365,6 +1429,62 @@ mod tests {
         let thresholds = QualityThresholds::default();
         let report = detect_artifacts(&img, 16, 16, &thresholds);
         assert!(report.has_clipping, "all-black → clipping");
+    }
+
+    #[test]
+    fn test_artifacts_clipping_excludes_matching_background_color() {
+        // Regression: a 3DGS avatar render composited over a solid black
+        // background used to report every such render as FAIL for
+        // "clipping" (background pixels saturate every channel at 0).
+        // With `background_color` set to that exact fill colour, a
+        // pure-background image must report zero clipping.
+        let img = solid_rgba(16, 16, 0, 0, 0, 255);
+        let thresholds = QualityThresholds {
+            background_color: Some([0, 0, 0]),
+            ..Default::default()
+        };
+        let report = detect_artifacts(&img, 16, 16, &thresholds);
+        assert!(
+            !report.has_clipping,
+            "background-colour pixels must be excluded from clipping"
+        );
+        assert_eq!(report.clipping_fraction, 0.0);
+    }
+
+    #[test]
+    fn test_artifacts_clipping_still_catches_subject_pixels_over_background() {
+        // Companion to the above: excluding the background colour must not
+        // blind clipping detection to *genuine* blown-out subject pixels.
+        let mut img = solid_rgba(16, 16, 0, 0, 0, 255); // all background
+                                                        // Blow out one subject pixel to solid white.
+        img[0] = 255;
+        img[1] = 255;
+        img[2] = 255;
+        let thresholds = QualityThresholds {
+            background_color: Some([0, 0, 0]),
+            ..Default::default()
+        };
+        let report = detect_artifacts(&img, 16, 16, &thresholds);
+        assert!(
+            report.has_clipping,
+            "a genuinely blown-out subject pixel must still be caught"
+        );
+        assert!((report.clipping_fraction - 1.0 / 256.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_artifacts_clipping_single_channel_saturation_not_flagged() {
+        // Regression: a vividly saturated single-channel colour (e.g. pure
+        // red) used to be flagged as "clipping" via the `r == 255` arm even
+        // though it is a legitimate colour, not exposure clipping. Only all
+        // three channels saturating at the *same* extreme should count.
+        let img = solid_rgba(16, 16, 255, 0, 0, 255); // pure red
+        let thresholds = QualityThresholds::default();
+        let report = detect_artifacts(&img, 16, 16, &thresholds);
+        assert!(
+            !report.has_clipping,
+            "a saturated single channel alone is not clipping"
+        );
     }
 
     #[test]
@@ -1705,7 +1825,7 @@ mod tests {
             psnr: 30.0,
             mse: 0.001,
             mae: 0.01,
-            ssim: 0.95,
+            ssim: Some(0.95),
             max_error: 0.1,
             width: 16,
             height: 16,
@@ -1718,6 +1838,26 @@ mod tests {
         assert!(
             !m.passes_threshold(25.0, 0.99),
             "should fail SSIM threshold"
+        );
+    }
+
+    #[test]
+    fn test_passes_threshold_unevaluated_ssim_does_not_block_pass() {
+        // Regression: `None` (not evaluated) must not itself fail the check
+        // -- only a genuinely low *evaluated* SSIM should.
+        let m = ImageQualityMetrics {
+            psnr: 30.0,
+            mse: 0.001,
+            mae: 0.01,
+            ssim: None,
+            max_error: 0.1,
+            width: 4,
+            height: 4,
+        };
+        assert!(m.passes_threshold(25.0, 0.85));
+        assert!(
+            !m.passes_threshold(35.0, 0.85),
+            "should still fail on PSNR alone"
         );
     }
 }

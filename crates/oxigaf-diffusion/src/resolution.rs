@@ -530,7 +530,7 @@ mod tests {
         assert_eq!(out.len(), 8);
         // All values must be within the input range [0, 7].
         for &v in &out {
-            assert!(v >= 0.0 && v <= 7.0, "value out of range: {v}");
+            assert!((0.0..=7.0).contains(&v), "value out of range: {v}");
         }
     }
 
@@ -637,7 +637,8 @@ mod tests {
         // Scale to fit width: scaled_w=4, scaled_h=1.
         // Padding along height: pad_y = (4-1)/2 = 1.
         // Rows 0 and 2..3 should be fill=0.0; row 1 should have image content.
-        let img: Vec<f32> = vec![1.0; 8 * 2 * 1];
+        // Length is width × height × channels, at channels = 1.
+        let img: Vec<f32> = vec![1.0; 8 * 2];
         let out = letterbox_pad(&img, 8, 2, 4, 1, 0.0).unwrap();
         assert_eq!(out.len(), 16, "output length should be 4*4*1=16");
 
@@ -662,7 +663,8 @@ mod tests {
         // 2×8 (tall) image into a 4×4 target.
         // Scale to fit height: scaled_h=4, scaled_w=1.
         // Padding along width: pad_x = (4-1)/2 = 1.
-        let img: Vec<f32> = vec![1.0; 2 * 8 * 1];
+        // Length is width × height × channels, at channels = 1.
+        let img: Vec<f32> = vec![1.0; 2 * 8];
         let out = letterbox_pad(&img, 2, 8, 4, 1, 0.0).unwrap();
         assert_eq!(out.len(), 16);
 

@@ -106,6 +106,23 @@ pub struct SpatialErrorMap {
     pub error_std: f32,
 }
 
+impl SpatialErrorMap {
+    /// Fraction of pixels (in `[0, 1]`) whose per-pixel error strictly
+    /// exceeds `threshold`. Returns `0.0` for an empty map.
+    ///
+    /// Typically called with [`NoiseAnalysisConfig::error_threshold`] to
+    /// answer "what fraction of the image is badly predicted?", a question
+    /// `mean_error` alone cannot answer (a few very bad pixels and many
+    /// mediocre ones can produce the same mean as many uniformly-bad pixels).
+    pub fn fraction_above(&self, threshold: f32) -> f32 {
+        if self.errors.is_empty() {
+            return 0.0;
+        }
+        let count = self.errors.iter().filter(|&&e| e > threshold).count();
+        count as f32 / self.errors.len() as f32
+    }
+}
+
 /// Configuration knobs for the analysis pipeline.
 #[derive(Debug, Clone)]
 pub struct NoiseAnalysisConfig {
@@ -143,6 +160,10 @@ pub struct NoisePredictionReport {
     pub spatial_error: SpatialErrorMap,
     /// Detected failure mode, if any.
     pub failure_mode: Option<FailureMode>,
+    /// Fraction of pixels (in `[0, 1]`) whose per-pixel error exceeds
+    /// [`NoiseAnalysisConfig::error_threshold`]. See
+    /// [`SpatialErrorMap::fraction_above`].
+    pub fraction_pixels_above_threshold: f32,
 }
 
 /// Common failure modes detected in diffusion noise predictions.
@@ -301,11 +322,13 @@ pub fn compute_alpha_bar(timestep: usize, max_timesteps: usize, schedule: &str) 
 
 /// Compute SNR information for a specific timestep.
 ///
-/// Uses the default `snr_clamp = 5.0` for the loss weight denominator.
+/// `snr_clamp` sets the Min-SNR loss-weight denominator (see
+/// [`NoiseAnalysisConfig::snr_clamp`]; the conventional default is `5.0`).
 pub fn compute_timestep_snr(
     timestep: usize,
     max_timesteps: usize,
     schedule: &str,
+    snr_clamp: f32,
 ) -> Result<TimestepSnr, NoiseAnalysisError> {
     if max_timesteps == 0 || timestep > max_timesteps {
         return Err(NoiseAnalysisError::InvalidTimestep {
@@ -325,7 +348,6 @@ pub fn compute_timestep_snr(
 
     // Min-SNR weighting: clamp(snr, snr_clamp) / snr
     // Equivalently: snr_clamp / max(snr, epsilon) when snr >= snr_clamp, else 1.0
-    let snr_clamp = 5.0_f32;
     let loss_weight = (snr_clamp / snr.max(1e-8)).min(1.0);
 
     Ok(TimestepSnr {
@@ -358,7 +380,12 @@ pub fn compute_spatial_error_map(
             true_len: true_noise.len(),
         });
     }
-    if !pred.len().is_multiple_of(channels) {
+    // Require an exact match against the declared width/height/channels
+    // rather than just divisibility by `channels`: a buffer shorter than
+    // `expected_len` (but still a multiple of `channels`) would otherwise
+    // silently read as having trailing pixels with zero error — a
+    // perfect-looking but wrong report — instead of being rejected.
+    if pred.len() != expected_len {
         return Err(NoiseAnalysisError::InvalidDimensions {
             len: pred.len(),
             channels,
@@ -372,10 +399,10 @@ pub fn compute_spatial_error_map(
         let base = p * channels;
         let mut abs_sum = 0.0_f32;
         for c in 0..channels {
-            let idx = base + c;
-            if idx < pred.len() && idx < true_noise.len() {
-                abs_sum += (pred[idx] - true_noise[idx]).abs();
-            }
+            // Safe: `pred.len() == true_noise.len() == expected_len ==
+            // n_pixels * channels`, and `base + c < n_pixels * channels`
+            // for all `p < n_pixels`, `c < channels`.
+            abs_sum += (pred[base + c] - true_noise[base + c]).abs();
         }
         errors.push(abs_sum / channels as f32);
     }
@@ -399,16 +426,45 @@ pub fn compute_spatial_error_map(
     })
 }
 
+/// Ratio of "energy a 3-tap box blur removes" to "total error energy" above
+/// which [`detect_failure_mode`] reports [`FailureMode::HighFreqArtifact`].
+///
+/// Calibrated empirically (see the comment at the call site) so that
+/// genuinely random, i.i.d. per-pixel prediction error — which is *not*
+/// itself evidence of ringing — stays comfortably below this line even in
+/// its observed worst case, while a structured/checkerboard ringing pattern
+/// scores well above it.
+const HIGH_FREQ_ENERGY_RATIO_THRESHOLD: f32 = 0.7;
+
+/// Minimum pixel count (`width * height`) required before
+/// [`detect_failure_mode`] attempts [`FailureMode::HighFreqArtifact`]
+/// detection. Below this, the high-frequency-energy ratio for pure i.i.d.
+/// noise has enough sample variance to occasionally exceed
+/// [`HIGH_FREQ_ENERGY_RATIO_THRESHOLD`] by chance (observed up to ~0.87 at
+/// 10 pixels), so the check is skipped rather than risk a false positive on
+/// small images.
+const HIGH_FREQ_MIN_PIXELS: usize = 64;
+
 /// Detect whether the noise prediction exhibits a common failure mode.
 ///
-/// Priority order: `Diverged` → `Oversmoothing` → `ColorShift` → `None`.
+/// Priority order: `Diverged` → `Oversmoothing` → `HighFreqArtifact` →
+/// `ColorShift` → `None`.
 ///
-/// `channels` is used for `ColorShift` detection; defaults to 3 if 0.
+/// `channels` is used for `ColorShift` and `HighFreqArtifact` detection;
+/// `ColorShift` defaults to 3 channels if 0. `width`/`height` are the spatial
+/// dimensions of `pred`/`true_noise` (needed only for `HighFreqArtifact`,
+/// which requires 2D structure); that check is silently skipped if
+/// `pred.len()` or `true_noise.len()` differs from `width * height *
+/// channels`, or if there are fewer than `HIGH_FREQ_MIN_PIXELS` pixels.
+/// This function never panics, regardless of how `pred`/`true_noise`/
+/// `width`/`height`/`channels` relate to each other.
 pub fn detect_failure_mode(
     pred: &[f32],
     true_noise: &[f32],
     stats: &PredictionStats,
     channels: usize,
+    width: usize,
+    height: usize,
 ) -> Option<FailureMode> {
     // 1. Diverged: MSE > 2.0
     if stats.mse > 2.0 {
@@ -422,7 +478,63 @@ pub fn detect_failure_mode(
         return Some(FailureMode::Oversmoothing);
     }
 
-    // 3. ColorShift: per-channel mean bias > 0.1
+    // 3. HighFreqArtifact: build a per-pixel error map and compare its
+    // energy against a box-blurred version of itself (reusing the
+    // separable box blur from `latent_blend::lb_smooth_mask`). Ringing
+    // concentrates error energy at high spatial frequencies, so blurring
+    // cancels most of it out; a smooth or uniform error field survives
+    // blurring almost unchanged. Only runs when the buffers cleanly
+    // reshape into `width * height` pixels of `channels` values each, and
+    // when there are enough pixels for the ratio below to be a reliable
+    // statistic (see the threshold constants' doc for the calibration).
+    let n_pixels = width * height;
+    if channels > 0
+        && n_pixels >= HIGH_FREQ_MIN_PIXELS
+        && pred.len() == n_pixels * channels
+        && true_noise.len() == n_pixels * channels
+    {
+        let mut error_map = Vec::with_capacity(n_pixels);
+        for p in 0..n_pixels {
+            let base = p * channels;
+            let mut abs_sum = 0.0_f32;
+            for c in 0..channels {
+                abs_sum += (pred[base + c] - true_noise[base + c]).abs();
+            }
+            error_map.push(abs_sum / channels as f32);
+        }
+        if let Ok(blurred) = crate::latent_blend::lb_smooth_mask(&error_map, height, width, 1) {
+            let error_energy = error_map.iter().sum::<f32>() / n_pixels as f32;
+            let high_freq_energy = error_map
+                .iter()
+                .zip(blurred.iter())
+                .map(|(&e, &b)| (e - b).abs())
+                .sum::<f32>()
+                / n_pixels as f32;
+            // The energy a 3-tap box blur removes from *genuinely random,
+            // i.i.d.* per-pixel error (healthy prediction noise) already
+            // averages ~47% of the total error energy at 1 channel and
+            // ~27% at 3 channels (verified empirically: a linear
+            // combination of independent samples has std sqrt(2/3) times
+            // the source std, so even pure noise "loses" a large,
+            // non-trivial fraction of its energy to blurring — this is not
+            // by itself evidence of structure). Genuine ringing/checkerboard
+            // patterns score far higher (~1.3, since they are a
+            // near-deterministic alternation rather than independent
+            // samples). The threshold and minimum pixel count below are
+            // chosen with a comfortable margin above the empirically
+            // observed noise ceiling (max ~0.59 at n=64 over 200 trials, up
+            // to ~0.87 for tiny n<20 samples, which is why a minimum pixel
+            // count is enforced) while still firing clearly on structured
+            // ringing.
+            if error_energy > 1e-6
+                && high_freq_energy > HIGH_FREQ_ENERGY_RATIO_THRESHOLD * error_energy
+            {
+                return Some(FailureMode::HighFreqArtifact);
+            }
+        }
+    }
+
+    // 4. ColorShift: per-channel mean bias > 0.1
     let ch = channels.max(1);
     let pred_means = channel_means(pred, ch);
     let true_means = channel_means(true_noise, ch);
@@ -458,10 +570,13 @@ pub fn analyze_noise_prediction(
     }
 
     let stats = compute_prediction_stats(pred, true_noise)?;
-    let snr_info = compute_timestep_snr(timestep, config.max_timesteps, "cosine")?;
+    let snr_info =
+        compute_timestep_snr(timestep, config.max_timesteps, "cosine", config.snr_clamp)?;
     let spatial_error =
         compute_spatial_error_map(pred, true_noise, width, height, config.channels)?;
-    let failure_mode = detect_failure_mode(pred, true_noise, &stats, config.channels);
+    let failure_mode =
+        detect_failure_mode(pred, true_noise, &stats, config.channels, width, height);
+    let fraction_pixels_above_threshold = spatial_error.fraction_above(config.error_threshold);
 
     Ok(NoisePredictionReport {
         timestep,
@@ -469,21 +584,24 @@ pub fn analyze_noise_prediction(
         snr_info,
         spatial_error,
         failure_mode,
+        fraction_pixels_above_threshold,
     })
 }
 
 /// Compute an SNR-weighted noise prediction loss.
 ///
-/// `loss = mse × loss_weight` where `loss_weight` comes from [`compute_timestep_snr`].
+/// `loss = mse × loss_weight` where `loss_weight` comes from [`compute_timestep_snr`]
+/// using the given `snr_clamp` (see [`NoiseAnalysisConfig::snr_clamp`]).
 pub fn weighted_noise_loss(
     pred: &[f32],
     true_noise: &[f32],
     timestep: usize,
     max_timesteps: usize,
     schedule: &str,
+    snr_clamp: f32,
 ) -> Result<f32, NoiseAnalysisError> {
     let stats = compute_prediction_stats(pred, true_noise)?;
-    let snr = compute_timestep_snr(timestep, max_timesteps, schedule)?;
+    let snr = compute_timestep_snr(timestep, max_timesteps, schedule, snr_clamp)?;
     Ok(stats.mse * snr.loss_weight)
 }
 
@@ -816,7 +934,7 @@ mod tests {
 
     #[test]
     fn test_snr_t0_high() {
-        let snr = compute_timestep_snr(0, 1000, "cosine").expect("t=0 SNR");
+        let snr = compute_timestep_snr(0, 1000, "cosine", 5.0).expect("t=0 SNR");
         assert!(
             snr.snr > 100.0,
             "SNR at t=0 should be large, got {}",
@@ -826,7 +944,7 @@ mod tests {
 
     #[test]
     fn test_snr_tmax_near_zero() {
-        let snr = compute_timestep_snr(999, 1000, "cosine").expect("t=999 SNR");
+        let snr = compute_timestep_snr(999, 1000, "cosine", 5.0).expect("t=999 SNR");
         assert!(
             snr.snr < 1.0,
             "SNR near t=T should be small, got {}",
@@ -836,7 +954,7 @@ mod tests {
 
     #[test]
     fn test_snr_invalid_timestep_error() {
-        let r = compute_timestep_snr(1001, 1000, "cosine");
+        let r = compute_timestep_snr(1001, 1000, "cosine", 5.0);
         assert!(matches!(r, Err(NoiseAnalysisError::InvalidTimestep { .. })));
     }
 
@@ -845,7 +963,7 @@ mod tests {
         // At low t (high SNR), loss_weight should equal the clamped value / snr,
         // which must be ≤ 1.0.
         for t in [0, 100, 500, 999] {
-            let snr = compute_timestep_snr(t, 1000, "cosine").expect("snr");
+            let snr = compute_timestep_snr(t, 1000, "cosine", 5.0).expect("snr");
             assert!(
                 snr.loss_weight <= 1.0 + EPSILON,
                 "loss_weight must be ≤ 1 at t={t}, got {}",
@@ -857,15 +975,36 @@ mod tests {
 
     #[test]
     fn test_snr_db_finite_for_mid_timestep() {
-        let snr = compute_timestep_snr(500, 1000, "cosine").expect("t=500 SNR");
+        let snr = compute_timestep_snr(500, 1000, "cosine", 5.0).expect("t=500 SNR");
         assert!(snr.snr_db.is_finite(), "snr_db should be finite at t=500");
     }
 
     #[test]
     fn test_snr_alpha_bar_matches_direct() {
         let ab_direct = compute_alpha_bar(300, 1000, "linear");
-        let snr = compute_timestep_snr(300, 1000, "linear").expect("snr linear");
+        let snr = compute_timestep_snr(300, 1000, "linear", 5.0).expect("snr linear");
         assert!((snr.alpha_bar - ab_direct).abs() < EPSILON);
+    }
+
+    // Regression test: `snr_clamp` was previously hardcoded to 5.0 inside
+    // `compute_timestep_snr` and the parameter had no effect on the result.
+    #[test]
+    fn test_snr_clamp_is_wired_through() {
+        // t=0 has very high SNR, so loss_weight == snr_clamp / snr for any
+        // clamp well below that SNR value, making the two results diverge
+        // proportionally to the clamp used.
+        let snr_small_clamp = compute_timestep_snr(0, 1000, "cosine", 1.0).expect("clamp 1.0");
+        let snr_large_clamp = compute_timestep_snr(0, 1000, "cosine", 20.0).expect("clamp 20.0");
+        assert!(
+            (snr_large_clamp.loss_weight - 20.0 * snr_small_clamp.loss_weight).abs() < 1e-3,
+            "loss_weight should scale linearly with snr_clamp when unclamped at 1.0, got {} vs {}",
+            snr_small_clamp.loss_weight,
+            snr_large_clamp.loss_weight
+        );
+        assert!(
+            (snr_small_clamp.loss_weight - snr_large_clamp.loss_weight).abs() > 1e-6,
+            "different snr_clamp values must produce different loss_weight"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -984,6 +1123,62 @@ mod tests {
         assert_eq!(map.errors.len(), 15);
     }
 
+    // Regression test: `NoiseAnalysisConfig::error_threshold` was previously
+    // never read anywhere in the crate.
+    #[test]
+    fn test_fraction_above_counts_pixels_over_threshold() {
+        let map = SpatialErrorMap {
+            errors: vec![0.0, 0.05, 0.2, 0.5, 0.9],
+            width: 5,
+            height: 1,
+            channels: 1,
+            mean_error: 0.33,
+            max_error: 0.9,
+            error_std: 0.0,
+        };
+        // 0.2, 0.5, 0.9 exceed 0.1 -> 3/5.
+        assert!((map.fraction_above(0.1) - 0.6).abs() < EPSILON);
+        // Nothing exceeds 10.0.
+        assert!((map.fraction_above(10.0)).abs() < EPSILON);
+        // Everything exceeds a negative threshold.
+        assert!((map.fraction_above(-1.0) - 1.0).abs() < EPSILON);
+    }
+
+    #[test]
+    fn test_fraction_above_empty_map_is_zero() {
+        let map = SpatialErrorMap {
+            errors: Vec::new(),
+            width: 0,
+            height: 0,
+            channels: 1,
+            mean_error: 0.0,
+            max_error: 0.0,
+            error_std: 0.0,
+        };
+        assert!((map.fraction_above(0.0)).abs() < EPSILON);
+    }
+
+    // Regression test: a buffer shorter than `width * height * channels`
+    // (but still evenly divisible by `channels`) must be rejected, not
+    // silently zero-padded into a perfect-looking report.
+    #[test]
+    fn test_spatial_error_map_rejects_buffer_shorter_than_declared_dims() {
+        // width=4, height=4, channels=3 declares 48 elements; supply only 24
+        // (still a multiple of 3, so the old divisibility-only check would
+        // have accepted it and silently treated the missing half as
+        // zero-error pixels).
+        let pred = uniform_buf(24, 1.0);
+        let truth = uniform_buf(24, 0.0);
+        let r = compute_spatial_error_map(&pred, &truth, 4, 4, 3);
+        assert!(matches!(
+            r,
+            Err(NoiseAnalysisError::InvalidDimensions {
+                len: 24,
+                channels: 3
+            })
+        ));
+    }
+
     // -----------------------------------------------------------------------
     // detect_failure_mode
     // -----------------------------------------------------------------------
@@ -993,7 +1188,7 @@ mod tests {
         let pred = uniform_buf(4, 0.0);
         let truth = uniform_buf(4, 2.0); // diff=2, mse=4 > 2.0
         let stats = compute_prediction_stats(&pred, &truth).expect("stats");
-        let fm = detect_failure_mode(&pred, &truth, &stats, 3);
+        let fm = detect_failure_mode(&pred, &truth, &stats, 3, 1, 1);
         assert_eq!(fm, Some(FailureMode::Diverged));
     }
 
@@ -1003,7 +1198,7 @@ mod tests {
         let pred = uniform_buf(100, 0.01); // near constant
         let truth = linspace_buf(100, -1.0, 1.0); // large spread
         let stats = compute_prediction_stats(&pred, &truth).expect("stats");
-        let fm = detect_failure_mode(&pred, &truth, &stats, 3);
+        let fm = detect_failure_mode(&pred, &truth, &stats, 3, 1, 1);
         // mse will be around 0.33 (< 2.0) so won't diverge; should detect Oversmoothing
         assert_eq!(fm, Some(FailureMode::Oversmoothing));
     }
@@ -1016,7 +1211,10 @@ mod tests {
             .collect();
         let truth: Vec<f32> = (0..90).map(|_| 0.0_f32).collect();
         let stats = compute_prediction_stats(&pred, &truth).expect("stats");
-        let fm = detect_failure_mode(&pred, &truth, &stats, 3);
+        // 90 values / 3 channels = 30 pixels, below HIGH_FREQ_MIN_PIXELS
+        // (64), so HighFreqArtifact detection is skipped here and this
+        // falls straight through to the expected ColorShift.
+        let fm = detect_failure_mode(&pred, &truth, &stats, 3, 30, 1);
         assert_eq!(fm, Some(FailureMode::ColorShift));
     }
 
@@ -1024,7 +1222,7 @@ mod tests {
     fn test_detect_no_failure() {
         let v = linspace_buf(30, -0.3, 0.3);
         let stats = compute_prediction_stats(&v, &v).expect("perfect");
-        let fm = detect_failure_mode(&v, &v, &stats, 3);
+        let fm = detect_failure_mode(&v, &v, &stats, 3, 10, 1);
         assert_eq!(fm, None);
     }
 
@@ -1034,8 +1232,126 @@ mod tests {
         let pred = uniform_buf(10, 0.0);
         let truth = uniform_buf(10, 3.0); // mse = 9.0
         let stats = compute_prediction_stats(&pred, &truth).expect("stats");
-        let fm = detect_failure_mode(&pred, &truth, &stats, 3);
+        let fm = detect_failure_mode(&pred, &truth, &stats, 3, 1, 1);
         assert_eq!(fm, Some(FailureMode::Diverged));
+    }
+
+    // Regression tests for the previously-unreachable HighFreqArtifact variant.
+
+    /// Deterministic LCG (glibc-style constants), matched against an
+    /// independent Python reference implementation used to calibrate
+    /// [`HIGH_FREQ_ENERGY_RATIO_THRESHOLD`] / [`HIGH_FREQ_MIN_PIXELS`].
+    fn lcg_next(state: u64) -> u64 {
+        (1103515245u64.wrapping_mul(state).wrapping_add(12345)) & 0x7FFF_FFFF
+    }
+
+    /// Generate a `pred` buffer of i.i.d.-ish zero-mean noise (a 4-uniform
+    /// sum, approximating a bounded Gaussian via a crude CLT) with the given
+    /// `scale`, alongside an all-zero `true_noise` of the same shape — i.e.
+    /// a synthetic "healthy" noise-prediction residual with no structure.
+    fn gen_noise_pred(n_pixels: usize, channels: usize, seed: u64, scale: f32) -> Vec<f32> {
+        let mut state = seed;
+        let mut pred = Vec::with_capacity(n_pixels * channels);
+        for _ in 0..(n_pixels * channels) {
+            let mut u = 0.0_f32;
+            for _ in 0..4 {
+                state = lcg_next(state);
+                u += state as f32 / 0x7FFF_FFFF as f32;
+            }
+            u -= 2.0;
+            pred.push(u * scale);
+        }
+        pred
+    }
+
+    #[test]
+    fn test_detect_high_freq_artifact() {
+        // Checkerboard-pattern error (alternating between 1 and 0 every
+        // pixel) is almost entirely high-frequency energy: a box blur
+        // collapses most of its magnitude, so the "energy removed by
+        // blurring" is large relative to the raw error magnitude.
+        let n = 80; // >= HIGH_FREQ_MIN_PIXELS
+        let pred: Vec<f32> = (0..n).map(|i| if i % 2 == 0 { 1.0 } else { 0.0 }).collect();
+        let truth = vec![0.0_f32; n];
+        let stats = compute_prediction_stats(&pred, &truth).expect("stats");
+        let fm = detect_failure_mode(&pred, &truth, &stats, 1, n, 1);
+        assert_eq!(fm, Some(FailureMode::HighFreqArtifact));
+    }
+
+    #[test]
+    fn test_detect_high_freq_artifact_not_triggered_by_smooth_gradient() {
+        // A smoothly-varying (linear) error survives box-blurring almost
+        // unchanged in its interior, so it must not be misclassified as
+        // ringing.
+        let n = 80; // >= HIGH_FREQ_MIN_PIXELS
+        let pred = linspace_buf(n, 0.0, 1.0);
+        let truth = vec![0.0_f32; n];
+        let stats = compute_prediction_stats(&pred, &truth).expect("stats");
+        let fm = detect_failure_mode(&pred, &truth, &stats, 1, n, 1);
+        assert_ne!(fm, Some(FailureMode::HighFreqArtifact));
+    }
+
+    // Regression tests for the false-positive risk flagged during review:
+    // genuinely random (i.i.d.) prediction noise is NOT itself evidence of
+    // ringing, even though a box blur removes a large fraction of its
+    // energy too. These use a fixed deterministic PRNG sequence (values
+    // cross-checked against an independent reference implementation) rather
+    // than `rand`, so the result is reproducible.
+    #[test]
+    fn test_detect_high_freq_artifact_not_triggered_by_random_noise_1channel() {
+        let n = 100; // >= HIGH_FREQ_MIN_PIXELS
+        let pred = gen_noise_pred(n, 1, 42, 0.3);
+        let truth = vec![0.0_f32; n];
+        let stats = compute_prediction_stats(&pred, &truth).expect("stats");
+        let fm = detect_failure_mode(&pred, &truth, &stats, 1, n, 1);
+        assert_ne!(
+            fm,
+            Some(FailureMode::HighFreqArtifact),
+            "pure i.i.d. noise (1 channel) must not be misclassified as ringing"
+        );
+    }
+
+    #[test]
+    fn test_detect_high_freq_artifact_not_triggered_by_random_noise_3channel() {
+        let n_pixels = 100; // >= HIGH_FREQ_MIN_PIXELS
+        let pred = gen_noise_pred(n_pixels, 3, 42, 0.3);
+        let truth = vec![0.0_f32; n_pixels * 3];
+        let stats = compute_prediction_stats(&pred, &truth).expect("stats");
+        let fm = detect_failure_mode(&pred, &truth, &stats, 3, n_pixels, 1);
+        assert_ne!(
+            fm,
+            Some(FailureMode::HighFreqArtifact),
+            "pure i.i.d. noise (3 channels) must not be misclassified as ringing"
+        );
+    }
+
+    #[test]
+    fn test_detect_high_freq_artifact_skipped_below_min_pixels() {
+        // A checkerboard pattern that WOULD trigger at n >= 64 must be
+        // skipped below HIGH_FREQ_MIN_PIXELS, since the ratio statistic is
+        // unreliable at very small pixel counts.
+        let n = 20;
+        let pred: Vec<f32> = (0..n).map(|i| if i % 2 == 0 { 1.0 } else { 0.0 }).collect();
+        let truth = vec![0.0_f32; n];
+        let stats = compute_prediction_stats(&pred, &truth).expect("stats");
+        let fm = detect_failure_mode(&pred, &truth, &stats, 1, n, 1);
+        assert_ne!(fm, Some(FailureMode::HighFreqArtifact));
+    }
+
+    #[test]
+    fn test_detect_high_freq_artifact_skipped_on_shape_mismatch() {
+        // width * height * channels != pred.len(): the HighFreqArtifact
+        // check must be silently skipped (not panic, not error) rather than
+        // attempting an out-of-bounds reshape.
+        let pred = uniform_buf(7, 1.0);
+        let truth = uniform_buf(7, 0.0);
+        let stats = compute_prediction_stats(&pred, &truth).expect("stats");
+        // 7 does not factor as width * height * channels for (3, 3, 1).
+        let fm = detect_failure_mode(&pred, &truth, &stats, 1, 3, 3);
+        // MSE = 1.0 (< 2.0, no Diverged); std_pred == 0 == std_true (no
+        // Oversmoothing); shape mismatch skips HighFreqArtifact; per-channel
+        // bias of 1.0 (> 0.1) still correctly falls through to ColorShift.
+        assert_eq!(fm, Some(FailureMode::ColorShift));
     }
 
     // -----------------------------------------------------------------------
@@ -1053,6 +1369,19 @@ mod tests {
         assert!(report.stats.mse.is_finite());
         assert!(report.snr_info.snr.is_finite());
         assert_eq!(report.spatial_error.errors.len(), 16);
+        assert!((0.0..=1.0).contains(&report.fraction_pixels_above_threshold));
+    }
+
+    // Regression test: `analyze_noise_prediction` now threads
+    // `config.error_threshold` into the report end-to-end.
+    #[test]
+    fn test_analyze_fraction_pixels_above_threshold_matches_config() {
+        let pred = linspace_buf(3 * 4 * 4, -0.5, 0.5);
+        let truth = linspace_buf(3 * 4 * 4, -0.4, 0.4);
+        let cfg = NoiseAnalysisConfig::default();
+        let report = analyze_noise_prediction(&pred, &truth, 500, 4, 4, &cfg).expect("report");
+        let expected = report.spatial_error.fraction_above(cfg.error_threshold);
+        assert!((report.fraction_pixels_above_threshold - expected).abs() < EPSILON);
     }
 
     #[test]
@@ -1079,7 +1408,7 @@ mod tests {
     fn test_weighted_loss_finite() {
         let pred = linspace_buf(12, -0.5, 0.5);
         let truth = linspace_buf(12, -0.4, 0.6);
-        let w = weighted_noise_loss(&pred, &truth, 500, 1000, "cosine").expect("wloss");
+        let w = weighted_noise_loss(&pred, &truth, 500, 1000, "cosine", 5.0).expect("wloss");
         assert!(w.is_finite());
         assert!(w >= 0.0);
     }
@@ -1087,15 +1416,29 @@ mod tests {
     #[test]
     fn test_weighted_loss_perfect_is_zero() {
         let v = linspace_buf(12, -1.0, 1.0);
-        let w = weighted_noise_loss(&v, &v, 500, 1000, "cosine").expect("perfect wloss");
+        let w = weighted_noise_loss(&v, &v, 500, 1000, "cosine", 5.0).expect("perfect wloss");
         assert!(w < EPSILON);
     }
 
     #[test]
     fn test_weighted_loss_invalid_timestep() {
         let v = vec![0.0_f32; 12];
-        let r = weighted_noise_loss(&v, &v, 2000, 1000, "cosine");
+        let r = weighted_noise_loss(&v, &v, 2000, 1000, "cosine", 5.0);
         assert!(matches!(r, Err(NoiseAnalysisError::InvalidTimestep { .. })));
+    }
+
+    #[test]
+    fn test_weighted_loss_snr_clamp_changes_result() {
+        // t=0 (very high SNR) so loss_weight is unclamped and scales with
+        // snr_clamp; a non-trivial mse makes the resulting loss differ too.
+        let pred = linspace_buf(12, -0.5, 0.5);
+        let truth = linspace_buf(12, -0.4, 0.6);
+        let w_small = weighted_noise_loss(&pred, &truth, 0, 1000, "cosine", 1.0).expect("w1");
+        let w_large = weighted_noise_loss(&pred, &truth, 0, 1000, "cosine", 20.0).expect("w20");
+        assert!(
+            (w_large - 20.0 * w_small).abs() < 1e-3,
+            "loss should scale with snr_clamp, got {w_small} vs {w_large}"
+        );
     }
 
     // -----------------------------------------------------------------------

@@ -92,7 +92,10 @@ fn main() {
         println!();
         println!("Running in demonstration mode (API showcase only).");
         println!();
-        demonstrate_api();
+        if let Err(e) = demonstrate_api() {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
         return;
     }
 
@@ -191,7 +194,10 @@ fn run_inference(weights_dir: &Path, _reference_image: Option<&Path>) -> oxigaf:
 
     println!();
     println!("Running multi-view generation...");
-    println!("  (This may take several minutes on CPU)");
+    match &device {
+        candle_core::Device::Cpu => println!("  (This may take several minutes on CPU)"),
+        other => println!("  (Using {:?} — should be faster than CPU)", other),
+    }
 
     let seed = 42u64;
     let output = pipeline.generate(&reference_image, &normal_map_latents, &camera_poses, seed)?;
@@ -245,7 +251,7 @@ fn run_inference(weights_dir: &Path, _reference_image: Option<&Path>) -> oxigaf:
 }
 
 /// Demonstrate the API without requiring model weights.
-fn demonstrate_api() {
+fn demonstrate_api() -> oxigaf::Result<()> {
     println!("API Demonstration");
     println!("-----------------");
     println!();
@@ -293,7 +299,7 @@ fn demonstrate_api() {
 
     // Configure inference steps
     let mut scheduler = scheduler;
-    scheduler.set_timesteps(50);
+    scheduler.set_timesteps(50)?;
     let timesteps = scheduler.timesteps();
     println!(
         "   Inference timesteps (first 5): {:?}...",
@@ -349,14 +355,33 @@ fn demonstrate_api() {
     println!();
     println!("To run with actual model weights:");
     println!("  cargo run --example diffusion_inference -- --weights-dir /path/to/weights");
+
+    Ok(())
 }
 
 /// Select the best available compute device.
 ///
-/// To use GPU backends (Metal/CUDA), enable the corresponding feature on
-/// candle-core directly in your own Cargo.toml.
+/// Prefers Metal, then CUDA, falling back to CPU. Which (if either) GPU
+/// backend is actually compiled into `candle-core` is a build-time choice:
+/// this crate's `Cargo.toml` does not enable candle's `cuda`/`metal`
+/// features, so in the default build `metal_is_available()` /
+/// `cuda_is_available()` are both `false` and this always resolves to CPU.
+/// To get a real GPU device here, enable the corresponding feature on
+/// `candle-core` directly in your own Cargo.toml (Cargo's feature
+/// unification then turns it on for this dependency across the build) —
+/// `Device::new_metal`/`Device::new_cuda` will then succeed instead of
+/// returning `Err(NotCompiledWith*Support)`.
 fn select_device() -> candle_core::Device {
-    // Fallback to CPU (GPU backends must be enabled via candle-core features)
+    if candle_core::utils::metal_is_available() {
+        if let Ok(device) = candle_core::Device::new_metal(0) {
+            return device;
+        }
+    }
+    if candle_core::utils::cuda_is_available() {
+        if let Ok(device) = candle_core::Device::new_cuda(0) {
+            return device;
+        }
+    }
     candle_core::Device::Cpu
 }
 
@@ -491,4 +516,19 @@ fn save_tensor_as_image(
 
     img.save(path)
         .map_err(|e| format!("Failed to save image: {}", e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test: `DdimScheduler::set_timesteps` returns
+    /// `DiffusionResult<()>` rather than being infallible. `demonstrate_api`
+    /// propagates that result with `?` instead of discarding it, so this
+    /// exercises the call site end-to-end and confirms it still succeeds for
+    /// a valid step count (50 inference steps out of 1000 training steps).
+    #[test]
+    fn demonstrate_api_propagates_set_timesteps_result() {
+        demonstrate_api().expect("demonstrate_api should succeed with a valid step count");
+    }
 }

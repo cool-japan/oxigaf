@@ -190,6 +190,10 @@ pub struct DenoisingVizConfig {
     pub image_height: usize,
     /// Colormap used to visualize latents.
     pub colormap: LatentColormap,
+    /// Total number of views being generated (default: 1). Used to
+    /// populate [`DenoisingTimeline::total_views`] for every timeline
+    /// [`DenoisingVisualizer::capture_step`] creates.
+    pub total_views: usize,
 }
 
 impl Default for DenoisingVizConfig {
@@ -200,6 +204,7 @@ impl Default for DenoisingVizConfig {
             image_width: 256,
             image_height: 256,
             colormap: LatentColormap::RgbNormalized,
+            total_views: 1,
         }
     }
 }
@@ -227,6 +232,11 @@ impl DenoisingVizConfig {
                 "image_height must be >= 1".to_string(),
             ));
         }
+        if self.total_views == 0 {
+            return Err(DiffusionError::InvalidConfig(
+                "total_views must be >= 1".to_string(),
+            ));
+        }
         Ok(())
     }
 }
@@ -252,22 +262,60 @@ const VIRIDIS_TABLE: [(f32, [u8; 3]); 5] = [
 
 impl DenoisingVisualizer {
     /// Create a new visualizer with the given configuration.
-    pub fn new(config: DenoisingVizConfig) -> Self {
-        Self {
+    ///
+    /// # Errors
+    /// Propagates [`DenoisingVizConfig::validate`]'s error when `config` is
+    /// invalid (e.g. `capture_every_n_steps == 0`, which would otherwise
+    /// silently record only step 0 of every view).
+    pub fn new(config: DenoisingVizConfig) -> Result<Self, DiffusionError> {
+        config.validate()?;
+        Ok(Self {
             config,
             timelines: Vec::new(),
+        })
+    }
+
+    /// Update the configured `total_views` and back-fill it onto every
+    /// timeline captured so far (as well as any created afterward).
+    pub fn set_total_views(&mut self, total_views: usize) {
+        self.config.total_views = total_views;
+        for timeline in &mut self.timelines {
+            timeline.total_views = total_views;
         }
     }
 
     /// Capture a step for the given view.
     ///
     /// Only records the step when `step_index % capture_every_n_steps == 0`.
-    pub fn capture_step(&mut self, view_index: usize, step: DenoisingStep) {
-        if !step
-            .step_index
-            .is_multiple_of(self.config.capture_every_n_steps)
-        {
+    /// When the step doesn't already carry a decoded image (i.e. the caller
+    /// did not attach one via [`DenoisingStep::with_decoded`]) and
+    /// `step_index % decode_every_n_steps == 0`, converts the latent to an
+    /// RGBA preview via [`Self::latent_to_rgba`] and rescales it to the
+    /// configured `image_width`/`image_height` before storing it.
+    pub fn capture_step(&mut self, view_index: usize, mut step: DenoisingStep) {
+        let capture_every = self.config.capture_every_n_steps.max(1);
+        if !step.step_index.is_multiple_of(capture_every) {
             return;
+        }
+
+        let decode_every = self.config.decode_every_n_steps.max(1);
+        if step.decoded_image.is_none() && step.step_index.is_multiple_of(decode_every) {
+            let raw = self.latent_to_rgba(
+                &step.latent,
+                step.latent_channels,
+                step.latent_height,
+                step.latent_width,
+            );
+            let resized = resize_rgba_nearest(
+                &raw,
+                step.latent_width,
+                step.latent_height,
+                self.config.image_width,
+                self.config.image_height,
+            );
+            step.decoded_image = Some(resized);
+            step.image_width = self.config.image_width;
+            step.image_height = self.config.image_height;
         }
 
         // Find existing timeline for this view or create one.
@@ -278,7 +326,7 @@ impl DenoisingVisualizer {
         let pos = match timeline_pos {
             Some(p) => p,
             None => {
-                let new_timeline = DenoisingTimeline::new(view_index, view_index + 1);
+                let new_timeline = DenoisingTimeline::new(view_index, self.config.total_views);
                 self.timelines.push(new_timeline);
                 self.timelines.len() - 1
             }
@@ -550,6 +598,32 @@ impl DenoisingVisualizer {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
+/// Nearest-neighbour resize of an RGBA buffer from `(src_w, src_h)` to
+/// `(dst_w, dst_h)`. Returns an all-zero buffer of the destination size if
+/// either the source or destination has a zero dimension.
+fn resize_rgba_nearest(
+    src: &[u8],
+    src_w: usize,
+    src_h: usize,
+    dst_w: usize,
+    dst_h: usize,
+) -> Vec<u8> {
+    let mut out = vec![0u8; dst_w * dst_h * 4];
+    if src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
+        return out;
+    }
+    for dy in 0..dst_h {
+        let sy = (dy * src_h / dst_h).min(src_h - 1);
+        for dx in 0..dst_w {
+            let sx = (dx * src_w / dst_w).min(src_w - 1);
+            let src_idx = (sy * src_w + sx) * 4;
+            let dst_idx = (dy * dst_w + dx) * 4;
+            out[dst_idx..dst_idx + 4].copy_from_slice(&src[src_idx..src_idx + 4]);
+        }
+    }
+    out
+}
+
 /// Normalize a value to [0, 1].  When min == max returns 0.5.
 fn normalize_value(v: f32, min_val: f32, max_val: f32) -> f32 {
     let range = max_val - min_val;
@@ -756,7 +830,7 @@ mod tests {
             colormap,
             ..Default::default()
         };
-        DenoisingVisualizer::new(cfg)
+        DenoisingVisualizer::new(cfg).expect("valid config in test helper")
     }
 
     #[test]
@@ -856,7 +930,7 @@ mod tests {
             capture_every_n_steps: 3,
             ..Default::default()
         };
-        let mut viz = DenoisingVisualizer::new(cfg);
+        let mut viz = DenoisingVisualizer::new(cfg).expect("valid config");
 
         // Steps 0, 1, 2, 3, 4, 5 — only 0 and 3 are multiples of 3.
         for i in 0..6usize {
@@ -872,11 +946,21 @@ mod tests {
         assert_eq!(timeline.steps[1].step_index, 3);
     }
 
+    #[test]
+    fn test_visualizer_new_rejects_invalid_config() {
+        let cfg = DenoisingVizConfig {
+            capture_every_n_steps: 0,
+            ..Default::default()
+        };
+        assert!(DenoisingVisualizer::new(cfg).is_err());
+    }
+
     // -- view_timeline -------------------------------------------------------
 
     #[test]
     fn test_visualizer_view_timeline() {
-        let mut viz = DenoisingVisualizer::new(DenoisingVizConfig::default());
+        let mut viz =
+            DenoisingVisualizer::new(DenoisingVizConfig::default()).expect("valid config");
 
         viz.capture_step(0, DenoisingStep::new(0, 5, 0, vec![], 1, 1, 1));
         viz.capture_step(2, DenoisingStep::new(0, 5, 0, vec![], 1, 1, 1));
@@ -892,7 +976,8 @@ mod tests {
 
     #[test]
     fn test_format_report() {
-        let mut viz = DenoisingVisualizer::new(DenoisingVizConfig::default());
+        let mut viz =
+            DenoisingVisualizer::new(DenoisingVizConfig::default()).expect("valid config");
 
         // Empty visualizer.
         let report = viz.format_report();
@@ -907,5 +992,103 @@ mod tests {
             report
         );
         assert!(report.contains("View 0"), "got: {}", report);
+    }
+
+    // -- total_views wiring ---------------------------------------------------
+
+    #[test]
+    fn test_capture_step_uses_configured_total_views() {
+        let cfg = DenoisingVizConfig {
+            total_views: 4,
+            ..Default::default()
+        };
+        let mut viz = DenoisingVisualizer::new(cfg).expect("valid config");
+
+        // Capture views out of order and starting from a nonzero index —
+        // the old code fabricated total_views = view_index + 1 per
+        // timeline, giving inconsistent values across views.
+        viz.capture_step(2, DenoisingStep::new(0, 5, 0, vec![], 1, 1, 1));
+        viz.capture_step(0, DenoisingStep::new(0, 5, 0, vec![], 1, 1, 1));
+
+        let t0 = viz.view_timeline(0).expect("view 0 timeline");
+        let t2 = viz.view_timeline(2).expect("view 2 timeline");
+        assert_eq!(t0.total_views, 4);
+        assert_eq!(t2.total_views, 4);
+    }
+
+    #[test]
+    fn test_set_total_views_backfills_existing_timelines() {
+        let mut viz =
+            DenoisingVisualizer::new(DenoisingVizConfig::default()).expect("valid config");
+        viz.capture_step(0, DenoisingStep::new(0, 5, 0, vec![], 1, 1, 1));
+        assert_eq!(viz.view_timeline(0).unwrap().total_views, 1);
+
+        viz.set_total_views(6);
+        assert_eq!(viz.view_timeline(0).unwrap().total_views, 6);
+
+        // New timelines created afterward should also pick up the new value.
+        viz.capture_step(1, DenoisingStep::new(0, 5, 0, vec![], 1, 1, 1));
+        assert_eq!(viz.view_timeline(1).unwrap().total_views, 6);
+    }
+
+    // -- auto-decode / resize wiring -------------------------------------------
+
+    #[test]
+    fn test_capture_step_auto_decodes_at_configured_interval() {
+        let cfg = DenoisingVizConfig {
+            capture_every_n_steps: 1,
+            decode_every_n_steps: 2,
+            image_width: 8,
+            image_height: 8,
+            ..Default::default()
+        };
+        let mut viz = DenoisingVisualizer::new(cfg).expect("valid config");
+
+        for i in 0..4usize {
+            let latent = vec![0.25_f32; 3 * 2 * 2]; // 3 channels, 2x2
+            let step = DenoisingStep::new(i, 4, 0, latent, 3, 2, 2);
+            viz.capture_step(0, step);
+        }
+
+        let timeline = viz.view_timeline(0).expect("timeline");
+        assert_eq!(timeline.steps.len(), 4);
+        for step in &timeline.steps {
+            if step.step_index.is_multiple_of(2) {
+                let img = step
+                    .decoded_image
+                    .as_ref()
+                    .expect("should have been auto-decoded");
+                assert_eq!(img.len(), 8 * 8 * 4);
+                assert_eq!(step.image_width, 8);
+                assert_eq!(step.image_height, 8);
+            } else {
+                assert!(
+                    step.decoded_image.is_none(),
+                    "step {} should not be decoded (not a multiple of decode_every_n_steps)",
+                    step.step_index
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_capture_step_does_not_overwrite_existing_decoded_image() {
+        let cfg = DenoisingVizConfig {
+            decode_every_n_steps: 1,
+            ..Default::default()
+        };
+        let mut viz = DenoisingVisualizer::new(cfg).expect("valid config");
+        let custom_img = vec![42u8; 4 * 4 * 4];
+        let step = DenoisingStep::new(0, 1, 0, vec![0.1; 4], 1, 2, 2).with_decoded(
+            custom_img.clone(),
+            4,
+            4,
+        );
+        viz.capture_step(0, step);
+
+        let timeline = viz.view_timeline(0).expect("timeline");
+        assert_eq!(timeline.steps[0].decoded_image, Some(custom_img));
+        assert_eq!(timeline.steps[0].image_width, 4);
+        assert_eq!(timeline.steps[0].image_height, 4);
     }
 }

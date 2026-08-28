@@ -6,6 +6,16 @@
 //! - [`apply_motion_blur`]: end-to-end pipeline
 //! - Velocity generation utilities (`mb_velocity_*`)
 //! - Primitive helpers (`mb_bilinear_sample`, `mb_triangle_weight`, …)
+//!
+//! # Relationship to the sibling motion-blur modules
+//!
+//! This is the richest of the three CPU motion-blur modules: prefer it when
+//! you have a real velocity buffer and want shutter-angle control,
+//! depth-aware sample rejection, stratified jitter, or velocity
+//! dilation/smoothing. See the module docs of [`crate::motion_blur`] for the
+//! full comparison table. This module reuses that module's
+//! [`MotionBlurError`] and its `f32`-RGB bilinear tap (re-exported here as
+//! [`mb_bilinear_sample`]) rather than defining its own copies.
 
 use crate::motion_blur::MotionBlurError;
 
@@ -193,8 +203,15 @@ pub struct MbStats {
     pub max_blur_pixels: f32,
     /// Fraction of pixels with blur magnitude > 0.5 px.
     pub blurred_fraction: f32,
-    /// Mean effective samples used per pixel.
-    pub mean_samples_used: f32,
+    /// Estimated sample utilisation per pixel, in `[1, n_samples]`.
+    ///
+    /// This is a fast, **config-derived estimate** (`1 + (n_samples - 1) *
+    /// min(mean_blur/max_blur_pixels, 1)`), not a measurement of the actual
+    /// per-pixel sample/weight counts evaluated by [`mb_apply`] (which
+    /// always evaluates exactly `n_samples` samples for every moving
+    /// pixel). Treat it as a utilisation heuristic for tuning
+    /// `n_samples`/`max_blur_pixels`, not as ground truth.
+    pub estimated_sample_utilization: f32,
 }
 
 /// Result of the full `apply_motion_blur` pipeline.
@@ -226,43 +243,16 @@ fn xorshift64(state: &mut u64) -> u64 {
 
 /// Bilinear sample from a flat row-major RGB image at fractional coordinates.
 ///
-/// Coordinates outside the image are clamped to the nearest edge pixel.
+/// Coordinates outside the image are clamped to the nearest edge pixel; an
+/// empty image (`width == 0` or `height == 0`) yields `[0, 0, 0]`.
 /// Returns `[r, g, b]`.
+///
+/// The implementation is shared with [`crate::motion_blur`] (this function is
+/// the public entry point for the crate-internal `motion_blur::bilinear_sample`)
+/// so the two motion-blur paths cannot resample differently.
+#[inline]
 pub fn mb_bilinear_sample(image: &[f32], width: usize, height: usize, x: f32, y: f32) -> [f32; 3] {
-    if width == 0 || height == 0 {
-        return [0.0; 3];
-    }
-    let x = x.clamp(0.0, width as f32 - 1.0 - f32::EPSILON);
-    let y = y.clamp(0.0, height as f32 - 1.0 - f32::EPSILON);
-
-    let x0 = x.floor() as usize;
-    let y0 = y.floor() as usize;
-    let x1 = (x0 + 1).min(width - 1);
-    let y1 = (y0 + 1).min(height - 1);
-
-    let tx = x - x0 as f32;
-    let ty = y - y0 as f32;
-    let inv_tx = 1.0 - tx;
-    let inv_ty = 1.0 - ty;
-
-    let w00 = inv_tx * inv_ty;
-    let w10 = tx * inv_ty;
-    let w01 = inv_tx * ty;
-    let w11 = tx * ty;
-
-    let i00 = (y0 * width + x0) * 3;
-    let i10 = (y0 * width + x1) * 3;
-    let i01 = (y1 * width + x0) * 3;
-    let i11 = (y1 * width + x1) * 3;
-
-    let mut out = [0.0_f32; 3];
-    for c in 0..3 {
-        out[c] = w00 * image[i00 + c]
-            + w10 * image[i10 + c]
-            + w01 * image[i01 + c]
-            + w11 * image[i11 + c];
-    }
-    out
+    crate::motion_blur::bilinear_sample(image, width, height, x, y)
 }
 
 /// Triangle weight for temporal sample position `t ∈ [-0.5, 0.5]`.
@@ -288,18 +278,28 @@ pub fn mb_depth_weight(d1: f32, d2: f32, sigma: f32) -> f32 {
 /// Each offset is in `[-cell_width/2, cell_width/2]` where
 /// `cell_width = 1/n`, centred on the uniform grid spacing.
 pub fn mb_jitter_samples(n: usize, rng_state: &mut u64) -> Vec<f32> {
+    let mut out = vec![0.0_f32; n];
+    mb_fill_jitter_samples(&mut out, rng_state);
+    out
+}
+
+/// Fill `dst` with `dst.len()` jitter offsets, drawing from `rng_state`.
+///
+/// Allocation-free twin of [`mb_jitter_samples`]: it draws the *same*
+/// sequence of values from the same state, so hot loops can reuse one scratch
+/// buffer across pixels without perturbing the random stream.
+fn mb_fill_jitter_samples(dst: &mut [f32], rng_state: &mut u64) {
+    let n = dst.len();
     if n == 0 {
-        return Vec::new();
+        return;
     }
     let cell_width = 1.0 / n as f32;
     let half_cell = cell_width * 0.5;
-    (0..n)
-        .map(|_| {
-            let bits = xorshift64(rng_state);
-            let r = (bits as f64 / u64::MAX as f64) as f32;
-            r * cell_width - half_cell
-        })
-        .collect()
+    for slot in dst.iter_mut() {
+        let bits = xorshift64(rng_state);
+        let r = (bits as f64 / u64::MAX as f64) as f32;
+        *slot = r * cell_width - half_cell;
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -583,6 +583,12 @@ pub fn mb_apply(
     let mut output = image.to_vec();
     let mut rng_state: u64 = 0xDEAD_BEEF_1234_5678;
 
+    // Reusable per-pixel jitter scratch, allocated once for the whole call
+    // instead of once per pixel. With `jitter == false` the buffer stays all
+    // zeros for the entire pass (nothing ever writes it), which is exactly
+    // what the old per-pixel `vec![0.0; n]` produced.
+    let mut jitters = vec![0.0_f32; n];
+
     for py in 0..h {
         for px in 0..w {
             let pi = py * w + px;
@@ -600,11 +606,14 @@ pub fn mb_apply(
                 (raw_vx, raw_vy)
             };
 
-            let jitters = if config.jitter {
-                mb_jitter_samples(n, &mut rng_state)
-            } else {
-                vec![0.0_f32; n]
-            };
+            // NOTE: the refill must stay *after* the `mag < 1e-8` early
+            // `continue` above. `rng_state` advances only for pixels that
+            // actually get blurred, so hoisting the draw to the top of the
+            // pixel body would shift the jitter stream on every image with
+            // static regions.
+            if config.jitter {
+                mb_fill_jitter_samples(&mut jitters, &mut rng_state);
+            }
 
             let center_depth = depth_buf.map(|d| d[pi]).unwrap_or(0.0);
             let mut acc = [0.0_f32; 3];
@@ -656,7 +665,11 @@ pub fn mb_apply(
 // Full pipeline
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Compute [`MbStats`] from a velocity buffer and config.
+/// Compute an [`MbStats`] *estimate* from a velocity buffer and config.
+///
+/// This is a fast, config-only estimate that never runs the actual blur
+/// pass — see [`MbStats::estimated_sample_utilization`] for why it should
+/// not be read as a measurement.
 pub fn mb_compute_stats(velocity: &VelocityBuffer, config: &MbConfig) -> MbStats {
     let n = velocity.width * velocity.height;
     if n == 0 {
@@ -664,7 +677,7 @@ pub fn mb_compute_stats(velocity: &VelocityBuffer, config: &MbConfig) -> MbStats
             mean_blur_pixels: 0.0,
             max_blur_pixels: 0.0,
             blurred_fraction: 0.0,
-            mean_samples_used: 0.0,
+            estimated_sample_utilization: 0.0,
         };
     }
 
@@ -688,7 +701,7 @@ pub fn mb_compute_stats(velocity: &VelocityBuffer, config: &MbConfig) -> MbStats
 
     let mean_blur = sum_mag / n as f32;
     let blurred_fraction = blurred_count as f32 / n as f32;
-    let mean_samples_used = if mean_blur < 1e-6 {
+    let estimated_sample_utilization = if mean_blur < 1e-6 {
         1.0
     } else {
         let util = (mean_blur / config.max_blur_pixels).min(1.0);
@@ -699,7 +712,7 @@ pub fn mb_compute_stats(velocity: &VelocityBuffer, config: &MbConfig) -> MbStats
         mean_blur_pixels: mean_blur,
         max_blur_pixels: max_mag,
         blurred_fraction,
-        mean_samples_used,
+        estimated_sample_utilization,
     }
 }
 
@@ -741,11 +754,11 @@ pub fn mb_format_config(config: &MbConfig) -> String {
 pub fn mb_format_stats(stats: &MbStats) -> String {
     format!(
         "MbStats {{ mean_blur: {:.2}px, max_blur: {:.2}px, blurred_fraction: {:.3}, \
-         mean_samples_used: {:.2} }}",
+         estimated_sample_utilization: {:.2} }}",
         stats.mean_blur_pixels,
         stats.max_blur_pixels,
         stats.blurred_fraction,
-        stats.mean_samples_used,
+        stats.estimated_sample_utilization,
     )
 }
 
@@ -1000,6 +1013,26 @@ mod tests {
         let p = mb_bilinear_sample(&img, 2, 2, 100.0, 100.0);
         assert!(approx(p[0], 0.5));
     }
+    #[test]
+    fn mb_bilinear_sample_one_pixel_wide_no_panic() {
+        // Regression: `width - 1.0 - f32::EPSILON` is negative for width == 1,
+        // which used to panic inside `f32::clamp` (requires min <= max).
+        let img = vec![0.3_f32, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 0.1];
+        let p = mb_bilinear_sample(&img, 1, 3, 5.0, 1.0);
+        assert!(approx(p[0], 0.6) && approx(p[1], 0.7) && approx(p[2], 0.8));
+    }
+    #[test]
+    fn mb_bilinear_sample_one_pixel_tall_no_panic() {
+        let img = vec![0.2_f32, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0];
+        let p = mb_bilinear_sample(&img, 3, 1, 1.0, -7.0);
+        assert!(approx(p[0], 0.5) && approx(p[1], 0.6) && approx(p[2], 0.7));
+    }
+    #[test]
+    fn mb_bilinear_sample_1x1_no_panic() {
+        let img = vec![0.42_f32, 0.24, 0.99];
+        let p = mb_bilinear_sample(&img, 1, 1, -3.0, 8.0);
+        assert!(approx(p[0], 0.42) && approx(p[1], 0.24) && approx(p[2], 0.99));
+    }
 
     // ── mb_triangle_weight ────────────────────────────────────────────────────
     #[test]
@@ -1060,6 +1093,102 @@ mod tests {
             assert!(approx(a, b));
         }
     }
+    #[test]
+    fn mb_fill_jitter_samples_matches_allocating_twin() {
+        // Regression (per-pixel allocation removal): the in-place fill must
+        // draw exactly the sequence `mb_jitter_samples` draws, from the same
+        // state, and must leave the state at the same place.
+        for &(n, seed) in &[(1_usize, 7_u64), (4, 42), (8, 1), (16, 0xDEAD_BEEF)] {
+            let mut state_alloc = seed;
+            let expected = mb_jitter_samples(n, &mut state_alloc);
+
+            let mut state_fill = seed;
+            let mut buf = vec![f32::NAN; n];
+            mb_fill_jitter_samples(&mut buf, &mut state_fill);
+
+            assert_eq!(buf, expected, "value drift for n={n}, seed={seed}");
+            assert_eq!(
+                state_fill, state_alloc,
+                "rng state drift for n={n}, seed={seed}"
+            );
+        }
+    }
+
+    #[test]
+    fn mb_fill_jitter_samples_empty_is_noop() {
+        let mut state = 12345_u64;
+        let mut empty: [f32; 0] = [];
+        mb_fill_jitter_samples(&mut empty, &mut state);
+        assert_eq!(state, 12345_u64, "empty fill must not advance the rng");
+    }
+
+    #[test]
+    fn mb_apply_jitter_stream_skips_static_pixels() {
+        // Regression: `rng_state` advances only for pixels that actually get
+        // blurred (the `mag < 1e-8` early-continue fires first). A hoisted
+        // buffer that refills unconditionally would shift the stream for any
+        // image containing static regions, so a half-static velocity buffer
+        // must not produce the same result as an all-moving one, and each
+        // must be bit-reproducible across calls.
+        let w = 4_usize;
+        let h = 2_usize;
+        let img: Vec<f32> = (0..(w * h * 3)).map(|i| (i % 7) as f32 * 0.1).collect();
+        let cfg = MbConfig {
+            jitter: true,
+            depth_aware: false,
+            n_samples: 5,
+            ..MbConfig::default()
+        };
+
+        let all_moving = mb_velocity_from_camera_motion(w, h, 3.0, 1.0);
+        let mut half_static = mb_velocity_from_camera_motion(w, h, 3.0, 1.0);
+        for i in 0..(w * h) {
+            if i.is_multiple_of(2) {
+                half_static.velocity_x[i] = 0.0;
+                half_static.velocity_y[i] = 0.0;
+            }
+        }
+
+        let moving_a = mb_apply(&img, &all_moving, None, &cfg).expect("all-moving blur");
+        let moving_b = mb_apply(&img, &all_moving, None, &cfg).expect("all-moving blur again");
+        assert_eq!(moving_a, moving_b, "mb_apply must be deterministic");
+
+        let mixed_a = mb_apply(&img, &half_static, None, &cfg).expect("half-static blur");
+        let mixed_b = mb_apply(&img, &half_static, None, &cfg).expect("half-static blur again");
+        assert_eq!(mixed_a, mixed_b, "mb_apply must be deterministic");
+
+        // Odd (moving) pixels consume jitter draws 0..n in the mixed case but
+        // draws n..2n in the all-moving case, so at least one must differ.
+        assert!(
+            moving_a
+                .iter()
+                .zip(mixed_a.iter())
+                .any(|(a, b)| (a - b).abs() > 1e-9),
+            "static pixels must not consume jitter draws"
+        );
+    }
+
+    #[test]
+    fn mb_apply_no_jitter_buffer_stays_zeroed() {
+        // With `jitter: false` the hoisted scratch buffer is never written, so
+        // every pixel must see the same pure-uniform sample positions the old
+        // per-pixel `vec![0.0; n]` produced: a uniform image survives intact.
+        let w = 5_usize;
+        let h = 3_usize;
+        let img = vec![0.42_f32; w * h * 3];
+        let cfg = MbConfig {
+            jitter: false,
+            depth_aware: false,
+            n_samples: 7,
+            ..MbConfig::default()
+        };
+        let vb = mb_velocity_from_camera_motion(w, h, 2.0, -1.5);
+        let out = mb_apply(&img, &vb, None, &cfg).expect("blur");
+        for &v in &out {
+            assert!(approx(v, 0.42), "uniform image changed: {v}");
+        }
+    }
+
     #[test]
     fn mb_jitter_samples_different_seeds() {
         let j1 = mb_jitter_samples(8, &mut 1_u64);

@@ -129,8 +129,14 @@ impl PanoramicCamera {
             world_up
         };
 
-        let right = normalize(cross(fwd, up_hint));
-        let up = normalize(cross(right, fwd));
+        // Right-handed basis: right = up x forward, up' = forward x right.
+        // (`cross(fwd, up_hint)` / `cross(right, fwd)` — the previous order —
+        // produced a mirrored, determinant = -1 basis: for forward=[0,0,1]
+        // it gave right=[-1,0,0], the *left* axis, so `world_to_camera_dir`
+        // flipped X and every panorama produced through `looking_at` came
+        // out horizontally mirrored.)
+        let right = normalize(cross(up_hint, fwd));
+        let up = normalize(cross(fwd, right));
         // rows of the rotation matrix: [right, up, forward]
         let rotation = [right, up, fwd];
         Self { position, rotation }
@@ -814,6 +820,51 @@ mod tests {
                 "roundtrip failed for {wd:?}: got {recovered:?}"
             );
         }
+    }
+
+    #[test]
+    fn test_panoramic_camera_looking_at_matches_identity_for_forward_z() {
+        // looking_at(origin, +Z) describes the exact same pose as identity()
+        // — a mirrored (det = -1) basis would disagree on the right/up rows.
+        let cam = PanoramicCamera::looking_at([0.0, 0.0, 0.0], [0.0, 0.0, 1.0]);
+        let id = PanoramicCamera::identity();
+        for r in 0..3 {
+            for c in 0..3 {
+                assert!(
+                    (cam.rotation[r][c] - id.rotation[r][c]).abs() < 1e-5,
+                    "row {r} col {c}: looking_at={:?}, identity={:?}",
+                    cam.rotation[r],
+                    id.rotation[r]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_panoramic_camera_looking_at_is_a_proper_rotation() {
+        // The rotation matrix must have determinant +1 (a proper rotation),
+        // not -1 (a reflection) — checked for a non-trivial forward vector.
+        let cam = PanoramicCamera::looking_at([0.0, 0.0, 0.0], [0.3, 0.1, 0.9]);
+        let m = cam.rotation;
+        let det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+            - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+            + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+        assert!(
+            (det - 1.0).abs() < 1e-4,
+            "expected determinant +1 (proper rotation), got {det}"
+        );
+    }
+
+    #[test]
+    fn test_panoramic_camera_looking_at_right_points_toward_positive_x() {
+        // For a camera looking along +Z with +Y up, world +X must map to
+        // the camera's local +X (right) direction, not -X (mirrored).
+        let cam = PanoramicCamera::looking_at([0.0, 0.0, 0.0], [0.0, 0.0, 1.0]);
+        let cam_dir = cam.world_to_camera_dir([1.0, 0.0, 0.0]);
+        assert!(
+            cam_dir[0] > 0.9,
+            "world +X should map to camera +X (right), got {cam_dir:?}"
+        );
     }
 
     #[test]

@@ -41,7 +41,7 @@ pub use sdedit::{
     edit_cosine_similarity, edit_expand_mask_to_channels, edit_latent_distance, edit_lerp_latents,
     edit_linear_alpha_bars, edit_mean_latent, edit_normalize_latent, edit_project_out,
     edit_sample_noise, edit_slerp_latents, edit_start_timestep, edit_variance_map,
-    format_sdedit_stats, sdedit_perturb, EditConfig, ImageEditError, SdeditStats,
+    format_sdedit_stats, sdedit_perturb, sdedit_perturb_with_mask, EditConfig, SdeditStats,
 };
 
 use thiserror::Error;
@@ -365,13 +365,25 @@ impl EditMask {
     ///
     /// Builds a 1-D Gaussian kernel of size `2*ceil(3*sigma)+1`, applies it
     /// separably (horizontal then vertical pass), and thresholds the result
-    /// to produce a binary mask.
+    /// to produce a binary mask. When `sigma` is non-finite (e.g. NaN) or
+    /// `<= 0.0`, the Gaussian pass is skipped but the 0.5 threshold is still
+    /// applied to the original data, so the result is always a proper
+    /// binary mask as documented.
     pub fn smooth(&self, sigma: f32) -> Self {
         let h = self.height;
         let w = self.width;
 
-        if h == 0 || w == 0 || sigma <= 0.0 {
-            return self.clone();
+        if h == 0 || w == 0 || !sigma.is_finite() || sigma <= 0.0 {
+            let data = self
+                .data
+                .iter()
+                .map(|&v| if v >= 0.5 { 1.0 } else { 0.0 })
+                .collect();
+            return Self {
+                height: h,
+                width: w,
+                data,
+            };
         }
 
         // Build 1-D kernel.
@@ -442,7 +454,9 @@ impl EditMask {
     }
 
     /// Create a mask of the given size filled entirely with 1.0.
-    pub fn all_ones(width: usize, height: usize) -> Self {
+    ///
+    /// Takes `(height, width)`, matching [`Self::new`] and [`Self::from_data`].
+    pub fn all_ones(height: usize, width: usize) -> Self {
         let n = height * width;
         Self {
             height,
@@ -482,7 +496,12 @@ pub struct ImageEditingConfig {
     pub noise_level: f32,
     /// Edit strength for [`EditMode::Interpolate`] (`0` = source, `1` = target).
     pub strength: f32,
-    /// Number of denoising steps to run after noising (used by [`EditMode::SdEdit`]).
+    /// Number of denoising steps the caller should run after noising.
+    ///
+    /// This module (see the module docs) only prepares the noised/edited
+    /// input latent; it never runs denoising steps itself. This value is
+    /// therefore **advisory only** — it is range-checked by [`Self::validate`]
+    /// but the caller's own sampling loop is responsible for honouring it.
     pub num_denoise_steps: usize,
     /// Base seed for the PRNG.
     pub seed: u64,
@@ -578,11 +597,22 @@ impl ImageEditingConfig {
 // Core free functions
 // ---------------------------------------------------------------------------
 
-/// Add isotropic Gaussian noise at level `noise_level` to a latent.
+/// Add noise to a latent following the DDPM/SDEdit forward marginal.
 ///
-/// The noise scale is `sqrt(noise_level)` — a simple approximation of the
-/// DDPM forward process marginal at diffusion time `t`.  For `noise_level = 0`
-/// the output equals the input up to floating-point rounding.
+/// `noise_level ∈ [0, 1]` is mapped onto a 1000-step cosine noise schedule
+/// ([`sdedit::edit_cosine_alpha_bars`], Nichol & Dhariwal 2021) to obtain
+/// `alpha_bar`, then:
+///
+/// ```text
+/// x_t = sqrt(alpha_bar) * x + sqrt(1 - alpha_bar) * noise
+/// ```
+///
+/// This keeps `Var(x_t)` bounded and attenuates the original signal toward
+/// zero as `noise_level -> 1`, matching what a denoiser trained on this
+/// marginal expects. (A naive `x + sqrt(noise_level) * noise` — this
+/// function's previous implementation — leaves the signal at full strength
+/// regardless of `noise_level`, so the "fully noised" output at
+/// `noise_level = 1` would still be dominated by the original latent.)
 ///
 /// Uses xorshift64 + Box-Muller PRNG (no `rand` crate).
 pub fn add_edit_noise(
@@ -600,16 +630,20 @@ pub fn add_edit_noise(
         });
     }
 
-    let noise_scale = noise_level.sqrt();
-    let n = latent.numel();
-    let noise = gaussian_noise_vec(n, noise_scale, seed);
+    const SCHEDULE_LEN: usize = 1000;
+    let alpha_bars = sdedit::edit_cosine_alpha_bars(SCHEDULE_LEN);
+    let timestep = (noise_level * (SCHEDULE_LEN - 1) as f32)
+        .round()
+        .clamp(0.0, (SCHEDULE_LEN - 1) as f32) as usize;
 
-    let data: Vec<f32> = latent
-        .data
-        .iter()
-        .zip(noise.iter())
-        .map(|(&x, &z)| x + z)
-        .collect();
+    let n = latent.numel();
+    // Raw N(0,1) noise: edit_add_noise applies the alpha-bar scaling itself.
+    let noise = gaussian_noise_vec(n, 1.0, seed);
+
+    // `sdedit::edit_add_noise` shares this module's `ImageEditingError`, so its
+    // specific variant (e.g. `NoiseLevelOutOfRange`) now propagates directly
+    // instead of being collapsed into a generic `NumericalError` string.
+    let data = sdedit::edit_add_noise(&latent.data, &noise, timestep, &alpha_bars)?;
 
     Ok(EditLatent {
         channels: latent.channels,
@@ -1233,16 +1267,39 @@ mod tests {
     }
 
     #[test]
-    fn add_noise_level_zero_near_identity() {
+    fn add_noise_level_zero_stays_close_to_input() {
+        // With the corrected DDPM/SDEdit forward marginal, noise_level=0
+        // maps to alpha_bar close to (but not exactly) 1.0 — the cosine
+        // schedule's s=0.008 offset keeps a small noise floor even at the
+        // very first timestep — so the output correlates strongly with the
+        // input without being bit-identical to it.
         let lat = make_latent(2, 4, 4, 1.0);
         let out = add_edit_noise(&lat, 0.0, 42).unwrap();
-        // noise_scale = sqrt(0) = 0 → output identical to input
         for (&a, &b) in lat.data.iter().zip(out.data.iter()) {
             assert!(
-                (a - b).abs() < 1e-6,
-                "noise_level=0 should be near-identity"
+                (a - b).abs() < 0.5,
+                "noise_level=0 should stay close to input: {} vs {}",
+                a,
+                b
             );
         }
+    }
+
+    #[test]
+    fn add_noise_high_level_attenuates_large_signal() {
+        // Regression test for the SDEdit forward-marginal bug: the old
+        // `x + sqrt(noise_level) * z` formula left the signal at full
+        // strength regardless of noise_level, so a large-magnitude latent
+        // stayed large even at noise_level=1.0 ("pure noise"). The correct
+        // marginal sqrt(alpha_bar)*x + sqrt(1-alpha_bar)*z must shrink it.
+        let lat = make_latent(2, 8, 8, 1000.0);
+        let out = add_edit_noise(&lat, 1.0, 7).unwrap();
+        let max_abs = out.data.iter().cloned().fold(0.0f32, |m, v| m.max(v.abs()));
+        assert!(
+            max_abs < 200.0,
+            "noise_level=1.0 should mostly destroy a large-magnitude signal, got max_abs={}",
+            max_abs
+        );
     }
 
     #[test]
@@ -1593,5 +1650,139 @@ mod tests {
         let lat = make_latent(1, 1, 1, 1.0);
         history.push(lat, zero_stats(0.0));
         assert!(history.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // ImageEditError / ImageEditingError collapse
+    //
+    // `sdedit` used to declare its own `ImageEditError`, bridged into this
+    // module's `ImageEditingError` via a `From` impl so a caller mixing both
+    // APIs could use `?` throughout. The two error enums are now one type
+    // (`ImageEditingError`, declared here and used directly by `sdedit`), so
+    // these tests call `sdedit`'s functions directly and check that each
+    // failure mode still produces the same shape the old `From` mapping
+    // documented, and that mixing both APIs needs no conversion at all.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sdedit_dimension_mismatch_is_directly_this_modules_error() {
+        let err = sdedit::edit_lerp_latents(&[1.0, 2.0, 3.0], &[1.0, 2.0], 0.5)
+            .expect_err("mismatched lengths must fail");
+        match err {
+            ImageEditingError::DimensionMismatch { expected, actual } => {
+                assert_eq!(expected, 3);
+                assert_eq!(actual, 2);
+            }
+            other => panic!("Expected DimensionMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sdedit_empty_input_is_directly_this_modules_error() {
+        let err = sdedit::edit_latent_distance(&[], &[]).expect_err("empty input must fail");
+        assert!(matches!(err, ImageEditingError::EmptyInput));
+    }
+
+    #[test]
+    fn sdedit_invalid_strength_and_param_widen_to_invalid_config() {
+        let strength =
+            sdedit::edit_start_timestep(1.5, 1000).expect_err("strength outside (0, 1] must fail");
+        match strength {
+            ImageEditingError::InvalidConfig(msg) => {
+                assert!(msg.contains("1.5"), "value must survive: {msg}");
+            }
+            other => panic!("Expected InvalidConfig, got {other:?}"),
+        }
+
+        let param = EditConfig {
+            guidance_scale: f32::NAN,
+            ..Default::default()
+        }
+        .validate()
+        .expect_err("non-finite guidance_scale must fail");
+        assert!(matches!(param, ImageEditingError::InvalidConfig(_)));
+    }
+
+    #[test]
+    fn sdedit_timestep_out_of_range_widens_to_noise_level_out_of_range() {
+        let ab = sdedit::edit_cosine_alpha_bars(10);
+        let err = sdedit::edit_add_noise(&[0.0; 4], &[0.0; 4], 20, &ab)
+            .expect_err("timestep past the schedule length must fail");
+        match err {
+            ImageEditingError::NoiseLevelOutOfRange { t, max_t } => {
+                assert!((t - 20.0).abs() < f32::EPSILON);
+                assert!((max_t - 9.0).abs() < f32::EPSILON);
+            }
+            other => panic!("Expected NoiseLevelOutOfRange, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sdedit_invalid_mask_becomes_invalid_image_not_empty_mask() {
+        // `EmptyMask` means specifically all-zero/zero-size; a structurally
+        // invalid (missing) mask is a different failure and must not be
+        // conflated.
+        let config = EditConfig {
+            use_mask: true,
+            ..Default::default()
+        };
+        let ab = sdedit::edit_cosine_alpha_bars(config.n_timesteps);
+        let mut state = 7u64;
+        let err = sdedit::sdedit_perturb_with_mask(&[0.5, 0.5], &config, &ab, &mut state, None)
+            .expect_err("use_mask without a mask must fail");
+        match err {
+            ImageEditingError::InvalidImage(msg) => assert!(msg.contains("mask"), "{msg}"),
+            other => panic!("Expected InvalidImage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mixed_api_caller_needs_no_error_conversion() {
+        // Proves the merge is complete: a function calling both the
+        // slice-based `sdedit` API and this module's `EditLatent`-based API
+        // needs only `?` at every fallible call site, with no
+        // `.into()`/`map_err` bridging the two error types.
+        fn mixed(a: &EditLatent, b: &EditLatent, mask: &EditMask) -> Result<(), ImageEditingError> {
+            let ab = sdedit::edit_cosine_alpha_bars(10);
+            let noise = vec![0.0f32; a.numel()];
+            let _ = sdedit::edit_add_noise(&a.data, &noise, 0, &ab)?;
+            let _ = blend_with_mask(a, b, mask)?;
+            Ok(())
+        }
+
+        let a = EditLatent::new(1, 2, 2);
+        let b = EditLatent::new(1, 2, 2);
+        let mask = EditMask::new(2, 2, 1.0);
+        assert!(mixed(&a, &b, &mask).is_ok());
+    }
+
+    #[test]
+    fn add_edit_noise_propagates_sdedits_dimension_mismatch_directly() {
+        // `EditLatent`'s fields are all `pub`, so a caller can build one
+        // whose `data` length disagrees with `numel()` — bypassing
+        // `EditLatent::new` / `from_data`'s own validation.
+        // `add_edit_noise` only checks `numel() == 0` and the noise level
+        // itself before delegating to `sdedit::edit_add_noise`, so this is
+        // the case that used to reach the (now-removed)
+        // `.map_err(|e| NumericalError(format!("add_edit_noise: {e}")))`
+        // wrapper. Now that both APIs share `ImageEditingError`, it must
+        // surface `sdedit`'s own `DimensionMismatch` unchanged instead of a
+        // collapsed `NumericalError` string.
+        let malformed = EditLatent {
+            channels: 1,
+            height: 2,
+            width: 2,
+            data: vec![0.0f32; 3], // one short of numel() == 4
+        };
+        let err = add_edit_noise(&malformed, 0.5, 42).expect_err("data/numel mismatch must fail");
+        match err {
+            ImageEditingError::DimensionMismatch { expected, actual } => {
+                assert_eq!(expected, 3, "expected == latent.data.len()");
+                assert_eq!(actual, 4, "actual == the numel()-sized noise buffer");
+            }
+            other => {
+                panic!("Expected DimensionMismatch, not a collapsed NumericalError: {other:?}")
+            }
+        }
     }
 }

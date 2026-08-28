@@ -7,7 +7,9 @@
 //!
 //! - **Single file**: All model data in one file instead of multiple `.npy` files
 //! - **Metadata support**: Store model version, source, creation date, etc.
-//! - **Fast loading**: Memory-mapped access for large models
+//! - **Fast loading**: Single-read, zero-copy tensor views (the whole file is
+//!   read into memory once; no per-tensor file I/O). This crate does not use
+//!   memory-mapping.
 //! - **Cross-platform**: Better compatibility than pickle-based formats
 //! - **Type-safe**: Built-in validation of tensor shapes and dtypes
 //!
@@ -90,19 +92,39 @@ pub fn load_flame_model_safetensors(path: &Path) -> Result<FlameModel, FlameErro
     let kintree_i32 = load_tensor_i32_2d(&tensors, "kintree_table")?;
     let lbs_weights = load_tensor_f32_2d(&tensors, "lbs_weights")?;
 
-    // Convert faces from i32 → Vec<[u32; 3]>
-    let faces: Vec<[u32; 3]> = faces_i32
-        .rows()
-        .into_iter()
-        .map(|row| [row[0] as u32, row[1] as u32, row[2] as u32])
-        .collect();
+    // --- Validate shapes that don't depend on downstream conversions ---
+    // Mirrors `io::load_flame_model`'s validation so a malformed or
+    // untrusted .safetensors file is rejected here instead of panicking
+    // later inside `forward()` (ndarray shape mismatch, out-of-range
+    // kinematic-chain parent, or out-of-range face index).
+    let n_verts = v_template.nrows();
+    expect_shape("v_template", &[n_verts, 3], v_template.shape())?;
 
-    // Extract parent indices from kintree_table row 0
+    // --- Extract parent indices from kintree_table row 0, and validate the
+    // kinematic chain: every non-root joint must point to a strictly earlier
+    // joint index, matching the traversal order
+    // `FlameModel::compute_skinning_transforms` relies on. ---
     let n_joints = kintree_i32.ncols();
     let parents: Vec<i32> = (0..n_joints).map(|j| kintree_i32[[0, j]]).collect();
+    validate_parents(&parents)?;
 
-    // Validate shapes
-    let n_verts = v_template.nrows();
+    expect_shape("j_regressor", &[n_joints, n_verts], j_regressor.shape())?;
+    expect_shape("lbs_weights", &[n_verts, n_joints], lbs_weights.shape())?;
+
+    // --- Validate blend-shape directions share the vertex/component layout
+    // that `apply_blend_shapes` assumes when it slices them against `v`. ---
+    expect_dir_shape("shapedirs", shapedirs.shape(), n_verts, None)?;
+    expect_dir_shape("expressiondirs", expressiondirs.shape(), n_verts, None)?;
+    expect_dir_shape(
+        "posedirs",
+        posedirs.shape(),
+        n_verts,
+        Some((n_joints.max(1) - 1) * 9),
+    )?;
+
+    // --- Convert faces from i32 → Vec<[u32; 3]>, rejecting indices that
+    // would panic later in `Mesh::recompute_normals` or GPU upload. ---
+    let faces = convert_faces(&faces_i32, n_verts)?;
 
     tracing::info!(
         n_verts,
@@ -257,8 +279,27 @@ fn extract_model_slices<'a>(
         .flat_map(|face| face.iter().map(|&idx| idx.cast_signed()))
         .collect();
 
-    // Convert parents to kintree_table format
-    let kintree_i32: Vec<i32> = model.parents.clone();
+    // Convert parents to kintree_table format: row 0 holds each joint's
+    // parent index (the only row this crate's loader reads back via
+    // `kintree_i32[[0, j]]`), row 1 holds the joint's own index. This
+    // matches the documented `[2, n_joints]` shape and the SMPL/FLAME
+    // convention of a parents row plus a self/children row -- writing only
+    // `model.parents` (shape `[1, n_joints]`) contradicted the module's own
+    // format table.
+    let mut kintree_i32: Vec<i32> = Vec::with_capacity(model.parents.len() * 2);
+    kintree_i32.extend_from_slice(&model.parents);
+    let joint_indices: Vec<i32> = (0..model.n_joints)
+        .map(|j| {
+            i32::try_from(j).map_err(|_| FlameError::SafeTensorsSave {
+                path: path.to_path_buf(),
+                message: format!(
+                    "n_joints {} is too large to serialize as i32 indices",
+                    model.n_joints
+                ),
+            })
+        })
+        .collect::<Result<Vec<i32>, FlameError>>()?;
+    kintree_i32.extend(joint_indices);
 
     Ok(ModelDataSlices {
         v_template,
@@ -359,7 +400,7 @@ fn create_tensor_views<'a>(
         ),
         (
             "kintree_table",
-            TensorView::new(Dtype::I32, vec![1, model.n_joints], kintree_bytes).map_err(
+            TensorView::new(Dtype::I32, vec![2, model.n_joints], kintree_bytes).map_err(
                 |e: safetensors::SafeTensorError| FlameError::SafeTensorsSave {
                     path: path.to_path_buf(),
                     message: e.to_string(),
@@ -452,17 +493,15 @@ fn load_tensor_f32_2d(tensors: &SafeTensors, name: &str) -> Result<Array2<f32>, 
         });
     }
 
-    // Convert bytes to f32 slice
-    let data_bytes = tensor_view.data();
-    let data_f32: &[f32] = bytemuck::cast_slice(data_bytes);
+    // Convert bytes to f32 (see `bytes_to_f32_vec` for why this cannot use
+    // `bytemuck::cast_slice` directly).
+    let data_f32 = bytes_to_f32_vec(name, tensor_view.data())?;
 
     // Create ndarray
-    Array2::from_shape_vec((shape[0], shape[1]), data_f32.to_vec()).map_err(|e| {
-        FlameError::ShapeMismatch {
-            name: name.to_string(),
-            expected: format!("{shape:?}"),
-            got: e.to_string(),
-        }
+    Array2::from_shape_vec((shape[0], shape[1]), data_f32).map_err(|e| FlameError::ShapeMismatch {
+        name: name.to_string(),
+        expected: format!("{shape:?}"),
+        got: e.to_string(),
     })
 }
 
@@ -496,12 +535,12 @@ fn load_tensor_f32_3d(tensors: &SafeTensors, name: &str) -> Result<Array3<f32>, 
         });
     }
 
-    // Convert bytes to f32 slice
-    let data_bytes = tensor_view.data();
-    let data_f32: &[f32] = bytemuck::cast_slice(data_bytes);
+    // Convert bytes to f32 (see `bytes_to_f32_vec` for why this cannot use
+    // `bytemuck::cast_slice` directly).
+    let data_f32 = bytes_to_f32_vec(name, tensor_view.data())?;
 
     // Create ndarray
-    Array3::from_shape_vec((shape[0], shape[1], shape[2]), data_f32.to_vec()).map_err(|e| {
+    Array3::from_shape_vec((shape[0], shape[1], shape[2]), data_f32).map_err(|e| {
         FlameError::ShapeMismatch {
             name: name.to_string(),
             expected: format!("{shape:?}"),
@@ -540,18 +579,169 @@ fn load_tensor_i32_2d(tensors: &SafeTensors, name: &str) -> Result<Array2<i32>, 
         });
     }
 
-    // Convert bytes to i32 slice
-    let data_bytes = tensor_view.data();
-    let data_i32: &[i32] = bytemuck::cast_slice(data_bytes);
+    // Convert bytes to i32 (see `bytes_to_f32_vec` for why this cannot use
+    // `bytemuck::cast_slice` directly).
+    let data_i32 = bytes_to_i32_vec(name, tensor_view.data())?;
 
     // Create ndarray
-    Array2::from_shape_vec((shape[0], shape[1]), data_i32.to_vec()).map_err(|e| {
-        FlameError::ShapeMismatch {
-            name: name.to_string(),
-            expected: format!("{shape:?}"),
-            got: e.to_string(),
-        }
+    Array2::from_shape_vec((shape[0], shape[1]), data_i32).map_err(|e| FlameError::ShapeMismatch {
+        name: name.to_string(),
+        expected: format!("{shape:?}"),
+        got: e.to_string(),
     })
+}
+
+/// Decode little-endian bytes into a `Vec<f32>` without requiring the source
+/// slice to be 4-byte aligned.
+///
+/// `bytemuck::cast_slice::<u8, f32>` PANICS
+/// (`TargetAlignmentGreaterAndInputNotAligned`) whenever the source pointer
+/// is not 4-byte aligned, and also panics (`OutputSliceWouldHaveSlop`) when
+/// the length is not a multiple of 4. A tensor's byte payload inside a
+/// safetensors file starts at `8 + header_len + tensor_offset`; safetensors
+/// does not pad the JSON header, so alignment is a file-controlled property
+/// this crate cannot assume for an arbitrary (possibly untrusted or
+/// corrupted) input file. Decoding byte-by-byte via `from_le_bytes` works
+/// for any alignment and lets a malformed length be reported as a
+/// [`FlameError`] instead of aborting the process.
+fn bytes_to_f32_vec(name: &str, data_bytes: &[u8]) -> Result<Vec<f32>, FlameError> {
+    if !data_bytes.len().is_multiple_of(4) {
+        return Err(FlameError::ShapeMismatch {
+            name: name.to_string(),
+            expected: "byte length that is a multiple of 4 (f32)".to_string(),
+            got: format!("{} bytes", data_bytes.len()),
+        });
+    }
+    Ok(data_bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect())
+}
+
+/// Decode little-endian bytes into a `Vec<i32>`. See [`bytes_to_f32_vec`]
+/// for why a manual, alignment-independent decode is required here instead
+/// of `bytemuck::cast_slice`.
+fn bytes_to_i32_vec(name: &str, data_bytes: &[u8]) -> Result<Vec<i32>, FlameError> {
+    if !data_bytes.len().is_multiple_of(4) {
+        return Err(FlameError::ShapeMismatch {
+            name: name.to_string(),
+            expected: "byte length that is a multiple of 4 (i32)".to_string(),
+            got: format!("{} bytes", data_bytes.len()),
+        });
+    }
+    Ok(data_bytes
+        .chunks_exact(4)
+        .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect())
+}
+
+/// Assert that an array has an expected shape.
+///
+/// Mirrors `io::expect_shape` (duplicated here since that helper is
+/// private to the NPY loader and this module has its own independent
+/// loading path).
+fn expect_shape(name: &str, expected: &[usize], got: &[usize]) -> Result<(), FlameError> {
+    if expected != got {
+        return Err(FlameError::ShapeMismatch {
+            name: name.to_string(),
+            expected: format!("{expected:?}"),
+            got: format!("{got:?}"),
+        });
+    }
+    Ok(())
+}
+
+/// Validate a blend-shape direction array's shape against `[n_verts, 3, K]`.
+///
+/// The first two dimensions are always checked; the trailing component
+/// count `K` is only checked when `expected_k` is `Some` (shape/expression
+/// basis sizes are data-driven, but the pose-corrective basis size is fixed
+/// by `n_joints`). Mirrors `io::expect_dir_shape`.
+fn expect_dir_shape(
+    name: &str,
+    shape: &[usize],
+    n_verts: usize,
+    expected_k: Option<usize>,
+) -> Result<(), FlameError> {
+    let dims_ok = shape.len() == 3 && shape[0] == n_verts && shape[1] == 3;
+    let k_ok = match expected_k {
+        Some(k) => shape.len() == 3 && shape[2] == k,
+        None => true,
+    };
+    if !dims_ok || !k_ok {
+        let expected = match expected_k {
+            Some(k) => format!("[{n_verts}, 3, {k}]"),
+            None => format!("[{n_verts}, 3, K]"),
+        };
+        return Err(FlameError::ShapeMismatch {
+            name: name.to_string(),
+            expected,
+            got: format!("{shape:?}"),
+        });
+    }
+    Ok(())
+}
+
+/// Validate that `parents` describes a well-formed kinematic chain: the root
+/// joint (index 0) carries a negative parent marker, and every other
+/// joint's parent is a strictly earlier joint index.
+///
+/// `FlameModel::compute_skinning_transforms` builds global transforms by
+/// iterating joints `0..n_joints` in order and reading `global[parent]`,
+/// which is only valid (and only correct -- not merely non-panicking) when
+/// `parent < j`. Mirrors `io::validate_parents`.
+fn validate_parents(parents: &[i32]) -> Result<(), FlameError> {
+    if parents.is_empty() {
+        return Err(FlameError::InvalidParams(
+            "kintree_table must describe at least one joint".to_string(),
+        ));
+    }
+    if parents[0] >= 0 {
+        return Err(FlameError::InvalidParams(format!(
+            "parents[0] = {} must be negative (root joint marker)",
+            parents[0]
+        )));
+    }
+    for (j, &p) in parents.iter().enumerate().skip(1) {
+        let j_i32 = i32::try_from(j).map_err(|_| {
+            FlameError::InvalidParams(format!(
+                "parents has too many entries ({j}) to validate as ancestor indices"
+            ))
+        })?;
+        if p < 0 || p >= j_i32 {
+            return Err(FlameError::InvalidParams(format!(
+                "parents[{j}] = {p} is not a valid ancestor; expected 0 <= parents[{j}] < {j}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Convert raw `i32` face indices to `[u32; 3]` triangles, rejecting any
+/// index that is negative or falls outside `0..n_verts`.
+///
+/// Without this check a negative index silently wraps to a huge `u32` under
+/// `as` casting, and an out-of-range positive index is only caught much
+/// later (and only as a panic) inside `Mesh::recompute_normals` or GPU
+/// buffer upload. Mirrors `io::convert_faces`.
+fn convert_faces(faces_i32: &Array2<i32>, n_verts: usize) -> Result<Vec<[u32; 3]>, FlameError> {
+    let mut faces = Vec::with_capacity(faces_i32.nrows());
+    for (row_idx, row) in faces_i32.rows().into_iter().enumerate() {
+        let mut tri = [0u32; 3];
+        for (c, slot) in tri.iter_mut().enumerate() {
+            let v = row[c];
+            if v < 0 || v as usize >= n_verts {
+                return Err(FlameError::IndexOutOfBounds {
+                    context: format!("faces[{row_idx}][{c}]"),
+                    index: usize::try_from(v).unwrap_or(usize::MAX),
+                    len: n_verts,
+                });
+            }
+            *slot = v as u32;
+        }
+        faces.push(tri);
+    }
+    Ok(faces)
 }
 
 #[cfg(test)]
@@ -568,7 +758,11 @@ mod tests {
         let n_joints = 5;
         let n_shape = 3;
         let n_expr = 2;
-        let n_pose_dirs = 4;
+        // Must equal (n_joints - 1) * 9 to pass `expect_dir_shape`'s
+        // posedirs check in `load_flame_model_safetensors` (pose-corrective
+        // basis size is fixed by the kinematic chain, unlike shapedirs /
+        // expressiondirs which are data-driven).
+        let n_pose_dirs = (n_joints - 1) * 9;
 
         FlameModel {
             v_template: Array2::zeros((n_verts, 3)),
@@ -721,5 +915,222 @@ mod tests {
         assert_eq!(loaded.faces[0], [0, 1, 2]);
         assert_eq!(loaded.faces[1], [3, 4, 5]);
         assert_eq!(loaded.faces[2], [6, 7, 8]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Alignment-independent byte decoding (regression for the
+    // `bytemuck::cast_slice` panic on unaligned/short tensor payloads).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_bytes_to_f32_vec_rejects_non_multiple_of_4_length() {
+        let bytes = [0u8; 6]; // not a multiple of 4
+        let result = bytes_to_f32_vec("test_tensor", &bytes);
+        assert!(matches!(result, Err(FlameError::ShapeMismatch { .. })));
+    }
+
+    #[test]
+    fn test_bytes_to_f32_vec_handles_unaligned_slice_without_panicking() {
+        // Build a buffer where the f32 payload starts at a 1-byte offset
+        // from the start of the allocation, so the slice's alignment is not
+        // guaranteed to be 4 -- exactly the situation a safetensors file
+        // produces whenever `8 + header_len + tensor_offset` is not a
+        // multiple of 4. `bytemuck::cast_slice` would panic on this input.
+        let value: f32 = 1234.5;
+        let mut buf = vec![0xAAu8]; // 1 padding byte to misalign what follows
+        buf.extend_from_slice(&value.to_le_bytes());
+        let payload = &buf[1..]; // 4 bytes, not necessarily 4-byte aligned
+        let decoded = bytes_to_f32_vec("test_tensor", payload).expect("should decode");
+        assert_eq!(decoded.len(), 1);
+        assert!((decoded[0] - value).abs() < 1e-3);
+    }
+
+    #[test]
+    fn test_bytes_to_i32_vec_rejects_non_multiple_of_4_length() {
+        let bytes = [0u8; 5];
+        let result = bytes_to_i32_vec("test_tensor", &bytes);
+        assert!(matches!(result, Err(FlameError::ShapeMismatch { .. })));
+    }
+
+    #[test]
+    fn test_bytes_to_i32_vec_handles_unaligned_slice_without_panicking() {
+        let value: i32 = -987_654;
+        let mut buf = vec![0xAAu8, 0xBBu8, 0xCCu8]; // 3 padding bytes
+        buf.extend_from_slice(&value.to_le_bytes());
+        let payload = &buf[3..];
+        let decoded = bytes_to_i32_vec("test_tensor", payload).expect("should decode");
+        assert_eq!(decoded, vec![value]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Shape validation helpers (regression for the "no shape validation at
+    // all despite documenting it" finding).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_expect_shape_rejects_mismatch() {
+        assert!(expect_shape("v_template", &[10, 3], &[10, 3]).is_ok());
+        assert!(expect_shape("v_template", &[10, 3], &[10, 4]).is_err());
+    }
+
+    #[test]
+    fn test_validate_parents_accepts_well_formed_chain() {
+        assert!(validate_parents(&[-1, 0, 1, 1, 3]).is_ok());
+    }
+
+    #[test]
+    fn test_validate_parents_rejects_non_negative_root() {
+        let err = validate_parents(&[0, 0]).unwrap_err();
+        assert!(matches!(err, FlameError::InvalidParams(_)));
+    }
+
+    #[test]
+    fn test_validate_parents_rejects_forward_reference() {
+        let err = validate_parents(&[-1, 2, 0]).unwrap_err();
+        assert!(matches!(err, FlameError::InvalidParams(_)));
+    }
+
+    #[test]
+    fn test_validate_parents_rejects_empty() {
+        assert!(validate_parents(&[]).is_err());
+    }
+
+    #[test]
+    fn test_convert_faces_rejects_out_of_range_index() {
+        let faces_i32 = Array2::from_shape_vec((1, 3), vec![0, 1, 5])
+            .expect("valid (1, 3) shape for a 3-element vec");
+        let err = convert_faces(&faces_i32, 3).unwrap_err();
+        assert!(matches!(err, FlameError::IndexOutOfBounds { len: 3, .. }));
+    }
+
+    #[test]
+    fn test_convert_faces_rejects_negative_index() {
+        let faces_i32 = Array2::from_shape_vec((1, 3), vec![0, 1, -1])
+            .expect("valid (1, 3) shape for a 3-element vec");
+        let err = convert_faces(&faces_i32, 3).unwrap_err();
+        assert!(matches!(err, FlameError::IndexOutOfBounds { .. }));
+    }
+
+    #[test]
+    fn test_expect_dir_shape_checks_leading_dims() {
+        let dirs = Array3::<f32>::zeros((5, 3, 10));
+        assert!(expect_dir_shape("shapedirs", dirs.shape(), 5, None).is_ok());
+        assert!(expect_dir_shape("shapedirs", dirs.shape(), 6, None).is_err());
+    }
+
+    #[test]
+    fn test_expect_dir_shape_checks_trailing_k_when_requested() {
+        let dirs = Array3::<f32>::zeros((5, 3, 36));
+        assert!(expect_dir_shape("posedirs", dirs.shape(), 5, Some(36)).is_ok());
+        assert!(expect_dir_shape("posedirs", dirs.shape(), 5, Some(9)).is_err());
+    }
+
+    /// End-to-end regression: a hand-built, on-disk `.safetensors` file
+    /// (bypassing `save_flame_model_safetensors`, which always writes
+    /// internally-consistent shapes) with a `j_regressor` tensor that does
+    /// not match `[n_joints, n_verts]` must be rejected by
+    /// `load_flame_model_safetensors` with a typed error, not accepted and
+    /// left to panic later inside `forward()`.
+    #[test]
+    fn test_load_flame_model_safetensors_rejects_mismatched_j_regressor_shape() {
+        let temp_dir = TempDir::new().expect("test: temp dir creation should succeed");
+        let path = temp_dir.path().join("bad_j_regressor.safetensors");
+
+        let n_verts = 10usize;
+        let n_joints = 5usize;
+        let v_template = vec![0.0f32; n_verts * 3];
+        let faces = vec![0i32; 5 * 3];
+        let shapedirs = vec![0.0f32; n_verts * 3 * 3];
+        let expressiondirs = vec![0.0f32; n_verts * 3 * 2];
+        let posedirs = vec![0.0f32; n_verts * 3 * (n_joints - 1) * 9];
+        // Deliberately wrong: must be [n_joints, n_verts] = [5, 10].
+        let j_regressor = vec![0.0f32; n_joints * n_joints];
+        let kintree: Vec<i32> = vec![-1, 0, 1, 2, 3, 0, 1, 2, 3, 4];
+        let lbs_weights = vec![0.0f32; n_verts * n_joints];
+
+        let tensors = vec![
+            (
+                "v_template",
+                TensorView::new(
+                    Dtype::F32,
+                    vec![n_verts, 3],
+                    bytemuck::cast_slice(&v_template),
+                )
+                .expect("view"),
+            ),
+            (
+                "faces",
+                TensorView::new(Dtype::I32, vec![5, 3], bytemuck::cast_slice(&faces))
+                    .expect("view"),
+            ),
+            (
+                "shapedirs",
+                TensorView::new(
+                    Dtype::F32,
+                    vec![n_verts, 3, 3],
+                    bytemuck::cast_slice(&shapedirs),
+                )
+                .expect("view"),
+            ),
+            (
+                "expressiondirs",
+                TensorView::new(
+                    Dtype::F32,
+                    vec![n_verts, 3, 2],
+                    bytemuck::cast_slice(&expressiondirs),
+                )
+                .expect("view"),
+            ),
+            (
+                "posedirs",
+                TensorView::new(
+                    Dtype::F32,
+                    vec![n_verts, 3, (n_joints - 1) * 9],
+                    bytemuck::cast_slice(&posedirs),
+                )
+                .expect("view"),
+            ),
+            (
+                "j_regressor",
+                TensorView::new(
+                    Dtype::F32,
+                    vec![n_joints, n_joints],
+                    bytemuck::cast_slice(&j_regressor),
+                )
+                .expect("view"),
+            ),
+            (
+                "kintree_table",
+                TensorView::new(
+                    Dtype::I32,
+                    vec![2, n_joints],
+                    bytemuck::cast_slice(&kintree),
+                )
+                .expect("view"),
+            ),
+            (
+                "lbs_weights",
+                TensorView::new(
+                    Dtype::F32,
+                    vec![n_verts, n_joints],
+                    bytemuck::cast_slice(&lbs_weights),
+                )
+                .expect("view"),
+            ),
+        ];
+        let serialized = safetensors::tensor::serialize(tensors, None).expect("serialize");
+        std::fs::write(&path, serialized).expect("write");
+
+        // `FlameModel` does not implement `Debug`, so match manually rather
+        // than formatting the whole `Result` in the assertion message.
+        match load_flame_model_safetensors(&path) {
+            Err(FlameError::ShapeMismatch { .. }) => {}
+            Err(e) => panic!(
+                "expected ShapeMismatch for a malformed j_regressor, got a different error: {e}"
+            ),
+            Ok(_) => {
+                panic!("expected ShapeMismatch for a malformed j_regressor, but load succeeded")
+            }
+        }
     }
 }

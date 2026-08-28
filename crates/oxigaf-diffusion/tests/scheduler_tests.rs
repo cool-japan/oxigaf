@@ -3,9 +3,17 @@
 //! Comprehensive tests for the DDIM scheduler including step computation,
 //! alpha schedule verification, and noise addition.
 
-use candle_core::{DType, Device, Result, Tensor};
-use oxigaf_diffusion::{DdimScheduler, PredictionType};
+use candle_core::{DType, Device, Tensor};
+use oxigaf_diffusion::{DdimScheduler, DiffusionError, PredictionType};
 use proptest::prelude::*;
+
+/// `DdimScheduler::set_timesteps`, `step` and `add_noise` all return
+/// [`oxigaf_diffusion::DiffusionResult`], and `DiffusionError` converts from
+/// `candle_core::Error`, so aliasing `Result` to the crate's own result type
+/// lets `?` carry both scheduler and tensor failures out of a test body.
+/// (Aliasing it to `candle_core::Result` — as this file used to — cannot work:
+/// there is no `From<DiffusionError> for candle_core::Error`.)
+use oxigaf_diffusion::DiffusionResult as Result;
 
 // ---------------------------------------------------------------------------
 // Basic Scheduler Tests
@@ -14,7 +22,7 @@ use proptest::prelude::*;
 #[test]
 fn test_scheduler_creation() {
     let mut scheduler = DdimScheduler::new(1000, PredictionType::Epsilon);
-    scheduler.set_timesteps(50);
+    scheduler.set_timesteps(50).expect("set_timesteps failed");
 
     // Basic validation
     assert!(!scheduler.timesteps().is_empty());
@@ -24,7 +32,7 @@ fn test_scheduler_creation() {
 #[test]
 fn test_scheduler_timesteps_ordered() {
     let mut scheduler = DdimScheduler::new(1000, PredictionType::Epsilon);
-    scheduler.set_timesteps(50);
+    scheduler.set_timesteps(50).expect("set_timesteps failed");
     let timesteps = scheduler.timesteps();
 
     // Timesteps should be in descending order (for DDIM)
@@ -41,10 +49,14 @@ fn test_scheduler_timesteps_ordered() {
 #[test]
 fn test_scheduler_different_num_steps() {
     let mut scheduler_10 = DdimScheduler::new(1000, PredictionType::Epsilon);
-    scheduler_10.set_timesteps(10);
+    scheduler_10
+        .set_timesteps(10)
+        .expect("set_timesteps failed");
 
     let mut scheduler_50 = DdimScheduler::new(1000, PredictionType::Epsilon);
-    scheduler_50.set_timesteps(50);
+    scheduler_50
+        .set_timesteps(50)
+        .expect("set_timesteps failed");
 
     assert!(scheduler_10.timesteps().len() <= 10);
     assert!(scheduler_50.timesteps().len() <= 50);
@@ -54,7 +66,7 @@ fn test_scheduler_different_num_steps() {
 #[test]
 fn test_scheduler_epsilon_prediction() {
     let mut scheduler = DdimScheduler::new(1000, PredictionType::Epsilon);
-    scheduler.set_timesteps(50);
+    scheduler.set_timesteps(50).expect("set_timesteps failed");
     // Just verify creation works with Epsilon prediction type
     assert!(!scheduler.timesteps().is_empty());
 }
@@ -62,28 +74,64 @@ fn test_scheduler_epsilon_prediction() {
 #[test]
 fn test_scheduler_v_prediction() {
     let mut scheduler = DdimScheduler::new(1000, PredictionType::VPrediction);
-    scheduler.set_timesteps(50);
+    scheduler.set_timesteps(50).expect("set_timesteps failed");
     // Just verify creation works with VPrediction type
     assert!(!scheduler.timesteps().is_empty());
 }
 
-// Note: Zero timesteps causes division by zero in set_timesteps()
-// This is an invalid configuration, so we don't test it
+/// Regression test: `set_timesteps(0)` used to divide by zero and panic, which
+/// is why this file previously carried a comment saying zero timesteps were
+/// "an invalid configuration, so we don't test it". It is now a reported
+/// [`DiffusionError::InvalidConfig`], so it *is* testable.
+#[test]
+fn test_scheduler_zero_timesteps_is_an_error_not_a_panic() {
+    let mut scheduler = DdimScheduler::new(1000, PredictionType::Epsilon);
+    let err = scheduler
+        .set_timesteps(0)
+        .expect_err("set_timesteps(0) must be rejected");
+    assert!(
+        matches!(err, DiffusionError::InvalidConfig(_)),
+        "got {err:?}"
+    );
+    assert!(
+        scheduler.timesteps().is_empty(),
+        "a rejected schedule must leave the scheduler uninitialised"
+    );
+}
+
+/// Regression test: asking for more inference steps than the scheduler has
+/// training timesteps used to truncate `num_train / num_inference` to `0` and
+/// emit N identical zero timesteps.
+#[test]
+fn test_scheduler_more_steps_than_train_timesteps_is_an_error() {
+    let mut scheduler = DdimScheduler::new(100, PredictionType::Epsilon);
+    let err = scheduler
+        .set_timesteps(500)
+        .expect_err("num_inference_steps > num_train_timesteps must be rejected");
+    assert!(
+        matches!(err, DiffusionError::InvalidConfig(_)),
+        "got {err:?}"
+    );
+}
 
 #[test]
 fn test_scheduler_single_step() {
     let mut scheduler = DdimScheduler::new(1000, PredictionType::Epsilon);
-    scheduler.set_timesteps(1);
+    scheduler.set_timesteps(1).expect("set_timesteps failed");
     assert_eq!(scheduler.timesteps().len(), 1);
 }
 
 #[test]
 fn test_scheduler_different_train_timesteps() {
     let mut scheduler_500 = DdimScheduler::new(500, PredictionType::Epsilon);
-    scheduler_500.set_timesteps(20);
+    scheduler_500
+        .set_timesteps(20)
+        .expect("set_timesteps failed");
 
     let mut scheduler_1000 = DdimScheduler::new(1000, PredictionType::Epsilon);
-    scheduler_1000.set_timesteps(20);
+    scheduler_1000
+        .set_timesteps(20)
+        .expect("set_timesteps failed");
 
     // Both should have 20 inference steps
     assert_eq!(scheduler_500.timesteps().len(), 20);
@@ -101,7 +149,7 @@ fn test_scheduler_different_train_timesteps() {
 #[test]
 fn test_scheduler_step_shape() -> Result<()> {
     let mut scheduler = DdimScheduler::new(1000, PredictionType::Epsilon);
-    scheduler.set_timesteps(50);
+    scheduler.set_timesteps(50).expect("set_timesteps failed");
 
     let batch = 4;
     let channels = 4;
@@ -122,7 +170,7 @@ fn test_scheduler_step_shape() -> Result<()> {
 #[test]
 fn test_ddim_step_finite_output() -> Result<()> {
     let mut scheduler = DdimScheduler::new(1000, PredictionType::Epsilon);
-    scheduler.set_timesteps(20);
+    scheduler.set_timesteps(20)?;
 
     let batch = 1;
     let channels = 4;
@@ -157,7 +205,7 @@ fn test_ddim_step_finite_output() -> Result<()> {
 #[test]
 fn test_ddim_step_v_prediction() -> Result<()> {
     let mut scheduler = DdimScheduler::new(1000, PredictionType::VPrediction);
-    scheduler.set_timesteps(10);
+    scheduler.set_timesteps(10)?;
 
     let batch = 2;
     let channels = 4;
@@ -180,7 +228,7 @@ fn test_ddim_step_v_prediction() -> Result<()> {
 #[test]
 fn test_ddim_step_epsilon_prediction() -> Result<()> {
     let mut scheduler = DdimScheduler::new(1000, PredictionType::Epsilon);
-    scheduler.set_timesteps(10);
+    scheduler.set_timesteps(10)?;
 
     let batch = 2;
     let channels = 4;
@@ -311,7 +359,9 @@ proptest! {
         num_inference in 1usize..100,
     ) {
         let mut scheduler = DdimScheduler::new(num_train, PredictionType::Epsilon);
-        scheduler.set_timesteps(num_inference);
+        scheduler
+            .set_timesteps(num_inference)
+            .expect("set_timesteps failed");
 
         let timesteps = scheduler.timesteps();
         for i in 0..timesteps.len().saturating_sub(1) {
@@ -332,7 +382,9 @@ proptest! {
             let noise = Tensor::randn(0f32, 1f32, (batch, channels, size, size), &Device::Cpu)?;
 
             let noisy = scheduler.add_noise(&original, &noise, t)?;
-            noisy.dims4()
+            // `dims4()` is a `candle_core::Result`; the closure returns the
+            // crate's `DiffusionResult`, which converts from it via `?`.
+            Ok(noisy.dims4()?)
         })();
 
         // Verify if successful
