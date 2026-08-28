@@ -4,7 +4,7 @@
 
 Implements the methods from [GAF: Gaussian Avatar Reconstruction from Monocular Videos via Multi-View Diffusion](https://arxiv.org/abs/2412.10209) entirely in the Rust ecosystem.
 
-## What's in v0.1.2
+## What's in v0.1.3
 
 ### Gradient-Correctness Fixes (read before upgrading)
 - **Backward rasterizer shaders fixed**: `rasterize_bwd.wgsl` could accumulate

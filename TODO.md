@@ -1,4 +1,4 @@
-# OxiGAF TODO — Production-Grade Release Plan (0.1.2)
+# OxiGAF TODO — Production-Grade Release Plan (0.1.3)
 
 > Regenerated 2026-08-24 from an exhaustive 21-agent production-readiness audit
 > (every src file of all 7 crates read end-to-end, plus cross-cutting audits of

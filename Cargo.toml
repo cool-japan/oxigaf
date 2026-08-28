@@ -11,7 +11,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 rust-version = "1.87"
 license = "Apache-2.0"
@@ -116,12 +116,12 @@ torsh-tensor = "0.2.0"
 torsh-nn = "0.2.0"
 
 # Internal crates (version required so member crates stay publishable)
-oxigaf-flame = { path = "crates/oxigaf-flame", version = "0.1.2" }
-oxigaf-diffusion = { path = "crates/oxigaf-diffusion", version = "0.1.2" }
-oxigaf-render = { path = "crates/oxigaf-render", version = "0.1.2" }
-oxigaf-trainer = { path = "crates/oxigaf-trainer", version = "0.1.2" }
-oxigaf = { path = "crates/oxigaf", version = "0.1.2" }
-oxigaf-bridge = { path = "crates/oxigaf-bridge", version = "0.1.2" }
+oxigaf-flame = { path = "crates/oxigaf-flame", version = "0.1.3" }
+oxigaf-diffusion = { path = "crates/oxigaf-diffusion", version = "0.1.3" }
+oxigaf-render = { path = "crates/oxigaf-render", version = "0.1.3" }
+oxigaf-trainer = { path = "crates/oxigaf-trainer", version = "0.1.3" }
+oxigaf = { path = "crates/oxigaf", version = "0.1.3" }
+oxigaf-bridge = { path = "crates/oxigaf-bridge", version = "0.1.3" }
 
 # Performance optimization profiles
 [profile.release]
